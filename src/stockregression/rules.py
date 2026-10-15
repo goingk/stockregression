@@ -12,6 +12,47 @@ from typing import Any
 import warnings
 
 
+def instrument_terms(symbol: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Canonical exchange terms. Provider-supplied product terms take precedence."""
+    supplied = {key: value for key, value in (metadata or {}).items() if value is not None}
+    code = symbol.split(".")[0]
+    etf = supplied.get("asset_type", "etf" if code.startswith(("1", "5")) else "stock") == "etf"
+    name = str(supplied.get("name", ""))
+    category = "stock"
+    for token, kind in [("债", "bond"), ("货币", "money"), ("日利", "money"), ("黄金", "commodity"), ("期货", "commodity"), ("纳指", "crossborder"), ("纳斯达克", "crossborder"), ("标普", "crossborder"), ("恒生", "crossborder"), ("港股", "crossborder"), ("日经", "crossborder"), ("德国", "crossborder"), ("法国", "crossborder")]:
+        if token in name:
+            category = kind
+            break
+    if any(token in name.upper() for token in ("H股", "香港", "美国", "日本", "沙特", "越南", "韩国", "东南亚", "印度", "海外", "全球", "英国", "中概")):
+        category = "crossborder"
+    if code.startswith(("513", "520", "521")):
+        category = "crossborder"
+    if code.startswith("511"):
+        category = "money" if code.startswith(("5116", "5117", "5118", "5119")) else "bond"
+    if code.startswith("518") or code in {"159980", "159981", "159985"}:
+        category = "commodity"
+    category = supplied.get("etf_category", category)
+    profile = "star" if code.startswith(("588", "589")) or "科创" in name else "chinext" if code == "159915" or "创业" in name or "双创" in name else "standard"
+    board = "etf" if etf else ("star" if code.startswith(("688", "689")) else "chinext" if code.startswith("3") else "main")
+    return {
+        "asset_type": "etf" if etf else "stock", "board": board,
+        "etf_category": category if etf else None, "price_tick": 0.001 if etf else 0.01,
+        "lot_size": 100, "settlement": "T0" if etf and category != "stock" else "T1",
+        "etf_limit_profile": profile if etf else None,
+        "price_limit_rate": 0.20 if etf and (code.startswith(("588", "589")) or any(x in name for x in ("科创", "创业", "双创"))) else 0.10,
+        **supplied,
+    }
+
+
+def etf_price_limit_rate(metadata: dict[str, Any], on_date: Any) -> float:
+    profile = metadata.get("etf_limit_profile")
+    if profile == "chinext":
+        return 0.20 if as_date(on_date) >= date(2020, 8, 24) else 0.10
+    if profile == "star":
+        return 0.20
+    return float(metadata.get("price_limit_rate", 0.10))
+
+
 def as_date(value: Any) -> date:
     if isinstance(value, datetime):
         return value.date()
@@ -115,6 +156,8 @@ def transfer_fee_terms(
     Shenzhen schedule and later CSDC schedules use transaction value.  The
     caller supplies quantity and share face value when applying this rate.
     """
+    if str(symbol or "").split(".")[0].startswith(("1", "5")):
+        return 0.0, False, 0.0
     day = as_date(on_date)
     exchange = str(symbol or "").upper().rsplit(".", 1)[-1]
     if day >= date(2022, 4, 29):
@@ -143,7 +186,8 @@ def fee_rates(on_date: Any, symbol: str | None = None) -> tuple[float, float]:
     whether a historical exchange rate applies to notional or face value.
     Calls without a symbol retain the historical 0.02‰ notional fallback.
     """
-    return _stamp_duty_rate(on_date), transfer_fee_terms(on_date, symbol)[0]
+    stamp = 0.0 if str(symbol or "").split(".")[0].startswith(("1", "5")) else _stamp_duty_rate(on_date)
+    return stamp, transfer_fee_terms(on_date, symbol)[0]
 
 
 def round_money(value: float) -> float:
@@ -167,7 +211,7 @@ def commissions_and_taxes(
     if notional <= 0:
         return {"commission": 0.0, "stamp_duty": 0.0, "transfer_fee": 0.0, "total": 0.0}
     day = as_date(on_date)
-    stamp_rate = _stamp_duty_rate(day)
+    stamp_rate = fee_rates(day, symbol)[0]
     # Notional and rates represent decimal exchange/account values.  Multiply
     # those decimal inputs before conversion to float so binary artifacts such
     # as 44_450 * 0.0003 becoming 13.334999999999999 do not change a cent.
@@ -178,7 +222,10 @@ def commissions_and_taxes(
     )
     stamp_is_bilateral = as_date(on_date) < date(2008, 9, 19)
     stamp = decimal_notional * Decimal(str(stamp_rate)) if side == "sell" or stamp_is_bilateral else Decimal(0)
-    if day < date(2015, 8, 1) and (quantity is None or symbol is None):
+    is_etf = str(symbol or "").split(".")[0].startswith(("1", "5"))
+    if is_etf:
+        transfer = Decimal(0)
+    elif day < date(2015, 8, 1) and (quantity is None or symbol is None):
         warnings.warn(
             "2015-08-01前的过户费规则依交易所、成交数量和面值区分；本次旧调用缺少symbol或quantity，按0.02‰成交金额估算。",
             UserWarning,

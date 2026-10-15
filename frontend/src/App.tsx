@@ -11,7 +11,7 @@ const ResearchPage = lazy(() => import('./pages/ResearchPage'))
 
 export type PageKey = 'data' | 'backtest' | 'results' | 'research'
 const nav: Array<{ id: PageKey; label: string; hint: string; icon: typeof Database }> = [
-  { id: 'data', label: '数据中心', hint: '数据与覆盖', icon: Database },
+  { id: 'data', label: '行情', hint: '股票 · ETF · 自选', icon: Database },
   { id: 'backtest', label: '回测工作台', hint: '策略配置', icon: Layers3 },
   { id: 'results', label: '结果分析', hint: '绩效与交易', icon: BarChart3 },
   { id: 'research', label: '参数研究', hint: '稳健性搜索', icon: FlaskConical },

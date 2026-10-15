@@ -16,14 +16,19 @@ export interface QuantityConfig {
 }
 
 export interface BacktestConfig {
+  schema_version: 2
   symbol: string
   start_date: string
   end_date: string | null
   frequency: Frequency
-  initial_cash: number
-  initial_position: number
-  min_position: number
-  max_position: number
+  initial_shares: number
+  min_shares: number
+  max_shares: number
+  buy_shares: number
+  sell_shares: number
+  dca: { frequency: 'daily' | 'weekly' | 'monthly'; shares: number }
+  reference_price_mode: 'auto' | 'manual'
+  initial_cash?: number
   grid_mode: 'trailing' | 'arithmetic' | 'geometric'
   buy_step: number
   sell_step: number
@@ -31,10 +36,7 @@ export interface BacktestConfig {
   reference_price: number | null
   lower_price: number | null
   upper_price: number | null
-  buy_quantity: QuantityConfig
-  sell_quantity: QuantityConfig
   fees: FeeConfig
-  dca_frequency: 'weekly' | 'monthly'
 }
 
 export interface Instrument {
@@ -42,6 +44,9 @@ export interface Instrument {
   name: string
   exchange: string
   board: string
+  asset_type: 'stock' | 'etf'
+  price_tick?: number
+  settlement?: 'T0' | 'T1'
 }
 
 export interface WatchItem extends Instrument {
@@ -80,7 +85,9 @@ export interface EquityPoint {
   cash?: number
   position?: number
   position_ratio?: number
-  drawdown?: number
+  drawdown?: number | null
+  normalized_equity?: number | null
+  total_invested?: number
 }
 
 export interface Trade {
@@ -95,7 +102,8 @@ export interface Trade {
 }
 
 export interface StrategyResult {
-  metrics: Record<string, number>
+  metrics: Record<string, number | null>
+  return_basis?: string
   equity: EquityPoint[]
   equity_frequency?: string
   trades: Trade[]
@@ -113,6 +121,9 @@ export interface BacktestResult {
   quality?: Record<string, unknown>
   warnings?: string[]
   strategies: Record<'grid' | 'dca' | 'buy_hold' | string, StrategyResult>
+  schema_version?: number
+  funding?: { reserve_cash: number; initial_equity: number; valuation_price: number; reference_price: number; reference_date: string }
+  effective_end_date?: string
 }
 
 export interface Coverage {

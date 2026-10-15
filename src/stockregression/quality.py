@@ -74,7 +74,7 @@ def align_minutes(frame: pd.DataFrame, convention: str, multiplier: float = 1) -
     return result.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
 
 
-def infer_profile(frame: pd.DataFrame, daily: pd.DataFrame, source: str, reference: pd.DataFrame | None = None, declared: str | None = None, reference_frequency: str = "1m") -> dict:
+def infer_profile(frame: pd.DataFrame, daily: pd.DataFrame, source: str, reference: pd.DataFrame | None = None, declared: str | None = None, reference_frequency: str = "1m", price_tick: float = 0.01) -> dict:
     """Calibrate volume using daily totals and labels using independently aligned bars.
 
     Daily totals alone never establish timestamp semantics. TDX's published code
@@ -100,7 +100,7 @@ def infer_profile(frame: pd.DataFrame, daily: pd.DataFrame, source: str, referen
                 close_error = abs(float(part.iloc[-1].close) - float(row.close))
                 high_error = abs(float(part.high.max()) - float(row.high))
                 low_error = abs(float(part.low.min()) - float(row.low))
-                if vol_error <= 0.005 and max(close_error, high_error, low_error) <= 0.011:
+                if vol_error <= 0.005 and max(close_error, high_error, low_error) <= price_tick * 1.1:
                     good += 1
             score = None
             volume_score = None
@@ -123,7 +123,7 @@ def infer_profile(frame: pd.DataFrame, daily: pd.DataFrame, source: str, referen
                 if overlap:
                     price_ok = np.ones(overlap, dtype=bool)
                     for field in ("open", "high", "low", "close"):
-                        price_ok &= (joined[field] - joined[field + "_ref"]).abs().to_numpy() <= 0.011
+                        price_ok &= (joined[field] - joined[field + "_ref"]).abs().to_numpy() <= price_tick * 1.1
                     volume_ok = (joined.volume - joined.volume_ref).abs() <= np.maximum(1, joined.volume_ref * 0.005)
                     # Labels are established by price paths; volume units already
                     # require three daily-total checks. Auction allocation may
@@ -153,6 +153,17 @@ def _max_run(mask: np.ndarray) -> int:
 
 
 def apply_price_limits(daily: pd.DataFrame, calendar: pd.DataFrame, metadata: dict) -> pd.DataFrame:
+    if metadata.get("asset_type") == "etf":
+        from .rules import round_limit_price, etf_price_limit_rate
+        result = daily.copy()
+        tick = metadata.get("price_tick", 0.001)
+        rates = result.date.map(lambda day: etf_price_limit_rate(metadata, day))
+        for column, multiplier in (("limit_up", 1 + rates), ("limit_down", 1 - rates)):
+            calculated = (result.preclose * multiplier).map(lambda price: round_limit_price(price, tick) if pd.notna(price) and price > 0 else np.nan)
+            result[column] = result[column].fillna(calculated) if column in result else calculated
+        result["no_price_limit"] = result.get("no_price_limit", pd.Series(False, index=result.index)).fillna(False).astype(bool)
+        result.loc[result.no_price_limit, ["limit_up", "limit_down"]] = np.nan
+        return result
     from .rules import calculated_price_limits
     result = daily.copy()
     board = metadata.get("board", "main")
@@ -243,7 +254,7 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
                 reason = "交易时段首分钟缺失，无法因果补齐"
             elif missing == 0 and unit_error > 0.01:
                 reason = "完整分钟聚合成交量与日线偏差超过1%"
-            elif max(abs(float(observed.high.max()) - row.high), abs(float(observed.low.min()) - row.low), abs(float(observed.iloc[-1].close) - row.close)) > 0.011 and missing == 0:
+            elif max(abs(float(observed.high.max()) - row.high), abs(float(observed.low.min()) - row.low), abs(float(observed.iloc[-1].close) - row.close)) > float(metadata.get("price_tick", 0.01)) * 1.1 and missing == 0:
                 reason = "完整分钟价格聚合与日线不符"
             else:
                 previous = part.close.groupby(np.repeat([0, 1], 120)).ffill()

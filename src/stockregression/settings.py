@@ -24,6 +24,7 @@ class Settings(BaseModel):
     port: int = 8000
     max_workers: int = Field(default=2, ge=1, le=8)
     hf_revision: str = "ba589a11534825044fe5a6b84838f50ba8d8d188"
+    etf_hf_revision: str = "4b7e48c1e8265cc7d25baee55879dd5bbb24f74d"
 
 
 def load_settings() -> Settings:

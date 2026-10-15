@@ -1260,6 +1260,8 @@ def _accept_grid_intent(
 
 
 def _dca_period_key(day: date, frequency: str):
+    if frequency == "daily":
+        return day.year, day.toordinal()
     if frequency == "weekly":
         return day.isocalendar().year, day.isocalendar().week
     return day.year, day.month
@@ -1841,10 +1843,14 @@ def run_backtest(
     progress: Callable[[float, str], Any] | None = None,
     cancelled: Callable[[], bool] | None = None,
     summary_only: bool = False,
+    preview: bool = False,
 ) -> dict[str, Any]:
     """Run grid, DCA and buy-and-hold ledgers against one canonical data bundle."""
     if config.symbol != data.symbol:
         raise ValueError(f"回测标的 {config.symbol} 与数据标的 {data.symbol} 不一致")
+    if config.schema_version == 2:
+        from .share_engine import run_share_backtest
+        return run_share_backtest(config, data, progress, cancelled, summary_only, preview)
     fast_inputs = _fast_market_inputs(config, data)
     if fast_inputs is not None:
         return _run_fastpath(config, data, fast_inputs, progress, cancelled, summary_only)

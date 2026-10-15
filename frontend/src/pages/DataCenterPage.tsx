@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CalendarClock, Database, Download, FileUp, RefreshCw, Search, Settings2, Sparkles, Trash2 } from 'lucide-react'
 import { del, get, post, put } from '../api'
 import { Badge, Button, Card, Empty, ErrorBox, Field, JobProgress, Loading, PageHeader, SelectInput, Stat, TextInput, compact, dateText, percent, useConfirm, useErrorMessage } from '../components'
+import MarketPanel from '../MarketPanel'
 import type { Coverage, Instrument, Job, WatchItem } from '../types'
 
 type SettingsResponse = { data_dir?: string; active_data_dir?: string; restart_required?: boolean; schedule?: { enabled?: boolean; daily_time?: string; weekly_day?: string; weekly_time?: string }; [key: string]: unknown }
@@ -40,7 +41,7 @@ export default function DataCenterPage() {
   const [jobs, setJobs] = useState<Job[]>([])
   const [syncMode, setSyncMode] = useState<'history' | 'daily' | 'repair'>('history')
   const [selectedSymbols, setSelectedSymbols] = useState<string[]>([])
-  const [importForm, setImportForm] = useState({ symbol: '', minute_path: '', daily_path: '', actions_path: '', calendar_path: '', label_convention: 'auto' })
+  const [importForm, setImportForm] = useState({ symbol: '', minute_path: '', daily_path: '', actions_path: '', calendar_path: '', label_convention: 'auto', etf_category: '' })
   const [demoForm, setDemoForm] = useState({ symbol: '000001.SZ', days: 780 })
   const [busy, setBusy] = useState('')
   const [loading, setLoading] = useState(true)
@@ -54,11 +55,12 @@ export default function DataCenterPage() {
       const [items, config, allJobs] = await Promise.all([get<WatchItem[]>('/watchlist'), get<SettingsResponse>('/settings'), get<Job[]>('/jobs')])
       setWatchlist(items); setSettings(config); setJobs(allJobs.slice(0, 12))
       if (!dataDirDraftEdited.current) setDataDirDraft(config.data_dir ?? '')
-      setActiveSymbol((old) => items.some((item) => item.symbol === old) ? old : items[0]?.symbol ?? '')
+      setActiveSymbol((old) => old || items[0]?.symbol || '')
     } catch (e) { setError(err(e)) } finally { setLoading(false) }
   }, [err])
 
   useEffect(() => { void refresh() }, [refresh])
+  const completedDataJobs = jobs.filter(job => ['sync', 'instruments', 'import', 'demo'].includes(job.kind) && JOB_TERMINAL.has(job.status)).map(job => `${job.id}:${job.status}`).join(',')
   useEffect(() => {
     const timer = window.setInterval(() => { void refresh() }, 3000)
     return () => window.clearInterval(timer)
@@ -68,7 +70,7 @@ export default function DataCenterPage() {
     let cancelled = false
     get<Coverage>(`/data/coverage/${encodeURIComponent(activeSymbol)}`).then((value) => { if (!cancelled) setCoverage(value) }).catch((e) => { if (!cancelled) setError(err(e)) })
     return () => { cancelled = true }
-  }, [activeSymbol, err])
+  }, [activeSymbol, err, completedDataJobs])
   useEffect(() => { setQualityPage(1) }, [activeSymbol, qualityFilter])
 
   const runAction = async (label: string, action: () => Promise<unknown>, success: (result: unknown) => string) => {
@@ -101,6 +103,7 @@ export default function DataCenterPage() {
   const importData = () => {
     if (!importForm.symbol.trim()) { setError('导入前请填写股票代码。'); return }
     const body: Record<string, string> = { symbol: importForm.symbol.trim().toUpperCase(), label_convention: importForm.label_convention }
+    if (importForm.etf_category) body.etf_category = importForm.etf_category
     if (importForm.minute_path.trim()) body.minute_path = importForm.minute_path.trim()
     if (importForm.daily_path.trim()) body.daily_path = importForm.daily_path.trim()
     if (importForm.actions_path.trim()) body.actions_path = importForm.actions_path.trim()
@@ -159,15 +162,15 @@ export default function DataCenterPage() {
   const warningCount = coverage?.warnings?.length ?? 0
 
   return <>
-    <PageHeader eyebrow="DATA & COVERAGE" title="数据中心" description="管理沪深 A 股、分钟与日线数据覆盖、质量诊断和本机同步计划。" action={<Button variant="secondary" busy={busy === 'refresh'} onClick={() => void runAction('refresh', () => post('/instruments/refresh'), () => '股票列表更新任务已提交。')}><RefreshCw size={15} />更新股票列表</Button>} />
+    <PageHeader eyebrow="MARKET" title="行情" description="浏览沪深股票与 ETF 的本地行情，维护自选并持续更新数据库。" action={<Button variant="secondary" busy={busy === 'refresh'} onClick={() => void runAction('refresh', () => post('/instruments/refresh'), () => '股票及 ETF 清单更新任务已提交。')}><RefreshCw size={15} />更新证券清单</Button>} />
     {error && <ErrorBox message={error} onClose={() => setError('')} />}{notice && <div className="notice success">{notice}</div>}
-    <div className="data-overview">
-      <Card title="股票检索" subtitle="搜索沪深股票并维护自选列表。">
+    <MarketPanel onSelect={setActiveSymbol} /><details className="market-admin"><summary>数据覆盖、历史同步、导入与本机更新计划</summary><div className="data-overview">
+      <Card title="证券检索" subtitle="搜索沪深股票、ETF 并维护自选列表。">
         <div className="search-row"><TextInput value={query} onChange={(e) => setQuery(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && void search()} placeholder="输入代码或名称，例如 600000 / 浦发银行" /><Button busy={busy === 'search'} onClick={() => void search()}><Search size={15} />搜索</Button></div>
         {instruments.length > 0 && <div className="instrument-results">{instruments.map((item) => <div className="instrument-row" key={item.symbol}><div><strong>{item.name}</strong><small>{item.symbol} · {item.exchange} · {item.board}</small></div>{watchlist.some((w) => w.symbol === item.symbol) ? <Badge tone="green">已自选</Badge> : <Button variant="secondary" onClick={() => void addWatch(item)}>加入自选</Button>}</div>)}</div>}
         {instruments.length === 0 && <div className="search-hint"><span>支持证券代码或本地清单名称搜索</span><span>{watchlist.length} 只自选</span></div>}
       </Card>
-      <Card title="自选股票" subtitle="选择标的查看覆盖；勾选后可批量同步。" action={<Badge tone="blue">{watchlist.length} 只</Badge>}>
+      <Card title="自选证券" subtitle="选择标的查看覆盖；勾选后可批量同步。" action={<Badge tone="blue">{watchlist.length} 只</Badge>}>
         {loading ? <Loading /> : watchlist.length === 0 ? <Empty title="自选列表为空" detail="搜索股票后添加，或先生成演示数据。" /> : <div className="watch-list">
           <div className="watch-select-all"><label className="check-label"><input type="checkbox" checked={allSelected} onChange={(e) => setSelectedSymbols(e.target.checked ? watchlist.map((x) => x.symbol) : [])} /><span>全选用于同步</span></label></div>
           {watchlist.map((item) => <div key={item.symbol} className={`watch-row ${activeSymbol === item.symbol ? 'selected' : ''}`}><input aria-label={`选择 ${item.symbol} 同步`} type="checkbox" checked={selectedSymbols.includes(item.symbol)} onChange={(e) => toggleSelection(item.symbol, e.target.checked)} /><button className="watch-main" onClick={() => setActiveSymbol(item.symbol)}><strong>{item.name}</strong><small>{item.symbol} · {item.exchange}</small></button><button className="icon-button danger-icon" aria-label="移除自选" onClick={() => void removeWatch(item.symbol)}><Trash2 size={15} /></button></div>)}
@@ -197,11 +200,11 @@ export default function DataCenterPage() {
       </div>
       <aside className="side-column">
         <Card title="本地文件导入" subtitle="读取用户本机 CSV 或 Parquet 文件路径。" action={<Badge>手动</Badge>}>
-          <div className="form-grid one"><Field label="股票代码"><TextInput value={importForm.symbol} onChange={(e) => setImportForm({ ...importForm, symbol: e.target.value.toUpperCase() })} placeholder="600000.SH" /></Field><Field label="分钟线文件路径"><TextInput value={importForm.minute_path} onChange={(e) => setImportForm({ ...importForm, minute_path: e.target.value })} placeholder="D:\\market\\600000_1m.parquet" /></Field><Field label="日线文件路径" hint="首次导入必需；需包含 preclose、tradestatus 与 is_st/isST"><TextInput value={importForm.daily_path} onChange={(e) => setImportForm({ ...importForm, daily_path: e.target.value })} placeholder="CSV / Parquet 路径" /></Field><Field label="分红送转文件路径"><TextInput value={importForm.actions_path} onChange={(e) => setImportForm({ ...importForm, actions_path: e.target.value })} placeholder="可选公司行动文件" /></Field><Field label="交易日历文件路径" hint="需为真实交易日；未填时将尝试在线获取"><TextInput value={importForm.calendar_path} onChange={(e) => setImportForm({ ...importForm, calendar_path: e.target.value })} placeholder="真实交易日列表，列名 date" /></Field><Field label="分钟线时间标签" hint="不确定时保持自动；如已核对数据源，再选择开始或结束时间标签。"><SelectInput value={importForm.label_convention} onChange={(e) => setImportForm({ ...importForm, label_convention: e.target.value })}><option value="auto">自动核验（无法确认时按日线）</option><option value="end">我确认：结束时间标签</option><option value="start">我确认：开始时间标签</option></SelectInput></Field></div>
+          <div className="form-grid one"><Field label="证券代码"><TextInput value={importForm.symbol} onChange={(e) => setImportForm({ ...importForm, symbol: e.target.value.toUpperCase() })} placeholder="600000.SH" /></Field><Field label="ETF 类型（股票可忽略）"><SelectInput value={importForm.etf_category} onChange={event => setImportForm({ ...importForm, etf_category: event.target.value })}><option value="">按证券清单识别</option><option value="stock">股票 ETF（T+1）</option><option value="bond">债券 ETF（T+0）</option><option value="crossborder">跨境 ETF（T+0）</option><option value="commodity">黄金 / 商品 ETF（T+0）</option><option value="money">货币 ETF（T+0）</option></SelectInput></Field><Field label="分钟线文件路径"><TextInput value={importForm.minute_path} onChange={(e) => setImportForm({ ...importForm, minute_path: e.target.value })} placeholder="D:\\market\\600000_1m.parquet" /></Field><Field label="日线文件路径" hint="首次导入必需；股票需 preclose、tradestatus、is_st/isST；ETF 无需 ST 字段"><TextInput value={importForm.daily_path} onChange={(e) => setImportForm({ ...importForm, daily_path: e.target.value })} placeholder="CSV / Parquet 路径" /></Field><Field label="分红送转文件路径"><TextInput value={importForm.actions_path} onChange={(e) => setImportForm({ ...importForm, actions_path: e.target.value })} placeholder="可选公司行动文件" /></Field><Field label="交易日历文件路径" hint="需为真实交易日；未填时将尝试在线获取"><TextInput value={importForm.calendar_path} onChange={(e) => setImportForm({ ...importForm, calendar_path: e.target.value })} placeholder="真实交易日列表，列名 date" /></Field><Field label="分钟线时间标签" hint="不确定时保持自动；如已核对数据源，再选择开始或结束时间标签。"><SelectInput value={importForm.label_convention} onChange={(e) => setImportForm({ ...importForm, label_convention: e.target.value })}><option value="auto">自动核验（无法确认时按日线）</option><option value="end">我确认：结束时间标签</option><option value="start">我确认：开始时间标签</option></SelectInput></Field></div>
           <div className="card-bottom"><Button busy={busy === 'import'} onClick={importData}><FileUp size={15} />提交导入</Button></div>
         </Card>
         <Card title="生成演示数据" subtitle="用于首次体验流程，演示数据由本机生成。" action={<Badge tone="amber">演示</Badge>}>
-          <div className="demo-callout"><Sparkles size={17} /><span>所有演示数据会明确标记，不能代表真实行情。</span></div><div className="form-grid two"><Field label="股票代码"><TextInput value={demoForm.symbol} onChange={(e) => setDemoForm({ ...demoForm, symbol: e.target.value.toUpperCase() })} /></Field><Field label="交易日数量"><TextInput type="number" min={20} max={1600} value={demoForm.days} onChange={(e) => setDemoForm({ ...demoForm, days: Number(e.target.value) })} /></Field></div><div className="card-bottom"><Button variant="secondary" busy={busy === 'demo'} onClick={() => void runAction('demo', () => post('/data/demo', { symbol: demoForm.symbol || undefined, days: demoForm.days }), () => `已提交 ${demoForm.symbol} 的演示数据任务。`)}><Sparkles size={15} />生成演示数据</Button></div>
+          <div className="demo-callout"><Sparkles size={17} /><span>所有演示数据会明确标记，不能代表真实行情。</span></div><div className="form-grid two"><Field label="证券代码"><TextInput value={demoForm.symbol} onChange={(e) => setDemoForm({ ...demoForm, symbol: e.target.value.toUpperCase() })} /></Field><Field label="交易日数量"><TextInput type="number" min={20} max={1600} value={demoForm.days} onChange={(e) => setDemoForm({ ...demoForm, days: Number(e.target.value) })} /></Field></div><div className="card-bottom"><Button variant="secondary" busy={busy === 'demo'} onClick={() => void runAction('demo', () => post('/data/demo', { symbol: demoForm.symbol || undefined, days: demoForm.days }), () => `已提交 ${demoForm.symbol} 的演示数据任务。`)}><Sparkles size={15} />生成演示数据</Button></div>
         </Card>
         <Card title="本机存储与计划" subtitle="存储和定时更新配置保存在本地。" action={<Badge tone="blue">本机</Badge>}>
           <div className="storage-path"><Database size={16} /><div><small>当前活动数据目录</small><strong title={settings.active_data_dir}>{settings.active_data_dir ?? '读取中或未配置'}</strong><small>本次运行正在使用的目录</small></div></div>
@@ -220,7 +223,7 @@ export default function DataCenterPage() {
     <Card title="任务日志" subtitle="任务会自动更新进度和状态；可在这里查看说明或取消运行中的任务。" action={<Button variant="quiet" onClick={() => { setError(''); void refresh() }}><RefreshCw size={14} />刷新</Button>}>
       {loading ? <Loading /> : jobs.length === 0 ? <Empty title="暂无任务日志" detail="执行同步、导入、定时安装或演示生成后会显示任务。" /> : <div className="table-wrap"><table><thead><tr><th>任务</th><th>创建时间</th><th>状态</th><th>进度</th><th>说明</th><th>操作</th></tr></thead><tbody>{jobs.map((job) => <tr key={job.id}><td><strong>{job.kind}</strong><small className="table-sub">{job.id}</small></td><td>{dateText(job.created_at)}</td><td><Badge tone={job.status === 'completed' ? 'green' : job.status === 'failed' ? 'red' : JOB_TERMINAL.has(job.status) ? 'neutral' : 'blue'}>{job.status}</Badge></td><td><JobProgress progress={job.progress} status={job.status} /></td><td><span>{job.message || '—'}</span>{job.error != null && <small className="error-detail error-detail-cell">{typeof job.error === 'string' ? job.error : JSON.stringify(job.error, null, 2)}</small>}</td><td>{!JOB_TERMINAL.has(job.status) && <button className="text-link danger-text" onClick={() => void runAction('cancel', () => post(`/jobs/${encodeURIComponent(job.id)}/cancel`), () => '已请求取消任务。')}>取消</button>}</td></tr>)}</tbody></table></div>}
     </Card>
-    {confirmNode}
+    </details>{confirmNode}
   </>
 }
 

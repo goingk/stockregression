@@ -61,6 +61,16 @@ class Store:
                 CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT);
                 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status,created_at);
             """)
+            if "metadata" not in {row[1] for row in db.execute("PRAGMA table_info(instruments)")}:
+                db.execute("ALTER TABLE instruments ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS sync_items(run_key TEXT,symbol TEXT,status TEXT,mode TEXT,daily_through TEXT,minute_through TEXT,error TEXT,updated_at TEXT,PRIMARY KEY(run_key,symbol));
+                CREATE INDEX IF NOT EXISTS sync_items_status ON sync_items(run_key,status);
+            """)
+            sync_columns = {row[1] for row in db.execute("PRAGMA table_info(sync_items)")}
+            for column in ("daily_status", "minute_status"):
+                if column not in sync_columns:
+                    db.execute(f"ALTER TABLE sync_items ADD COLUMN {column} TEXT NOT NULL DEFAULT 'pending'")
 
     @contextmanager
     def db(self):
@@ -75,21 +85,40 @@ class Store:
             connection.close()
 
     def put_instrument(self, symbol: str, name: str = "", **metadata):
+        from .rules import instrument_terms
         symbol = normalize_symbol(symbol)
         exchange = symbol.split(".")[1]
         board = "star" if symbol.startswith(("688", "689")) else "chinext" if symbol.startswith("3") else "main"
         with self.db() as db:
             old = db.execute("SELECT * FROM instruments WHERE symbol=?", (symbol,)).fetchone()
-            db.execute("INSERT OR REPLACE INTO instruments VALUES(?,?,?,?,?,?)", (
-                symbol, name or (old["name"] if old else symbol), exchange, board,
+            merged = {**(json.loads(old["metadata"] or "{}") if old else {}), **{key: value for key, value in metadata.items() if value is not None}}
+            merged = instrument_terms(symbol, {**merged, "name": name or (old["name"] if old else symbol)})
+            db.execute("INSERT OR REPLACE INTO instruments(symbol,name,exchange,board,listing_date,delisting_date,metadata) VALUES(?,?,?,?,?,?,?)", (
+                symbol, merged["name"], exchange, merged["board"],
                 metadata.get("listing_date") or (old["listing_date"] if old else None),
                 metadata.get("delisting_date") or (old["delisting_date"] if old else None),
+                dumps(merged),
             ))
 
-    def instruments(self, query: str = "", limit: int = 100) -> list[dict]:
+    def instruments(self, query: str = "", limit: int | None = 100, asset_type: str | None = None, offset: int = 0) -> list[dict]:
         with self.db() as db:
-            rows = db.execute("SELECT * FROM instruments WHERE symbol LIKE ? OR name LIKE ? ORDER BY symbol LIMIT ?", (f"%{query}%", f"%{query}%", limit)).fetchall()
-        return [dict(row) for row in rows]
+            rows = db.execute("SELECT * FROM instruments WHERE symbol LIKE ? OR name LIKE ? ORDER BY symbol", (f"%{query}%", f"%{query}%")).fetchall()
+        items = [self._instrument(row) for row in rows]
+        if asset_type:
+            items = [item for item in items if item["asset_type"] == asset_type]
+        return items[offset:] if limit is None else items[offset:offset + limit]
+
+    @staticmethod
+    def _instrument(row):
+        from .rules import instrument_terms
+        item = dict(row)
+        metadata = json.loads(item.pop("metadata", "{}") or "{}")
+        return instrument_terms(item["symbol"], {**item, **metadata})
+
+    def instrument(self, symbol):
+        with self.db() as db:
+            row = db.execute("SELECT * FROM instruments WHERE symbol=?", (normalize_symbol(symbol),)).fetchone()
+        return self._instrument(row) if row else None
 
     def add_watch(self, symbol: str, name: str = ""):
         self.put_instrument(symbol, name)
@@ -98,7 +127,27 @@ class Store:
 
     def watches(self):
         with self.db() as db:
-            return [dict(r) for r in db.execute("SELECT i.* FROM watchlist w JOIN instruments i USING(symbol) ORDER BY w.created_at").fetchall()]
+            return [self._instrument(r) for r in db.execute("SELECT i.* FROM watchlist w JOIN instruments i USING(symbol) ORDER BY w.created_at").fetchall()]
+
+    def sync_item(self, run_key, symbol, **values):
+        with self.db() as db:
+            row = db.execute("SELECT * FROM sync_items WHERE run_key=? AND symbol=?", (run_key, symbol)).fetchone()
+            if not values:
+                return dict(row) if row else None
+            item = {"status": "pending", "mode": "history", "daily_through": None, "minute_through": None, "error": None, "daily_status": "pending", "minute_status": "pending", **(dict(row) if row else {}), **values}
+            db.execute("INSERT OR REPLACE INTO sync_items(run_key,symbol,status,mode,daily_through,minute_through,error,updated_at,daily_status,minute_status) VALUES(?,?,?,?,?,?,?,?,?,?)", (run_key, symbol, item["status"], item["mode"], item["daily_through"], item["minute_through"], item["error"], now_iso(), item["daily_status"], item["minute_status"]))
+
+    def sync_status(self, run_key=None, status=None, limit=100, offset=0):
+        conditions, arguments = [], []
+        for column, value in (("run_key", run_key), ("status", status)):
+            if value:
+                conditions.append(column + "=?")
+                arguments.append(value)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        with self.db() as db:
+            counts = {row[0]: row[1] for row in db.execute("SELECT status,COUNT(*) FROM sync_items" + where + " GROUP BY status", arguments)}
+            rows = db.execute("SELECT * FROM sync_items" + where + " ORDER BY updated_at DESC,symbol LIMIT ? OFFSET ?", [*arguments, limit, offset]).fetchall()
+        return {"items": [dict(row) for row in rows], "counts": counts, "total": sum(counts.values())}
 
     def state(self, key: str, value: Any = ...):
         with self.db() as db:
@@ -141,14 +190,23 @@ class Store:
                 relation = relation.filter(f'"{column}" < TIMESTAMP \'{(pd.Timestamp(end).normalize() + pd.Timedelta(days=1)).isoformat()}\'')
             return relation.df()
 
-    def publish(self, symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actions: pd.DataFrame, calendar: pd.DataFrame, metadata: dict, profiles: dict) -> dict:
+    def publish(self, symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actions: pd.DataFrame, calendar: pd.DataFrame, metadata: dict, profiles: dict, incremental: bool = False) -> dict:
         symbol = normalize_symbol(symbol)
-        files = {
-            "minute": self.write_frame(symbol, "1m", minute, "timestamp"),
-            "daily": self.write_frame(symbol, "1d", daily, "date"),
-            "actions": self.write_frame(symbol, "actions", actions, "ex_date"),
-            "calendar": self.write_frame(symbol, "calendar", calendar, "date"),
-        }
+        previous = self.snapshot(symbol) if incremental else None
+        files = {}
+        for key, kind, frame, column in [("minute", "1m", minute, "timestamp"), ("daily", "1d", daily, "date"), ("actions", "actions", actions, "ex_date"), ("calendar", "calendar", calendar, "date")]:
+            old_paths = previous["files"].get(key, []) if previous else []
+            if previous:
+                if frame.empty:
+                    files[key] = old_paths
+                    continue
+                years = {str(year) for year in pd.to_datetime(frame[column]).dt.year.unique()}
+                touched = [path for path in old_paths if path.split("/")[3] in years]
+                frame = pd.concat([self.read_files(touched), frame], ignore_index=True).sort_values(column, kind="stable").drop_duplicates(column, keep="last")
+                untouched = [path for path in old_paths if path not in touched]
+            else:
+                untouched = []
+            files[key] = sorted(untouched + self.write_frame(symbol, kind, frame, column))
         content = {"symbol": symbol, "files": files, "metadata": metadata, "profiles": profiles}
         version = hashlib.sha256(dumps(content).encode()).hexdigest()[:24]
         manifest = {**content, "version": version, "created_at": now_iso()}

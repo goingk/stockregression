@@ -3,7 +3,8 @@ import type { EChartsOption } from 'echarts'
 import { FlaskConical, RefreshCw, RotateCcw } from 'lucide-react'
 import { get, post } from '../api'
 import ChartView from '../ChartView'
-import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, Field, JobProgress, Loading, PageHeader, SelectInput, TextInput, defaultConfig, percent, useErrorMessage } from '../components'
+import EquityPreview from '../EquityPreview'
+import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, Field, JobProgress, Loading, PageHeader, SelectInput, TextInput, defaultConfig, configPayload, loadConfig, percent, useErrorMessage } from '../components'
 import type { BacktestConfig, Job } from '../types'
 
 type Range = { low: number; high: number; step: number }
@@ -17,14 +18,14 @@ type OptimizationResult = {
   robust?: { status?: string; reason?: string; selected_params?: Record<string, unknown>; candidates?: Candidate[]; split?: Record<string, unknown>; train_metrics?: Record<string, number>; validation_metrics?: Record<string, number>; test_metrics?: Record<string, number>; test_result?: TestRun & Record<string, unknown> }
 }
 type Props = { onLoadConfig: (config: BacktestConfig) => void }
-const labels: Record<string, string> = { buy_step: '买入步长', sell_step: '卖出步长', grid_step: '网格间距', buy_ratio: '买入比例', sell_ratio: '卖出比例', initial_position: '初始仓位', min_position: '最小仓位', max_position: '最大仓位' }
+const labels: Record<string, string> = { buy_step: '买入步长', sell_step: '卖出步长', grid_step: '网格间距', buy_ratio: '旧版买入比例', sell_ratio: '旧版卖出比例', initial_position: '旧版初始仓位', min_position: '旧版最小仓位', max_position: '旧版最大仓位', buy_shares: '每次买入股数', sell_shares: '每次卖出股数', initial_shares: '初始持股', min_shares: '最低持股', max_shares: '最高持股' }
 const defaults: Record<string, Range> = {
   buy_step: { low: 0.005, high: 0.1, step: 0.005 }, sell_step: { low: 0.005, high: 0.1, step: 0.005 }, grid_step: { low: 0.005, high: 0.1, step: 0.005 },
-  buy_ratio: { low: 0.02, high: 0.2, step: 0.02 }, sell_ratio: { low: 0.02, high: 0.2, step: 0.02 },
-  initial_position: { low: 0.2, high: 0.8, step: 0.1 }, min_position: { low: 0, high: 0.4, step: 0.1 }, max_position: { low: 0.6, high: 1, step: 0.1 },
+  buy_shares: { low: 100, high: 1000, step: 100 }, sell_shares: { low: 100, high: 1000, step: 100 },
+  initial_shares: { low: 0, high: 2000, step: 100 }, min_shares: { low: 0, high: 1000, step: 100 }, max_shares: { low: 1000, high: 5000, step: 100 },
 }
 const knownRangeNames = Object.keys(defaults)
-const pctRange = new Set(['buy_step', 'sell_step', 'grid_step', 'buy_ratio', 'sell_ratio', 'initial_position', 'min_position', 'max_position'])
+const pctRange = new Set(['buy_step', 'sell_step', 'grid_step'])
 function n(value: unknown, fallback = 0) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : fallback }
 function record(value: unknown): Record<string, unknown> | undefined { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined }
 function searchConfigOf(value: unknown): SearchConfig | undefined { return record(value) as SearchConfig | undefined }
@@ -65,12 +66,12 @@ function StrategyComparison({ run }: { run?: TestRun }) {
   const entries = [['grid', '网格策略'], ['dca', '定投基准'], ['buy_hold', '买入持有基准']] as const
   const metrics = [['total_return', '总收益'], ['cagr', '年化收益'], ['max_drawdown', '最大回撤'], ['sharpe', '夏普比率']] as const
   const available = entries.filter(([key]) => strategies[key])
-  return <div className='robust-metric-block'><h4>测试段策略对比（未参与筛选）</h4>{available.length ? <div className='table-wrap'><table><thead><tr><th>指标</th>{available.map(([key, label]) => <th key={key}>{label}</th>)}</tr></thead><tbody>{metrics.map(([key, label]) => <tr key={key}><td>{label}</td>{available.map(([strategyKey]) => { const value = Number(strategies[strategyKey].metrics?.[key]); return <td key={strategyKey}>{Number.isFinite(value) ? key === 'sharpe' ? value.toFixed(2) : percent(value) : '—'}</td> })}</tr>)}</tbody></table></div> : <Empty title='测试段策略明细暂不可用' detail='可查看上方测试段网格指标。' />}</div>
+  return <div className='robust-metric-block'><h4>测试段策略对比（未参与筛选）</h4>{available.length ? <div className='table-wrap'><table><thead><tr><th>指标</th>{available.map(([key, label]) => <th key={key}>{label}</th>)}</tr></thead><tbody>{metrics.map(([key, label]) => <tr key={key}><td>{label}</td>{available.map(([strategyKey]) => { const raw = strategies[strategyKey].metrics?.[key]; const value = raw == null ? NaN : Number(raw); return <td key={strategyKey}>{Number.isFinite(value) ? key === 'sharpe' ? value.toFixed(2) : percent(value) : '—'}</td> })}</tr>)}</tbody></table></div> : <Empty title='测试段策略明细暂不可用' detail='可查看上方测试段网格指标。' />}</div>
 }
 
 function MetricStrip({ title, metrics }: { title: string; metrics?: Record<string, number> }) {
   if (!metrics) return <div className='robust-metric-block'><h4>{title}</h4><Empty title='暂无指标' /></div>
-  return <div className='robust-metric-block'><h4>{title}</h4><div className='metric-chip-grid'>{[['总收益', metrics.total_return], ['年化收益', metrics.cagr], ['最大回撤', metrics.max_drawdown], ['夏普', metrics.sharpe]].map(([name, value]) => <div key={String(name)}><small>{String(name)}</small><strong>{String(name).includes('夏普') ? n(value).toFixed(2) : percent(n(value))}</strong></div>)}</div></div>
+  return <div className='robust-metric-block'><h4>{title}</h4><div className='metric-chip-grid'>{[['总收益', metrics.total_return], ['年化收益', metrics.cagr], ['最大回撤', metrics.max_drawdown], ['夏普', metrics.sharpe]].map(([name, value]) => <div key={String(name)}><small>{String(name)}</small><strong>{value == null ? '—' : String(name).includes('夏普') ? n(value).toFixed(2) : percent(n(value))}</strong></div>)}</div></div>
 }
 
 export default function ResearchPage({ onLoadConfig }: Props) {
@@ -146,9 +147,9 @@ export default function ResearchPage({ onLoadConfig }: Props) {
     setBusy(true); setError(''); setNotice('')
     try {
       const response = await post<{ job_id: string }>('/optimizations', {
-        base, mode, n_trials: Math.min(5000, Math.max(1, trials)), seed, top_candidates: topCandidates,
+        base: configPayload(base), mode, n_trials: Math.min(5000, Math.max(1, trials)), seed, top_candidates: topCandidates,
         max_drawdown: maxDrawdown, min_trades: minTrades, min_history_days: minHistoryDays, min_minute_ratio: minMinuteRatio,
-        ranges,
+        ranges: Object.fromEntries(Object.entries(ranges).filter(([name]) => !['buy_step', 'sell_step', 'grid_step'].includes(name) || (base.grid_mode === 'trailing' ? name !== 'grid_step' : name === 'grid_step'))),
       })
       setSelectedJobId(response.job_id); setNotice('参数搜索任务已提交，完成后可查看历史最优与样本外推荐。')
       await refreshJobs()
@@ -162,17 +163,13 @@ export default function ResearchPage({ onLoadConfig }: Props) {
     if (!originalBase) { setError('这条研究任务未保存原始股票与区间配置，无法安全载入。请重新运行参数研究。'); return }
     const { buy_ratio, sell_ratio, ...configParams } = params
     const patch = configParams as Partial<BacktestConfig>
-    const config = {
-      ...originalBase,
-      ...patch,
-      fees: { ...originalBase.fees, ...patch.fees },
-      buy_quantity: { ...originalBase.buy_quantity, ...patch.buy_quantity },
-      sell_quantity: { ...originalBase.sell_quantity, ...patch.sell_quantity },
-    } as BacktestConfig
-    if (typeof buy_ratio === 'number') config.buy_quantity = { mode: 'equity_ratio', value: buy_ratio }
-    if (typeof sell_ratio === 'number') config.sell_quantity = { mode: 'equity_ratio', value: sell_ratio }
-    onLoadConfig(config)
+    const config = { ...originalBase, ...patch, fees: { ...originalBase.fees, ...patch.fees } } as BacktestConfig
+    const legacy = config as unknown as Record<string, unknown>
+    if (typeof buy_ratio === 'number') legacy.buy_quantity = { mode: 'equity_ratio', value: buy_ratio }
+    if (typeof sell_ratio === 'number') legacy.sell_quantity = { mode: 'equity_ratio', value: sell_ratio }
+    void loadConfig(config).then(value => onLoadConfig(value.config)).catch(error => setError(err(error)))
   }
+
   const cancel = async () => {
     if (!selectedJobId) return
     try { await post('/jobs/' + encodeURIComponent(selectedJobId) + '/cancel'); await refreshJobs() }
@@ -215,12 +212,12 @@ export default function ResearchPage({ onLoadConfig }: Props) {
   return <>
     <PageHeader eyebrow='PARAMETER RESEARCH' title='参数研究' description='分别评估历史收益最优参数与分段验证后的样本外推荐；每种模式最多 5000 次试验。' action={<Button variant='secondary' onClick={() => { setRanges(defaults); setNotice('已恢复默认搜索范围。') }}><RotateCcw size={15} />恢复默认范围</Button>} />
     {error && <ErrorBox message={error} onClose={() => setError('')} />}{notice && <div className='notice success'>{notice}</div>}
-    <div className='research-layout'>
-      <div className='main-column'><Card title='基准回测配置' subtitle='优化会在此配置和数据覆盖基础上展开。'><ConfigForm value={base} onChange={setBase} /></Card></div>
-      <aside className='side-column'>
+    <div className='research-layout research-share-layout'>
+      <div className='main-column'><Card title='基准回测配置' subtitle='优化会在此配置和数据覆盖基础上展开。'><div className="parameter-scroll"><ConfigForm value={base} onChange={setBase} /></div></Card></div>
+      <aside className='side-column'><EquityPreview config={base} />
         <Card title='搜索任务' subtitle='选择研究模式和筛选条件。'>
           <div className='form-grid two'><Field label='研究模式'><SelectInput value={mode} onChange={(e) => setMode(e.target.value as typeof mode)}><option value='both'>历史最优 + 稳健验证</option><option value='historical'>历史最优</option><option value='robust'>稳健验证</option></SelectInput></Field><Field label='候选数上限'><TextInput type='number' min={1} max={100} value={topCandidates} onChange={(e) => setTopCandidates(Number(e.target.value))} /></Field><Field label='每种搜索试验次数（最多 5000）'><TextInput type='number' min={1} max={5000} value={trials} onChange={(e) => setTrials(Number(e.target.value))} /><small>“历史最优 + 稳健验证”会分别搜索，各执行 N 次；合计最多 2×N 次试验。</small></Field><Field label='随机种子'><TextInput type='number' value={seed} onChange={(e) => setSeed(Number(e.target.value))} /></Field><Field label='最大回撤限制'><TextInput type='number' min={1} max={100} step='1' value={Number((maxDrawdown * 100).toPrecision(6))} onChange={(e) => setMaxDrawdown(Number(e.target.value) / 100)} /><small>按百分数设置</small></Field><Field label='最少成交笔数'><TextInput type='number' min={0} value={minTrades} onChange={(e) => setMinTrades(Number(e.target.value))} /></Field></div>
-          <details className='advanced-disclosure'><summary>高级样本约束</summary><div className='form-grid two'><Field label='最少历史交易日'><TextInput type='number' min={20} value={minHistoryDays} onChange={(e) => setMinHistoryDays(Number(e.target.value))} /></Field><Field label='最小分钟覆盖率'><TextInput type='number' min={0} max={100} step='1' value={Number((minMinuteRatio * 100).toPrecision(6))} onChange={(e) => setMinMinuteRatio(Number(e.target.value) / 100)} /><small>按百分数设置</small></Field></div></details>
+          <p className='inline-warning'>一年默认区间通常不足稳健研究的 504 个交易日门槛；不会自动降低样本要求。</p><Button variant='quiet' onClick={() => { get<{ first_date?: string }>(`/data/coverage/${base.symbol}`).then(value => { if (value.first_date) setBase(previous => ({ ...previous, start_date: new Date(Date.parse(value.first_date! + 'T00:00:00Z') + 86400000).toISOString().slice(0, 10), reference_price_mode: 'auto', reference_price: null })) }).catch(error => setError(err(error))) }}>使用全部本地历史</Button><details className='advanced-disclosure'><summary>高级样本约束</summary><div className='form-grid two'><Field label='最少历史交易日'><TextInput type='number' min={20} value={minHistoryDays} onChange={(e) => setMinHistoryDays(Number(e.target.value))} /></Field><Field label='最小分钟覆盖率'><TextInput type='number' min={0} max={100} step='1' value={Number((minMinuteRatio * 100).toPrecision(6))} onChange={(e) => setMinMinuteRatio(Number(e.target.value) / 100)} /><small>按百分数设置</small></Field></div></details>
           <div className='card-bottom'><Button busy={busy} onClick={() => void submit()}><FlaskConical size={15} />启动参数搜索</Button></div>
         </Card>
         <Card title='研究进度' subtitle={selectedJob ? selectedJob.message || selectedJob.status : '提交任务后查看实时进度。'} action={<Button variant='quiet' onClick={() => { setError(''); void refreshJobs() }}><RefreshCw size={14} /></Button>}>
@@ -228,8 +225,8 @@ export default function ResearchPage({ onLoadConfig }: Props) {
         </Card>
       </aside>
     </div>
-    <Card title='可调搜索范围' subtitle='仓位与买卖比例按百分数设置；步长用于调整候选范围。'>
-      <div className='range-grid'>{knownRangeNames.map((name) => <div className='range-row' key={name}><div><strong>{labels[name]}</strong><small>{pctRange.has(name) ? '比例（%）' : '数值'}</small></div>{(['low', 'high', 'step'] as const).map((key) => { const value = ranges[name][key]; const shown = pctRange.has(name) ? Number((value * 100).toPrecision(8)) : value; return <Field key={key} label={key === 'low' ? '下限' : key === 'high' ? '上限' : '步长'}><TextInput type='number' step='any' min={0} value={shown} onChange={(e) => updateRange(name, key, Number(e.target.value))} /></Field> })}</div>)}</div>
+    <Card title='可调搜索范围' subtitle='持股和交易量以 100 股 / 份为单位；仅搜索当前模式生效的参数。'>
+      <div className='range-grid'>{knownRangeNames.filter(name => !['buy_step', 'sell_step', 'grid_step'].includes(name) || (base.grid_mode === 'trailing' ? name !== 'grid_step' : name === 'grid_step')).map((name) => <div className='range-row' key={name}><div><strong>{labels[name]}</strong><small>{pctRange.has(name) ? '步长（%）' : '股 / 份'}</small></div>{(['low', 'high', 'step'] as const).map((key) => { const value = ranges[name][key]; const shown = pctRange.has(name) ? Number((value * 100).toPrecision(8)) : value; return <Field key={key} label={key === 'low' ? '下限' : key === 'high' ? '上限' : '步长'}><TextInput type='number' step={pctRange.has(name) ? 'any' : '100'} min={0} value={shown} onChange={(e) => updateRange(name, key, Number(e.target.value))} /></Field> })}</div>)}</div>
     </Card>
     {result && <><Card title='本次研究样本' subtitle='以下标的、区间和参数范围来自已完成任务的原始配置。'><div className='result-meta'><div><strong>{originalBase?.symbol ?? '原始标的不详'}</strong><span>{originalBase ? `${originalBase.frequency} · ${originalBase.start_date} 至 ${originalBase.end_date ?? '最新可用日期'}` : '任务未保存原始股票与日期配置'}</span></div><div>{isDemoResearch && <Badge tone='amber'>演示数据</Badge>}<Badge tone='blue'>{jobModeLabel(actualMode)}</Badge></div></div>{isDemoResearch && <div className='demo-callout'>此研究使用演示行情生成，不能代表真实历史数据或投资结论。</div>}<div className='result-meta'><span>每种搜索试验次数：{actualTrials ?? '—'}</span><span>随机种子：{actualSeed ?? '—'}</span><span>数据版本：{result.data_version ?? '—'}</span></div>{researchWarnings.length > 0 && <div className='warning-list'>{researchWarnings.map((warning, index) => <div key={index}><span className='warning-dot' />{warning}</div>)}</div>}<div className='param-block'><strong>本次实际搜索范围</strong>{actualRanges && Object.keys(actualRanges).length ? <div className='table-wrap'><table><thead><tr><th>参数</th><th>下限</th><th>上限</th><th>步长</th></tr></thead><tbody>{Object.entries(actualRanges).map(([key, raw]) => { const range = record(raw); return <tr key={key}><td>{labels[key] ?? key}</td><td>{range ? rangeValue(key, range.low) : '—'}</td><td>{range ? rangeValue(key, range.high) : '—'}</td><td>{range ? rangeValue(key, range.step) : '—'}</td></tr> })}</tbody></table></div> : <Empty title='任务中未保存搜索范围' />}</div></Card><div className='research-summary'><Card title='已搜索候选中的历史最优' subtitle='在历史样本内已搜索候选中得分最高的配置，不代表样本外表现。' action={<Button variant='secondary' onClick={() => loadBest('historical')} disabled={!result.historical?.best_params || !originalBase}>载入历史最优配置</Button>}>
       {!result.historical ? <Empty title='本次任务未运行历史优化' /> : <><div className='result-meta'><Badge tone='blue'>{result.historical.status ?? '已完成'}</Badge><span>版本 {result.data_version ?? '—'}</span></div><pre className='json-preview'>{JSON.stringify({ best_params: result.historical.best_params, best_result: result.historical.best_result }, null, 2)}</pre></>}

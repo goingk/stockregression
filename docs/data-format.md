@@ -1,6 +1,6 @@
 # 本地行情文件格式
 
-本页说明 `stockregression import-data` 和数据中心“本地文件导入”接受的 CSV / Parquet 格式。样例块只列出表头，不含价格或成交量样本，避免将示例误认为历史行情。请导入真实、未复权、时间和单位可核验的数据。
+本页说明 `stockregression import-data` 和“行情”辅助区域的“本地文件导入”接受的 CSV / Parquet 格式。支持沪深 A 股和场内 ETF，数量单位分别为股和份。样例块只列出表头，不含价格或成交量样本。请导入真实、未复权、时间和单位可核验的数据。
 
 ## 导入命令
 
@@ -22,7 +22,15 @@ uv run stockregression import-data 600000.SH .\daily.csv `
 
 ## 日线
 
-必需行情列为日期、开盘、最高、最低、收盘和成交量。为了完成交易日历、停牌与复权跳变校验，**准确导入还强制要求原始文件明确提供 `preclose`、`tradestatus` 和 `is_st` 或 `isST` 历史字段**。这三个准确性字段不由导入器推算或补默认值；缺少任一字段会拒绝日线导入。
+必需行情列为日期、开盘、最高、最低、收盘和成交量。准确导入还要求原始文件明确提供 `preclose`、`tradestatus`；股票额外要求 `is_st` 或 `isST` 历史字段，ETF 不要求 ST 字段。这些准确性字段不由导入器推算；缺少必需字段会拒绝日线导入。
+
+ETF 导入可通过网页类型选择，或 CLI `--etf-category stock|bond|crossborder|commodity|money` 覆盖证券清单识别结果，分别对应股票、债券、跨境、黄金/商品和货币 ETF。股票可忽略该选项。ETF OHLC 按 0.001 元精度、成交量按份提供；如果来源的成交量单位为手，须先正确转换，不能把手数直接当份数。
+
+```powershell
+uv run --frozen stockregression import-data 518880.SH .\etf-daily.csv --calendar-path .\calendar.csv --actions-path .\etf-actions.csv --etf-category commodity
+```
+
+ETF 分红资料未核验的区间不能严格回测。可提供经核实的公司行动文件（确认无行动时使用带规范表头的空文件），切勿为了绕过核验而伪造空资料。
 
 | 含义 | 规范列名 | 可识别的别名 / 说明 |
 | --- | --- | --- |

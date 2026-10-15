@@ -1,7 +1,8 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { get, post } from './api'
 import type { ButtonHTMLAttributes, ChangeEvent, InputHTMLAttributes, ReactNode, SelectHTMLAttributes } from 'react'
 import { AlertCircle, Check, ChevronRight, LoaderCircle, X } from 'lucide-react'
-import type { BacktestConfig, FeeConfig, QuantityConfig } from './types'
+import type { BacktestConfig, FeeConfig, Instrument } from './types'
 
 export function PageHeader({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) {
   return <div className="page-heading"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{action && <div className="heading-action">{action}</div>}</div>
@@ -81,75 +82,123 @@ export function downloadJson(data: unknown, filename: string) {
 export const today = () => new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().slice(0, 10)
 
 export function defaultConfig(): BacktestConfig {
-  const start = new Date(today() + 'T00:00:00Z')
-  start.setUTCFullYear(start.getUTCFullYear() - 3)
+  const current = today()
+  const year = Number(current.slice(0, 4)) - 1
+  const month = Number(current.slice(5, 7))
+  const day = Math.min(Number(current.slice(8, 10)), new Date(Date.UTC(year, month, 0)).getUTCDate())
   return {
-    symbol: '600000.SH', start_date: start.toISOString().slice(0, 10), end_date: null,
-    frequency: '1m', initial_cash: 100000, initial_position: 0.5, min_position: 0, max_position: 1,
-    grid_mode: 'trailing', buy_step: 0.03, sell_step: 0.03, grid_step: 0.03,
-    reference_price: null, lower_price: null, upper_price: null,
-    buy_quantity: { mode: 'equity_ratio', value: 0.1 }, sell_quantity: { mode: 'equity_ratio', value: 0.1 },
-    fees: { commission_rate: 0.0003, min_commission: 5, slippage_bps: 5, share_face_value: 1, legacy_sh_transfer_rate: 0.001, legacy_sh_min_transfer: 1, legacy_sz_transfer_rate: 0.0000255 }, dca_frequency: 'monthly',
+    schema_version: 2, symbol: '600000.SH', start_date: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`, end_date: current,
+    frequency: '1m', initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 100,
+    grid_mode: 'trailing', buy_step: .03, sell_step: .03, grid_step: .03,
+    reference_price: null, reference_price_mode: 'auto', lower_price: null, upper_price: null,
+    fees: { commission_rate: .0003, min_commission: 5, slippage_bps: 5 }, dca: { frequency: 'monthly', shares: 100 },
   }
+}
+
+export function configPayload(value: BacktestConfig) {
+  const result: Record<string, unknown> = { ...value }
+  for (const key of ['initial_cash', 'initial_position', 'min_position', 'max_position', 'buy_quantity', 'sell_quantity', 'dca_frequency']) delete result[key]
+  for (const key of value.grid_mode === 'trailing' ? ['grid_step'] : ['buy_step', 'sell_step']) delete result[key]
+  return result
+}
+
+export async function loadConfig(value: BacktestConfig): Promise<{ config: BacktestConfig; notice: string }> {
+  const result = await post<{ config: BacktestConfig; notice: string }>('/configs/convert', value)
+  return { ...result, config: { ...defaultConfig(), ...result.config } }
+}
+
+export function configError(value: BacktestConfig): string {
+  if (!/^(?:[56]\d{5}\.SH|[013]\d{5}\.SZ)$/.test(value.symbol)) return '请选择有效的沪深股票或 ETF'
+  if (!value.start_date || !value.end_date || value.start_date > value.end_date) return '请填写有效起止日期'
+  for (const name of ['initial_shares', 'min_shares', 'max_shares', 'buy_shares', 'sell_shares'] as const) {
+    if (!Number.isInteger(value[name]) || value[name] % 100 !== 0 || value[name] < (name === 'buy_shares' || name === 'sell_shares' ? 100 : 0)) return '持股和交易数量应以 100 为单位，交易量至少 100'
+  }
+  if (value.min_shares > value.initial_shares || value.initial_shares > value.max_shares) return '最低持股 ≤ 初始持股 ≤ 最高持股'
+  if (value.dca.shares < 100 || value.dca.shares % 100 !== 0) return '定投数量应为 100 的正整数倍'
+  return ''
 }
 
 function NumField({ label, value, onChange, suffix, percentValue = false, min, max, step = 'any', hint }: { label: string; value: number | null; onChange: (value: number | null) => void; suffix?: string; percentValue?: boolean; min?: number; max?: number; step?: string; hint?: string }) {
-  const shown = value == null ? '' : percentValue ? String(Number((value * 100).toPrecision(8))) : String(value)
+  const format = (next: number | null) => next == null ? '' : String(percentValue ? Number((next * 100).toPrecision(10)) : next)
+  const [draft, setDraft] = useState(() => format(value))
+  const focused = useRef(false)
+  useEffect(() => { if (!focused.current) setDraft(format(value)) }, [value, percentValue])
   const handle = (event: ChangeEvent<HTMLInputElement>) => {
-    if (!event.target.value) return onChange(null)
-    const parsed = Number(event.target.value)
-    onChange(Number.isFinite(parsed) ? percentValue ? parsed / 100 : parsed : null)
+    const text = event.target.value
+    setDraft(text)
+    if (!text) { onChange(null); return }
+    if (/^-?\d+(?:\.\d+)?$/.test(text)) {
+      const parsed = Number(text)
+      if (Number.isFinite(parsed)) onChange(percentValue ? parsed / 100 : parsed)
+    }
   }
-  return <Field label={label} hint={hint}><span className="input-suffix"><TextInput type="number" value={shown} onChange={handle} min={min} max={max} step={step} />{suffix && <i>{suffix}</i>}</span></Field>
+  return <Field label={label} hint={hint}><span className="input-suffix"><TextInput type="number" value={draft} onChange={handle} onFocus={() => { focused.current = true }} onBlur={() => { focused.current = false; setDraft(format(value)) }} min={min} max={max} step={step} />{suffix && <i>{suffix}</i>}</span></Field>
 }
 
-function QuantityEditor({ label, value, onChange }: { label: string; value: QuantityConfig; onChange: (next: QuantityConfig) => void }) {
-  return <div className="quantity-editor"><div className="quantity-title">{label}</div><div className="form-grid two">
-    <Field label="计量方式"><SelectInput value={value.mode} onChange={(e) => onChange({ ...value, mode: e.target.value as QuantityConfig['mode'] })}><option value="equity_ratio">净资产比例</option><option value="shares">股数</option><option value="cash">现金金额</option></SelectInput></Field>
-    <NumField label={value.mode === 'equity_ratio' ? '下单比例' : value.mode === 'shares' ? '股数' : '现金金额'} value={value.mode === 'equity_ratio' ? value.value : value.value} onChange={(next) => next != null && onChange({ ...value, value: value.mode === 'shares' ? Math.round(next) : next })} percentValue={value.mode === 'equity_ratio'} suffix={value.mode === 'equity_ratio' ? '%' : value.mode === 'shares' ? '股' : '元'} step={value.mode === 'shares' ? '100' : 'any'} min={0} />
-  </div></div>
+export function SymbolPicker({ value, onChange }: { value: string; onChange: (value: string) => void }) {
+  const [query, setQuery] = useState(value)
+  const [options, setOptions] = useState<Instrument[]>([])
+  const [open, setOpen] = useState(false)
+  useEffect(() => { setQuery(value) }, [value])
+  useEffect(() => {
+    if (!open || !query.trim()) { setOptions([]); return }
+    let active = true
+    const timer = window.setTimeout(() => { get<Instrument[]>(`/instruments?q=${encodeURIComponent(query)}&limit=12`).then(list => { if (active) setOptions(list) }).catch(() => { if (active) setOptions([]) }) }, 250)
+    return () => { active = false; clearTimeout(timer) }
+  }, [query, open])
+  return <div className="symbol-picker"><TextInput value={query} placeholder="代码或名称搜索股票 / ETF" onFocus={() => setOpen(true)} onBlur={() => window.setTimeout(() => setOpen(false), 150)} onChange={event => { const next = event.target.value; setQuery(next); setOpen(true); if (/^\d{6}(?:\.(?:SH|SZ))?$/i.test(next)) onChange(next.includes('.') ? next.toUpperCase() : next + (['5', '6'].includes(next[0]) ? '.SH' : '.SZ')) }} />{open && options.length > 0 && <div className="symbol-options">{options.map(item => <button key={item.symbol} type="button" onMouseDown={event => event.preventDefault()} onClick={() => { onChange(item.symbol); setQuery(item.symbol); setOpen(false) }}><strong>{item.name}</strong><small>{item.symbol} · {item.asset_type === 'etf' ? 'ETF' : '股票'}</small></button>)}</div>}</div>
 }
 
 export function ConfigForm({ value, onChange }: { value: BacktestConfig; onChange: (next: BacktestConfig | ((previous: BacktestConfig) => BacktestConfig)) => void }) {
-  const set = <K extends keyof BacktestConfig>(key: K, next: BacktestConfig[K]) => onChange((previous) => ({ ...previous, [key]: next }))
-  const fees: Required<FeeConfig> = { share_face_value: 1, legacy_sh_transfer_rate: 0.001, legacy_sh_min_transfer: 1, legacy_sz_transfer_rate: 0.0000255, ...value.fees }
-  const setFees = (next: Partial<FeeConfig>) => onChange((previous) => ({ ...previous, fees: { ...previous.fees, ...next } }))
-  return <div className="config-form">
-    <div className="form-section"><div className="section-title"><span>01</span><div><strong>标的与区间</strong><small>选择股票、频率和回测起止日期</small></div></div><div className="form-grid three">
-      <Field label="股票代码"><TextInput value={value.symbol} onChange={(e) => set('symbol', e.target.value.toUpperCase())} placeholder="600000.SH" /></Field>
-      <Field label="数据频率"><SelectInput value={value.frequency} onChange={(e) => set('frequency', e.target.value as BacktestConfig['frequency'])}>{['1m', '5m', '15m', '30m', '60m', '1d'].map((f) => <option key={f} value={f}>{f}</option>)}</SelectInput></Field>
-      <Field label="开始日期"><TextInput type="date" value={value.start_date} onInput={(e) => set('start_date', e.currentTarget.value)} onChange={(e) => set('start_date', e.target.value)} /></Field>
-      <Field label="结束日期" hint="留空表示截至最新可用数据"><TextInput type="date" value={value.end_date ?? ''} onInput={(e) => set('end_date', e.currentTarget.value || null)} onChange={(e) => set('end_date', e.target.value || null)} /></Field>
-      <NumField label="初始资金" value={value.initial_cash} onChange={(v) => v != null && set('initial_cash', v)} suffix="元" min={1} />
-      <Field label="定投频率"><SelectInput value={value.dca_frequency} onChange={(e) => set('dca_frequency', e.target.value as BacktestConfig['dca_frequency'])}><option value="weekly">每周</option><option value="monthly">每月</option></SelectInput></Field>
+  const [reference, setReference] = useState<{ reference_date: string; reference_price: number } | null>(null)
+  const [referenceError, setReferenceError] = useState('')
+  const set = <K extends keyof BacktestConfig>(key: K, next: BacktestConfig[K]) => onChange(previous => ({ ...previous, [key]: next }))
+  const unit = /^[15]/.test(value.symbol) ? '份' : '股'
+  const fees: Required<FeeConfig> = { share_face_value: 1, legacy_sh_transfer_rate: .001, legacy_sh_min_transfer: 1, legacy_sz_transfer_rate: .0000255, ...value.fees }
+  const setFees = (next: Partial<FeeConfig>) => onChange(previous => ({ ...previous, fees: { ...previous.fees, ...next } }))
+  useEffect(() => {
+    let active = true
+    setReference(null); setReferenceError('')
+    if (!value.symbol || !value.start_date) return
+    get<{ reference_date: string; reference_price: number }>(`/data/reference-price/${encodeURIComponent(value.symbol)}?start_date=${value.start_date}`).then(context => {
+      if (!active) return
+      setReference(context)
+      onChange(previous => previous.reference_price_mode === 'auto' ? { ...previous, reference_price: context.reference_price } : previous)
+    }).catch(error => { if (active) setReferenceError(error instanceof Error ? error.message : String(error)) })
+    return () => { active = false }
+  }, [value.symbol, value.start_date, onChange])
+  const share = (key: 'initial_shares' | 'min_shares' | 'max_shares' | 'buy_shares' | 'sell_shares', label: string) => <NumField key={key} label={label} value={value[key]} onChange={next => next != null && set(key, next)} suffix={unit} min={key === 'buy_shares' || key === 'sell_shares' ? 100 : 0} step="100" />
+  return <div className="config-form share-config-form">
+    <div className="form-section"><div className="section-title"><span>01</span><strong>标的与区间</strong></div><div className="form-grid two">
+      <Field label="股票 / ETF" className="full-width"><SymbolPicker value={value.symbol} onChange={symbol => onChange(previous => ({ ...previous, symbol, reference_price_mode: 'auto', reference_price: null }))} /></Field>
+      <Field label="开始日期"><TextInput type="date" value={value.start_date} onChange={event => onChange(previous => ({ ...previous, start_date: event.target.value, reference_price_mode: 'auto', reference_price: null }))} /></Field>
+      <Field label="结束日期"><TextInput type="date" value={value.end_date ?? ''} onChange={event => set('end_date', event.target.value || null)} /></Field>
+      <Field label="数据频率"><SelectInput value={value.frequency} onChange={event => set('frequency', event.target.value as BacktestConfig['frequency'])}>{['1m', '5m', '15m', '30m', '60m', '1d'].map(item => <option key={item}>{item}</option>)}</SelectInput></Field>
+      <NumField label="参考价格" value={value.reference_price} onChange={next => onChange(previous => ({ ...previous, reference_price: next, reference_price_mode: next == null ? 'auto' : 'manual' }))} suffix="元" min={.001} hint={reference ? `${reference.reference_date} 收盘 ${reference.reference_price} 元 · ${value.reference_price_mode === 'auto' ? '自动' : '手动'}` : '开始日期前最近交易日收盘价'} />
+    </div>{referenceError && <p className="inline-warning">{referenceError}</p>}</div>
+    <div className="form-section"><div className="section-title"><span>02</span><strong>网格规则</strong></div><div className="form-grid two">
+      <Field label="网格模式"><SelectInput value={value.grid_mode} onChange={event => set('grid_mode', event.target.value as BacktestConfig['grid_mode'])}><option value="trailing">移动网格</option><option value="arithmetic">等差网格</option><option value="geometric">等比网格</option></SelectInput></Field>
+      {value.grid_mode === 'trailing' ? <><NumField label="买入步长" value={value.buy_step ?? .03} onChange={next => next != null && set('buy_step', next)} percentValue suffix="%" min={.01} max={100} /><NumField label="卖出步长" value={value.sell_step ?? .03} onChange={next => next != null && set('sell_step', next)} percentValue suffix="%" min={.01} max={100} /></> : <NumField label="网格间距" value={value.grid_step ?? .03} onChange={next => next != null && set('grid_step', next)} percentValue suffix="%" min={.01} max={100} hint={value.grid_mode === 'arithmetic' && value.reference_price ? `固定每格约 ${(value.reference_price * (value.grid_step ?? .03)).toFixed(3)} 元` : undefined} />}
+      <NumField label="价格下限" value={value.lower_price} onChange={next => set('lower_price', next)} suffix="元" min={.001} />
+      <NumField label="价格上限" value={value.upper_price} onChange={next => set('upper_price', next)} suffix="元" min={.001} />
     </div></div>
-
-    <div className="form-section"><div className="section-title"><span>02</span><div><strong>网格规则</strong><small>收益和仓位按比例输入，例如 3 表示 3%</small></div></div><div className="form-grid three">
-      <Field label="网格模式"><SelectInput value={value.grid_mode} onChange={(e) => set('grid_mode', e.target.value as BacktestConfig['grid_mode'])}><option value="trailing">移动网格</option><option value="arithmetic">等差网格</option><option value="geometric">等比网格</option></SelectInput></Field>
-      <NumField label="买入步长" value={value.buy_step} onChange={(v) => v != null && set('buy_step', v)} percentValue suffix="%" min={0.01} max={100} />
-      <NumField label="卖出步长" value={value.sell_step} onChange={(v) => v != null && set('sell_step', v)} percentValue suffix="%" min={0.01} max={100} />
-      <NumField label="网格间距" value={value.grid_step} onChange={(v) => v != null && set('grid_step', v)} percentValue suffix="%" min={0.01} max={100} />
-      <NumField label="参考价格" value={value.reference_price} onChange={(v) => set('reference_price', v)} suffix="元" min={0} />
-      <NumField label="价格下限" value={value.lower_price} onChange={(v) => set('lower_price', v)} suffix="元" min={0} />
-      <NumField label="价格上限" value={value.upper_price} onChange={(v) => set('upper_price', v)} suffix="元" min={0} />
+    <div className="form-section"><div className="section-title"><span>03</span><div><strong>仓位与交易量</strong><small>初始持股在开始前已持有，首日可卖；现金自动预留</small></div></div><div className="form-grid two">
+      {share('initial_shares', '初始持股')}{share('min_shares', '最低持股')}{share('max_shares', '最高持股')}{share('buy_shares', '每次买入')}{share('sell_shares', '每次卖出')}
     </div></div>
-
-    <div className="form-section"><div className="section-title"><span>03</span><div><strong>仓位与交易量</strong><small>仓位按百分数设置</small></div></div><div className="form-grid three">
-      <NumField label="初始仓位" value={value.initial_position} onChange={(v) => v != null && set('initial_position', v)} percentValue suffix="%" min={0} max={100} />
-      <NumField label="最小仓位" value={value.min_position} onChange={(v) => v != null && set('min_position', v)} percentValue suffix="%" min={0} max={100} />
-      <NumField label="最大仓位" value={value.max_position} onChange={(v) => v != null && set('max_position', v)} percentValue suffix="%" min={0} max={100} />
-    </div><div className="quantity-grid"><QuantityEditor label="买入数量" value={value.buy_quantity} onChange={(q) => set('buy_quantity', q)} /><QuantityEditor label="卖出数量" value={value.sell_quantity} onChange={(q) => set('sell_quantity', q)} /></div></div>
-
-    <div className="form-section last"><div className="section-title"><span>04</span><div><strong>费用设置</strong><small>按真实下单成本估算手续费与滑点</small></div></div><div className="form-grid three">
-      <NumField label="佣金费率" value={fees.commission_rate} onChange={(v) => v != null && setFees({ commission_rate: v })} percentValue suffix="%" min={0} max={5} />
-      <NumField label="最低佣金" value={fees.min_commission} onChange={(v) => v != null && setFees({ min_commission: v })} suffix="元" min={0} />
-      <NumField label="滑点" value={fees.slippage_bps} onChange={(v) => v != null && setFees({ slippage_bps: v })} suffix="基点" min={0} max={1000} />
-    </div><details className="advanced-disclosure fee-settings"><summary>早期过户费设置</summary><p className="fee-model-note">2012 年 6 月以前的收费沿革不完整，模型使用估算并在结果说明中标注；可根据本人券商资料调整。2012 年 6 月至 2015 年按中国结算收费的可核实部分估算，佣金按券商合约费用计取，不重复计入单列过户费。</p><div className="form-grid three">
-      <NumField label="股票面值" value={fees.share_face_value} onChange={(v) => v != null && setFees({ share_face_value: v })} suffix="元/股" min={0.0001} />
-      <NumField label="沪市历史过户费率" value={fees.legacy_sh_transfer_rate} onChange={(v) => v != null && setFees({ legacy_sh_transfer_rate: v })} percentValue suffix="%" min={0} max={5} hint="默认 0.1%" />
-      <NumField label="沪市历史最低过户费" value={fees.legacy_sh_min_transfer} onChange={(v) => v != null && setFees({ legacy_sh_min_transfer: v })} suffix="元" min={0} />
-      <NumField label="深市历史过户费率" value={fees.legacy_sz_transfer_rate} onChange={(v) => v != null && setFees({ legacy_sz_transfer_rate: v })} percentValue suffix="%" min={0} max={5} hint="默认 0.00255%" />
-    </div></details></div>
+    <div className="form-section"><div className="section-title"><span>04</span><div><strong>定投设置</strong><small>每期独立投入；获利按累计投入计算</small></div></div><div className="form-grid two">
+      <Field label="定投频率"><SelectInput value={value.dca.frequency} onChange={event => set('dca', { ...value.dca, frequency: event.target.value as BacktestConfig['dca']['frequency'] })}><option value="daily">每天</option><option value="weekly">每周</option><option value="monthly">每月</option></SelectInput></Field>
+      <NumField label="每期定投" value={value.dca.shares} onChange={next => next != null && set('dca', { ...value.dca, shares: next })} suffix={unit} min={100} step="100" />
+    </div></div>
+    <div className="form-section last"><div className="section-title"><span>05</span><strong>费用设置</strong></div><div className="form-grid two">
+      <NumField label="佣金费率" value={fees.commission_rate} onChange={next => next != null && setFees({ commission_rate: next })} percentValue suffix="%" min={0} max={5} hint="0.03 表示 0.03%" />
+      <NumField label="最低佣金" value={fees.min_commission} onChange={next => next != null && setFees({ min_commission: next })} suffix="元" min={0} />
+      <NumField label="滑点" value={fees.slippage_bps} onChange={next => next != null && setFees({ slippage_bps: next })} suffix="基点" min={0} max={1000} />
+    </div>{unit === '股' && <details className="advanced-disclosure"><summary>股票早期过户费设置</summary><div className="form-grid two">
+      <NumField label="股票面值" value={fees.share_face_value} onChange={next => next != null && setFees({ share_face_value: next })} suffix="元" min={.0001} />
+      <NumField label="沪市历史过户费率" value={fees.legacy_sh_transfer_rate} onChange={next => next != null && setFees({ legacy_sh_transfer_rate: next })} percentValue suffix="%" min={0} />
+      <NumField label="沪市历史最低过户费" value={fees.legacy_sh_min_transfer} onChange={next => next != null && setFees({ legacy_sh_min_transfer: next })} suffix="元" min={0} />
+      <NumField label="深市历史过户费率" value={fees.legacy_sz_transfer_rate} onChange={next => next != null && setFees({ legacy_sz_transfer_rate: next })} percentValue suffix="%" min={0} />
+    </div></details>}</div>
   </div>
 }
 

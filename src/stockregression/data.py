@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import time
+import shutil
+from filelock import FileLock
 
 import numpy as np
 import pandas as pd
 
 from .models import BacktestConfig, normalize_symbol
-from .providers import fetch_auxiliary, fetch_hf, fetch_instruments, fetch_tdx, fetch_sina, fetch_reference_5m, latest_closed_date, normalize_actions
+from .providers import fetch_auxiliary, fetch_hf, fetch_instruments, fetch_tdx, fetch_sina, fetch_reference_5m, fetch_latest_trading_date, latest_closed_date, normalize_actions
 from .quality import DataQualityError, align_minutes, canonical_frame, infer_profile, minute_slots, prepare_bundle
 from .settings import load_settings
 from .storage import Store
+from .rules import instrument_terms
 
 
 def merge_frames(old: pd.DataFrame, new: pd.DataFrame, key: str) -> pd.DataFrame:
@@ -22,6 +28,12 @@ def merge_frames(old: pd.DataFrame, new: pd.DataFrame, key: str) -> pd.DataFrame
 class DataService:
     def __init__(self, store: Store):
         self.store = store
+        self._sync_context = threading.local()
+
+    def _sync_stage(self, symbol, **values):
+        run_key = getattr(self._sync_context, "run_key", None)
+        if run_key:
+            self.store.sync_item(run_key, symbol, **values)
 
     def refresh_instruments(self, progress=lambda *_: None, cancelled=lambda: False):
         progress(0.1, "下载固定版本的证券覆盖清单")
@@ -30,44 +42,122 @@ class DataService:
             if cancelled():
                 raise InterruptedError("任务已取消")
             self.store.put_instrument(**record)
-        return {"count": len(records), "message": f"已更新 {len(records)} 只沪深股票；未过滤 ST 或退市历史"}
+        warnings = sorted({warning for record in records for warning in record.get("catalog_warnings", [])})
+        self.store.state("catalog:latest", {"count": len(records), "warnings": warnings})
+        return {"count": len(records), "warnings": warnings, "message": f"已更新 {len(records)} 只股票及 ETF；保留来源覆盖的 ST 与退市历史"}
 
-    def sync(self, symbols: list[str], mode: str, progress=lambda *_: None, cancelled=lambda: False):
-        if not symbols:
+    def sync(self, symbols: list[str], mode: str, progress=lambda *_: None, cancelled=lambda: False, scope: str | None = None, resume: bool = False, retry_failed: bool = False, workers: int = 2):
+        scope = scope or ("selected" if symbols else "watchlist")
+        if scope == "market":
+            if symbols:
+                raise ValueError("全市场范围不能同时指定代码")
+            if not retry_failed or not self.store.instruments(limit=1):
+                self.refresh_instruments(progress, cancelled)
+            symbols = [row["symbol"] for row in self.store.instruments(limit=None)]
+        elif not symbols:
             symbols = [row["symbol"] for row in self.store.watches()]
         if not symbols:
             return {"symbols": [], "message": "自选股为空，本次无需更新", "warnings": []}
-        results, failures = [], []
-        with self.store.lock:
-            for index, raw_symbol in enumerate(symbols):
+        symbols = sorted({normalize_symbol(symbol) for symbol in symbols})
+        cutoff = latest_closed_date()
+        calendar_warning = None
+        if mode != "history":
+            try:
+                cutoff = fetch_latest_trading_date(str(cutoff.date()))
+            except Exception as exc:
+                calendar_warning = "最新交易日预检暂不可用，各标的仍须获取真实交易日历：" + str(exc)
+        estimate = None
+        estimate_warning = None
+        if scope == "market" and mode == "history":
+            try:
+                from .providers import estimate_history_bytes
+                estimate = estimate_history_bytes(symbols, load_settings())
+            except Exception as exc:
+                estimate_warning = "无法取得精确下载量估算：" + str(exc)
+        free = shutil.disk_usage(self.store.root).free
+        preflight = {"target_count": len(symbols), "source_bytes": estimate, "free_bytes": free, "warning": estimate_warning, "closed_through": str(cutoff.date()), "calendar_warning": calendar_warning}
+        self.store.state("sync:preflight", preflight)
+        progress(0.0, f"目标 {len(symbols)} 个标的 · 历史源约 {estimate / 1024 ** 3:.2f} GiB · 可用 {free / 1024 ** 3:.1f} GiB" if estimate is not None else f"目标 {len(symbols)} 个标的 · 可用空间 {free / 1024 ** 3:.1f} GiB；历史源需数十 GB，另预留缓存及分区空间")
+        run_key = f"{scope}:{mode}:" + (f"{load_settings().hf_revision}:{load_settings().etf_hf_revision}" if mode == "history" else str(cutoff.date()))
+        results, failures, skipped = [], [], []
+        targets = []
+        for symbol in symbols:
+            state = self.store.sync_item(run_key, symbol)
+            if (resume and state and state["status"] == "completed") or (retry_failed and (not state or state["status"] != "failed")):
+                skipped.append(symbol)
+            else:
+                targets.append(symbol)
+        report_lock = threading.Lock()
+        completed = 0
+
+        def one(symbol):
+            nonlocal completed
+            self._sync_context.run_key = run_key
+            self._sync_context.cutoff = cutoff
+            self.store.sync_item(run_key, symbol, status="running", mode=mode, daily_status="running", minute_status="running", error=None)
+            try:
                 if cancelled():
                     raise InterruptedError("任务已取消")
-                symbol = normalize_symbol(raw_symbol)
                 current = self.store.snapshot(symbol)
                 if mode != "history" and current and current["metadata"].get("is_demo"):
-                    results.append({"symbol": symbol, "skipped": True, "message": "演示数据不参与自动真实行情更新"})
-                    continue
-                prefix = index / len(symbols)
+                    self.store.sync_item(run_key, symbol, status="completed", daily_status="skipped_demo", minute_status="skipped_demo", error=None)
+                    return {"symbol": symbol, "skipped": True, "message": "演示数据不参与自动真实行情更新"}
                 def report(fraction, message):
-                    progress(prefix + fraction / len(symbols), f"{symbol}：{message}")
-                try:
-                    results.append(self._sync_one(symbol, mode, report, cancelled))
-                except InterruptedError:
-                    raise
-                except Exception as exc:
-                    failures.append({"symbol": symbol, "reason": str(exc)})
-                self.store.state(f"sync:{symbol}", {"mode": mode, "result": results[-1] if results and results[-1].get("symbol") == symbol else None, "error": next((r["reason"] for r in failures if r["symbol"] == symbol), None)})
-        if failures and not results:
-            raise RuntimeError("；".join(row["symbol"] + " " + row["reason"] for row in failures))
-        return {"symbols": results, "failures": failures, "message": f"完成 {len(results)} 只，失败 {len(failures)} 只"}
+                    with report_lock:
+                        progress((completed + fraction) / max(1, len(targets)), f"{completed}/{len(targets)} · {symbol}：{message}")
+                with FileLock(str(self.store.root / f"sync-{symbol}.lock"), timeout=60):
+                    for attempt in range(3):
+                        try:
+                            result = self._sync_one(symbol, mode, report, cancelled)
+                            break
+                        except InterruptedError:
+                            raise
+                        except Exception:
+                            if attempt == 2:
+                                raise
+                            for _ in range(5 * (attempt + 1)):
+                                if cancelled():
+                                    raise InterruptedError("任务已取消")
+                                time.sleep(0.2)
+                self.store.sync_item(run_key, symbol, status="completed", daily_status="completed", minute_status=result.get("minute_status", "available" if result.get("minute_through") else "unavailable"), daily_through=result.get("last_date"), minute_through=result.get("minute_through"), error=None)
+                self.store.state(f"sync:{symbol}", {"mode": mode, "result": result, "error": None})
+                return result
+            except InterruptedError:
+                self.store.sync_item(run_key, symbol, status="pending", error="任务中断，可恢复")
+                raise
+            except Exception as exc:
+                state = self.store.sync_item(run_key, symbol) or {}
+                self.store.sync_item(run_key, symbol, status="failed", daily_status="failed" if state.get("daily_status") == "running" else state.get("daily_status", "failed"), minute_status="failed", error=str(exc))
+                return {"symbol": symbol, "error": str(exc)}
+            finally:
+                with report_lock:
+                    completed += 1
+
+        # Bound the queue as well as worker count, so cancellation does not leave
+        # thousands of requests waiting to execute.
+        with ThreadPoolExecutor(max_workers=max(1, min(4, workers))) as executor:
+            for offset in range(0, len(targets), max(1, workers)):
+                if cancelled():
+                    raise InterruptedError("任务已取消")
+                for future in as_completed([executor.submit(one, symbol) for symbol in targets[offset:offset + max(1, workers)]]):
+                    result = future.result()
+                    if "error" in result:
+                        failures.append({"symbol": result["symbol"], "reason": result["error"]})
+                    else:
+                        results.append(result)
+        warnings = (self.store.state("catalog:latest") or {}).get("warnings", []) if scope == "market" else []
+        if calendar_warning:
+            warnings = [*warnings, calendar_warning]
+        return {"status": "failed" if failures and not results else "completed", "run_key": run_key, "scope": scope, "preflight": preflight, "warnings": warnings, "symbols": results, "failures": failures, "skipped": skipped, "message": f"完成 {len(results)} 只，失败 {len(failures)} 只，已完成跳过 {len(skipped)} 只" + (f"；证券目录来源警告 {len(warnings)} 条，请查看报告" if warnings else "")}
 
     def _sync_one(self, symbol, mode, progress, cancelled):
         previous = self.store.snapshot(symbol)
         if previous and previous["metadata"].get("is_demo"):
             previous = None  # Never mix simulated records into a real-data snapshot.
         old_files = previous["files"] if previous else {}
-        old_minute = self.store.read_files(old_files.get("minute", []))
-        old_daily = self.store.read_files(old_files.get("daily", []))
+        # Only the tail is read for calibration; publish merges affected years.
+        end = getattr(self._sync_context, "cutoff", latest_closed_date())
+        old_daily = self.store.read_files(old_files.get("daily", []), "date", end - pd.Timedelta(days=45))
         warnings = []
         hf = pd.DataFrame()
         profiles = dict(previous.get("profiles", {})) if previous else {}
@@ -77,18 +167,30 @@ class DataService:
                 hf = fetch_hf(symbol, self.store.root, load_settings().hf_revision)
             except Exception as exc:
                 warnings.append("历史分钟下载失败：" + str(exc))
-        start = (old_daily.date.max() - pd.Timedelta(days=30)) if mode != "history" and not old_daily.empty else pd.Timestamp("2010-01-01")
-        end = latest_closed_date()
+        known = self.store.instrument(symbol) or {}
+        if old_daily.empty and previous:
+            # A long-offline database must resume from its own watermark.
+            paths = old_files.get("daily", [])
+            old_daily = self.store.read_files(paths[-1:] if paths else [])
+        start = (old_daily.date.max() - pd.Timedelta(days=30)) if mode != "history" and not old_daily.empty else pd.Timestamp(known.get("listing_date") or "1990-01-01")
         progress(0.25, "获取不复权日线、交易日历和公司行动")
         daily, actions, calendar, metadata = fetch_auxiliary(symbol, start, end, cancelled)
+        self._sync_stage(symbol, daily_status="fetched", daily_through=str(daily.date.max().date()))
+        incoming_daily = daily
+        # A history calibration needs the daily history, an increment needs only
+        # its recent overlap. Neither reads the old full minute archive.
         daily = merge_frames(old_daily, daily, "date")
-        actions = merge_frames(self.store.read_files(old_files.get("actions", [])), actions, "ex_date")
-        calendar = merge_frames(self.store.read_files(old_files.get("calendar", [])), calendar, "date")
-        metadata["board"] = "star" if symbol.startswith("688") else "chinext" if symbol.startswith("3") else "main"
-        metadata["hf_revision"] = load_settings().hf_revision
+        if metadata.get("actions_checked_years"):
+            checked = set(metadata["actions_checked_years"])
+            earlier = (previous or {}).get("metadata", {}).get("actions_unverified_years", [])
+            metadata["actions_unverified_years"] = sorted((set(earlier) - checked) | set(metadata.get("actions_unverified_years", [])))
+            metadata["actions_verified"] = not metadata["actions_unverified_years"]
+        metadata = instrument_terms(symbol, {**known, **metadata})
+        if not metadata.get("listing_date") and start.year <= 1990:
+            metadata["listing_date"] = str(daily.date.min().date())
+        metadata["hf_revision"] = load_settings().etf_hf_revision if metadata["asset_type"] == "etf" else load_settings().hf_revision
         metadata["is_demo"] = False
-        self.store.put_instrument(symbol, **{key: metadata.get(key) for key in ("name", "listing_date", "delisting_date")})
-        self.store.add_watch(symbol, metadata.get("name", symbol))
+        self.store.put_instrument(symbol, **{key: value for key, value in metadata.items() if key != "symbol"})
         if metadata.get("listing_date"):
             calendar = calendar[calendar.date >= pd.Timestamp(metadata["listing_date"])].reset_index(drop=True)
         if metadata.get("delisting_date"):
@@ -98,7 +200,7 @@ class DataService:
         earliest = end - pd.Timedelta(days=14) if mode == "daily" and previous else None
         try:
             recent_raw = fetch_tdx(symbol, earliest, cancelled)
-            profiles["tdx"] = infer_profile(recent_raw, daily, "tdx")
+            profiles["tdx"] = infer_profile(recent_raw, daily, "tdx", price_tick=metadata.get("price_tick", .01))
             recent = align_minutes(recent_raw, profiles["tdx"]["convention"], profiles["tdx"]["volume_multiplier"])
             recent["source_verified"] = profiles["tdx"]["verified"]
             raw_folder = self.store.root / "raw" / "tdx" / symbol
@@ -112,7 +214,7 @@ class DataService:
             try:
                 recent_raw = fetch_sina(symbol)
                 reference = fetch_reference_5m(symbol, recent_raw.timestamp.max().normalize() - pd.Timedelta(days=21), recent_raw.timestamp.max().normalize())
-                profiles["sina"] = infer_profile(recent_raw, daily, "sina", reference=reference, reference_frequency="5m")
+                profiles["sina"] = infer_profile(recent_raw, daily, "sina", reference=reference, reference_frequency="5m", price_tick=metadata.get("price_tick", .01))
                 recent = align_minutes(recent_raw, profiles["sina"]["convention"], profiles["sina"]["volume_multiplier"])
                 recent["source_verified"] = profiles["sina"]["verified"]
                 raw_folder = self.store.root / "raw" / "sina" / symbol
@@ -121,7 +223,7 @@ class DataService:
             except Exception as backup_error:
                 warnings.append("新浪分钟备源不可用或未校准：" + str(backup_error))
         if not hf.empty:
-            profiles["hf"] = infer_profile(hf, daily, "hf", recent if not recent.empty and profiles.get("tdx", {}).get("verified") else None)
+            profiles["hf"] = infer_profile(hf, daily, "hf", recent if not recent.empty and profiles.get("tdx", {}).get("verified") else None, price_tick=metadata.get("price_tick", .01))
             if not profiles["hf"]["verified"]:
                 progress(0.72, "用独立历史5分钟行情核验历史分钟时间标签")
                 try:
@@ -129,20 +231,29 @@ class DataService:
                     reference = fetch_reference_5m(symbol, reference_end - pd.Timedelta(days=21), reference_end)
                     # Only the bounded reference window is needed for calibration.
                     sample = hf[hf.timestamp.between(reference.timestamp.min() - pd.Timedelta(minutes=5), reference.timestamp.max())]
-                    profiles["hf"] = infer_profile(sample, daily, "hf", reference=reference, reference_frequency="5m")
+                    profiles["hf"] = infer_profile(sample, daily, "hf", reference=reference, reference_frequency="5m", price_tick=metadata.get("price_tick", .01))
                 except Exception as exc:
                     warnings.append("历史分钟独立校验失败：" + str(exc))
             hf = align_minutes(hf, profiles["hf"]["convention"], profiles["hf"]["volume_multiplier"])
             hf["source_verified"] = profiles["hf"]["verified"]
         # Prefer the explicitly calibrated recent provider in its overlap window.
-        minute = merge_frames(merge_frames(old_minute, hf, "timestamp"), recent, "timestamp")
+        minute = merge_frames(hf, recent, "timestamp")
         if not minute.empty:
             minute = minute[minute.timestamp < end + pd.Timedelta(days=1)].copy()
-        metadata["warnings"] = warnings
+        warnings.extend(metadata.get("warnings", []))
+        if metadata.get("asset_type") == "etf":
+            warnings.append("ETF 历史分钟库仅覆盖部分标的；东财 1 分钟备源仅覆盖近期约 5 个交易日，其他缺口需导入补齐")
+        metadata["warnings"] = list(dict.fromkeys(warnings))
+        metadata["daily_through"] = str(daily.date.max().date())
+        metadata["minute_through"] = str(minute.timestamp.max()) if not minute.empty else (previous or {}).get("metadata", {}).get("minute_through")
+        minute_status = "available" if any(profile.get("verified") for profile in profiles.values()) else "unverified" if metadata["minute_through"] else "unavailable"
+        self._sync_stage(symbol, minute_status=minute_status, minute_through=metadata["minute_through"])
+        if cancelled():
+            raise InterruptedError("任务已取消")
         progress(0.85, "发布不可变分区和数据版本")
-        manifest = self.store.publish(symbol, minute, daily, actions, calendar, metadata, profiles)
+        manifest = self.store.publish(symbol, minute, incoming_daily, actions, calendar, metadata, profiles, incremental=previous is not None)
         progress(1, "完成；质量报告已可查看")
-        return {"symbol": symbol, "version": manifest["version"], "last_date": str(daily.date.max().date()), "rows": len(minute), "warnings": warnings, "profiles": profiles}
+        return {"symbol": symbol, "version": manifest["version"], "last_date": str(daily.date.max().date()), "daily_status": "completed", "minute_status": minute_status, "minute_through": metadata["minute_through"], "rows": len(minute), "warnings": metadata["warnings"], "profiles": profiles}
 
     def load_bundle(self, config: BacktestConfig, version: str | None = None):
         manifest = self.store.snapshot(config.symbol, version)
@@ -153,7 +264,20 @@ class DataService:
         if daily_all.empty:
             raise DataQualityError("本地版本没有日线")
         end = pd.Timestamp(config.end_date) if config.end_date else daily_all.date.max()
-        if end > daily_all.date.max():
+        if config.schema_version == 2:
+            requested_end = end
+            end = min(end, daily_all.date.max(), latest_closed_date())
+            if end < pd.Timestamp(config.start_date):
+                raise DataQualityError("所选区间没有本地已收盘数据")
+            context = self.reference_price(config.symbol, config.start_date, manifest["version"])
+            metadata = {**metadata, **context, "requested_end_date": str(requested_end.date()), "effective_end_date": str(end.date()), "prior_closes": {str(row.date.date()): float(row.close) for row in daily_all.itertuples() if row.tradestatus == 1 and row.volume > 0}}
+            if end < requested_end:
+                metadata["warnings"] = [*metadata.get("warnings", []), f"请求截至 {requested_end.date()}，实际本地已收盘数据截至 {end.date()}"]
+            unverified = metadata.get("actions_unverified_years")
+            missing_actions = any(config.start_date.year <= year <= end.year for year in unverified) if unverified is not None else metadata.get("actions_verified") is False
+            if metadata.get("asset_type") == "etf" and missing_actions:
+                raise DataQualityError("ETF 分红或拆分资料未完成核验，请补齐资料后回测；行情浏览仍可使用")
+        elif end > daily_all.date.max():
             raise DataQualityError(f"日线完整截止到 {daily_all.date.max().date()}，请补数或缩短结束日期")
         minute = self.store.read_files(files["minute"], "timestamp", config.start_date, end)
         actions = self.store.read_files(files["actions"])
@@ -161,13 +285,104 @@ class DataService:
         # A changed exchange reference price requires a modelled action, not qfq.
         observed = daily_all[(daily_all.tradestatus == 1) & (daily_all.volume > 0)].copy()
         previous_close = observed.close.shift(1)
-        unexplained = (observed.preclose - previous_close).abs() > 0.011
+        unexplained = (observed.preclose - previous_close).abs() > float(metadata.get("price_tick", 0.01)) * 1.1
         action_days = set(actions.ex_date.dt.normalize()) if not actions.empty else set()
         unexplained &= observed.date.between(pd.Timestamp(config.start_date), end)
         unknown = [str(day.date()) for day in observed.loc[unexplained, "date"] if day not in action_days]
         if unknown:
             raise DataQualityError("除权参考价发生变化但缺少公司行动资料：" + ", ".join(unknown[:20]))
         return prepare_bundle(config.symbol, minute, daily_all, actions, calendar, config.start_date, end, config.frequency, manifest["version"], metadata, manifest["profiles"])
+
+    def reference_price(self, symbol, start_date, version=None):
+        manifest = self.store.snapshot(normalize_symbol(symbol), version)
+        if not manifest:
+            raise DataQualityError("尚无本地数据，请先同步该标的")
+        daily = self.store.read_files(manifest["files"]["daily"], "date", end=pd.Timestamp(start_date) - pd.Timedelta(days=1))
+        available = daily[(daily.tradestatus == 1) & (daily.volume > 0) & (daily.close > 0)].sort_values("date") if not daily.empty else daily
+        if available.empty:
+            raise DataQualityError("开始日期前缺少有效交易日收盘价，请补齐历史或调整开始日期")
+        row = available.iloc[-1]
+        return {"reference_price": float(row.close), "valuation_price": float(row.close), "reference_date": str(row.date.date()), "data_version": manifest["version"], "asset_type": instrument_terms(symbol, manifest["metadata"])["asset_type"]}
+
+    def market_bars(self, symbol, frequency="1d", start_date=None, end_date=None, before=None, limit=600, ma_periods=(5, 10, 20, 60)):
+        symbol = normalize_symbol(symbol)
+        manifest = self.store.snapshot(symbol)
+        if not manifest:
+            return {"symbol": symbol, "bars": [], "warnings": ["尚无本地行情"]}
+        if frequency not in ("1d", "1m", "5m", "15m", "30m", "60m"):
+            raise ValueError("不支持的行情周期")
+        periods = sorted({int(p) for p in ma_periods if 1 <= int(p) <= 500})
+        column = "date" if frequency == "1d" else "timestamp"
+        files = manifest["files"]["daily" if frequency == "1d" else "minute"]
+        # Read newest partitions first. MA lookback is included before viewport
+        # slicing, while an older page never scans the entire minute archive.
+        minutes = 1 if frequency == "1d" else int(frequency[:-1])
+        wanted = (limit + max(periods, default=1) + 2) * minutes + (240 if frequency != "1d" else 0)
+        upper = min(pd.Timestamp(end_date), pd.Timestamp(before)) if end_date and before else end_date or before
+        parts, count = [], 0
+        for path in sorted(files, reverse=True):
+            part = self.store.read_files([path], column, end=upper)
+            if part.empty:
+                continue
+            parts.append(part.tail(wanted))
+            count += len(parts[-1])
+            if count >= wanted:
+                break
+        frame = pd.concat(parts, ignore_index=True).sort_values(column).tail(wanted) if parts else pd.DataFrame()
+        if frame.empty:
+            return {"symbol": symbol, "version": manifest["version"], "bars": [], "warnings": ["该周期尚无行情，请同步或导入分钟数据"]}
+        frame = frame.sort_values(column).rename(columns={column: "timestamp"})
+        if frequency != "1d":
+            frame["source_verified"] = frame.get("source_verified", pd.Series(any(profile.get("verified") for profile in manifest.get("profiles", {}).values()), index=frame.index)).fillna(False).astype(bool)
+            if frequency == "1m":
+                stamps = pd.to_datetime(frame.timestamp)
+                same_session = stamps.dt.normalize().eq(stamps.shift().dt.normalize()) & stamps.dt.hour.lt(12).eq(stamps.shift().dt.hour.lt(12))
+                frame["missing_minutes"] = (stamps.diff().dt.total_seconds().div(60).sub(1).where(same_session, 0).fillna(0).clip(lower=0)).astype(int)
+        if frequency not in ("1d", "1m"):
+            size = int(frequency[:-1])
+            stamps = pd.to_datetime(frame.timestamp)
+            minute = stamps.dt.hour * 60 + stamps.dt.minute
+            session = np.where(minute <= 690, 570, 780)
+            bucket = np.maximum(0, (minute.to_numpy() - session - 1) // size)
+            group = stamps.dt.strftime("%Y-%m-%d").astype(str) + ":" + pd.Series(session, index=frame.index).astype(str) + ":" + pd.Series(bucket, index=frame.index).astype(str)
+            frame = frame.groupby(group, sort=False).agg(timestamp=("timestamp", "last"), open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"), volume=("volume", "sum"), source_verified=("source_verified", "all"), minute_count=("timestamp", "count")).sort_values("timestamp")
+            frame["missing_minutes"] = (size - frame.minute_count).clip(lower=0)
+        for period in periods:
+            frame[f"ma{period}"] = frame.close.rolling(period, min_periods=period).mean()
+        if start_date:
+            frame = frame[frame.timestamp >= pd.Timestamp(start_date)]
+        if before:
+            frame = frame[frame.timestamp < pd.Timestamp(before)]
+        more = len(frame) > limit
+        frame = frame.tail(limit).copy()
+        frame["frequency"] = frequency
+        quote_frame = self.store.read_files(manifest["files"]["daily"], "date", end=frame.timestamp.iloc[-1] if not frame.empty else upper)
+        quote = quote_frame.sort_values("date").iloc[-1].to_dict() if not quote_frame.empty else None
+        flags = []
+        if not frame.empty:
+            days = pd.to_datetime(frame.timestamp).dt.normalize()
+            states = dict(zip(quote_frame.date, quote_frame.tradestatus)) if not quote_frame.empty else {}
+            suspended = days.map(states).eq(0)
+            frame["quality_note"] = np.where(suspended, "确认停牌", "")
+            if suspended.any():
+                flags.append(f"显示区间含 {days[suspended].nunique()} 个确认停牌日")
+            if frequency != "1d":
+                unverified = ~frame.source_verified
+                frame.loc[unverified, "quality_note"] += " 分钟来源未核验"
+                if unverified.any():
+                    flags.append(f"{int(unverified.sum())} 根 K 线的分钟来源未核验，严格回测可能按日线处理")
+                if "missing_minutes" in frame:
+                    incomplete = frame.missing_minutes.gt(0)
+                    frame.loc[incomplete, "quality_note"] += " 此前分钟有缺口" if frequency == "1m" else " 周期内分钟不完整"
+                    if incomplete.any():
+                        flags.append(f"{int(incomplete.sum())} 根 K 线内缺少分钟，未补造价格")
+            calendar = self.store.read_files(manifest["files"]["calendar"], "date", days.min(), days.max())
+            missing_days = set(calendar.date) - set(days) if not calendar.empty else set()
+            if missing_days:
+                flags.append(f"显示区间缺少 {len(missing_days)} 个交易日的所选周期行情")
+        if manifest["metadata"].get("actions_verified") is False:
+            flags.append("公司行动资料未完成核验，补齐前仅浏览价格")
+        return {"symbol": symbol, "version": manifest["version"], "frequency": frequency, "bars": frame.to_dict("records"), "quote": quote, "has_more": more, "next_before": str(frame.timestamp.iloc[0]) if more else None, "is_demo": bool(manifest["metadata"].get("is_demo")), "warnings": list(dict.fromkeys([*manifest["metadata"].get("warnings", []), *flags])), "quality_flags": flags, "instrument": instrument_terms(symbol, manifest["metadata"])}
 
     def coverage(self, symbol: str):
         symbol = normalize_symbol(symbol)
@@ -201,7 +416,7 @@ class DataService:
             if not path.is_file():
                 raise ValueError("导入文件不存在：" + str(path))
             return pd.read_parquet(path) if path.suffix.lower() == ".parquet" else pd.read_csv(path)
-        with self.store.lock:
+        with FileLock(str(self.store.root / f"sync-{symbol}.lock"), timeout=60), self.store.lock:
             previous = self.store.snapshot(symbol)
             files = previous["files"] if previous else {}
             if payload.get("daily_path"):
@@ -214,7 +429,7 @@ class DataService:
                     if len(listings):
                         csv_listing = str(pd.Timestamp(listings[0]).date())
                 required = {"preclose", "tradestatus"}
-                if not required.issubset(raw_daily.columns) or not ({"is_st", "isST"} & set(raw_daily.columns)):
+                if not required.issubset(raw_daily.columns) or (instrument_terms(symbol)["asset_type"] == "stock" and not ({"is_st", "isST"} & set(raw_daily.columns))):
                     raise DataQualityError("准确导入的日线需包含 preclose、tradestatus 和 is_st/isST 历史状态字段")
                 daily = canonical_frame(raw_daily, daily=True)
             else:
@@ -228,14 +443,20 @@ class DataService:
                 declared = payload.get("label_convention")
                 if declared not in (None, "auto", "start", "end"):
                     raise DataQualityError("时间标签应为 auto/start/end")
-                profiles["import"] = infer_profile(raw, daily, "import", declared=declared if declared in ("start", "end") else None)
+                profiles["import"] = infer_profile(raw, daily, "import", declared=declared if declared in ("start", "end") else None, price_tick=instrument_terms(symbol)["price_tick"])
                 imported = align_minutes(raw, profiles["import"]["convention"], profiles["import"]["volume_multiplier"])
                 imported["source_verified"] = profiles["import"]["verified"]
                 minute = merge_frames(minute, imported, "timestamp")
             actions = normalize_actions(read(payload["actions_path"])) if payload.get("actions_path") else self.store.read_files(files.get("actions", []))
             metadata = dict(previous.get("metadata", {})) if previous else {}
             known = self.store.instruments(symbol, limit=1)
-            metadata["board"] = "star" if symbol.startswith("688") else "chinext" if symbol.startswith("3") else "main"
+            metadata = {**(known[0] if known else {}), **metadata}
+            if payload.get("etf_category"):
+                if payload["etf_category"] not in {"stock", "bond", "crossborder", "commodity", "money"}:
+                    raise DataQualityError("无效的 ETF 类别")
+                metadata["etf_category"] = payload["etf_category"]
+                metadata.pop("settlement", None)
+            metadata = instrument_terms(symbol, metadata)
             metadata["listing_date"] = payload.get("listing_date") or (csv_listing if payload.get("daily_path") else None) or metadata.get("listing_date") or (known[0].get("listing_date") if known else None)
             # Imported files supply their own explicit calendar; an optional calendar
             # file can include expected no-bar days so missing daily rows are detected.
@@ -259,7 +480,12 @@ class DataService:
                     raise DataQualityError("导入必须提供真实交易日历文件(calendar_path)，自动日历获取失败：" + str(exc))
             calendar["date"] = pd.to_datetime(calendar["date"]).dt.normalize()
             metadata.update({"actions_verified": bool(payload.get("actions_path")) or bool(metadata.get("actions_verified")), "is_demo": False, "imported": True})
+            if payload.get("actions_path"):
+                metadata["actions_unverified_years"] = []
+            self.store.put_instrument(symbol, **{key: value for key, value in metadata.items() if key != "symbol"})
             self.store.add_watch(symbol)
+            if cancelled():
+                raise InterruptedError("任务已取消")
             progress(0.8, "发布导入数据版本")
             manifest = self.store.publish(symbol, minute, daily, actions, calendar, metadata, profiles)
             return {"symbol": symbol, "version": manifest["version"], "profiles": profiles}
@@ -290,7 +516,9 @@ class DataService:
         metadata = {"name": "演示 · " + symbol, "listing_date": str(calendar_days[0].date()), "board": "star" if symbol.startswith("688") else "chinext" if symbol.startswith("3") else "main", "actions_verified": True, "is_demo": True}
         profiles = {"demo": {"verified": True, "convention": "end", "volume_multiplier": 1, "reason": "确定性生成的模拟数据；不是历史行情"}}
         progress(0.6, "保存已标记的演示分钟与日线数据")
-        with self.store.lock:
+        with FileLock(str(self.store.root / f"sync-{symbol}.lock"), timeout=60), self.store.lock:
+            if self.store.snapshot(symbol) and not self.store.snapshot(symbol)["metadata"].get("is_demo"):
+                raise ValueError("该标的已有真实数据，不能用演示数据覆盖")
             manifest = self.store.publish(symbol, minute, daily, actions, calendar, metadata, profiles)
             self.store.add_watch(symbol, metadata["name"])
         return {"symbol": symbol, "version": manifest["version"], "is_demo": True, "days": days, "message": "演示数据已生成；包含短缺口与日线降级示例"}

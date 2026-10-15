@@ -14,6 +14,7 @@ Progress = Callable[[float, str], None]
 Cancelled = Callable[[], bool]
 
 _SUPPORTED_RANGES = {
+    "initial_shares", "min_shares", "max_shares", "buy_shares", "sell_shares",
     "buy_step",
     "sell_step",
     "grid_step",
@@ -40,8 +41,15 @@ def _check_ranges(config: OptimizationConfig) -> None:
         raise ValueError(f"不支持的搜索参数: {', '.join(unknown)}")
 
     for name, search_range in config.ranges.items():
+        if name in {"buy_step", "sell_step", "grid_step"} and name not in (("buy_step", "sell_step") if config.base.grid_mode == "trailing" else ("grid_step",)):
+            continue
         low, high = float(search_range.low), float(search_range.high)
         step = search_range.step
+        if name.endswith("_shares"):
+            if config.base.schema_version != 2 or low < (100 if name in {"buy_shares", "sell_shares"} else 0) or any(value % 100 for value in [low, high, step or 100]):
+                raise ValueError(f"股数搜索范围 {name} 必须以 100 为单位，交易量至少 100")
+        elif config.base.schema_version == 2 and name in {"buy_ratio", "sell_ratio", "initial_position", "min_position", "max_position"}:
+            raise ValueError("新版配置应搜索股数，不能搜索资金或仓位比例")
         if not math.isfinite(low) or not math.isfinite(high):
             raise ValueError(f"搜索区间 {name} 必须是有限数值")
         if step is not None and (not math.isfinite(float(step)) or float(step) <= 0):
@@ -173,7 +181,10 @@ def _slice_bundle(data: DataBundle, start: pd.Timestamp, end: pd.Timestamp) -> D
             )
         if registration_column is not None:
             action_dates = _dates_in_frame(actions, registration_column)
-            actions = actions.loc[action_dates.between(start, end)].copy()
+            if "prior_closes" in data.metadata and "ex_date" in actions:
+                actions = actions.loc[(_dates_in_frame(actions, "ex_date") >= start) & (action_dates <= end)].copy()
+            else:
+                actions = actions.loc[action_dates.between(start, end)].copy()
         else:
             actions = actions.iloc[0:0].copy()
 
@@ -304,6 +315,15 @@ def _parameters_for_trial(
         params[name] = (
             _sample(trial, name, ranges[name]) if name in ranges else float(getattr(base, name))
         )
+
+    if base.schema_version == 2:
+        for name in ("initial_shares", "min_shares", "max_shares", "buy_shares", "sell_shares"):
+            if name in ranges:
+                r = ranges[name]
+                params[name] = trial.suggest_int(name, int(r.low), int(r.high), step=int(r.step or 100))
+            else:
+                params[name] = int(getattr(base, name))
+        return params
 
     for name in ("initial_position", "min_position", "max_position"):
         params[name] = (

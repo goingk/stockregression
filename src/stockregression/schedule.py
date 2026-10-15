@@ -28,14 +28,14 @@ def configure_schedule(install: bool) -> dict:
     commands = ["$ErrorActionPreference = 'Stop'"]
     if install:
         commands += [
-            "$taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4) -MultipleInstances IgnoreNew",
+            "$taskSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 24) -MultipleInstances IgnoreNew -Hidden",
             "$taskPrincipal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited",
         ]
         for name, mode, schedule_time, days in [
             (TASK_NAMES[0], "daily", settings.schedule.daily_time, "Monday,Tuesday,Wednesday,Thursday,Friday"),
             (TASK_NAMES[1], "repair", settings.schedule.weekly_time, weekday),
         ]:
-            arguments = f'-m stockregression.cli sync --mode {mode}'
+            arguments = f'-m stockregression.cli sync --mode {mode} --scope market --resume'
             commands += [
                 "$taskAction = New-ScheduledTaskAction -Execute " + _powershell_literal(sys.executable) + " -Argument " + _powershell_literal(arguments) + " -WorkingDirectory " + _powershell_literal(PROJECT_ROOT),
                 "$taskTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek " + days + " -At " + _powershell_literal(schedule_time),

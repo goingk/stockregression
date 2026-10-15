@@ -13,6 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from typing import Literal
+from .preview import PreviewManager
 
 from .data import DataService
 from .jobs import JobManager
@@ -25,6 +27,16 @@ from .storage import Store, dumps, json_safe, now_iso
 class SyncRequest(BaseModel):
     symbols: list[str] = Field(default_factory=list)
     mode: str = "history"
+    scope: Literal["market", "watchlist", "selected"] | None = None
+    resume: bool = False
+    retry_failed: bool = False
+    workers: int = Field(default=2, ge=1, le=4)
+
+
+class PreviewRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$")
+    revision: int = Field(ge=1)
+    config: BacktestConfig
 
 
 class BatchRequest(BaseModel):
@@ -57,17 +69,20 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     root = str(Path(data_dir or configured.data_dir).resolve())
     store = Store(root)
     manager = JobManager(root, configured.max_workers)
+    previews = PreviewManager(store)
 
     @asynccontextmanager
     async def lifespan(app):
         if start_jobs:
             manager.start()
         yield
+        previews.stop()
         if start_jobs:
             manager.stop()
 
-    app = FastAPI(title="A 股网格研究台", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="A 股及 ETF 行情与网格研究台", version="0.1.0", lifespan=lifespan)
     app.state.store = store
+    app.state.previews = previews
     app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
 
     def submit(kind, payload):
@@ -84,8 +99,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         return {"status": "ok", "data_dir": root, "version": "0.1.0"}
 
     @app.get("/api/v1/instruments")
-    def instruments(q: str = ""):
-        return store.instruments(q)
+    def instruments(q: str = "", asset_type: Literal["stock", "etf"] | None = None, limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
+        return store.instruments(q, limit, asset_type, offset)
 
     @app.post("/api/v1/instruments/refresh")
     def refresh_instruments():
@@ -124,9 +139,15 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         try:
             values = payload.model_dump()
             values["symbols"] = [normalize_symbol(symbol) for symbol in payload.symbols]
+            if payload.scope == "market" and payload.symbols:
+                raise ValueError("全市场范围不能同时指定代码")
             return submit("sync", values)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/v1/data/sync-status")
+    def sync_status(run_key: str | None = None, status: str | None = None, limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
+        return store.sync_status(run_key, status, limit, offset)
 
     @app.post("/api/v1/data/demo")
     def demo(payload: dict):
@@ -163,6 +184,57 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     @app.post("/api/v1/backtests")
     def backtest(config: BacktestConfig):
         return submit("backtest", {"config": config.model_dump(mode="json"), "version": snapshot_version(config)})
+
+    @app.get("/api/v1/data/reference-price/{symbol}")
+    def reference_price(symbol: str, start_date: str):
+        try:
+            return DataService(store).reference_price(normalize_symbol(symbol), pd.Timestamp(start_date).date())
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/v1/market/bars/{symbol}")
+    def market_bars(symbol: str, frequency: str = "1d", start_date: str | None = None, end_date: str | None = None, before: str | None = None, limit: int = Query(600, ge=1, le=5000), ma: str = "5,10,20,60"):
+        try:
+            return json_safe(DataService(store).market_bars(symbol, frequency, start_date, end_date, before, limit, [int(value) for value in ma.split(",") if value.strip()]))
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/backtests/preview")
+    def preview(payload: PreviewRequest):
+        if payload.config.schema_version != 2:
+            raise HTTPException(422, "请先将旧配置转换为股数配置")
+        return json_safe(previews.submit(payload.session_id, payload.revision, payload.config, snapshot_version(payload.config)))
+
+    @app.get("/api/v1/backtests/preview/{session_id}")
+    def preview_status(session_id: str):
+        status = previews.snapshot(session_id)
+        if status is None:
+            raise HTTPException(404, "预览已过期")
+        return json_safe(status)
+
+    @app.delete("/api/v1/backtests/preview/{session_id}")
+    def cancel_preview(session_id: str):
+        previews.cancel(session_id)
+        return {"cancelled": True}
+
+    @app.post("/api/v1/configs/convert")
+    def convert_config(config: BacktestConfig):
+        if config.schema_version == 2:
+            return {"config": config.model_dump(mode="json"), "notice": "已载入股数配置"}
+        try:
+            context = DataService(store).reference_price(config.symbol, config.start_date)
+            price = context["reference_price"]
+            def shares(ratio):
+                return int(config.initial_cash * ratio / price / 100) * 100
+            def quantity(value):
+                amount = value.value if value.mode == "shares" else value.value / price if value.mode == "cash" else config.initial_cash * value.value / price
+                return max(200 if config.symbol.startswith(("688", "689")) else 100, int(amount / 100) * 100)
+            values = {key: value for key, value in config.model_dump(mode="json").items() if key not in {"schema_version", "initial_cash", "initial_position", "min_position", "max_position", "buy_quantity", "sell_quantity", "dca_frequency"}}
+            values.update(schema_version=2, initial_shares=shares(config.initial_position), min_shares=shares(config.min_position), max_shares=shares(config.max_position), buy_shares=quantity(config.buy_quantity), sell_shares=quantity(config.sell_quantity), reference_price_mode="manual" if config.reference_price else "auto", dca={"frequency": config.dca_frequency, "shares": 200 if config.symbol.startswith(("688", "689")) else 100})
+            modern = BacktestConfig.model_validate(values)
+            return {"config": modern.model_dump(mode="json"), "reference_date": context["reference_date"], "notice": "旧现金/比例配置已按历史参考价换算为股数草稿；资金按新规则重算，请检查后另存，原配置保持保留。"}
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
 
     @app.post("/api/v1/backtests/batch")
     def batch(payload: BatchRequest):

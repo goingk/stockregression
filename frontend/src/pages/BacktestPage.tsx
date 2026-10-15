@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Copy, Play, Plus, RefreshCw, Save, Trash2 } from 'lucide-react'
 import { del, get, post } from '../api'
-import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, JobProgress, Loading, PageHeader, dateText, defaultConfig, useErrorMessage } from '../components'
+import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, JobProgress, Loading, PageHeader, dateText, defaultConfig, configPayload, loadConfig, useErrorMessage } from '../components'
+import EquityPreview from '../EquityPreview'
 import type { BacktestConfig, ConfigRecord, Job } from '../types'
 
 type Props = { initialConfig: BacktestConfig | null; clearInitialConfig: () => void; onOpenResult: (id: string) => void }
@@ -34,7 +35,7 @@ export default function BacktestPage({ initialConfig, clearInitialConfig, onOpen
     return () => window.clearInterval(timer)
   }, [refresh])
   useEffect(() => {
-    if (initialConfig) { setConfig(initialConfig); clearInitialConfig(); setNotice('已将推荐配置载入表单，请检查后运行。') }
+    if (initialConfig) { void loadConfig(initialConfig).then(value => { setConfig(value.config); setNotice(value.notice) }).catch(e => setError(err(e))); clearInitialConfig() }
   }, [initialConfig, clearInitialConfig])
 
   const activeJobs = useMemo(() => jobs.filter((job) => ['queued', 'running'].includes(job.status)), [jobs])
@@ -49,7 +50,7 @@ export default function BacktestPage({ initialConfig, clearInitialConfig, onOpen
     if (!saveDialog || !name) { setDialogError('请填写配置名称。'); return }
     setBusy(true); setError(''); setNotice('')
     try {
-      const response = await post<{ id: string }>('/configs', { name: name.trim(), config })
+      const response = await post<{ id: string }>('/configs', { name: name.trim(), config: configPayload(config) })
       const saved: ConfigRecord = { id: response.id, name: name.trim(), config }
       setRecords((list) => [saved, ...list.filter((item) => item.id !== saved.id)])
       setNotice(`配置“${saved.name}”已保存。`)
@@ -60,7 +61,7 @@ export default function BacktestPage({ initialConfig, clearInitialConfig, onOpen
   const runOne = async () => {
     setBusy(true); setError(''); setNotice('')
     try {
-      const result = await post<{ job_id: string }>('/backtests', config)
+      const result = await post<{ job_id: string }>('/backtests', configPayload(config))
       setNotice(`回测任务 ${result.job_id} 已提交。`)
       await refresh()
     } catch (e) { setError(err(e)) } finally { setBusy(false) }
@@ -71,7 +72,7 @@ export default function BacktestPage({ initialConfig, clearInitialConfig, onOpen
     if (chosen.length < 2) { setError('批量回测至少选择两份已保存配置。'); return }
     setBusy(true); setError(''); setNotice('')
     try {
-      const result = await post<{ job_ids: string[] }>('/backtests/batch', { configs: chosen.map((item) => item.config) })
+      const result = await post<{ job_ids: string[] }>('/backtests/batch', { configs: await Promise.all(chosen.map(async item => configPayload((await loadConfig(item.config)).config))) })
       setNotice(`已独立提交 ${result.job_ids.length} 个回测任务。`)
       await refresh()
     } catch (e) { setError(err(e)) } finally { setBusy(false) }
@@ -99,23 +100,23 @@ export default function BacktestPage({ initialConfig, clearInitialConfig, onOpen
   }
 
   return <>
-    <PageHeader eyebrow="BACKTEST WORKSPACE" title="回测工作台" description="比较网格、定投与持有基准，逐项配置交易规则并运行独立回测。" action={<Button variant="secondary" onClick={() => setConfig(defaultConfig())}><RefreshCw size={15} />重置表单</Button>} />
+    <PageHeader eyebrow="BACKTEST WORKSPACE" title="回测工作台" description="按股数配置网格，实时查看净值与定投获利；正式回测保存完整分析。" action={<Button variant="secondary" onClick={() => setConfig(defaultConfig())}><RefreshCw size={15} />重置表单</Button>} />
     {error && <ErrorBox message={error} onClose={() => setError('')} />}
     {notice && <div className="notice success"><span>{notice}</span></div>}
-    <div className="workspace-grid">
-      <div className="main-column"><Card title="回测参数" subtitle="填写策略区间、仓位比例和交易规则。">
-        <ConfigForm value={config} onChange={setConfig} />
+    <div className="backtest-layout">
+      <div className="main-column"><Card title="回测参数" subtitle="按股数设置持仓与交易量，初始持股在开始前已持有。">
+        <div className="parameter-scroll"><ConfigForm value={config} onChange={setConfig} /></div>
         <div className="form-footer"><span className="form-footnote">运行前会校验数据覆盖、日期区间和仓位约束。</span><div className="button-row"><Button variant="secondary" busy={busy} onClick={() => void saveConfig(true)}><Copy size={15} />复制配置</Button><Button variant="secondary" busy={busy} onClick={() => void saveConfig()}><Save size={15} />保存配置</Button><Button busy={busy} onClick={() => void runOne()}><Play size={15} />运行回测</Button></div></div>
       </Card></div>
-      <aside className="side-column">
+      <aside className="side-column"><EquityPreview config={config} /><div className="workspace-support">
         <Card title="已保存配置" subtitle="选择多份配置，可同时独立运行并分别生成结果。" action={<Badge tone="blue">{records.length} 份</Badge>}>
-          {loading ? <Loading /> : records.length === 0 ? <Empty title="还没有保存的配置" detail="保存后即可复用或批量比较。" /> : <div className="saved-list">{records.map((record) => <div className="saved-row" key={record.id}><label className="check-label"><input type="checkbox" checked={selected.includes(record.id)} onChange={(e) => setSelected((old) => e.target.checked ? [...old, record.id] : old.filter((id) => id !== record.id))} /><span className="saved-copy"><strong>{record.name}</strong><small>{record.config.symbol} · {record.config.frequency} · {record.config.grid_mode}</small></span></label><div className="saved-actions"><button title="载入" onClick={() => { setConfig(record.config); setNotice(`已载入“${record.name}”。`) }}><RefreshCw size={14} /></button><button title="复制" onClick={() => { setConfig({ ...record.config, buy_quantity: { ...record.config.buy_quantity }, sell_quantity: { ...record.config.sell_quantity }, fees: { ...record.config.fees } }); setNotice(`已复制“${record.name}”到参数表单。`) }}><Copy size={14} /></button><button title="删除" className="danger-icon" onClick={() => removeConfig(record)}><Trash2 size={14} /></button></div></div>)}</div>}
+          {loading ? <Loading /> : records.length === 0 ? <Empty title="还没有保存的配置" detail="保存后即可复用或批量比较。" /> : <div className="saved-list">{records.map((record) => <div className="saved-row" key={record.id}><label className="check-label"><input type="checkbox" checked={selected.includes(record.id)} onChange={(e) => setSelected((old) => e.target.checked ? [...old, record.id] : old.filter((id) => id !== record.id))} /><span className="saved-copy"><strong>{record.name}</strong><small>{record.config.symbol} · {record.config.frequency} · {record.config.grid_mode}</small></span></label><div className="saved-actions"><button title="载入" onClick={() => { void loadConfig(record.config).then(value => { setConfig(value.config); setNotice(value.notice) }).catch(e => setError(err(e))) }}><RefreshCw size={14} /></button><button title="复制" onClick={() => { void loadConfig(record.config).then(value => { setConfig(value.config); setNotice('已复制配置草稿。' + value.notice) }).catch(e => setError(err(e))) }}><Copy size={14} /></button><button title="删除" className="danger-icon" onClick={() => removeConfig(record)}><Trash2 size={14} /></button></div></div>)}</div>}
           <div className="saved-footer"><Button variant="secondary" disabled={selected.length < 2 || busy} busy={busy} onClick={() => void runBatch()}><Plus size={15} />批量运行所选（{selected.length}）</Button></div>
         </Card>
         <Card title="任务进度" subtitle={activeJobs.length ? `${activeJobs.length} 个任务正在处理` : '提交后的任务会显示在这里。'} action={<button className="icon-button" onClick={() => { setError(''); void refresh() }} aria-label="刷新任务"><RefreshCw size={15} /></button>}>
           {loading ? <Loading /> : jobs.length === 0 ? <Empty title="暂无回测任务" /> : <div className="job-list">{jobs.map((job) => <div className="job-card" key={job.id}><div className="job-title"><div><strong>{job.kind === 'batch_backtest' ? '批量回测' : '策略回测'}</strong><small>{dateText(job.created_at)} · {job.id.slice(0, 12)}</small></div><Badge tone={job.status === 'completed' ? 'green' : job.status === 'failed' ? 'red' : 'blue'}>{job.status}</Badge></div><JobProgress progress={job.progress} status={job.status} /><p>{job.message || '等待处理'}</p>{job.error != null && <pre className="error-detail">{typeof job.error === 'string' ? job.error : JSON.stringify(job.error, null, 2)}</pre>}<div className="job-bottom">{job.result_id && <button className="text-link" onClick={() => onOpenResult(job.result_id!)}>查看结果</button>}{['queued', 'running'].includes(job.status) && <button className="text-link danger-text" onClick={() => void cancelJob(job.id)}>取消任务</button>}</div></div>)}</div>}
         </Card>
-      </aside>
+      </div></aside>
     </div>
     {saveDialog && <div className="backtest-dialog-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setSaveDialog(null) }} onKeyDown={(event) => { if (event.key === 'Escape' && !busy) setSaveDialog(null) }}>
       <section className="backtest-dialog" role="dialog" aria-modal="true" aria-labelledby="save-config-title">

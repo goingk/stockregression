@@ -26,4 +26,6 @@ SOFTWARE.
 
 [neigezhu/china-a-share-1min-ohlcv](https://huggingface.co/datasets/neigezhu/china-a-share-1min-ohlcv) 的数据仓库声明 Apache-2.0 许可，原始文件保留在本地 Hugging Face 缓存中，数据版本写入清单。本项目不重新分发完整行情库。
 
+[neigezhu/china-etf-1min-ohlcv](https://huggingface.co/datasets/neigezhu/china-etf-1min-ohlcv) 是独立的 ETF 分钟数据源，仓库声明 Apache-2.0 许可。同样固定来源版本并保留原始缓存，不重新分发行情文件；实际覆盖仅限其清单中的标的。
+
 AKShare、BaoStock、pytdx、Hugging Face Hub 以及其所连接的数据服务，按各自许可和服务条款使用。代码许可不代替底层行情提供方对数据使用的规定。
