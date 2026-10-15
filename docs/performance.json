@@ -1,0 +1,120 @@
+{
+  "measured_at": "2026-10-15",
+  "simulation_measurement_date": "2026-10-14",
+  "environment": {
+    "os": "Windows 11",
+    "python": "3.12.13",
+    "numpy": "2.3.5",
+    "numba": "0.68.0",
+    "numba_cache": "warm disk cache"
+  },
+  "input": {
+    "source": "DataService.demo",
+    "sessions": 1200,
+    "date_range": ["2022-03-10", "2026-10-14"],
+    "prepared_bar_rows": 287761,
+    "simulated_real_bar_rows": 287759,
+    "synthetic_rows_skipped": 2,
+    "daily_fallback_sessions": 1,
+    "bundle_load_seconds": 8.607,
+    "cash_dividend_fixture": {
+      "events": [
+        {"record_date": "2022-08-04", "ex_date": "2022-08-05", "cash_per_share": 0.12},
+        {"record_date": "2023-06-30", "ex_date": "2023-07-03", "cash_per_share": 0.14},
+        {"record_date": "2024-07-01", "ex_date": "2024-07-02", "cash_per_share": 0.16},
+        {"record_date": "2025-07-01", "ex_date": "2025-07-02", "cash_per_share": 0.18},
+        {"record_date": "2026-05-22", "ex_date": "2026-05-25", "cash_per_share": 0.20}
+      ],
+      "raw_price_method": "Subtract each cash dividend from OHLC beginning on its ex-date; set ex-date preclose to prior raw close minus that dividend; recalculate daily price limits from adjusted preclose."
+    }
+  },
+  "ordinary_demo_fast_vs_reference": {
+    "full_fast_seconds_first_call": 5.718,
+    "full_reference_seconds": 6.159,
+    "trade_differences": {"grid": 0, "dca": 0, "buy_hold": 0},
+    "max_metric_absolute_difference": 6.7e-16
+  },
+  "annual_cash_dividend_fixture": {
+    "summary_fast_seconds_first_call_including_array_preparation": 1.649,
+    "summary_reference_seconds": 4.232,
+    "full_fast_seconds_with_prepared_market_arrays": 2.349,
+    "full_equity_rows_per_strategy": 287759,
+    "summary_vs_reference": {
+      "trade_counts_equal": true,
+      "fees_equal": true,
+      "max_metric_absolute_difference": 3.4e-16
+    }
+  },
+  "optimization": {
+    "summary_trials": 200,
+    "seconds": 1.175,
+    "market_array_preparation_reused": true,
+    "trial_configurations_varied": ["buy_step", "sell_step", "grid_step"]
+  },
+  "locked_real_market_validation": {
+    "measured_at": "2026-10-15",
+    "source": "Local Store snapshot loaded via DataService.load_bundle",
+    "machine": {
+      "cpu": "Intel Core Ultra 5 125H",
+      "logical_processors": 18,
+      "memory_bytes": 33779150848
+    },
+    "input": {
+      "symbol": "600000.SH",
+      "data_version": "cb67c30a71d0d1b8980224bf",
+      "is_demo": false,
+      "date_range": ["2020-01-02", "2026-10-14"],
+      "frequency": "1m",
+      "calendar_sessions": 1641,
+      "prepared_bar_rows": 308995,
+      "synthetic_rows_skipped": 16,
+      "real_nontradable_rows_retained": 2114,
+      "fastpath_rows": 308979
+    },
+    "full_fast_vs_reference": {
+      "timings_seconds": {
+        "bundle_load": 12.332994,
+        "fast_market_array_preparation": 1.900998,
+        "full_fast_including_output_build": 3.301335,
+        "full_reference_including_output_build": 7.48139
+      },
+      "trade_differences": {"grid": 0, "dca": 0, "buy_hold": 0},
+      "rejection_differences": {"grid": 0, "dca": 0, "buy_hold": 0},
+      "max_metric_absolute_difference": {
+        "grid": 1.304512053934559e-15,
+        "dca": 1.6653345369377348e-16,
+        "buy_hold": 2.7755575615628914e-17
+      },
+      "position_ratio_max_absolute_difference": {"grid": 0.0, "dca": 0.0, "buy_hold": 0.0},
+      "trade_counts": {"grid": 159, "dca": 82, "buy_hold": 1},
+      "rejection_counts": {"grid": 1067, "dca": 14, "buy_hold": 0},
+      "timing_scope": "Bundle load includes local Parquet reads and data-quality preparation. Fast array preparation is timed separately. Full engine timings exclude bundle loading and fast array preparation, and include simulation plus construction of equity, trade, rejection and metric output. Numba disk cache was warm; no other application backtest jobs were running."
+    },
+    "historical_optimization_200": {
+      "mode": "historical",
+      "requested_trials": 200,
+      "seed": 42,
+      "status": "completed",
+      "completed_trials": 192,
+      "invalid_constraint_trials": 8,
+      "seconds_with_warm_market_arrays": 5.074271,
+      "summary_warmup_seconds_before_timing": 0.187106,
+      "market_array_preparation_reused": true,
+      "timing_scope": "Excludes DataService.load_bundle, fast array preparation and the separate summary warm-up. Includes the 200-trial search and full output construction for the selected candidate."
+    },
+    "application_job_record": {
+      "job_id": "a2eeb587aa6e4e7680c389ceb4618fad",
+      "result_id": "e33e4b2481d9495396f6a46925ac8a78",
+      "mode": "both",
+      "date_range": ["2020-01-02", "2026-10-14"],
+      "requested_trials": 200,
+      "created_at": "2026-10-15T01:06:41.936875+00:00",
+      "updated_at": "2026-10-15T01:07:16.391286+00:00",
+      "elapsed_seconds": 34.454411,
+      "historical_trials": {"completed": 192, "invalid_constraints": 8},
+      "robust_validation": "unavailable because minute coverage was below the configured 95% threshold",
+      "timing_scope": "Application job created-to-updated wall time, including queueing, data loading and preparation, available search work, and result persistence; not a pure engine runtime."
+    }
+  },
+  "notes": "Timings are local wall-clock measurements. The retained simulated-data measurements above are deterministic demo data, not historical market evidence; real locked-market results are recorded separately. Full output constructs equity rows, while summary-only retains session returns and metrics without detailed paths or trades."
+}

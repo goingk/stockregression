@@ -1,0 +1,31 @@
+[project]
+name = "stockregression"
+version = "0.1.0"
+description = "本地 A 股分钟级网格回测与参数研究工作台"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn>=0.34,<1", "pydantic>=2.10,<3",
+  "pandas>=2.2,<3", "numpy>=2.1,<2.4", "pyarrow>=19,<24",
+  "duckdb>=1.2,<2", "numba>=0.61,<1", "optuna>=4,<6",
+  "huggingface-hub>=0.30,<2", "httpx>=0.28,<1",
+  "baostock>=0.8.9,<1", "akshare>=1.16,<2", "pytdx>=1.72,<2",
+  "typer>=0.15,<1", "filelock>=3.17,<4",
+]
+
+[project.scripts]
+stockregression = "stockregression.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stockregression"]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-cov>=6,<8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
