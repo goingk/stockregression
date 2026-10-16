@@ -208,10 +208,11 @@ def fetch_tdx(symbol: str, earliest=None, cancelled=lambda: False) -> pd.DataFra
 def fetch_sina(symbol: str) -> pd.DataFrame:
     import akshare as ak
     code, exchange = normalize_symbol(symbol).split(".")
-    if code.startswith(("1", "5")):
-        frame = ak.fund_etf_hist_min_em(symbol=code, period="1", adjust="")
-    else:
-        frame = ak.stock_zh_a_minute(symbol=exchange.lower() + code, period="1", adjust="")
+    # EastMoney's trends2 minute endpoint (fund_etf_hist_min_em) reports a
+    # 0.000 open for every historical session (observed for ETFs on
+    # 2026-10-12..15). The Sina minute feed returns full OHLC for stocks and
+    # ETFs alike, so both go through it.
+    frame = ak.stock_zh_a_minute(symbol=exchange.lower() + code, period="1", adjust="")
     if frame is None or frame.empty:
         raise RuntimeError("新浪未返回近期分钟行情")
     frame = canonical_frame(frame, source="sina")
@@ -220,12 +221,8 @@ def fetch_sina(symbol: str) -> pd.DataFrame:
 
 @serialized_baostock
 def fetch_reference_5m(symbol: str, start, end) -> pd.DataFrame:
-    if symbol.startswith(("1", "5")):
-        import akshare as ak
-        frame = ak.fund_etf_hist_min_em(symbol=symbol.split(".")[0], period="5", adjust="", start_date=str(pd.Timestamp(start)), end_date=str(pd.Timestamp(end) + pd.Timedelta(days=1)))
-        frame = canonical_frame(frame, source="etf_reference_5m")
-        frame["volume"] *= 100
-        return frame
+    # BaoStock serves unadjusted 5-minute bars for A shares and listed ETFs
+    # alike, and is independent of the Sina minute feed used for recent bars.
     import baostock as bs
     code, exchange = normalize_symbol(symbol).split(".")
     with contextlib.redirect_stdout(io.StringIO()):
@@ -310,19 +307,37 @@ def fetch_etf_auxiliary(symbol, start, end, cancelled=lambda: False):
     import akshare as ak
     import baostock as bs
     from .rules import instrument_terms
-    code = symbol.split(".")[0]
-    frame = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=pd.Timestamp(start).strftime("%Y%m%d"), end_date=pd.Timestamp(end).strftime("%Y%m%d"), adjust="")
-    if frame is None or frame.empty:
-        raise RuntimeError("ETF 日线来源未返回数据")
-    if "涨跌额" in frame:
-        frame["preclose"] = (pd.to_numeric(frame["收盘"]) - pd.to_numeric(frame["涨跌额"])).round(3)
-    daily = canonical_frame(frame, daily=True)
-    daily["volume"] *= 100  # Eastmoney reports lots; canonical ETF volume is units.
+    code, exchange = normalize_symbol(symbol).split(".")
+    daily_notes = []
     with contextlib.redirect_stdout(io.StringIO()):
         login = bs.login()
         if login.error_code != "0":
             raise RuntimeError("交易日历登录失败")
         try:
+            try:
+                frame = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=pd.Timestamp(start).strftime("%Y%m%d"), end_date=pd.Timestamp(end).strftime("%Y%m%d"), adjust="")
+                if frame is None or frame.empty:
+                    raise RuntimeError("ETF 日线来源未返回数据")
+                if "涨跌额" in frame:
+                    frame["preclose"] = (pd.to_numeric(frame["收盘"]) - pd.to_numeric(frame["涨跌额"])).round(3)
+                daily = canonical_frame(frame, daily=True)
+                daily["volume"] *= 100  # Eastmoney reports lots; canonical ETF volume is units.
+            except Exception as exc:
+                # EastMoney's push2his host rate-limits or refuses connections at
+                # times; BaoStock serves the same unadjusted ETF daily in units.
+                fallback = bs.query_history_k_data_plus(exchange.lower() + "." + code,
+                    "date,open,high,low,close,preclose,volume,amount,tradestatus",
+                    start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date()),
+                    frequency="d", adjustflag="3")
+                if fallback.error_code != "0":
+                    raise RuntimeError(f"ETF 日线来源均不可用：东财 {exc}；BaoStock {fallback.error_msg}")
+                rows = []
+                while fallback.next():
+                    rows.append(fallback.get_row_data())
+                daily = canonical_frame(pd.DataFrame(rows, columns=fallback.fields), daily=True)
+                if daily.empty:
+                    raise RuntimeError("ETF 日线来源均未返回数据：" + str(exc))
+                daily_notes.append("东财 ETF 日线不可用，已改用 BaoStock 不复权日线：" + str(exc))
             result = bs.query_trade_dates(str(pd.Timestamp(start).date()), str(pd.Timestamp(end).date()))
             if result.error_code != "0":
                 raise RuntimeError(result.error_msg)
@@ -346,7 +361,7 @@ def fetch_etf_auxiliary(symbol, start, end, cancelled=lambda: False):
         except Exception as exc:
             warnings.append(f"{year} ETF 分红/拆分资料未核验：{exc}")
             unverified.append(year)
-    metadata = {"actions_verified": not warnings, "actions_checked_years": list(range(daily.date.min().year, pd.Timestamp(end).year + 1)), "actions_unverified_years": unverified, "warnings": warnings}
+    metadata = {"actions_verified": not warnings, "actions_checked_years": list(range(daily.date.min().year, pd.Timestamp(end).year + 1)), "actions_unverified_years": unverified, "warnings": [*daily_notes, *warnings]}
     return daily, normalize_actions(pd.DataFrame(records)), calendar, metadata
 
 

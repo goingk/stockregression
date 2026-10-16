@@ -41,8 +41,8 @@ class QuantityConfig(BaseModel):
 
 class FeeConfig(BaseModel):
     model_config = ConfigDict(allow_inf_nan=False)
-    commission_rate: float = Field(default=0.0003, ge=0, le=0.05)
-    min_commission: float = Field(default=5, ge=0)
+    commission_rate: float = Field(default=0.0005, ge=0, le=0.05)
+    min_commission: float = Field(default=0.1, ge=0)
     slippage_bps: float = Field(default=5, ge=0, le=1000)
     share_face_value: float = Field(default=1, gt=0)
     legacy_sh_transfer_rate: float = Field(default=0.001, ge=0, le=0.05)
@@ -53,6 +53,7 @@ class FeeConfig(BaseModel):
 class DcaConfig(BaseModel):
     frequency: Literal["daily", "weekly", "monthly"] = "monthly"
     shares: int = Field(default=100, ge=100, multiple_of=100)
+    initial_shares: int = Field(default=0, ge=0, multiple_of=100)
 
 
 class BacktestConfig(BaseModel):

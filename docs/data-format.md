@@ -16,6 +16,8 @@ uv run stockregression import-data 600000.SH .\daily.csv `
 
 `symbol` 和 `daily_path` 不能写为 `--symbol` 或 `--daily-path`。文件扩展名为 `.parquet` 时按 Parquet 读取；其他扩展名按 CSV 读取。CLI、网页和 API 都在运行程序所在的本机读取该路径，不会上传到远端处理。
 
+若 Parquet 把 K 线时钟放在索引而不是列里（例如 Tushare 导出的 `trade_date` / `trade_time` 两级索引），导入器会把日期时间索引层级提升为列后再按上表别名识别，不需要事先 `reset_index`。索引中的其他层级会作为普通列保留。
+
 示例假定分钟时间戳是结束标签，因此写了 `--label-convention end`；若供应方给的是开始标签，应改为 `start`。不确定时省略该选项，默认值 `auto` 会尝试校准，未核验的交易日按日线处理。请根据数据源说明选择标签，不要仅凭文件中时间看起来接近收盘就判断。
 
 日线文件在首次导入时必需；API / 网页导入在该股票已有数据时可以省略日线路径并沿用当前版本日线，但要确保数据确实完整。CLI 的 `daily_path` 是必需的位置参数，所以通过 CLI 时每次都要提供一个日线文件路径。导入会发布一个新的不可变数据版本。
@@ -34,7 +36,7 @@ ETF 分红资料未核验的区间不能严格回测。可提供经核实的公�
 
 | 含义 | 规范列名 | 可识别的别名 / 说明 |
 | --- | --- | --- |
-| 交易日期 | `date` | 也可用 `timestamp`、`datetime`、`day`、`dt`、`time` 或中文 `日期`；按日期归一化。 |
+| 交易日期 | `date` | 也可用 `timestamp`、`datetime`、`day`、`dt`、`time`、`trade_date` 或中文 `日期`；按日期归一化。 |
 | 开盘价 | `open` | 或 `开盘` |
 | 最高价 | `high` | 或 `最高` |
 | 最低价 | `low` | 或 `最低` |
@@ -60,7 +62,7 @@ date,open,high,low,close,volume,preclose,tradestatus,is_st,listing_date,turnover
 
 | 含义 | 规范列名 | 可识别的别名 / 说明 |
 | --- | --- | --- |
-| 分钟时间 | `timestamp` | 也可用 `datetime`、`day`、`dt`、`time` 或中文 `时间`；日线式 `date` 也可映射，但分钟记录仍必须带具体时分。 |
+| 分钟时间 | `timestamp` | 也可用 `datetime`、`day`、`dt`、`time`、`trade_time` 或中文 `时间`；日线式 `date`、`trade_date` 也可映射，但分钟记录仍必须带具体时分。 |
 | 开盘价 | `open` | 或 `开盘` |
 | 最高价 | `high` | 或 `最高` |
 | 最低价 | `low` | 或 `最低` |
@@ -75,7 +77,7 @@ date,open,high,low,close,volume,preclose,tradestatus,is_st,listing_date,turnover
 timestamp,open,high,low,close,volume,turnover
 ```
 
-时间可以带时区；如带时区，导入器先转换到 `Asia/Shanghai`，再去掉时区标识用于本地交易时段校验。请保证源数据实际对应上海市场时钟。默认 `label_convention=auto`，系统会尝试校准时间标签；无法确认的交易日会标记为未校准并使用日线。数据供应方已明确标签定义时，可选择 `end`（K 线时间是分钟结束时间）或 `start`（分钟开始时间，导入器会向后平移 1 分钟）。选择前请核对数据源说明；选错标签可能导致分钟行情无法通过核验，届时覆盖报告会标记未校准并回退日线。
+时间可以带时区；如带时区，导入器先转换到 `Asia/Shanghai`，再去掉时区标识用于本地交易时段校验。请保证源数据实际对应上海市场时钟。分钟记录的开盘、最高、最低、收盘必须为正；出现 0 或负值的文件会被整帧拒绝，因为非正价格是来源缺陷，不是真实成交。默认 `label_convention=auto`，系统会尝试校准时间标签；无法确认的交易日会标记为未校准并使用日线。数据供应方已明确标签定义时，可选择 `end`（K 线时间是分钟结束时间）或 `start`（分钟开始时间，导入器会向后平移 1 分钟）。选择前请核对数据源说明；选错标签可能导致分钟行情无法通过核验，届时覆盖报告会标记未校准并回退日线。
 
 ## 交易日历
 

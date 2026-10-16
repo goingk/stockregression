@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from stockregression import engine
 from stockregression.api import create_app
 from stockregression.data import DataService
-from stockregression.models import BacktestConfig, DataBundle, OptimizationConfig
+from stockregression.models import BacktestConfig, DataBundle, DcaConfig, FeeConfig, OptimizationConfig
 from stockregression.optimization import optimize
 from stockregression.providers import normalize_actions
 from stockregression.rules import instrument_terms
@@ -41,29 +41,81 @@ def test_existing_shares_sell_first_day_and_orders_use_hundreds(monkeypatch):
     assert result["funding"]["initial_equity"] == 18500.1  # Ten buy orders reserve exchange transfer fees.
 
 
-def test_dca_external_contributions_are_not_profit_and_preview_matches_full():
+def test_dca_initial_holdings_and_external_contributions_share_one_return_basis():
     config, bundle = fixture("510300.SH")
+    config = config.model_copy(update={"dca": DcaConfig(frequency="daily", shares=100, initial_shares=200), "fees": FeeConfig()})
     full = engine.run_backtest(config, bundle)
     preview = engine.run_backtest(config, bundle, preview=True)
     trades = full["strategies"]["dca"]["trades"]
     total = sum(trade["quantity"] * trade["price"] + trade["fees"] for trade in trades)
     dca = full["strategies"]["dca"]
     assert len(trades) == 8
-    assert dca["metrics"]["total_invested"] == pytest.approx(total)
-    assert dca["metrics"]["total_return"] == pytest.approx((8 * 100 * bundle.daily.close.iloc[-1]) / total - 1)
+    assert dca["metrics"]["initial_equity"] == 2000
+    assert dca["metrics"]["total_invested"] == pytest.approx(2000 + total)
+    assert dca["metrics"]["total_return"] == pytest.approx((1000 * bundle.daily.close.iloc[-1]) / (2000 + total) - 1)
     assert dca["metrics"]["cagr"] is None and dca["period_returns"] == []
     for name in full["strategies"]:
         assert full["strategies"][name]["equity"] == preview["strategies"][name]["equity"]
+    assert full["accounting_basis"] == "independent_contributions_v1"
+    for point in dca["equity"]:
+        assert point["normalized_equity"] == pytest.approx(point["equity"] / point["total_invested"])
+    for name, starting_value in (("grid", full["funding"]["initial_equity"]), ("buy_hold", 10000)):
+        for point in full["strategies"][name]["equity"]:
+            assert point["total_invested"] == pytest.approx(starting_value)
+            assert point["normalized_equity"] == pytest.approx(point["equity"] / starting_value)
+
+
+def test_initial_shares_defaults_and_fee_defaults():
+    assert FeeConfig().commission_rate == .0005
+    assert FeeConfig().min_commission == .1
+    assert DcaConfig().initial_shares == 0
+    for value in (1, 99, 150, 100.5, -100):
+        with pytest.raises(ValueError):
+            DcaConfig(initial_shares=value)
+    assert DcaConfig(initial_shares=0).initial_shares == 0
+    assert DcaConfig(initial_shares=100).initial_shares == 100
+    config, _ = fixture("510300.SH")
+    older_v2_payload = config.model_dump(mode="json")
+    older_v2_payload["dca"].pop("initial_shares")
+    loaded = BacktestConfig.model_validate(older_v2_payload)
+    assert loaded.schema_version == 2 and loaded.dca.initial_shares == 0
+
+
+def test_buy_hold_and_dca_are_independent_of_grid_funding_fields():
+    config, bundle = fixture("510300.SH")
+    config = config.model_copy(update={"dca": DcaConfig(frequency="daily", shares=100, initial_shares=200)})
+    baseline = engine.run_backtest(config, bundle)
+    dca_variant_raw = config.model_dump(mode="json")
+    dca_variant_raw["dca"].update(frequency="weekly", shares=300, initial_shares=400)
+    dca_variant = engine.run_backtest(BacktestConfig.model_validate(dca_variant_raw), bundle)
+    for name in ("grid", "buy_hold"):
+        assert dca_variant["strategies"][name] == baseline["strategies"][name]
+    assert dca_variant["strategies"]["dca"] != baseline["strategies"]["dca"]
+    raw = config.model_dump(mode="json")
+    raw.update(initial_shares=0, min_shares=0, max_shares=0, grid_mode="arithmetic", grid_step=.15, reference_price_mode="manual", reference_price=20)
+    gridless = engine.run_backtest(BacktestConfig.model_validate(raw), bundle)
+    assert gridless["funding"]["initial_equity"] == 0
+    assert gridless["strategies"]["grid"]["metrics"]["total_return"] is None
+    for name in ("dca", "buy_hold"):
+        assert gridless["strategies"][name] == baseline["strategies"][name]
+    hold = gridless["strategies"]["buy_hold"]
+    assert hold["trades"] == []
+    assert all(point["position"] == 1000 and point["cash"] == 0 for point in hold["equity"])
+    assert hold["metrics"]["initial_equity"] == 10000
+    assert all(point["normalized_equity"] == pytest.approx(point["equity"] / 10000) for point in hold["equity"])
 
 
 def test_compiled_and_interpreted_share_accounting_match(monkeypatch):
     config, bundle = fixture("518880.SH")
+    config = config.model_copy(update={"dca": DcaConfig(frequency="daily", shares=100, initial_shares=200)})
     fast = engine.run_backtest(config, bundle)
     monkeypatch.setattr(engine, "_NUMBA_FASTPATH_ENABLED", False)
     slow = engine.run_backtest(config, bundle)
     assert fast == slow
     summary = engine.run_backtest(config, bundle, summary_only=True)
-    assert summary["strategies"]["grid"]["metrics"] == fast["strategies"]["grid"]["metrics"]
+    assert summary["accounting_basis"] == fast["accounting_basis"] == "independent_contributions_v1"
+    for name in fast["strategies"]:
+        assert summary["strategies"][name]["metrics"] == fast["strategies"][name]["metrics"]
 
 
 def test_fee_decimals_quantities_and_inactive_fields():
@@ -110,10 +162,38 @@ def test_share_optimization_uses_integer_quantities():
     assert "buy_quantity" not in result["historical"]["best_params"]
 
 
-def test_v2_api_preview_does_not_persist_jobs_or_results(tmp_path):
+def test_optimization_segment_seeds_each_account_from_its_own_starting_value():
+    from stockregression.optimization import _slice_bundle
+
+    config, bundle = fixture("510300.SH", days=8)
+    start, end = bundle.calendar[3], bundle.calendar[5]
+    previous = bundle.daily.loc[bundle.daily.date < start].iloc[-1]
+    bundle.metadata["prior_closes"] = {str(previous.date.date()): float(previous.close)}
+    sliced = _slice_bundle(bundle, start, end)
+    config = config.model_copy(update={
+        "start_date": start.date(),
+        "end_date": end.date(),
+        "dca": DcaConfig(frequency="daily", shares=100, initial_shares=200),
+    })
+    result = engine.run_backtest(config, sliced)
+    price = float(previous.close)
+    assert result["funding"]["valuation_price"] == price
+    assert result["funding"]["dca_initial_equity"] == pytest.approx(200 * price)
+    assert result["funding"]["buy_hold_initial_equity"] == pytest.approx(1000 * price)
+    for name, initial in (("grid", result["funding"]["initial_equity"]), ("dca", 200 * price), ("buy_hold", 1000 * price)):
+        strategy = result["strategies"][name]
+        assert strategy["metrics"]["initial_equity"] == pytest.approx(initial)
+        if initial > 0 and strategy["equity"]:
+            point = strategy["equity"][0]
+            assert point["normalized_equity"] == pytest.approx(point["equity"] / point["total_invested"])
+
+
+def test_v2_api_preview_does_not_persist_jobs_or_results(tmp_path, monkeypatch):
     config, bundle = fixture("510300.SH")
     store = Store(tmp_path)
     store.publish(config.symbol, bundle.bars, bundle.daily, bundle.actions, pd.DataFrame({"date": bundle.daily.date}), {**bundle.metadata, "actions_verified": True}, {})
+    sync_calls = []
+    monkeypatch.setattr(DataService, "sync", lambda self, symbols, mode, *args, **kwargs: sync_calls.append((symbols, mode)) or {"status": "failed", "symbols": [], "failures": [{"symbol": config.symbol, "reason": "mock source unavailable"}]})
     with TestClient(create_app(str(tmp_path), start_jobs=False)) as client:
         raw = config.model_dump(mode="json")
         raw["end_date"] = "2024-01-31"
@@ -127,6 +207,7 @@ def test_v2_api_preview_does_not_persist_jobs_or_results(tmp_path):
             time.sleep(.05)
         assert state["status"] == "completed", state
         assert state["result"]["effective_end_date"] == str(bundle.calendar[-1].date())
+        assert sync_calls == [([config.symbol], "daily")]
         assert client.get("/api/v1/jobs").json() == []
         assert client.get("/api/v1/results").json() == []
 
@@ -147,13 +228,26 @@ def test_new_purchases_respect_product_t0_t1(symbol, can_sell):
 
 def test_initial_holding_receives_first_day_dividend_without_nav_jump():
     config, bundle = fixture()
-    config = config.model_copy(update={"max_shares": 1000, "buy_step": 1., "sell_step": 1.})
+    config = config.model_copy(update={"max_shares": 1000, "buy_step": 1., "sell_step": 1., "dca": DcaConfig(frequency="daily", shares=100, initial_shares=200)})
     bundle.daily.loc[bundle.daily.date == bundle.calendar[0], "preclose"] = 9.4
     bundle.actions = normalize_actions(pd.DataFrame([{"record_date": "2024-01-02", "ex_date": "2024-01-03", "pay_date": "2024-01-04", "cash_per_share": .6, "bonus_ratio": 0}]))
     result = engine.run_backtest(config, bundle)
     assert result["strategies"]["grid"]["equity"][0]["equity"] == pytest.approx(10000)
     assert result["strategies"]["grid"]["equity"][1]["cash"] == 600
+    assert result["strategies"]["dca"]["metrics"]["initial_equity"] == 2000
+    assert result["strategies"]["dca"]["equity"][0]["position"] == 300
+    assert result["strategies"]["dca"]["equity"][0]["equity"] == pytest.approx(2940)
+    first_dca_trade = result["strategies"]["dca"]["trades"][0]
+    first_invested = 2000 + first_dca_trade["quantity"] * first_dca_trade["price"] + first_dca_trade["fees"]
+    assert result["strategies"]["dca"]["equity"][0]["total_invested"] == pytest.approx(first_invested)
+    assert result["strategies"]["dca"]["equity"][0]["normalized_equity"] == pytest.approx(2940 / first_invested)
     assert result["strategies"]["dca"]["equity"][0]["cash"] == 0
+    assert result["strategies"]["dca"]["equity"][1]["cash"] == 120
+    hold = result["strategies"]["buy_hold"]
+    assert hold["trades"] == []
+    assert hold["metrics"]["initial_equity"] == 10000
+    assert hold["equity"][0]["equity"] == pytest.approx(10000)
+    assert hold["equity"][1]["cash"] == 600
 
 
 def test_market_sync_uses_full_catalog_and_can_resume_failures(tmp_path, monkeypatch):
@@ -221,6 +315,9 @@ def test_zero_position_bounds_do_not_create_assets_or_fixed_capital_returns():
     assert result["strategies"]["grid"]["trades"] == []
     assert result["strategies"]["grid"]["metrics"]["total_return"] is None
     assert result["strategies"]["dca"]["metrics"]["total_invested"] > 0
+    assert result["strategies"]["buy_hold"]["metrics"]["initial_equity"] == 10000
+    assert result["strategies"]["buy_hold"]["trades"] == []
+    assert all(point["position"] == 1000 for point in result["strategies"]["buy_hold"]["equity"])
 
 
 def test_legacy_config_conversion_is_a_separate_draft(tmp_path):
@@ -248,7 +345,7 @@ def test_latest_preview_supersedes_running_and_pending_requests(tmp_path, monkey
     config, bundle = fixture()
     calls = []
     monkeypatch.setattr(module.DataService, "load_bundle", lambda *args: bundle)
-    def run(config, data, cancelled, preview):
+    def run(config, data, progress=None, cancelled=None, preview=False):
         calls.append(config.buy_shares)
         if len(calls) == 1:
             started.set()
@@ -268,6 +365,49 @@ def test_latest_preview_supersedes_running_and_pending_requests(tmp_path, monkey
         state = manager.snapshot("page")
         assert state["revision"] == 3 and state["result"] == {"shares": 300}
         assert calls == [100, 300]
+    finally:
+        release.set()
+        manager.stop()
+
+
+def test_latest_preview_edit_reuses_inflight_same_range_preparation(tmp_path, monkeypatch):
+    import threading
+    import stockregression.preview as module
+
+    config, bundle = fixture()
+    store = Store(tmp_path)
+    manifest = store.publish(config.symbol, bundle.bars, bundle.daily, bundle.actions, pd.DataFrame({"date": bundle.daily.date}), bundle.metadata, {})
+    bundle.version = manifest["version"]
+    started, release = threading.Event(), threading.Event()
+    preparation_checks, calculated = [], []
+
+    def ensure(self, config, version=None, progress=None, cancelled=None, **kwargs):
+        preparation_checks.append(bool(cancelled()))
+        if len(preparation_checks) == 1:
+            started.set()
+            assert release.wait(5)
+            preparation_checks[-1] = bool(cancelled())
+        return kwargs.get("cached_bundle") or bundle
+
+    def run(config, data, progress=None, cancelled=None, preview=False):
+        calculated.append(config.buy_shares)
+        return {"shares": config.buy_shares}
+
+    monkeypatch.setattr(module.DataService, "ensure_bundle", ensure)
+    monkeypatch.setattr(module, "run_backtest", run)
+    manager = module.PreviewManager(store)
+    try:
+        manager.submit("page", 1, config)
+        assert started.wait(5)
+        manager.submit("page", 2, config.model_copy(update={"buy_shares": 200}))
+        release.set()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and manager.snapshot("page")["status"] != "completed":
+            time.sleep(.01)
+        state = manager.snapshot("page")
+        assert state["revision"] == 2 and state["result"] == {"shares": 200}
+        assert preparation_checks == [False, False]
+        assert calculated == [200]
     finally:
         release.set()
         manager.stop()

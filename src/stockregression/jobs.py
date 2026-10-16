@@ -45,16 +45,22 @@ def execute_job(root: str, job_id: str, observer=None):
         if kind == "backtest":
             from .engine import run_backtest
             config = BacktestConfig.model_validate(payload["config"])
-            progress(0.01, "读取锁定的数据版本并进行质量检查")
-            bundle = service.load_bundle(config, payload.get("version"))
-            result = run_backtest(config, bundle, lambda fraction, message: progress(0.1 + 0.9 * fraction, message), cancelled)
+            progress(0.01, "检查本地行情并准备回测数据")
+            bundle = service.ensure_bundle(config, payload.get("version"), lambda fraction, message: progress(0.02 + 0.30 * fraction, message), cancelled)
+            payload["version"] = bundle.version
+            store.update_job(job_id, payload=payload)
+            progress(0.33, "行情准备完成，开始回测")
+            result = run_backtest(config, bundle, lambda fraction, message: progress(0.33 + 0.67 * fraction, message), cancelled)
             symbol, title = config.symbol, "股数网格 / 定投 / 买入持有" if config.schema_version == 2 else "网格 / 定投 / 初始全仓"
         elif kind == "optimization":
             from .optimization import optimize
             config = OptimizationConfig.model_validate(payload["config"])
-            progress(0.01, "载入锁定版本和时间切分数据")
-            bundle = service.load_bundle(config.base, payload.get("version"))
-            result = optimize(config, bundle, lambda fraction, message: progress(0.1 + 0.9 * fraction, message), cancelled)
+            progress(0.01, "检查本地行情并准备研究数据")
+            bundle = service.ensure_bundle(config.base, payload.get("version"), lambda fraction, message: progress(0.02 + 0.30 * fraction, message), cancelled)
+            payload["version"] = bundle.version
+            store.update_job(job_id, payload=payload)
+            progress(0.33, "行情准备完成，开始参数搜索")
+            result = optimize(config, bundle, lambda fraction, message: progress(0.33 + 0.67 * fraction, message), cancelled)
             symbol, title = config.base.symbol, "历史搜索 / 样本外验证"
         elif kind == "sync":
             result = service.sync(payload.get("symbols", []), payload.get("mode", "daily"), progress, cancelled, scope=payload.get("scope"), resume=payload.get("resume", False), retry_failed=payload.get("retry_failed", False), workers=payload.get("workers", 2))
@@ -75,7 +81,11 @@ def execute_job(root: str, job_id: str, observer=None):
         result_id = store.save_result(kind, result, symbol, title)
         was_cancelled = cancelled()
         failed_sync = kind == "sync" and result.get("status") == "failed"
-        store.update_job(job_id, status="cancelled" if was_cancelled else "failed" if failed_sync else "completed", progress=1, message="已取消，已完成的搜索候选保留" if was_cancelled else result.get("message", "完成"), error="所有同步目标失败，逐标的原因已保存在结果报告，可重试失败项" if failed_sync else None, result_id=result_id)
+        sync_error = None
+        if failed_sync:
+            failures = result.get("failures", [])
+            sync_error = "; ".join(f"{item.get('symbol', '标的')}: {item.get('reason', '未知错误')}" for item in failures) or result.get("message") or "所有同步目标失败"
+        store.update_job(job_id, status="cancelled" if was_cancelled else "failed" if failed_sync else "completed", progress=1, message="已取消，已完成的搜索候选保留" if was_cancelled else (f"同步失败：{sync_error}" if failed_sync else result.get("message", "完成")), error=sync_error, result_id=result_id)
     except InterruptedError as exc:
         store.update_job(job_id, status="cancelled", message=str(exc))
     except Exception as exc:

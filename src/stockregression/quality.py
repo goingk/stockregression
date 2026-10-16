@@ -14,11 +14,20 @@ class DataQualityError(ValueError):
 
 def canonical_frame(frame: pd.DataFrame, daily: bool = False, source: str = "import") -> pd.DataFrame:
     names = {"datetime": "timestamp", "day": "timestamp", "dt": "timestamp", "time": "timestamp",
+             "trade_time": "timestamp", "trade_date": "date",
              "vol": "volume", "amount": "turnover", "日期": "date", "时间": "timestamp",
              "开盘": "open", "最高": "high", "最低": "low", "收盘": "close",
              "成交量": "volume", "成交额": "turnover", "isST": "is_st"}
-    frame = frame.copy().rename(columns={k: v for k, v in names.items() if k in frame and v not in frame})
     column = "date" if daily else "timestamp"
+    frame = frame.copy().rename(columns={k: v for k, v in names.items() if k in frame and v not in frame})
+    levels = frame.index.levels if isinstance(frame.index, pd.MultiIndex) else [frame.index]
+    if column not in frame and any(pd.api.types.is_datetime64_any_dtype(level.dtype) for level in levels):
+        # Tushare-style exports keep the bar clock in the index instead of a
+        # named column; promote the levels so the aliases above can match them.
+        frame = frame.reset_index()
+        if column not in frame and "index" in frame and pd.api.types.is_datetime64_any_dtype(frame["index"]):
+            frame = frame.rename(columns={"index": column})
+        frame = frame.rename(columns={k: v for k, v in names.items() if k in frame and v not in frame})
     if daily and "date" not in frame and "timestamp" in frame:
         frame = frame.rename(columns={"timestamp": "date"})
     if not daily and "timestamp" not in frame and "date" in frame:
@@ -48,6 +57,11 @@ def canonical_frame(frame: pd.DataFrame, daily: bool = False, source: str = "imp
         if "preclose" not in frame:
             frame["preclose"] = frame.sort_values(column)["close"].shift(1)
     else:
+        # A non-positive unadjusted minute price is a source defect (observed
+        # as 0.000 opens), never a tradeable bar; refuse it before calibration.
+        invalid = (frame[["open", "high", "low", "close"]] <= 0).any(axis=1)
+        if invalid.any():
+            raise DataQualityError(f"分钟行情包含 {int(invalid.sum())} 条非正价格，开盘/最高/最低/收盘必须为正")
         frame["source"] = source if "source" not in frame else frame["source"].fillna(source)
     return frame.sort_values(column, kind="stable").drop_duplicates(column, keep="last").reset_index(drop=True)
 

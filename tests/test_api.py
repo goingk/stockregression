@@ -39,6 +39,13 @@ def test_complete_api_workflow_and_version_lock(tmp_path):
         assert equity.status_code == 200 and "attachment" in equity.headers["content-disposition"]
         assert b"strategy" in equity.content
         assert len(equity.content.splitlines()) > 25 * 3
+        exported_json = client.get(f"/api/v1/results/{job['result_id']}/export?kind=json")
+        assert exported_json.status_code == 200
+        assert exported_json.json()["data_version"] == captured_version
+        exported_trades = client.get(f"/api/v1/results/{job['result_id']}/export?kind=trades")
+        assert exported_trades.status_code == 200
+        assert "attachment" in exported_trades.headers["content-disposition"]
+        assert b"strategy" in exported_trades.content
         bars = client.get("/api/v1/data/bars/000001.SZ?limit=40").json()
         assert len(bars) <= 40 and all(row["high"] >= row["low"] for row in bars)
         locked_bars = client.get(f"/api/v1/data/bars/000001.SZ?limit=40&version={captured_version}").json()
@@ -49,7 +56,15 @@ def test_validation_cancel_and_short_optimization_api(tmp_path):
     app = create_app(str(tmp_path), start_jobs=False)
     with TestClient(app) as client:
         assert client.post("/api/v1/watchlist", json={"symbol": "920001.BJ"}).status_code == 422
-        assert client.post("/api/v1/backtests", json={"symbol": "600000.SH", "start_date": "2026-01-01"}).status_code == 400
+        missing_data = client.post("/api/v1/backtests", json={"symbol": "600000.SH", "start_date": "2026-01-01"})
+        assert missing_data.status_code == 200
+        assert client.get(f"/api/v1/jobs/{missing_data.json()['job_id']}").json()["payload"]["version"] is None
+        batch = client.post("/api/v1/backtests/batch", json={"configs": [{"symbol": "600000.SH", "start_date": "2026-01-01"}]})
+        assert batch.status_code == 200
+        assert client.get(f"/api/v1/jobs/{batch.json()['job_ids'][0]}").json()["payload"]["version"] is None
+        optimization = client.post("/api/v1/optimizations", json={"base": {"symbol": "600000.SH", "start_date": "2026-01-01"}, "n_trials": 1})
+        assert optimization.status_code == 200
+        assert client.get(f"/api/v1/jobs/{optimization.json()['job_id']}").json()["payload"]["version"] is None
         queued = client.post("/api/v1/data/demo", json={"days": 20}).json()["job_id"]
         client.post(f"/api/v1/jobs/{queued}/cancel")
         execute_job(str(tmp_path), queued)

@@ -26,7 +26,7 @@ export interface BacktestConfig {
   max_shares: number
   buy_shares: number
   sell_shares: number
-  dca: { frequency: 'daily' | 'weekly' | 'monthly'; shares: number }
+  dca: { frequency: 'daily' | 'weekly' | 'monthly'; shares: number; initial_shares: number }
   reference_price_mode: 'auto' | 'manual'
   initial_cash?: number
   grid_mode: 'trailing' | 'arithmetic' | 'geometric'
@@ -122,8 +122,9 @@ export interface BacktestResult {
   warnings?: string[]
   strategies: Record<'grid' | 'dca' | 'buy_hold' | string, StrategyResult>
   schema_version?: number
-  funding?: { reserve_cash: number; initial_equity: number; valuation_price: number; reference_price: number; reference_date: string }
+  funding?: { reserve_cash: number; initial_equity: number; valuation_price: number; reference_price: number; reference_date: string; dca_initial_equity?: number; buy_hold_initial_shares?: number; buy_hold_initial_equity?: number }
   effective_end_date?: string
+  accounting_basis?: string
 }
 
 export interface Coverage {

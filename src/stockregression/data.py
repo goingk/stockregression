@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
 import shutil
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 import numpy as np
 import pandas as pd
@@ -150,6 +152,329 @@ class DataService:
             warnings = [*warnings, calendar_warning]
         return {"status": "failed" if failures and not results else "completed", "run_key": run_key, "scope": scope, "preflight": preflight, "warnings": warnings, "symbols": results, "failures": failures, "skipped": skipped, "message": f"完成 {len(results)} 只，失败 {len(failures)} 只，已完成跳过 {len(skipped)} 只" + (f"；证券目录来源警告 {len(warnings)} 条，请查看报告" if warnings else "")}
 
+    def current_version_if_ready(self, config: BacktestConfig) -> str | None:
+        """Return an immutable submission-time version only when it needs no refresh."""
+        manifest = self.store.snapshot(config.symbol)
+        if not manifest:
+            return None
+        request, context_key = self._preparation_request(config, check_minutes=True)
+        cache_key = "ready:" + context_key
+        cached = self.store.state(cache_key)
+        if cached and cached.get("version") == manifest["version"]:
+            return manifest["version"] if cached.get("ready") else None
+        try:
+            bundle, gaps, load_error = self._probe_bundle(config, manifest["version"], check_minutes=True)
+        except DataQualityError as exc:
+            bundle, gaps, load_error = None, [], str(exc)
+        gaps = self._ignore_demo_gaps(manifest, gaps)
+        ready = bundle is not None and not gaps and not load_error
+        self.store.state(cache_key, {"version": manifest["version"], "ready": ready, "error": load_error, "gaps": gaps})
+        return manifest["version"] if ready else None
+
+    def ensure_bundle(
+        self,
+        config: BacktestConfig,
+        version: str | None = None,
+        progress=lambda *_: None,
+        cancelled=lambda: False,
+        check_minutes: bool = True,
+        cached_bundle=None,
+    ):
+        """Prepare and verify local data, sharing one cross-process attempt per symbol/range.
+
+        Explicit versions are immutable inputs from an already-submitted job and are
+        never replaced by a newer active snapshot. New requests pass ``None`` when
+        their current snapshot needs preparation, then lock the exact resolved version.
+        """
+        if version is not None:
+            progress(0.02, "读取已锁定的数据版本")
+            if cancelled():
+                raise InterruptedError("任务已取消")
+            if cached_bundle is not None and cached_bundle.version == version:
+                bundle = cached_bundle
+            else:
+                try:
+                    bundle = self.load_bundle(config, version)
+                except DataQualityError as exc:
+                    raise DataQualityError(f"锁定的数据版本 {version} 不满足本次配置：{exc}") from exc
+            return self._add_preparation_warnings(bundle, [])
+
+        progress(0.01, "检查本地数据覆盖")
+        if cancelled():
+            raise InterruptedError("任务已取消")
+        request, context_key = self._preparation_request(config, check_minutes)
+        target_cutoff = pd.Timestamp(request["end_date"])
+        source_versions = request["source_versions"]
+        key = "prepare:" + context_key
+
+        # This lock is deliberately distinct from sync-{symbol}.lock. sync() owns
+        # that lock around _sync_one; nesting the same lock here would deadlock.
+        prepare_lock = FileLock(str(self.store.root / f"prepare-{config.symbol}.lock"))
+        self._acquire_prepare_lock(prepare_lock, cancelled, timeout=300)
+        try:
+            if cancelled():
+                raise InterruptedError("任务已取消")
+            manifest = self.store.snapshot(config.symbol)
+            active_version = manifest["version"] if manifest else None
+            if cached_bundle is not None and cached_bundle.version == active_version:
+                bundle = cached_bundle
+                gaps = self._bundle_gaps(config, manifest, bundle, check_minutes)
+                load_error = None
+            else:
+                bundle, gaps, load_error = self._probe_bundle(config, active_version, check_minutes)
+            gaps = self._ignore_demo_gaps(manifest, gaps)
+            mode = self._sync_mode(config, manifest, bundle, gaps, load_error, target_cutoff, check_minutes)
+            record = self.store.state(key) or {}
+            same_attempt = (
+                record.get("source_versions") == source_versions
+                and record.get("target_cutoff") == str(target_cutoff.date())
+                and record.get("request") == request
+            )
+            suppress = False
+            if same_attempt and record.get("output_version") == active_version:
+                if record.get("status") in {"prepared", "insufficient"} and not record.get("error"):
+                    suppress = True
+                elif record.get("error"):
+                    retry_after = float(record.get("retry_after", 0) or 0)
+                    suppress = time.time() < retry_after
+            elif same_attempt and record.get("input_version") == active_version:
+                retry_after = float(record.get("retry_after", 0) or 0)
+                suppress = record.get("status") == "failed" and time.time() < retry_after
+
+            if mode is None or suppress:
+                progress(0.06, "复用已检查的本地数据" if mode is None else "复用最近一次补数检查结果")
+                if bundle is None:
+                    detail = record.get("error") if suppress else load_error
+                    raise DataQualityError(self._preparation_error(config.symbol, detail, gaps))
+                warnings = self._preparation_messages(gaps)
+                if suppress and record.get("error"):
+                    warnings.append(f"最近一次自动补数未完成：{record['error']}；60 秒后可重试")
+                return self._add_preparation_warnings(bundle, warnings)
+
+            input_version = active_version
+            gap_signature = hashlib.sha256(json.dumps(gaps, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            self.store.state(key, {
+                "status": "running",
+                "source_versions": source_versions,
+                "request": request,
+                "target_cutoff": str(target_cutoff.date()),
+                "input_version": input_version,
+                "gap_signature": gap_signature,
+                "remaining_gaps": gaps,
+                "attempted_at": time.time(),
+            })
+            progress(0.08, self._sync_message(mode, gaps))
+            if cancelled():
+                raise InterruptedError("任务已取消")
+            try:
+                report = self.sync([config.symbol], mode, lambda fraction, message: progress(0.08 + 0.55 * max(0, min(1, fraction)), message), cancelled, scope="selected", workers=1)
+                failures = report.get("failures", [])
+                sync_error = "; ".join(f"{item.get('symbol')}: {item.get('reason')}" for item in failures) or None
+                synced = next((item for item in report.get("symbols", []) if item.get("symbol") == config.symbol), None)
+                candidate_version = (synced or {}).get("version")
+                source_errors = (synced or {}).get("source_errors", [])
+                if source_errors and not sync_error:
+                    sync_error = "; ".join(source_errors)
+                if report.get("status") == "failed" and sync_error is None:
+                    sync_error = report.get("message") or "数据源未返回可用数据"
+            except InterruptedError:
+                self.store.state(key, {"status": "cancelled", "source_versions": source_versions, "request": request, "target_cutoff": str(target_cutoff.date()), "input_version": input_version, "error": "任务已取消"})
+                raise
+            except Exception as exc:
+                sync_error = str(exc)
+                candidate_version = None
+
+            if cancelled():
+                raise InterruptedError("任务已取消")
+            progress(0.68, "校验补数结果并锁定数据版本")
+            resolved_version = candidate_version or ((self.store.snapshot(config.symbol) or {}).get("version"))
+            try:
+                bundle, remaining, load_error = self._probe_bundle(config, resolved_version, check_minutes)
+            except Exception as exc:
+                bundle, remaining, load_error = None, gaps, str(exc)
+            status = "failed" if bundle is None else "insufficient" if remaining else "prepared"
+            state = {
+                "status": status,
+                "source_versions": source_versions,
+                "request": request,
+                "target_cutoff": str(target_cutoff.date()),
+                "input_version": input_version,
+                "output_version": resolved_version if bundle is not None else active_version,
+                "gap_signature": gap_signature,
+                "remaining_gaps": remaining,
+                "attempted_at": time.time(),
+                "retry_after": time.time() + 60 if sync_error or bundle is None else None,
+                "error": sync_error or load_error,
+            }
+            self.store.state(key, state)
+            if bundle is None:
+                raise DataQualityError(self._preparation_error(config.symbol, sync_error or load_error, remaining))
+            warnings = self._preparation_messages(remaining)
+            if sync_error:
+                warnings.append(f"自动补数未完全成功：{sync_error}")
+            progress(0.72, "本地行情已校验；开始计算")
+            return self._add_preparation_warnings(bundle, warnings)
+        finally:
+            prepare_lock.release()
+
+    @staticmethod
+    def _acquire_prepare_lock(lock, cancelled, timeout=300):
+        """Acquire the preparation lock in short waits so queued jobs can cancel."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancelled():
+                raise InterruptedError("任务已取消")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Timeout(f"等待行情准备锁超过 {timeout} 秒")
+            try:
+                lock.acquire(timeout=min(0.25, remaining))
+                return
+            except Timeout:
+                continue
+
+    @staticmethod
+    def _preparation_request(config, check_minutes):
+        target_cutoff = min(
+            pd.Timestamp(config.end_date or latest_closed_date()).normalize(),
+            pd.Timestamp(latest_closed_date()).normalize(),
+        )
+        settings = load_settings()
+        source_versions = {
+            "stock_history": settings.hf_revision,
+            "etf_history": settings.etf_hf_revision,
+            "preparation": 1,
+        }
+        request = {
+            "symbol": config.symbol,
+            "start_date": str(pd.Timestamp(config.start_date).date()),
+            "end_date": str(target_cutoff.date()),
+            "frequency": config.frequency if check_minutes else "1d",
+            "schema_version": config.schema_version,
+            "check_minutes": bool(check_minutes),
+            "source_versions": source_versions,
+        }
+        key = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
+        return request, key
+
+    @staticmethod
+    def _ignore_demo_gaps(manifest, gaps):
+        if not manifest or not manifest.get("metadata", {}).get("is_demo"):
+            return gaps
+        return [gap for gap in gaps if not gap.startswith(("日线尾部缺失", "分钟数据待补"))]
+
+    def _probe_bundle(self, config, version, check_minutes):
+        manifest = self.store.snapshot(config.symbol, version)
+        if not manifest:
+            return None, ["尚无本地快照"], "尚无本地行情"
+        daily = self.store.read_files(manifest["files"].get("daily", []))
+        if daily.empty:
+            return None, ["缺少日线"], "本地版本没有日线"
+        try:
+            bundle = self.load_bundle(config, manifest["version"])
+        except DataQualityError as exc:
+            # V2 historically permits a request end beyond local coverage by
+            # clipping to the last available closed bar. Keep that behavior for
+            # a failed tail refresh; all other hard quality failures still stop.
+            message = str(exc)
+            target_end = min(pd.Timestamp(config.end_date or latest_closed_date()).normalize(), pd.Timestamp(latest_closed_date()).normalize())
+            if config.schema_version == 2 and target_end > daily.date.max() and not any(token in message for token in ("ETF 分红", "参考价发生变化", "没有可回测交易日")):
+                clipped = config.model_copy(update={"end_date": daily.date.max().date()})
+                try:
+                    bundle = self.load_bundle(clipped, manifest["version"])
+                except DataQualityError:
+                    return None, [message], message
+            else:
+                return None, [message], message
+        gaps = self._bundle_gaps(config, manifest, bundle, check_minutes, daily)
+        return bundle, gaps, None
+
+    def _bundle_gaps(self, config, manifest, bundle, check_minutes, daily=None):
+        daily = daily if daily is not None else bundle.daily
+        gaps = []
+        start = pd.Timestamp(config.start_date).normalize()
+        target_end = min(pd.Timestamp(config.end_date or latest_closed_date()).normalize(), pd.Timestamp(latest_closed_date()).normalize())
+        if daily.date.min().normalize() > start:
+            gaps.append(f"历史日线起点缺失：请求 {start.date()}，本地 {daily.date.min().date()}")
+        if daily.date.max().normalize() < target_end:
+            gaps.append(f"日线尾部缺失：请求至 {target_end.date()}，本地至 {daily.date.max().date()}")
+        if check_minutes and config.frequency != "1d":
+            daily_days = [row for row in bundle.quality.get("days", []) if row.get("mode") == "daily"]
+            if daily_days:
+                dates = [row.get("date") for row in daily_days]
+                gaps.append("分钟数据待补：" + ", ".join(str(value) for value in dates[:12]) + ("…" if len(dates) > 12 else ""))
+        if check_minutes and config.frequency != "1d":
+            source = "etf_history" if manifest.get("metadata", {}).get("asset_type") == "etf" else "stock_history"
+            settings = load_settings()
+            current_source = getattr(settings, "etf_hf_revision" if source == "etf_history" else "hf_revision")
+            saved_source = manifest.get("metadata", {}).get("hf_revision")
+            if saved_source and saved_source != current_source:
+                gaps.append(f"历史分钟源版本已变化：本地 {saved_source}，当前 {current_source}")
+        return gaps
+
+    def _preparation_gaps(self, config, manifest, bundle, check_minutes):
+        _, gaps, _ = self._probe_bundle(config, manifest["version"], check_minutes)
+        # A demo snapshot is an explicit local fixture; preserve its existing
+        # behavior instead of silently replacing it during parameter edits.
+        if manifest.get("metadata", {}).get("is_demo"):
+            gaps = [gap for gap in gaps if not gap.startswith("日线尾部缺失") and not gap.startswith("分钟数据待补")]
+        return gaps
+
+    def _sync_mode(self, config, manifest, bundle, gaps, load_error, target_cutoff, check_minutes):
+        if not gaps:
+            return None
+        if not manifest or any(gap.startswith(("尚无", "缺少日线", "历史日线起点缺失", "历史分钟源版本已变化")) for gap in gaps):
+            return "history"
+        if load_error and not bundle:
+            if "ETF 分红" in load_error or "公司行动" in load_error or "除权" in load_error:
+                return "history"
+            if "日线完整截止" in load_error or "请求至" in load_error:
+                return "daily"
+            return "history"
+        daily = self.store.read_files(manifest["files"].get("daily", []))
+        has_tail = daily.empty or daily.date.max().normalize() < target_cutoff
+        minute_gap = any(gap.startswith("分钟数据待补") for gap in gaps)
+        if has_tail and not minute_gap:
+            return "daily"
+        if minute_gap:
+            rows = [row for row in (bundle.quality.get("days", []) if bundle else []) if row.get("mode") == "daily"]
+            gap_dates = [pd.Timestamp(row["date"]).normalize() for row in rows if row.get("date")]
+            if gap_dates and min(gap_dates) >= target_cutoff - pd.Timedelta(days=100):
+                return "repair"
+            return "history"
+        return "daily"
+
+    @staticmethod
+    def _preparation_messages(gaps):
+        messages = []
+        for gap in gaps:
+            if gap.startswith("分钟数据待补"):
+                messages.append("分钟数据源补数后仍存在缺口，相关交易日按已校验日线降级；稳健研究分钟覆盖率门槛保持不变。" + gap)
+            elif gap.startswith("日线尾部缺失"):
+                messages.append(gap + "；本次结果截至本地最后一个已收盘日。")
+            elif gap.startswith("历史日线起点缺失"):
+                messages.append(gap)
+            elif gap != "尚无本地快照":
+                messages.append(gap)
+        return messages
+
+    @staticmethod
+    def _preparation_error(symbol, detail, gaps):
+        reason = detail or ("；".join(gaps) if gaps else "数据源未返回可用数据")
+        return f"{symbol} 自动准备行情失败：{reason}。请检查数据源，或在行情页导入本地数据后重试。"
+
+    @staticmethod
+    def _sync_message(mode, gaps):
+        label = {"history": "补齐历史行情", "daily": "更新近期日线和分钟行情", "repair": "修复近期分钟缺口"}.get(mode, "更新行情")
+        return f"{label}：" + ("；".join(gaps[:2]) if gaps else "发现数据覆盖不足")
+
+    @staticmethod
+    def _add_preparation_warnings(bundle, warnings):
+        if warnings:
+            bundle.warnings = list(dict.fromkeys([*(bundle.warnings or []), *warnings]))
+            bundle.metadata = {**bundle.metadata, "warnings": list(dict.fromkeys([*bundle.metadata.get("warnings", []), *warnings]))}
+        return bundle
+
     def _sync_one(self, symbol, mode, progress, cancelled):
         previous = self.store.snapshot(symbol)
         if previous and previous["metadata"].get("is_demo"):
@@ -159,6 +484,7 @@ class DataService:
         end = getattr(self._sync_context, "cutoff", latest_closed_date())
         old_daily = self.store.read_files(old_files.get("daily", []), "date", end - pd.Timedelta(days=45))
         warnings = []
+        source_errors = []
         hf = pd.DataFrame()
         profiles = dict(previous.get("profiles", {})) if previous else {}
         if mode == "history" or previous is None:
@@ -167,6 +493,7 @@ class DataService:
                 hf = fetch_hf(symbol, self.store.root, load_settings().hf_revision)
             except Exception as exc:
                 warnings.append("历史分钟下载失败：" + str(exc))
+                source_errors.append("历史分钟下载失败：" + str(exc))
         known = self.store.instrument(symbol) or {}
         if old_daily.empty and previous:
             # A long-offline database must resume from its own watermark.
@@ -190,26 +517,25 @@ class DataService:
             metadata["listing_date"] = str(daily.date.min().date())
         metadata["hf_revision"] = load_settings().etf_hf_revision if metadata["asset_type"] == "etf" else load_settings().hf_revision
         metadata["is_demo"] = False
-        self.store.put_instrument(symbol, **{key: value for key, value in metadata.items() if key != "symbol"})
         if metadata.get("listing_date"):
             calendar = calendar[calendar.date >= pd.Timestamp(metadata["listing_date"])].reset_index(drop=True)
         if metadata.get("delisting_date"):
             calendar = calendar[calendar.date < pd.Timestamp(metadata["delisting_date"])].reset_index(drop=True)
         progress(0.55, "采集通达信分钟窗口并核对标签与单位")
         recent = pd.DataFrame()
+        raw_cache = []
         earliest = end - pd.Timedelta(days=14) if mode == "daily" and previous else None
         try:
             recent_raw = fetch_tdx(symbol, earliest, cancelled)
             profiles["tdx"] = infer_profile(recent_raw, daily, "tdx", price_tick=metadata.get("price_tick", .01))
             recent = align_minutes(recent_raw, profiles["tdx"]["convention"], profiles["tdx"]["volume_multiplier"])
             recent["source_verified"] = profiles["tdx"]["verified"]
-            raw_folder = self.store.root / "raw" / "tdx" / symbol
-            raw_folder.mkdir(parents=True, exist_ok=True)
-            recent_raw.to_parquet(raw_folder / "latest.parquet", index=False)
+            raw_cache.append(("tdx", recent_raw))
         except InterruptedError:
             raise
         except Exception as exc:
             warnings.append("近期分钟源不可用：" + str(exc))
+            source_errors.append("近期分钟源不可用：" + str(exc))
             progress(0.62, "通达信不可用，尝试新浪近期分钟备源")
             try:
                 recent_raw = fetch_sina(symbol)
@@ -217,11 +543,10 @@ class DataService:
                 profiles["sina"] = infer_profile(recent_raw, daily, "sina", reference=reference, reference_frequency="5m", price_tick=metadata.get("price_tick", .01))
                 recent = align_minutes(recent_raw, profiles["sina"]["convention"], profiles["sina"]["volume_multiplier"])
                 recent["source_verified"] = profiles["sina"]["verified"]
-                raw_folder = self.store.root / "raw" / "sina" / symbol
-                raw_folder.mkdir(parents=True, exist_ok=True)
-                recent_raw.to_parquet(raw_folder / "latest.parquet", index=False)
+                raw_cache.append(("sina", recent_raw))
             except Exception as backup_error:
                 warnings.append("新浪分钟备源不可用或未校准：" + str(backup_error))
+                source_errors.append("新浪分钟备源不可用或未校准：" + str(backup_error))
         if not hf.empty:
             profiles["hf"] = infer_profile(hf, daily, "hf", recent if not recent.empty and profiles.get("tdx", {}).get("verified") else None, price_tick=metadata.get("price_tick", .01))
             if not profiles["hf"]["verified"]:
@@ -234,6 +559,7 @@ class DataService:
                     profiles["hf"] = infer_profile(sample, daily, "hf", reference=reference, reference_frequency="5m", price_tick=metadata.get("price_tick", .01))
                 except Exception as exc:
                     warnings.append("历史分钟独立校验失败：" + str(exc))
+                    source_errors.append("历史分钟独立校验失败：" + str(exc))
             hf = align_minutes(hf, profiles["hf"]["convention"], profiles["hf"]["volume_multiplier"])
             hf["source_verified"] = profiles["hf"]["verified"]
         # Prefer the explicitly calibrated recent provider in its overlap window.
@@ -242,18 +568,68 @@ class DataService:
             minute = minute[minute.timestamp < end + pd.Timedelta(days=1)].copy()
         warnings.extend(metadata.get("warnings", []))
         if metadata.get("asset_type") == "etf":
-            warnings.append("ETF 历史分钟库仅覆盖部分标的；东财 1 分钟备源仅覆盖近期约 5 个交易日，其他缺口需导入补齐")
+            warnings.append("ETF 历史分钟库仅覆盖部分标的；新浪 1 分钟备源仅覆盖近期约 8 个交易日，其他缺口需导入补齐")
         metadata["warnings"] = list(dict.fromkeys(warnings))
+        metadata["source_errors"] = list(dict.fromkeys(source_errors))
         metadata["daily_through"] = str(daily.date.max().date())
         metadata["minute_through"] = str(minute.timestamp.max()) if not minute.empty else (previous or {}).get("metadata", {}).get("minute_through")
         minute_status = "available" if any(profile.get("verified") for profile in profiles.values()) else "unverified" if metadata["minute_through"] else "unavailable"
         self._sync_stage(symbol, minute_status=minute_status, minute_through=metadata["minute_through"])
         if cancelled():
             raise InterruptedError("任务已取消")
-        progress(0.85, "发布不可变分区和数据版本")
+        progress(0.80, "检查日线、日历、公司行动和分钟质量")
+        previous_actions = self.store.read_files(old_files.get("actions", [])) if previous else pd.DataFrame()
+        validation_actions = merge_frames(previous_actions, actions, "ex_date")
+        candidate_quality = self._validate_candidate(symbol, daily, minute, validation_actions, calendar, metadata, profiles)
+        metadata["quality_summary"] = {
+            key: candidate_quality.get(key)
+            for key in ("minute_days", "daily_days", "suspended_days", "total_days", "minute_ratio", "synthetic_bars")
+        }
+        metadata["quality_warnings"] = list(candidate_quality.get("warnings", []))
+        for source, raw_frame in raw_cache:
+            raw_folder = self.store.root / "raw" / source / symbol
+            raw_folder.mkdir(parents=True, exist_ok=True)
+            raw_frame.to_parquet(raw_folder / "latest.parquet", index=False)
+        progress(0.85, "发布已校验的不可变分区和数据版本")
         manifest = self.store.publish(symbol, minute, incoming_daily, actions, calendar, metadata, profiles, incremental=previous is not None)
+        self.store.put_instrument(symbol, **{key: value for key, value in metadata.items() if key != "symbol"})
         progress(1, "完成；质量报告已可查看")
-        return {"symbol": symbol, "version": manifest["version"], "last_date": str(daily.date.max().date()), "daily_status": "completed", "minute_status": minute_status, "minute_through": metadata["minute_through"], "rows": len(minute), "warnings": metadata["warnings"], "profiles": profiles}
+        return {"symbol": symbol, "version": manifest["version"], "last_date": str(daily.date.max().date()), "daily_status": "completed", "minute_status": minute_status, "minute_through": metadata["minute_through"], "rows": len(minute), "warnings": metadata["warnings"], "source_errors": metadata["source_errors"], "profiles": profiles}
+
+    def _validate_candidate(self, symbol, daily, minute, actions, calendar, metadata, profiles):
+        """Reject hard-invalid candidate data before it can become an active snapshot.
+
+        Minute coverage failures remain valid, reportable data: prepare_bundle
+        intentionally falls back to checked daily bars for those days.
+        """
+        if daily.empty:
+            raise DataQualityError("候选行情没有日线")
+        if calendar.empty:
+            raise DataQualityError("候选行情没有真实交易日历")
+        start = pd.Timestamp(calendar.date.min()).normalize()
+        end = pd.Timestamp(calendar.date.max()).normalize()
+        candidate = prepare_bundle(
+            symbol,
+            minute,
+            daily,
+            actions,
+            calendar,
+            start,
+            end,
+            "1m",
+            "candidate",
+            {**metadata, "delisting_date": None},
+            profiles,
+        )
+        observed = daily[(daily.tradestatus == 1) & (daily.volume > 0)].sort_values("date").copy()
+        previous_close = observed.close.shift(1)
+        unexplained = (observed.preclose - previous_close).abs() > float(metadata.get("price_tick", 0.01)) * 1.1
+        action_days = set(actions.ex_date.dt.normalize()) if not actions.empty and "ex_date" in actions else set()
+        unexplained &= observed.date.between(start, end)
+        unknown = [str(day.date()) for day in observed.loc[unexplained, "date"] if day not in action_days]
+        if unknown:
+            raise DataQualityError("候选行情存在未解释的除权参考价变化：" + ", ".join(unknown[:20]))
+        return candidate.quality
 
     def load_bundle(self, config: BacktestConfig, version: str | None = None):
         manifest = self.store.snapshot(config.symbol, version)

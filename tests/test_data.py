@@ -15,8 +15,10 @@ from stockregression.quality import (
     minute_slots,
     prepare_bundle,
 )
+from stockregression.providers import normalize_actions
 from stockregression.settings import load_settings, save_settings
 from stockregression.storage import Store
+from stockregression.rules import instrument_terms
 
 
 def _market(days: int = 3, convention: str = "end"):
@@ -76,6 +78,133 @@ def _market(days: int = 3, convention: str = "end"):
 
 def _profiles_for_import():
     return {"fixture": {"verified": True, "convention": "end", "volume_multiplier": 1}}
+
+
+def _daily_only_snapshot(store: Store, symbol="600000.SH"):
+    _, daily, _, calendar = _market(4)
+    daily["preclose"] = daily.close.shift(1).fillna(daily.close.iloc[0])
+    metadata = instrument_terms(symbol, {"actions_verified": True, "hf_revision": load_settings().hf_revision})
+    manifest = store.publish(
+        symbol,
+        pd.DataFrame(),
+        daily,
+        normalize_actions(pd.DataFrame()),
+        pd.DataFrame({"date": calendar}),
+        metadata,
+        {},
+    )
+    config = BacktestConfig(symbol=symbol, start_date=calendar[0].date(), end_date=calendar[-1].date(), frequency="1m")
+    return config, manifest
+
+
+def test_ensure_bundle_retries_degraded_snapshot_after_source_failure_backoff(tmp_path, monkeypatch):
+    import stockregression.data as data_module
+
+    store = Store(tmp_path)
+    config, manifest = _daily_only_snapshot(store)
+    calls = []
+
+    def fail_sync(self, symbols, mode, *args, **kwargs):
+        calls.append(mode)
+        return {
+            "status": "completed",
+            "symbols": [{"symbol": config.symbol, "version": manifest["version"], "source_errors": ["近期分钟源不可用：mock network timeout"]}],
+            "failures": [],
+        }
+
+    monkeypatch.setattr(DataService, "sync", fail_sync)
+    service = DataService(store)
+    first = service.ensure_bundle(config)
+    assert first.version == manifest["version"]
+    assert first.quality["daily_days"] == len(first.quality["days"])
+    assert any("mock network timeout" in warning for warning in first.warnings)
+    cached = DataService(store).ensure_bundle(config)
+    assert calls == ["repair"]
+    assert any("60 秒后可重试" in warning for warning in cached.warnings)
+
+    original_time = data_module.time.time
+    monkeypatch.setattr(data_module.time, "time", lambda: original_time() + 61)
+    DataService(store).ensure_bundle(config)
+    assert calls == ["repair", "repair"]
+
+
+def test_ensure_bundle_retries_missing_snapshot_after_source_failure_backoff(tmp_path, monkeypatch):
+    import stockregression.data as data_module
+
+    store = Store(tmp_path)
+    config = BacktestConfig(symbol="600000.SH", start_date=date(2024, 1, 2), end_date=date(2024, 1, 5), frequency="1m")
+    calls = []
+
+    def fail_sync(self, symbols, mode, *args, **kwargs):
+        calls.append(mode)
+        return {"status": "failed", "symbols": [], "failures": [{"symbol": config.symbol, "reason": "mock history endpoint unavailable"}]}
+
+    monkeypatch.setattr(DataService, "sync", fail_sync)
+    with pytest.raises(DataQualityError, match="mock history endpoint unavailable"):
+        DataService(store).ensure_bundle(config)
+    with pytest.raises(DataQualityError, match="mock history endpoint unavailable"):
+        DataService(store).ensure_bundle(config)
+    assert calls == ["history"]
+
+    original_time = data_module.time.time
+    monkeypatch.setattr(data_module.time, "time", lambda: original_time() + 61)
+    with pytest.raises(DataQualityError, match="mock history endpoint unavailable"):
+        DataService(store).ensure_bundle(config)
+    assert calls == ["history", "history"]
+
+
+def test_submission_readiness_probe_is_cached_for_same_immutable_request(tmp_path, monkeypatch):
+    store = Store(tmp_path)
+    config, manifest = _daily_only_snapshot(store)
+    # Use a one-day configuration with a daily-only frequency so no minute
+    # download is required and the local snapshot is immediately ready.
+    config = config.model_copy(update={"frequency": "1d"})
+    service = DataService(store)
+    calls = 0
+    original = service._probe_bundle
+
+    def count_probe(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_probe_bundle", count_probe)
+    assert service.current_version_if_ready(config) == manifest["version"]
+    assert service.current_version_if_ready(config) == manifest["version"]
+    assert calls == 1
+
+
+def test_preparation_lock_wait_checks_cancellation_in_short_intervals(tmp_path):
+    import threading
+    import time
+    from filelock import FileLock
+
+    path = str(tmp_path / "prepare-600000.SH.lock")
+    acquired, release = threading.Event(), threading.Event()
+
+    def hold_lock():
+        with FileLock(path):
+            acquired.set()
+            release.wait(5)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert acquired.wait(2)
+    checks = 0
+
+    def cancelled():
+        nonlocal checks
+        checks += 1
+        return checks >= 3
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(InterruptedError, match="任务已取消"):
+            DataService._acquire_prepare_lock(FileLock(path), cancelled, timeout=20)
+        assert time.monotonic() - started < 1
+    finally:
+        release.set()
+        holder.join(2)
 
 
 def _aggregate_five_minute_reference(reference: pd.DataFrame, days: pd.DatetimeIndex):

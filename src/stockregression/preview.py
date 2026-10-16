@@ -16,12 +16,12 @@ class PreviewManager:
         self.bundles = OrderedDict()
         self.thread = None
 
-    def submit(self, session, revision, config, version):
+    def submit(self, session, revision, config, version=None):
         with self.lock:
             previous = self.records.get(session)
             if previous and revision <= previous["revision"]:
                 return self.snapshot(session)
-            self.records[session] = {"session_id": session, "revision": revision, "status": "queued", "config": config, "version": version, "updated": time.monotonic()}
+            self.records[session] = {"session_id": session, "revision": revision, "status": "queued", "progress": 0.0, "message": "等待检查行情数据", "config": config, "version": version, "updated": time.monotonic()}
             self.records.move_to_end(session)
             while len(self.records) > 16:
                 self.records.popitem(last=False)
@@ -43,6 +43,14 @@ class PreviewManager:
             if session in self.records:
                 self.records[session]["status"] = "cancelled"
 
+    @staticmethod
+    def _data_key(config):
+        return (config.symbol, str(config.start_date), str(config.end_date), config.frequency, config.schema_version)
+
+    @staticmethod
+    def _bundle_key(version, config):
+        return (version, *PreviewManager._data_key(config))
+
     def _loop(self):
         while not self.stopped:
             self.wake.wait(.5)
@@ -53,30 +61,70 @@ class PreviewManager:
                     if entry is None:
                         break
                     session, request = entry
-                    self.records[session]["status"] = "running"
+                    self.records[session].update(status="running", message="检查本地行情并准备预览", progress=0.01)
                 def cancelled():
                     with self.lock:
                         current = self.records.get(session)
                         return self.stopped or not current or current["revision"] != request["revision"] or current["status"] == "cancelled"
+                def preparation_cancelled():
+                    with self.lock:
+                        current = self.records.get(session)
+                        if self.stopped or not current or current["status"] == "cancelled":
+                            return True
+                        if current["revision"] != request["revision"]:
+                            # A grid/strategy edit with the same data range can
+                            # share this in-flight preparation. The stale
+                            # calculation is still cancelled after preparation.
+                            return self._data_key(current["config"]) != self._data_key(request["config"])
+                        return False
+                def update(**values):
+                    with self.lock:
+                        current = self.records.get(session)
+                        if current and current["revision"] == request["revision"] and current["status"] == "running":
+                            current.update(values)
+                def report(fraction, message):
+                    update(progress=max(0.0, min(1.0, float(fraction))), message=str(message))
                 try:
                     config, version = request["config"], request["version"]
-                    key = (version, config.symbol, config.start_date, config.end_date, config.frequency)
-                    bundle = self.bundles.get(key)
-                    if bundle is None:
-                        bundle = DataService(self.store).load_bundle(config, version)
-                        self.bundles[key] = bundle
+                    service = DataService(self.store)
+                    active = self.store.snapshot(config.symbol, version)
+                    lookup_version = version or (active["version"] if active else None)
+                    cache_key = self._bundle_key(lookup_version, config) if lookup_version else None
+                    with self.lock:
+                        cached_bundle = self.bundles.get(cache_key) if cache_key else None
+                        if cached_bundle is not None:
+                            self.bundles.move_to_end(cache_key)
+                    prepared_bundle = service.ensure_bundle(
+                        config,
+                        version,
+                        lambda fraction, message: report(0.05 + 0.35 * max(0.0, min(1.0, fraction)), message),
+                        preparation_cancelled,
+                        cached_bundle=cached_bundle,
+                    )
+                    version = prepared_bundle.version
+                    key = self._bundle_key(version, config)
+                    with self.lock:
+                        self.bundles[key] = prepared_bundle
+                        self.bundles.move_to_end(key)
                         while len(self.bundles) > 2:
                             self.bundles.popitem(last=False)
-                    result = run_backtest(config, bundle, cancelled=cancelled, preview=True)
+                    if cancelled():
+                        continue
+                    update(version=version, progress=0.42, message="行情已检查并锁定；正在计算预览")
                     with self.lock:
-                        if not cancelled():
-                            self.records[session].update(status="completed", result=result)
+                        bundle = self.bundles.get(key)
+                        bundle = bundle or prepared_bundle
+                        self.bundles.move_to_end(key)
+                    result = run_backtest(config, bundle, lambda fraction, message: report(0.42 + 0.58 * max(0.0, min(1.0, fraction)), message), cancelled=cancelled, preview=True)
+                    with self.lock:
+                        current = self.records.get(session)
+                        if current and current["revision"] == request["revision"] and not cancelled():
+                            current.update(status="completed", progress=1.0, message="预览完成", version=version, result=result)
                 except InterruptedError:
                     pass
                 except Exception as exc:
-                    with self.lock:
-                        if not cancelled():
-                            self.records[session].update(status="failed", error=str(exc))
+                    if not cancelled():
+                        update(status="failed", message="预览失败", error=str(exc))
 
     def stop(self):
         self.stopped = True

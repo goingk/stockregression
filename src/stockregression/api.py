@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import uuid
 from contextlib import asynccontextmanager
@@ -10,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from typing import Literal
@@ -19,6 +18,7 @@ from .preview import PreviewManager
 from .data import DataService
 from .jobs import JobManager
 from .models import BacktestConfig, OptimizationConfig, normalize_symbol
+from .rules import instrument_terms
 from .schedule import configure_schedule
 from .settings import PROJECT_ROOT, load_settings, save_settings
 from .storage import Store, dumps, json_safe, now_iso
@@ -89,10 +89,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         return {"job_id": store.new_job(kind, payload)}
 
     def snapshot_version(config):
-        manifest = store.snapshot(config.symbol)
-        if not manifest:
-            raise HTTPException(400, "该股票尚无本地数据，请先下载或导入")
-        return manifest["version"]
+        # Preserve a submission-time immutable input when the active snapshot
+        # already covers this request. Missing or stale coverage is prepared by
+        # the worker, so the API never blocks on a source download.
+        return DataService(store).current_version_if_ready(config)
 
     @app.get("/api/v1/health")
     def health():
@@ -101,6 +101,26 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     @app.get("/api/v1/instruments")
     def instruments(q: str = "", asset_type: Literal["stock", "etf"] | None = None, limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
         return store.instruments(q, limit, asset_type, offset)
+
+    @app.get("/api/v1/workbench/recent-symbols")
+    def recent_workbench_symbols():
+        items = []
+        for submitted in store.recent_submitted_symbols(10):
+            symbol = submitted["symbol"]
+            stored = store.instrument(symbol)
+            if stored is None:
+                terms = instrument_terms(symbol, {"name": symbol})
+                item = {
+                    "symbol": symbol,
+                    "name": symbol,
+                    "exchange": symbol.rsplit(".", 1)[-1],
+                    "board": terms["board"],
+                    **terms,
+                }
+            else:
+                item = stored
+            items.append({**item, "last_submitted_at": submitted["last_submitted_at"]})
+        return items
 
     @app.post("/api/v1/instruments/refresh")
     def refresh_instruments():
@@ -203,7 +223,9 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     def preview(payload: PreviewRequest):
         if payload.config.schema_version != 2:
             raise HTTPException(422, "请先将旧配置转换为股数配置")
-        return json_safe(previews.submit(payload.session_id, payload.revision, payload.config, snapshot_version(payload.config)))
+        # Preview is deliberately submitted without a synchronous coverage scan;
+        # the worker reports preparation progress and pins the result version.
+        return json_safe(previews.submit(payload.session_id, payload.revision, payload.config, None))
 
     @app.get("/api/v1/backtests/preview/{session_id}")
     def preview_status(session_id: str):
@@ -222,7 +244,9 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         if config.schema_version == 2:
             return {"config": config.model_dump(mode="json"), "notice": "已载入股数配置"}
         try:
-            context = DataService(store).reference_price(config.symbol, config.start_date)
+            service = DataService(store)
+            bundle = service.ensure_bundle(config, check_minutes=False)
+            context = service.reference_price(config.symbol, config.start_date, bundle.version)
             price = context["reference_price"]
             def shares(ratio):
                 return int(config.initial_cash * ratio / price / 100) * 100
@@ -311,7 +335,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             extension, media = "csv", "text/csv"
         else:
             raise HTTPException(422, "导出类型应为 json/equity/trades")
-        return StreamingResponse(io.BytesIO(content), media_type=media, headers={"Content-Disposition": f'attachment; filename="{result_id}-{kind}.{extension}"'})
+        return Response(content=content, media_type=media, headers={"Content-Disposition": f'attachment; filename="{result_id}-{kind}.{extension}"'})
 
     @app.get("/api/v1/configs")
     def configs():

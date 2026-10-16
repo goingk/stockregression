@@ -237,8 +237,10 @@ class Store:
         return job_id
 
     def update_job(self, job_id: str, **values):
-        allowed = {"status", "progress", "message", "error", "result_id", "cancel_requested", "pid"}
+        allowed = {"status", "progress", "message", "error", "result_id", "cancel_requested", "pid", "payload"}
         values = {k: v for k, v in values.items() if k in allowed}
+        if "payload" in values:
+            values["payload"] = dumps(values["payload"])
         values["updated_at"] = now_iso()
         with self.db() as db:
             db.execute(f"UPDATE jobs SET {','.join(k+'=?' for k in values)} WHERE id=?", (*values.values(), job_id))
@@ -257,6 +259,65 @@ class Store:
         with self.db() as db:
             ids = [r[0] for r in db.execute("SELECT id FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,))]
         return [self.job(job_id) for job_id in ids]
+
+    def recent_submitted_symbols(self, limit: int = 10) -> list[dict[str, str]]:
+        """Return the most recently submitted symbols from formal backtest jobs."""
+        if limit <= 0:
+            return []
+        accepted_kinds = {"backtest", "optimization", "optimize", "batch", "batch_backtest"}
+        with self.db() as db:
+            rows = db.execute(
+                "SELECT kind,payload,created_at FROM jobs ORDER BY created_at DESC,rowid DESC"
+            ).fetchall()
+
+        recent: dict[str, str] = {}
+
+        def add(symbol: Any, submitted_at: Any) -> None:
+            if not isinstance(symbol, str) or not isinstance(submitted_at, str) or symbol in ("",):
+                return
+            try:
+                normalized = normalize_symbol(symbol)
+            except (TypeError, ValueError):
+                return
+            recent.setdefault(normalized, submitted_at)
+
+        def config_symbol(value: Any) -> str | None:
+            if not isinstance(value, dict):
+                return None
+            return value.get("symbol") if isinstance(value.get("symbol"), str) else None
+
+        for row in rows:
+            if row["kind"] not in accepted_kinds:
+                continue
+            try:
+                payload = json.loads(row["payload"]) if isinstance(row["payload"], str) else row["payload"]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+
+            # Older batch records kept the original submitted configs together.
+            configs = payload.get("configs")
+            if isinstance(configs, list):
+                for config in configs:
+                    if isinstance(config, dict) and isinstance(config.get("config"), dict):
+                        config = config["config"]
+                    add(config_symbol(config), row["created_at"])
+
+            config = payload.get("config")
+            if not isinstance(config, dict):
+                config = payload
+            base = config.get("base")
+            symbol = config_symbol(base) if isinstance(base, dict) else config_symbol(config)
+            add(symbol, row["created_at"])
+
+            if len(recent) >= limit:
+                break
+
+        return [
+            {"symbol": symbol, "last_submitted_at": submitted_at}
+            for symbol, submitted_at in list(recent.items())[:limit]
+        ]
 
     def save_result(self, kind: str, result: dict, symbol: str, title: str) -> str:
         result_id = uuid.uuid4().hex

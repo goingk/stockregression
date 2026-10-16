@@ -3,6 +3,8 @@ import type { EChartsOption } from 'echarts'
 import { Download, RefreshCw } from 'lucide-react'
 import { download, get } from '../api'
 import ChartView from '../ChartView'
+import EquityCurve from '../EquityCurve'
+import { costBasisDrawdowns } from '../equityMath'
 import { Badge, Button, Card, Empty, ErrorBox, Loading, PageHeader, SelectInput, money, percent, useErrorMessage } from '../components'
 import type { BacktestResult, EquityPoint, ResultSummary, StrategyResult, Trade } from '../types'
 
@@ -20,7 +22,6 @@ const reasonText = (value: unknown) => reasonNames[String(value)] ?? String(valu
 const sideText = (value: unknown) => value === 'buy' ? '买入' : value === 'sell' ? '卖出' : String(value ?? '—')
 const metricLabels: Record<string, string> = { total_return: '总收益率', cagr: '年化收益', max_drawdown: '最大回撤', sharpe: '夏普比率', calmar: '卡玛比率', trade_count: '成交笔数', total_fees: '总手续费', turnover: '换手率', buy_count: '买入次数', sell_count: '卖出次数' }
 type Strategy = { key: string; name: string; value: StrategyResult }
-const normalized = (points: EquityPoint[], base: number) => points.map((p) => [p.timestamp, p.normalized_equity !== undefined ? p.normalized_equity : base ? p.equity / base : p.equity])
 const tone = (key: string, value: number) => ['total_return', 'cagr'].includes(key) ? value >= 0 ? 'gain' : 'loss' : key === 'max_drawdown' ? 'loss' : ''
 const timestampMs = (value: unknown) => {
   const text = String(value ?? '').trim().replace(' ', 'T')
@@ -99,7 +100,8 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
   const equityFrequency = result?.equity_frequency ?? Object.values(result?.strategies ?? {}).find((strategy) => strategy.equity_frequency)?.equity_frequency
   const curvePeriod = equityFrequency === '1d' ? '每日收盘' : '回测时间点'
   const shareUnit = /^[15]/.test(result?.symbol ?? '') ? '份' : '股'
-  const hasPositionRatio = strategies.length > 0 && strategies.every((strategy) => (strategy.value.equity ?? []).every((point) => typeof point.position_ratio === 'number'))
+  const gridPoints = strategies.find((strategy) => strategy.key === 'grid')?.value.equity ?? []
+  const hasPositionRatio = gridPoints.length > 0 && gridPoints.every((point) => typeof point.position_ratio === 'number' && Number.isFinite(point.position_ratio))
 
   useEffect(() => {
     let active = true
@@ -138,19 +140,24 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
     catch (e) { setError(err(e)) } finally { setBusy('') }
   }
 
-  const equityOption: EChartsOption = useMemo(() => ({
-    tooltip: { trigger: 'axis', valueFormatter: (v) => Number(v).toFixed(3) + '×' }, legend: { top: 2, right: 4 },
-    grid: { left: 55, right: 20, top: 50, bottom: 36 }, xAxis: { type: 'time', axisLabel: { hideOverlap: true } }, yAxis: { type: 'value', axisLabel: { formatter: (v: number) => v.toFixed(1) + 'x' }, splitLine: { lineStyle: { color: '#eef1f5' } } },
-    dataZoom: [{ type: 'inside' }], series: strategies.filter(s => s.value.return_basis !== 'cost').map((s) => ({ name: s.name, type: 'line' as const, showSymbol: false, data: normalized(s.value.equity ?? [], result?.config.initial_cash ?? 1), itemStyle: { color: colors[s.key] ?? '#2864dc' }, lineStyle: { color: colors[s.key] ?? '#2864dc', width: s.key === 'grid' ? 2.4 : 1.7 } })),
-  }), [strategies])
   const drawdownOption: EChartsOption = useMemo(() => ({
-    tooltip: { trigger: 'axis', valueFormatter: (v) => percent(Number(v)) }, legend: { top: 2, right: 4 }, grid: { left: 55, right: 20, top: 50, bottom: 30 }, xAxis: { type: 'time', axisLabel: { hideOverlap: true } },
+    tooltip: { trigger: 'axis', valueFormatter: (v) => v == null ? '—' : percent(Number(v)) }, legend: { top: 2, right: 4 }, grid: { left: 55, right: 20, top: 50, bottom: 30 }, xAxis: { type: 'time', axisLabel: { hideOverlap: true } },
     yAxis: { type: 'value', axisLabel: { formatter: (v: number) => (v * 100).toFixed(0) + '%' }, splitLine: { lineStyle: { color: '#eef1f5' } } },
-    series: strategies.filter(s => s.value.return_basis !== 'cost').map((s) => ({ name: s.name, type: 'line' as const, showSymbol: false, data: (s.value.equity ?? []).map((p) => [p.timestamp, p.drawdown ?? 0]), itemStyle: { color: colors[s.key] ?? '#2864dc' }, lineStyle: { color: colors[s.key] ?? '#2864dc' }, areaStyle: s.key === 'grid' ? { opacity: 0.08 } : undefined })),
-  }), [strategies])
+    series: strategies.map((s) => ({
+      name: s.name,
+      type: 'line' as const,
+      showSymbol: false,
+      data: s.key === 'dca' && result
+        ? costBasisDrawdowns(s.value.equity ?? [], s.value, result)
+        : (s.value.equity ?? []).map((p) => [p.timestamp, p.drawdown ?? 0]),
+      itemStyle: { color: colors[s.key] ?? '#2864dc' },
+      lineStyle: { color: colors[s.key] ?? '#2864dc' },
+      areaStyle: s.key === 'grid' ? { opacity: 0.08 } : undefined,
+    })),
+  }), [strategies, result])
   const positionOption: EChartsOption = useMemo(() => ({
     tooltip: { trigger: 'axis', valueFormatter: (v) => hasPositionRatio ? percent(Number(v)) : Number(v).toLocaleString('zh-CN') + ` ${shareUnit}` }, legend: { top: 2, right: 4 }, grid: { left: 55, right: 20, top: 50, bottom: 30 }, xAxis: { type: 'time', axisLabel: { hideOverlap: true } }, yAxis: { type: 'value', axisLabel: { formatter: (v: number) => hasPositionRatio ? (v * 100).toFixed(0) + '%' : v.toLocaleString('zh-CN') }, splitLine: { lineStyle: { color: '#eef1f5' } } },
-    series: strategies.map((s) => ({ name: s.name, type: 'line' as const, showSymbol: false, data: (s.value.equity ?? []).map((p) => [p.timestamp, hasPositionRatio ? p.position_ratio ?? 0 : p.position ?? 0]), itemStyle: { color: colors[s.key] ?? '#2864dc' }, lineStyle: { color: colors[s.key] ?? '#2864dc' } })),
+    series: strategies.filter((s) => s.key === 'grid').map((s) => ({ name: s.name, type: 'line' as const, showSymbol: false, data: (s.value.equity ?? []).map((p) => [p.timestamp, hasPositionRatio ? p.position_ratio ?? 0 : p.position ?? 0]), itemStyle: { color: colors[s.key] ?? '#2864dc' }, lineStyle: { color: colors[s.key] ?? '#2864dc' } })),
   }), [strategies, hasPositionRatio])
   const candleOption: EChartsOption = useMemo(() => {
     const rows = bars.map((b) => [String(b.timestamp ?? '').replace('T', ' ').slice(0, 16), Number(b.open ?? 0), Number(b.close ?? 0), Number(b.low ?? 0), Number(b.high ?? 0)])
@@ -174,8 +181,8 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
   return <>
     <PageHeader eyebrow='PERFORMANCE REVIEW' title='结果分析' description='比较三类策略净值、回撤和持仓，沿 K 线核对交易并导出明细。' action={<div className='button-row export-row'><Button variant='secondary' busy={busy === 'json'} disabled={!result} onClick={() => void exportFile('json')}><Download size={14} />JSON</Button><Button variant='secondary' busy={busy === 'equity'} disabled={!result} onClick={() => void exportFile('equity')}>净值 CSV</Button><Button variant='secondary' busy={busy === 'trades'} disabled={!result} onClick={() => void exportFile('trades')}>成交 CSV</Button></div>} />
     {error && <ErrorBox message={error} onClose={() => setError('')} />}
-    <Card title='回测结果' subtitle='查看策略回测结果；参数研究详情可在参数研究页查看。' action={<div className='result-select'><SelectInput value={selectedId} onChange={(e) => setSelectedId(e.target.value)}><option value=''>选择结果</option>{results.map((x) => <option key={x.id} value={x.id}>{x.symbol} · {x.title} · {new Date(x.created_at).toLocaleString('zh-CN', { hour12: false })}</option>)}</SelectInput><Button variant='quiet' onClick={() => { setError(''); setLoading(true); get<ResultSummary[]>('/results').then((list) => setResults(list.filter((item) => item.kind === 'backtest'))).catch((e) => setError(err(e))).finally(() => setLoading(false)) }}><RefreshCw size={14} /></Button></div>}>
-      {loading ? <Loading /> : !results.length ? <Empty title='尚无回测结果' detail='在回测工作台运行真实回测后，结果会在这里出现。' /> : !result ? <Loading label='正在读取结果…' /> : <>
+    <Card title='回测结果' subtitle='查看策略回测结果；参数搜索和样本外推荐可在“回测与研究”中查看。' action={<div className='result-select'><SelectInput value={selectedId} onChange={(e) => setSelectedId(e.target.value)}><option value=''>选择结果</option>{results.map((x) => <option key={x.id} value={x.id}>{x.symbol} · {x.title} · {new Date(x.created_at).toLocaleString('zh-CN', { hour12: false })}</option>)}</SelectInput><Button variant='quiet' onClick={() => { setError(''); setLoading(true); get<ResultSummary[]>('/results').then((list) => setResults(list.filter((item) => item.kind === 'backtest'))).catch((e) => setError(err(e))).finally(() => setLoading(false)) }}><RefreshCw size={14} /></Button></div>}>
+      {loading ? <Loading /> : !results.length ? <Empty title='尚无回测结果' detail='在“回测与研究”中运行真实回测后，结果会在这里出现。' /> : !result ? <Loading label='正在读取结果…' /> : <>
         <div className='result-meta'><div><strong>{result.symbol}</strong><span>{result.config.frequency} · {result.config.start_date} 至 {result.config.end_date ?? '最新'}</span></div><div>{isDemoResult && <Badge tone='amber'>演示数据</Badge>}<Badge tone='blue'>数据版本 {result.data_version ?? '未知'}</Badge></div></div>
         {isDemoResult && <div className='demo-callout'>此结果基于本机生成的演示行情，不代表真实历史数据或投资结论。</div>}
         {result.warnings?.map((warning, i) => <div className='warning-list' key={i}><span className='warning-dot' />{warning}</div>)}
@@ -183,8 +190,8 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
       </>}
     </Card>
     {result && <>
-      {result.funding && <Card title='股数回测口径'><p>估值日 {result.funding.reference_date} · 起始总资产 {money(result.funding.initial_equity)} 元 · 预留现金 {money(result.funding.reserve_cash)} 元 · 实际截至 {result.effective_end_date}</p><p>定投累计投入 {money(result.strategies.dca.metrics.total_invested)} 元，获利 {percent(result.strategies.dca.metrics.total_return)}；定投新增资金不计作盈利，不与网格共用本金。</p><ChartView height={220} option={{ tooltip: { trigger: 'axis' }, grid: { left: 55, right: 20, top: 15, bottom: 30 }, xAxis: { type: 'time' }, yAxis: { type: 'value', axisLabel: { formatter: '{value}%' } }, series: [{ type: 'line', name: '定投获利百分比', showSymbol: false, data: result.strategies.dca.equity.map(point => [point.timestamp, point.normalized_equity == null ? null : (point.normalized_equity - 1) * 100]) }] }} /></Card>}
-      <div className='chart-grid'><Card title='策略净值' subtitle={`${curvePeriod}净值 · 以起始总资产为 1.0${equityFrequency === '1d' ? '；净值 CSV 保留完整曲线' : ''}`}><ChartView option={equityOption} height={290} /></Card><Card title='回撤曲线' subtitle={`${curvePeriod}回撤`}><ChartView option={drawdownOption} height={290} /></Card></div>
+      {result.funding && <Card title='股数回测口径'><p>估值日 {result.funding.reference_date} · 网格起始资产 {money(result.funding.initial_equity)} 元 · 网格预留现金 {money(result.funding.reserve_cash)} 元 · 实际截至 {result.effective_end_date}</p><p>期初持有：网格 {result.config.initial_shares} {shareUnit} · 全仓 {result.funding.buy_hold_initial_shares ?? 1000} {shareUnit} · 定投 {result.config.dca.initial_shares} {shareUnit}。初始资产：全仓 {money(result.funding.buy_hold_initial_equity)} 元 · 定投 {money(result.funding.dca_initial_equity)} 元；定投累计实际投入 {money(result.strategies.dca.metrics.total_invested)} 元，各策略使用独立资产账户。</p></Card>}
+      <div className='chart-grid'><Card title='三策略资产投入曲线' subtitle={`收益率 = 资产总值 ÷ 累计实际投入 − 1 · ${curvePeriod}${equityFrequency === '1d' ? '；净值 CSV 保留完整曲线' : ''}`} action={!result.accounting_basis ? <Badge tone='amber'>历史口径</Badge> : <Badge tone='blue'>独立投入</Badge>}><EquityCurve result={result} height={290} /></Card><Card title='回撤曲线' subtitle={`${curvePeriod}回撤；定投按资产 ÷ 累计投入相对前高计算`}><ChartView option={drawdownOption} height={290} /></Card></div>
       <div className='chart-grid'><Card title={hasPositionRatio ? '仓位变化' : '持股数量'} subtitle={hasPositionRatio ? `${curvePeriod}股票市值占净资产比例` : `${curvePeriod}持股数量 · 单位：${shareUnit}`}><ChartView option={positionOption} height={245} /></Card><Card title='收益指标'><div className='table-wrap'><table><thead><tr><th>指标</th>{strategies.map((s) => <th key={s.key}>{s.name}</th>)}</tr></thead><tbody>{Object.entries(metricLabels).map(([key, label]) => <tr key={key}><td>{label}</td>{strategies.map((s) => { const value = s.value.metrics?.[key]; const shown = ['total_return', 'cagr', 'max_drawdown'].includes(key) ? percent(value) : key.includes('count') ? value ?? '—' : key === 'total_fees' ? money(value) : value == null ? '—' : Number(value).toFixed(2); return <td key={s.key} className={tone(key, Number(value))}>{shown}</td> })}</tr>)}{((result.schema_version === 2 ? ['buy_hold'] : ['dca', 'buy_hold']) as Array<'dca' | 'buy_hold'>).map((baseline) => <tr key={baseline}><td>{baseline === 'dca' ? '相对定投超额' : '相对全仓超额'}（百分点）</td>{strategies.map((strategy) => { const excess = Number(strategy.value.metrics?.total_return ?? 0) - Number(result.strategies[baseline]?.metrics?.total_return ?? 0); return <td key={strategy.key} className={excess >= 0 ? 'gain' : 'loss'}>{strategy.value.return_basis === 'cost' ? '—' : (excess * 100).toFixed(2)}</td> })}</tr>)}</tbody></table></div></Card></div>
       <Card title={result.symbol + ' K 线与网格交易'} subtitle={'K线按时间汇总，买卖点映射到包含成交时刻的区间；标记取自 ' + (reference?.name ?? '策略') + ' 成交记录。'} action={<Badge tone='blue'>{result.config.frequency}</Badge>}>
         {barsLoading ? <Loading label='读取 K 线…' /> : bars.length ? <ChartView option={candleOption} height={410} /> : <Empty title='当前区间没有可用 K 线' detail='成交和净值仍可查看；请确认该标的存在对应频率行情。' />}

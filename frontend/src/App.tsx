@@ -1,20 +1,17 @@
 import { Component, lazy, Suspense, useState } from 'react'
 import type { ErrorInfo, ReactNode } from 'react'
-import { Activity, BarChart3, Database, FlaskConical, Layers3, Menu, TrendingUp } from 'lucide-react'
-import type { BacktestConfig } from './types'
+import { Activity, BarChart3, Database, Layers3, Menu, TrendingUp } from 'lucide-react'
 import { defaultConfig } from './components'
 
 const DataCenterPage = lazy(() => import('./pages/DataCenterPage'))
 const BacktestPage = lazy(() => import('./pages/BacktestPage'))
 const ResultsPage = lazy(() => import('./pages/ResultsPage'))
-const ResearchPage = lazy(() => import('./pages/ResearchPage'))
 
-export type PageKey = 'data' | 'backtest' | 'results' | 'research'
+export type PageKey = 'data' | 'backtest' | 'results'
 const nav: Array<{ id: PageKey; label: string; hint: string; icon: typeof Database }> = [
   { id: 'data', label: '行情', hint: '股票 · ETF · 自选', icon: Database },
-  { id: 'backtest', label: '回测工作台', hint: '策略配置', icon: Layers3 },
+  { id: 'backtest', label: '回测与研究', hint: '策略 · 参数研究', icon: Layers3 },
   { id: 'results', label: '结果分析', hint: '绩效与交易', icon: BarChart3 },
-  { id: 'research', label: '参数研究', hint: '稳健性搜索', icon: FlaskConical },
 ]
 
 class PageErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
@@ -44,9 +41,8 @@ class PageErrorBoundary extends Component<{ children: ReactNode }, { failed: boo
 export default function App() {
   const [page, setPage] = useState<PageKey>('data')
   const [mobileOpen, setMobileOpen] = useState(false)
-  const [pendingConfig, setPendingConfig] = useState<BacktestConfig | null>(null)
   const [selectedResult, setSelectedResult] = useState<string | null>(null)
-  const go = (next: PageKey) => { setPage(next); setMobileOpen(false) }
+  const go = (next: PageKey) => { setPage(next); setMobileOpen(false); window.scrollTo({ top: 0, behavior: 'instant' }) }
   return <div className="app-shell">
     <aside className={`sidebar ${mobileOpen ? 'open' : ''}`}>
       <div className="brand"><div className="brand-mark"><TrendingUp size={19} strokeWidth={2.4} /></div><div><strong>StockRegression</strong><span>量化研究工作台</span></div></div>
@@ -65,9 +61,8 @@ export default function App() {
         <PageErrorBoundary>
           <Suspense fallback={<div className="route-loading">载入工作区…</div>}>
             {page === 'data' && <DataCenterPage />}
-            {page === 'backtest' && <BacktestPage initialConfig={pendingConfig} clearInitialConfig={() => setPendingConfig(null)} onOpenResult={(id) => { setSelectedResult(id); go('results') }} />}
+            {page === 'backtest' && <BacktestPage onOpenResult={(id) => { setSelectedResult(id); go('results') }} />}
             {page === 'results' && <ResultsPage requestedResult={selectedResult} clearRequestedResult={() => setSelectedResult(null)} />}
-            {page === 'research' && <ResearchPage onLoadConfig={(config) => { setPendingConfig(config); go('backtest') }} />}
           </Suspense>
         </PageErrorBoundary>
       </div>

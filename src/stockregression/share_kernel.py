@@ -135,12 +135,16 @@ def simulate(
     preclose_by_day: np.ndarray, action_record_day: np.ndarray,
     action_ex_day: np.ndarray, action_pay_day: np.ndarray, action_stock_day: np.ndarray,
     action_cash_per_share: np.ndarray, action_bonus_ratio: np.ndarray,
-    initial_equity: float, min_shares: float, max_shares: float,
+    grid_initial_equity: float, dca_initial_equity: float,
+    buy_hold_initial_equity: float, min_shares: float, max_shares: float,
     grid_mode: int, buy_step: float, sell_step: float, grid_step: float,
     reference_price: float, lower_price: float, upper_price: float,
     buy_shares: int, sell_shares: int,
     board_code: int, commission_rate: float,
-    min_commission: float, slippage: float, face_value: float, seed_shares: int, reserve_cash: float, dca_shares: int, valuation_price: float, tick: float, t0: bool, output_mode: int,
+    min_commission: float, slippage: float, face_value: float, seed_shares: int,
+    reserve_cash: float, dca_initial_shares: int, dca_shares: int,
+    buy_hold_initial_shares: int, valuation_price: float, tick: float,
+    t0: bool, output_mode: int,
 ) -> tuple:
     keep_details = output_mode == 2
     n = len(opens)
@@ -148,7 +152,8 @@ def simulate(
     for flag in last_bar_day:
         if flag:
             day_count += 1
-    cash = np.full(3, initial_equity, dtype=np.float64)
+    initial_equities = np.array([grid_initial_equity, dca_initial_equity, buy_hold_initial_equity], dtype=np.float64)
+    cash = initial_equities.copy()
     shares = np.zeros(3, dtype=np.int64)
     sellable = np.zeros(3, dtype=np.int64)
     cash_receivable = np.zeros(3, dtype=np.float64)
@@ -177,12 +182,12 @@ def simulate(
     sell_count = np.zeros(3, dtype=np.int64)
     total_fees = np.zeros(3, dtype=np.float64)
     gross_turnover = np.zeros(3, dtype=np.float64)
-    peak_equity = np.full(3, initial_equity, dtype=np.float64)
+    peak_equity = initial_equities.copy()
     max_drawdown = np.zeros(3, dtype=np.float64)
-    last_equity = np.full(3, initial_equity, dtype=np.float64)
+    last_equity = initial_equities.copy()
     daily_return_sum = np.zeros(3, dtype=np.float64)
     daily_return_sumsq = np.zeros(3, dtype=np.float64)
-    prior_day_equity = np.full(3, initial_equity, dtype=np.float64)
+    prior_day_equity = initial_equities.copy()
     daily_return_count = 0
     first_timestamp = 0
     last_timestamp = 0
@@ -241,12 +246,20 @@ def simulate(
     fixed_anchor[0] = reference_price
     has_active_cell[0] = True
     cash[1] = 0.0
-    dca_invested = 0.0
+    shares[1] = dca_initial_shares
+    sellable[1] = dca_initial_shares
+    cash[2] = 0.0
+    shares[2] = buy_hold_initial_shares
+    sellable[2] = buy_hold_initial_shares
+    started[2] = True
+    dca_invested = dca_initial_equity
     prior_close = valuation_price
+    initial_holdings = (seed_shares, dca_initial_shares, buy_hold_initial_shares)
     for action in range(action_count):
         if action_record_day[action] == -1 and action_ex_day[action] >= 0:
-            entitlement_cash[0, action] = seed_shares * action_cash_per_share[action]
-            entitlement_bonus[0, action] = seed_shares * action_bonus_ratio[action]
+            for account in range(3):
+                entitlement_cash[account, action] = initial_holdings[account] * action_cash_per_share[action]
+                entitlement_bonus[account, action] = initial_holdings[account] * action_bonus_ratio[action]
     output_count = n if output_mode == 2 else (day_count if output_mode == 1 else 0)
     equity_values = np.zeros((3, output_count), dtype=np.float64)
     equity_cash = np.zeros((3, output_count), dtype=np.float64)
@@ -429,44 +442,6 @@ def simulate(
                             trade_n += 1
                         traded = True
 
-            if not traded and account == 2 and not started[account]:
-                result = _nb_attempt(
-                    1, 2147483647, opening, volume, limit_ups[i], limit_downs[i],
-                    stamp_rates[i], transfer_rates[i], transfer_is_face_value[i],
-                    transfer_minimums[i], stamp_bilateral[i], day_id, cash[account],
-                    cash_receivable[account], share_receivable[account],
-                    shares[account], sellable[account], 2147483647.0, 0.0,
-                    commission_rate, min_commission, slippage, board_code, face_value, tick, t0,
-                )
-                if not result[0]:
-                    if keep_details:
-                        rejection_bar[rejection_n] = i
-                        rejection_ts[rejection_n] = open_timestamps_ns[i]
-                        rejection_strategy[rejection_n] = account
-                        rejection_side[rejection_n] = 1
-                        rejection_reason[rejection_n] = result[9]
-                        rejection_quantity[rejection_n] = result[8]
-                        rejection_n += 1
-                else:
-                    cash[account], shares[account], sellable[account] = result[1], result[2], result[3]
-                    started[account] = True
-                    trade_count[account] += 1
-                    buy_count[account] += 1
-                    total_fees[account] += result[6]
-                    gross_turnover[account] += result[7]
-                    if keep_details:
-                        trade_bar[trade_n] = i
-                        trade_strategy[trade_n] = account
-                        trade_side[trade_n] = 1
-                        trade_quantity[trade_n] = result[4]
-                        trade_price[trade_n] = result[5]
-                        trade_fees[trade_n] = result[6]
-                        trade_cash[trade_n] = cash[account]
-                        trade_shares[trade_n] = shares[account]
-                        trade_reason[trade_n] = 3
-                        trade_n += 1
-                    traded = True
-
         # Submit at most one grid order from the real close; it becomes eligible
         # at the next real bar's open.  Position sizing is frozen at this close.
         if started[0] and volumes[i] > 0:
@@ -565,10 +540,10 @@ def simulate(
     elapsed = (last_timestamp - first_timestamp) / 1_000_000_000.0 / (365.25 * 24.0 * 3600.0) if n else 0.0
     elapsed = max(elapsed, 1.0 / 252.0)
     for account in range(3):
-        total_return = last_equity[account] / initial_equity - 1.0 if initial_equity > 0 else 0.0
+        total_return = last_equity[account] / initial_equities[account] - 1.0 if initial_equities[account] > 0 else 0.0
         cagr = 0.0
-        if last_equity[account] > 0 and initial_equity > 0:
-            log_growth = math.log(last_equity[account] / initial_equity) / elapsed
+        if last_equity[account] > 0 and initial_equities[account] > 0:
+            log_growth = math.log(last_equity[account] / initial_equities[account]) / elapsed
             cagr = math.expm1(min(700.0, max(-700.0, log_growth)))
         sharpe = 0.0
         if daily_return_count > 1:
@@ -589,7 +564,7 @@ def simulate(
         metrics[account, 4] = calmar
         metrics[account, 5] = buy_count[account] + sell_count[account]
         metrics[account, 6] = total_fees[account]
-        metrics[account, 7] = gross_turnover[account] / initial_equity if initial_equity > 0 else 0.0
+        metrics[account, 7] = gross_turnover[account] / initial_equities[account] if initial_equities[account] > 0 else 0.0
         metrics[account, 8] = buy_count[account]
         metrics[account, 9] = sell_count[account]
 

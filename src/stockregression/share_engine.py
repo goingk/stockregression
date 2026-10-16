@@ -9,6 +9,7 @@ import pandas as pd
 from .rules import instrument_terms, commissions_and_taxes, round_to_tick, round_money, fee_rates, transfer_fee_terms, calculated_price_limits, etf_price_limit_rate
 
 _CACHE = OrderedDict()
+BUY_HOLD_INITIAL_SHARES = 1000
 
 
 def period_key(day, frequency):
@@ -41,7 +42,18 @@ def funding(config, data):
         return round_money(quantity * execution + charge["total"])
     count, remainder = divmod(config.max_shares - config.initial_shares, config.buy_shares)
     reserve = round_money(count * cost(config.buy_shares) + cost(remainder))
-    return {"reserve_cash": reserve, "initial_equity": round_money(config.initial_shares * price + reserve), "valuation_price": price, "reference_price": reference, "reference_date": day, "initial_shares": config.initial_shares, "max_shares": config.max_shares}
+    return {
+        "reserve_cash": reserve,
+        "initial_equity": round_money(config.initial_shares * price + reserve),
+        "dca_initial_equity": round_money(config.dca.initial_shares * price),
+        "buy_hold_initial_shares": BUY_HOLD_INITIAL_SHARES,
+        "buy_hold_initial_equity": round_money(BUY_HOLD_INITIAL_SHARES * price),
+        "valuation_price": price,
+        "reference_price": reference,
+        "reference_date": day,
+        "initial_shares": config.initial_shares,
+        "max_shares": config.max_shares,
+    }
 
 
 def _inputs(config, data):
@@ -144,7 +156,7 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
     if progress:
         progress(0.2, "已载入股数配置与锁定行情")
     mode = 0 if summary_only else 1 if preview else 2
-    options = (money["initial_equity"], float(config.min_shares), float(config.max_shares), {"trailing": 0, "arithmetic": 1, "geometric": 2}[config.grid_mode], config.buy_step, config.sell_step, config.grid_step, money["reference_price"], config.lower_price or 0.0, config.upper_price or 0.0, config.buy_shares, config.sell_shares, 2 if terms["board"] == "star" else 0, fees.commission_rate, fees.min_commission, fees.slippage_bps / 10000, fees.share_face_value, config.initial_shares, money["reserve_cash"], config.dca.shares, money["valuation_price"], terms["price_tick"], terms["settlement"] == "T0", mode)
+    options = (money["initial_equity"], money["dca_initial_equity"], money["buy_hold_initial_equity"], float(config.min_shares), float(config.max_shares), {"trailing": 0, "arithmetic": 1, "geometric": 2}[config.grid_mode], config.buy_step, config.sell_step, config.grid_step, money["reference_price"], config.lower_price or 0.0, config.upper_price or 0.0, config.buy_shares, config.sell_shares, 2 if terms["board"] == "star" else 0, fees.commission_rate, fees.min_commission, fees.slippage_bps / 10000, fees.share_face_value, config.initial_shares, money["reserve_cash"], config.dca.initial_shares, config.dca.shares, money["buy_hold_initial_shares"], money["valuation_price"], terms["price_tick"], terms["settlement"] == "T0", mode)
     runner = simulate if engine._NUMBA_FASTPATH_ENABLED else getattr(simulate, "py_func", simulate)
     output = runner(*prepared["arrays"], *options)
     if cancelled and cancelled():
@@ -154,18 +166,19 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
     points = prepared["days"] + pd.Timedelta(hours=15) if preview else prepared["stamps"]
     indices = np.arange(len(points)) if preview else np.flatnonzero(prepared["tradable"])
     openings = pd.to_datetime(prepared["opens"]).strftime("%Y-%m-%dT%H:%M:%S").tolist() if not summary_only else []
+    initial_equities = (money["initial_equity"], money["dca_initial_equity"], money["buy_hold_initial_equity"])
     for account, name in enumerate(("grid", "dca", "buy_hold")):
         metric = {key: (int(round(metrics[account, i])) if key in {"trade_count", "buy_count", "sell_count"} else float(metrics[account, i]) if math.isfinite(metrics[account, i]) else None) for i, key in enumerate(engine._METRIC_KEYS)}
-        metric["initial_equity"] = money["initial_equity"] if account != 1 else 0
-        if account != 1 and money["initial_equity"] <= 0:
+        metric["initial_equity"] = initial_equities[account]
+        if account != 1 and initial_equities[account] <= 0:
             metric.update({key: None for key in ("total_return", "cagr", "max_drawdown", "sharpe", "calmar", "turnover")})
         if account == 1:
             metric.update(total_invested=float(metrics[account, 10]), skipped_periods=len(set(prepared["period_keys"])) - metric["buy_count"])
         equity = []
         if not summary_only:
             for i in indices:
-                base = invested[i] if account == 1 else money["initial_equity"]
-                equity.append({"timestamp": points[i].isoformat(), "equity": float(eq[account, i]), "cash": float(cash[account, i]), "position": float(shares[account, i]), "drawdown": None if account == 1 else float(drawdown[account, i]), "normalized_equity": float(eq[account, i] / base) if base > 0 else None, "total_invested": float(invested[i]) if account == 1 else money["initial_equity"]})
+                base = invested[i] if account == 1 else initial_equities[account]
+                equity.append({"timestamp": points[i].isoformat(), "equity": float(eq[account, i]), "cash": float(cash[account, i]), "position": float(shares[account, i]), "drawdown": None if account == 1 else float(drawdown[account, i]), "normalized_equity": float(eq[account, i] / base) if base > 0 else None, "total_invested": float(invested[i]) if account == 1 else initial_equities[account]})
         trades = [{"timestamp": openings[int(tb[j])], "side": "buy" if ts[j] == 1 else "sell", "quantity": int(tq[j]), "price": float(tp[j]), "fees": float(tf[j]), "cash": float(tc[j]), "shares": int(th[j]), "reason": engine._TRADE_REASONS[int(tr[j])]} for j in range(len(tb)) if ta[j] == account]
         rejections = [{"timestamp": pd.Timestamp(rt[j]).isoformat(), "side": "buy" if rs[j] == 1 else "sell", "reason": engine._REJECTION_REASONS[int(rr[j])], "requested_quantity": int(rq[j])} for j in range(len(rb)) if ra[j] == account]
         if account == 1 and not summary_only and not preview:
@@ -178,4 +191,4 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
         strategies[name] = {"metrics": metric, "equity": equity, "equity_frequency": "1d" if preview else config.frequency, "trades": trades, "rejections": rejections, "period_returns": returns, "return_basis": "cost" if account == 1 else "initial_equity"}
     if progress:
         progress(1.0, "股数回测完成")
-    return {"schema_version": 2, "symbol": config.symbol, "config": config.model_dump(mode="json"), "data_version": data.version, "quality": data.quality, "is_demo": bool(data.metadata.get("is_demo")), "funding": money, "requested_end_date": str(config.end_date) if config.end_date else None, "effective_end_date": prepared["end"], "warnings": list(dict.fromkeys([*data.warnings, *data.metadata.get("warnings", [])])), "strategies": strategies}
+    return {"schema_version": 2, "accounting_basis": "independent_contributions_v1", "symbol": config.symbol, "config": config.model_dump(mode="json"), "data_version": data.version, "quality": data.quality, "is_demo": bool(data.metadata.get("is_demo")), "funding": money, "requested_end_date": str(config.end_date) if config.end_date else None, "effective_end_date": prepared["end"], "warnings": list(dict.fromkeys([*data.warnings, *data.metadata.get("warnings", [])])), "strategies": strategies}
