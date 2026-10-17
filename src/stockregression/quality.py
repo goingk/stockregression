@@ -5,6 +5,8 @@ import pandas as pd
 
 from .models import DataBundle
 
+QUALITY_RULES_VERSION = 2
+
 MINUTE_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume", "turnover", "source"]
 
 
@@ -80,9 +82,27 @@ def align_minutes(frame: pd.DataFrame, convention: str, multiplier: float = 1) -
     result["raw_volume"] = result.get("raw_volume", result["volume"])
     if convention == "start":
         result["timestamp"] = result["timestamp"] + pd.Timedelta(minutes=1)
+    result = result.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
     hour, minute = result["timestamp"].dt.hour, result["timestamp"].dt.minute
     clock = hour * 60 + minute
-    # Auxiliary auction/placeholder rows remain in the raw file, not continuous bars.
+    if convention == "end":
+        # Some exports separate the opening auction at 09:30. Include its real
+        # prices and volume in the first end-labelled bar rather than losing it.
+        auction = result[clock == 570].set_index(result.loc[clock == 570, "timestamp"].dt.normalize())
+        first = result.index[clock == 571]
+        days = result.loc[first, "timestamp"].dt.normalize()
+        matched = days.isin(auction.index)
+        first, days = first[matched], days[matched]
+        if len(first):
+            opening = auction.reindex(days)
+            result.loc[first, "open"] = opening.open.to_numpy()
+            result.loc[first, "high"] = np.maximum(result.loc[first, "high"].to_numpy(), opening.high.to_numpy())
+            result.loc[first, "low"] = np.minimum(result.loc[first, "low"].to_numpy(), opening.low.to_numpy())
+            for field in ("volume", "turnover", "raw_volume"):
+                if field in result and field in opening:
+                    result.loc[first, field] = result.loc[first, field].to_numpy() + opening[field].to_numpy()
+            result.loc[first, "opening_auction_volume"] = opening.volume.to_numpy() * multiplier
+    # Keep only continuous-session end slots after allocating the auction.
     result = result[((clock >= 571) & (clock <= 690)) | ((clock >= 781) & (clock <= 900))].copy()
     result["volume"] = (result["volume"] * multiplier).round().astype("int64")
     return result.sort_values("timestamp").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
@@ -124,7 +144,10 @@ def infer_profile(frame: pd.DataFrame, daily: pd.DataFrame, source: str, referen
                 if reference_frequency != "1m":
                     size = int(reference_frequency[:-1])
                     pieces = []
-                    for day, group in aligned.groupby(aligned.timestamp.dt.normalize()):
+                    reference_start = reference.timestamp.min().normalize()
+                    reference_end = reference.timestamp.max().normalize() + pd.Timedelta(days=1)
+                    sample = aligned[aligned.timestamp.between(reference_start, reference_end, inclusive="left")]
+                    for day, group in sample.groupby(sample.timestamp.dt.normalize()):
                         for session in (minute_slots(day)[:120], minute_slots(day)[120:]):
                             observed = group.set_index("timestamp").reindex(session)
                             for offset in range(0, 120, size):
@@ -164,6 +187,24 @@ def _max_run(mask: np.ndarray) -> int:
         current = current + 1 if value else 0
         longest = max(longest, current)
     return longest
+
+
+def _closing_auction_placeholders(symbol: str, day, part: pd.DataFrame, missing_mask: np.ndarray) -> np.ndarray:
+    """Identify empty valuation slots inside a verified SZ closing auction.
+
+    SZSE rules (2023 and 2026), 2.3.2 / 3.4.1: continuous matching ends
+    at 14:57 and the closing auction matches once at 15:00. Trade-only
+    vendors can omit 14:58/14:59. Existing observations are never removed.
+    Earlier dates and other markets retain ordinary gap handling.
+    """
+    placeholders = np.zeros(len(missing_mask), dtype=bool)
+    if not symbol.endswith(".SZ") or pd.Timestamp(day) < pd.Timestamp("2023-02-17") or len(part) != 240:
+        return placeholders
+    anchors = part.iloc[[236, 239]]  # End-labelled 14:57 and 15:00.
+    if anchors.close.isna().any() or not anchors.get("source_verified", pd.Series(False, index=anchors.index)).eq(True).all():
+        return placeholders
+    placeholders[237:239] = missing_mask[237:239]
+    return placeholders
 
 
 def apply_price_limits(daily: pd.DataFrame, calendar: pd.DataFrame, metadata: dict) -> pd.DataFrame:
@@ -239,7 +280,7 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
         if status not in (0, 1):
             raise DataQualityError(f"{day.date()} 的交易状态未知")
         if status == 0 or row.volume == 0:
-            reports.append({"date": str(day.date()), "mode": "suspended", "missing_minutes": 0, "reason": "确认停牌或零成交日"})
+            reports.append({"date": str(day.date()), "mode": "suspended", "missing_minutes": 0, "missing_data_minutes": 0, "auction_placeholders": 0, "reason": "确认停牌或零成交日"})
             continue
         prices = np.array([row.open, row.high, row.low, row.close], dtype=float)
         if not np.isfinite(prices).all() or (prices <= 0).any() or not np.isfinite(row.volume) or row.volume < 0 or row.high + 0.001 < max(row.open, row.close) or row.low - 0.001 > min(row.open, row.close) or row.high < row.low:
@@ -248,27 +289,35 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
         slots = minute_slots(day)
         reason = ""
         missing = len(slots)
+        missing_data = missing
+        auction_count = 0
         filled = None
+        download_needed = frequency != "1d" and part.empty
         if frequency != "1d" and not part.empty:
             part = part.drop_duplicates("timestamp", keep="last").set_index("timestamp").reindex(slots)
             missing_mask = part.close.isna().to_numpy()
             missing = int(missing_mask.sum())
+            auction_mask = _closing_auction_placeholders(symbol, day, part, missing_mask)
+            auction_count = int(auction_mask.sum())
+            data_missing_mask = missing_mask & ~auction_mask
+            missing_data = int(data_missing_mask.sum())
+            download_needed = bool(missing_data > 5 or _max_run(data_missing_mask[:120]) > 3 or _max_run(data_missing_mask[120:]) > 3 or missing_mask[0] or missing_mask[120])
             source_verified = part.get("source_verified", pd.Series(False, index=slots)).eq(True)
             observed = part[~part.close.isna()]
             invalid = observed[["open", "high", "low", "close", "volume"]].isna().any(axis=1)
-            invalid |= (observed.low > observed[["open", "close"]].min(axis=1) + 0.001) | (observed.high < observed[["open", "close"]].max(axis=1) - 0.001) | (observed.low > observed.high) | (observed.close <= 0) | (observed.volume < 0)
+            invalid |= (observed.low > observed[["open", "close"]].min(axis=1) + 0.001) | (observed.high < observed[["open", "close"]].max(axis=1) - 0.001) | (observed.low > observed.high + 1e-9) | (observed.close <= 0) | (observed.volume < 0)
             unit_error = abs(observed.volume.sum() / row.volume - 1) if row.volume else 0
             if not source_verified.loc[observed.index].all():
                 reason = "来源分钟标签/单位未校准"
             elif invalid.any():
                 reason = "分钟 OHLC/量额校验失败"
-            elif missing > 5 or _max_run(missing_mask[:120]) > 3 or _max_run(missing_mask[120:]) > 3:
+            elif missing_data > 5 or _max_run(data_missing_mask[:120]) > 3 or _max_run(data_missing_mask[120:]) > 3:
                 reason = "分钟缺口超过连续3根或全日5根阈值"
             elif missing_mask[0] or missing_mask[120]:
                 reason = "交易时段首分钟缺失，无法因果补齐"
-            elif missing == 0 and unit_error > 0.01:
+            elif missing_data == 0 and unit_error > 0.01:
                 reason = "完整分钟聚合成交量与日线偏差超过1%"
-            elif max(abs(float(observed.high.max()) - row.high), abs(float(observed.low.min()) - row.low), abs(float(observed.iloc[-1].close) - row.close)) > float(metadata.get("price_tick", 0.01)) * 1.1 and missing == 0:
+            elif max(abs(float(observed.high.max()) - row.high), abs(float(observed.low.min()) - row.low), abs(float(observed.iloc[-1].close) - row.close)) > float(metadata.get("price_tick", 0.01)) * 1.1 and missing_data == 0:
                 reason = "完整分钟价格聚合与日线不符"
             else:
                 previous = part.close.groupby(np.repeat([0, 1], 120)).ffill()
@@ -276,6 +325,7 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
                     part.loc[missing_mask, price] = previous.loc[missing_mask]
                 part.loc[missing_mask, ["volume", "turnover"]] = 0
                 part["is_synthetic"] = missing_mask
+                part["is_auction_placeholder"] = auction_mask
                 part["tradable"] = (~missing_mask) & (part.volume > 0)
                 part["frequency"] = "1m"
                 part["timestamp"] = slots
@@ -292,8 +342,11 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
                 resampled = []
                 for offset in (0, 120):
                     session = filled.iloc[offset:offset + 120].copy()
+                    # A known non-matching auction slot does not invalidate the
+                    # OHLCV of an otherwise observed five-minute closing bar.
+                    session["is_synthetic"] &= ~session.is_auction_placeholder
                     bins = np.arange(120) // size
-                    grouped = session.groupby(bins).agg(timestamp=("timestamp", "last"), open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"), volume=("volume", "sum"), turnover=("turnover", "sum"), is_synthetic=("is_synthetic", "any"))
+                    grouped = session.groupby(bins).agg(timestamp=("timestamp", "last"), open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"), volume=("volume", "sum"), turnover=("turnover", "sum"), is_synthetic=("is_synthetic", "any"), is_auction_placeholder=("is_auction_placeholder", "all"))
                     grouped["frequency"] = frequency
                     grouped["tradable"] = (grouped.volume > 0) & ~grouped.is_synthetic
                     resampled.append(grouped)
@@ -301,12 +354,21 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
         for field in ("preclose", "is_st", "limit_up", "limit_down", "no_price_limit"):
             filled[field] = row.get(field, False if field == "is_st" else np.nan)
         output.append(filled)
-        reports.append({"date": str(day.date()), "mode": mode, "missing_minutes": missing if frequency != "1d" else 0, "reason": reason or ("少量缺口因果补齐" if missing and mode == "minute" else "完整")})
+        reports.append({"date": str(day.date()), "mode": mode, "missing_minutes": missing if frequency != "1d" else 0,
+                        "missing_data_minutes": missing_data if frequency != "1d" else 0,
+                        "auction_placeholders": auction_count, "download_needed": download_needed,
+                        "reason": reason or ("少量缺口因果补齐" if missing_data and mode == "minute" else "收盘集合竞价无逐分钟成交，占位保留" if auction_count and mode == "minute" else "完整")})
     bars = pd.concat(output, ignore_index=True).sort_values("timestamp").reset_index(drop=True) if output else pd.DataFrame(columns=MINUTE_COLUMNS + ["frequency", "tradable", "is_synthetic"])
     minute_days = sum(report["mode"] == "minute" for report in reports)
     daily_days = sum(report["mode"] == "daily" for report in reports)
     suspended_days = sum(report["mode"] == "suspended" for report in reports)
-    quality = {"days": reports, "minute_days": minute_days, "daily_days": daily_days, "suspended_days": suspended_days, "total_days": len(days), "minute_ratio": minute_days / max(1, minute_days + daily_days), "synthetic_bars": int(bars.is_synthetic.sum()), "is_demo": bool(metadata.get("is_demo")), "warnings": warnings}
+    pending_calibration_days = sum(report["mode"] == "daily" and report["reason"] == "来源分钟标签/单位未校准" and not report.get("download_needed", False) for report in reports)
+    quality = {"pending_calibration_days": pending_calibration_days, "days": reports, "minute_days": minute_days, "daily_days": daily_days, "suspended_days": suspended_days, "total_days": len(days), "minute_ratio": minute_days / max(1, minute_days + daily_days),
+               "synthetic_bars": sum(report["missing_minutes"] for report in reports if report["mode"] == "minute"),
+               "auction_placeholders": sum(report.get("auction_placeholders", 0) for report in reports if report["mode"] == "minute"),
+               "is_demo": bool(metadata.get("is_demo")), "requested_frequency": frequency, "warnings": warnings}
+    if pending_calibration_days:
+        warnings.append(f"{pending_calibration_days} 个交易日已有本地分钟数据，但时间标签/单位尚未校准；重复下载不能解决此状态。请核对数据源说明，确认开始或结束时间标签后重新导入，或提供独立参考行情核验。")
     if daily_days and frequency != "1d":
         warnings.append(f"{daily_days} 个交易日已整日降级为日线；不还原盘中路径")
     if metadata.get("is_demo"):

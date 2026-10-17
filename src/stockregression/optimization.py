@@ -815,6 +815,10 @@ def optimize(
     selected parameters once on the untouched test period.
     """
     _check_ranges(config)
+    if config.protocol_version == 2:
+        from .scientific import optimize_scientific
+
+        return optimize_scientific(config, data, progress, cancelled)
     result = _base_result(config, data)
     if progress:
         _emit(progress, 0.0, "准备参数搜索")

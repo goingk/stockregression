@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { defaultWorkbenchDefaults, normalizeWorkbenchDefaults, researchRangesForSymbol, strategyDefaults, validWorkbenchGroup, workbenchConfig } from '../src/workbenchDefaults.ts'
+import { defaultWorkbenchDefaults, normalizeRememberedResearchDefaults, normalizeWorkbenchDefaults, researchRangesForSymbol, strategyDefaults, validWorkbenchGroup, workbenchConfig } from '../src/workbenchDefaults.ts'
 
 test('all four groups keep valid zero values and independent default copies', () => {
   const value = defaultWorkbenchDefaults()
@@ -14,6 +14,29 @@ test('all four groups keep valid zero values and independent default copies', ()
   assert.deepEqual(normalizeWorkbenchDefaults(value), value)
   value.research.ranges.buy_shares.high = 3000
   assert.equal(defaultWorkbenchDefaults().research.ranges.buy_shares.high, 1000)
+})
+
+test('new workspaces use the v2 selection protocol defaults', () => {
+  const research = defaultWorkbenchDefaults().research
+  assert.equal(research.protocol_version, 2)
+  assert.equal(research.selection_target, 'both')
+  assert.equal(research.rebalance_days, 63)
+  assert.equal(research.bootstrap_reps, 10000)
+  assert.equal(research.n_trials, 1000)
+})
+
+test('legacy saved research settings fill v2 fields while preserving every remembered range', () => {
+  const saved = defaultWorkbenchDefaults().research
+  saved.ranges.initial_shares = { low: 300, high: 2300, step: 200 }
+  saved.ranges.buy_step = { low: .01, high: .15, step: .01 }
+  for (const key of ['protocol_version', 'selection_target', 'rebalance_days', 'bootstrap_reps']) delete saved[key]
+  const migrated = normalizeWorkbenchDefaults({ research: saved }).research
+  assert.equal(migrated.protocol_version, 2)
+  assert.equal(migrated.selection_target, 'both')
+  assert.equal(migrated.rebalance_days, 63)
+  assert.equal(migrated.bootstrap_reps, 10000)
+  assert.deepEqual(migrated.ranges, saved.ranges)
+  assert.deepEqual(normalizeRememberedResearchDefaults(saved).ranges, saved.ranges)
 })
 
 test('invalid remembered groups fall back independently', () => {

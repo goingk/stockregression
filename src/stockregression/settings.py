@@ -89,8 +89,12 @@ _RESEARCH_RANGE_DEFAULTS = {
 
 
 class ResearchDefaults(_WorkbenchPreference):
+    protocol_version: Literal[1, 2] = 2
+    selection_target: Literal["fixed", "adaptive", "both"] = "both"
+    rebalance_days: int = Field(default=63, ge=1)
+    bootstrap_reps: int = Field(default=10_000, ge=1)
     mode: Literal["historical", "robust", "both"] = "both"
-    n_trials: int = Field(default=200, ge=1, le=5000)
+    n_trials: int = Field(default=1000, ge=1, le=5000)
     seed: int = 42
     top_candidates: int = Field(default=20, ge=1, le=100)
     max_drawdown: float = Field(default=0.2, gt=0, le=1)

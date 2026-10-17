@@ -1833,6 +1833,8 @@ def _run_fastpath(
     return {
         "symbol": config.symbol, "config": config.model_dump(mode="json"),
         "data_version": data.version, "quality": data.quality or {},
+        "diagnostics": data.metadata.get("diagnostics", {}),
+        "source_events": data.metadata.get("source_events", []),
         "warnings": list(dict.fromkeys(warnings)), "strategies": strategies,
     }
 
@@ -2096,6 +2098,8 @@ def run_backtest(
         "config": config.model_dump(mode="json"),
         "data_version": data.version,
         "quality": data.quality or {},
+        "diagnostics": data.metadata.get("diagnostics", {}),
+        "source_events": data.metadata.get("source_events", []),
         "warnings": list(dict.fromkeys(warnings)),
         "strategies": result_strategies,
     }

@@ -8,6 +8,7 @@ export { assetInvestmentRatio, assetInvestmentReturn, costBasisDrawdowns, costBa
 
 const curves = [
   { key: 'grid', name: '网格交易', color: '#2864dc', width: 2.3 },
+  { key: 'same_account_passive', name: '同账户被动持有', color: '#13957b', width: 1.9 },
   { key: 'buy_hold', name: '全仓持有', color: '#8a98af', width: 1.7 },
   { key: 'dca', name: '定投', color: '#e29136', width: 1.9 },
 ] as const
@@ -23,7 +24,7 @@ function denominator(point: EquityPoint, strategy: StrategyResult, result: Backt
   return result.funding?.initial_equity ?? result.config.initial_cash ?? null
 }
 
-export default function EquityCurve({ result, height }: { result: BacktestResult; height: number }) {
+export default function EquityCurve({ result, height, stretch = false }: { result: BacktestResult; height: number; stretch?: boolean }) {
   const option: EChartsOption = {
     animation: false,
     tooltip: {
@@ -46,7 +47,7 @@ export default function EquityCurve({ result, height }: { result: BacktestResult
     xAxis: { type: 'time', axisLabel: { hideOverlap: true } },
     yAxis: { type: 'value', scale: false, name: '投入收益率', axisLabel: { formatter: (value: number) => `${(value * 100).toFixed(0)}%` }, splitLine: { lineStyle: { color: '#eef1f5' } } },
     dataZoom: [{ type: 'inside' }],
-    series: curves.map((curve) => {
+    series: curves.filter((curve) => result.strategies[curve.key]).map((curve) => {
       const strategy = result.strategies[curve.key]
       const points = strategy?.equity ?? []
         return {
@@ -70,5 +71,5 @@ export default function EquityCurve({ result, height }: { result: BacktestResult
     }),
   }
 
-  return <ChartView option={option} height={height} />
+  return <ChartView option={option} height={height} stretch={stretch} />
 }

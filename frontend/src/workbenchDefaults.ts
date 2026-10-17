@@ -4,6 +4,10 @@ export type GridDefaults = Pick<BacktestConfig, 'grid_mode' | 'buy_step' | 'sell
 export type PositionDefaults = Pick<BacktestConfig, 'initial_shares' | 'min_shares' | 'max_shares' | 'buy_shares' | 'sell_shares'>
 export type SearchRange = { low: number; high: number; step: number }
 export interface ResearchDefaults {
+  protocol_version: 1 | 2
+  selection_target: 'fixed' | 'adaptive' | 'both'
+  rebalance_days: number
+  bootstrap_reps: number
   mode: 'historical' | 'robust' | 'both'
   n_trials: number
   seed: number
@@ -46,7 +50,7 @@ export function defaultWorkbenchDefaults(): WorkbenchDefaults {
     grid: { grid_mode: 'trailing', buy_step: .03, sell_step: .03, grid_step: .03, lower_price: null, upper_price: null },
     position: { initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 100 },
     dca: { frequency: 'monthly', shares: 100, initial_shares: 0 },
-    research: { mode: 'both', n_trials: 200, seed: 42, top_candidates: 20, max_drawdown: .2, min_trades: 10, min_history_days: 504, min_minute_ratio: .95, ranges: defaultSearchRanges() },
+    research: { protocol_version: 2, selection_target: 'both', rebalance_days: 63, bootstrap_reps: 10000, mode: 'both', n_trials: 1000, seed: 42, top_candidates: 20, max_drawdown: .2, min_trades: 10, min_history_days: 504, min_minute_ratio: .95, ranges: defaultSearchRanges() },
   }
 }
 
@@ -62,7 +66,9 @@ const price = (value: unknown) => value === null || finite(value) && value > 0
 
 export function validResearchDefaults(value: unknown): value is ResearchDefaults {
   const item = record(value)
-  if (!item || !['historical', 'robust', 'both'].includes(String(item.mode)) || !integer(item.n_trials, 1, 5000)
+  if (!item || ![1, 2].includes(Number(item.protocol_version)) || !['fixed', 'adaptive', 'both'].includes(String(item.selection_target))
+    || !integer(item.rebalance_days, 1, 504) || !integer(item.bootstrap_reps, 100, 100000)
+    || !['historical', 'robust', 'both'].includes(String(item.mode)) || !integer(item.n_trials, 1, 5000)
     || !integer(item.seed, Number.MIN_SAFE_INTEGER) || !integer(item.top_candidates, 1, 100) || !step(item.max_drawdown)
     || !integer(item.min_trades, 0) || !integer(item.min_history_days, 20) || !fraction(item.min_minute_ratio)) return false
   const ranges = record(item.ranges)
@@ -73,6 +79,52 @@ export function validResearchDefaults(value: unknown): value is ResearchDefaults
       ? step(range.low) && step(range.high)
       : quantity(range.low, name === 'buy_shares' || name === 'sell_shares' ? 100 : 0) && quantity(range.high, name === 'buy_shares' || name === 'sell_shares' ? 100 : 0) && quantity(range.step, 100)
   })
+}
+
+/** Fill fields added by newer research protocols without discarding remembered legacy ranges. */
+function normalizeResearchDefaults(value: unknown): ResearchDefaults {
+  const item = record(value)
+  const defaults = defaultWorkbenchDefaults().research
+  if (!item) return defaults
+  const ranges = record(item.ranges)
+  const normalizedRanges = Object.fromEntries(rangeNames.map((name) => {
+    const saved = record(ranges?.[name])
+    const fallback = defaults.ranges[name]
+    const candidate = saved && finite(saved.low) && finite(saved.high) && finite(saved.step)
+      ? { low: saved.low, high: saved.high, step: saved.step }
+      : fallback
+    return [name, candidate]
+  })) as Record<string, SearchRange>
+  const merged: ResearchDefaults = {
+    ...defaults,
+    protocol_version: item.protocol_version === 1 || item.protocol_version === 2 ? item.protocol_version : defaults.protocol_version,
+    selection_target: ['fixed', 'adaptive', 'both'].includes(String(item.selection_target)) ? item.selection_target as ResearchDefaults['selection_target'] : defaults.selection_target,
+    rebalance_days: integer(item.rebalance_days, 1, 504) ? item.rebalance_days : defaults.rebalance_days,
+    bootstrap_reps: integer(item.bootstrap_reps, 100, 100000) ? item.bootstrap_reps : defaults.bootstrap_reps,
+    mode: ['historical', 'robust', 'both'].includes(String(item.mode)) ? item.mode as ResearchDefaults['mode'] : defaults.mode,
+    n_trials: integer(item.n_trials, 1, 5000) ? item.n_trials : defaults.n_trials,
+    seed: integer(item.seed, Number.MIN_SAFE_INTEGER) ? item.seed : defaults.seed,
+    top_candidates: integer(item.top_candidates, 1, 100) ? item.top_candidates : defaults.top_candidates,
+    max_drawdown: step(item.max_drawdown) ? item.max_drawdown as number : defaults.max_drawdown,
+    min_trades: integer(item.min_trades, 0) ? item.min_trades : defaults.min_trades,
+    min_history_days: integer(item.min_history_days, 20) ? item.min_history_days : defaults.min_history_days,
+    min_minute_ratio: fraction(item.min_minute_ratio) ? item.min_minute_ratio as number : defaults.min_minute_ratio,
+    ranges: normalizedRanges,
+  }
+  // An invalid individual old range should fall back independently, while valid saved ranges survive.
+  for (const name of rangeNames) {
+    const candidate = { ...merged, ranges: { ...merged.ranges } }
+    if (!validResearchDefaults(candidate)) {
+      const range = merged.ranges[name]
+      const valid = percentageRanges.has(name)
+        ? step(range.low) && step(range.high) && range.low <= range.high && step(range.step)
+        : quantity(range.low, name === 'buy_shares' || name === 'sell_shares' ? 100 : 0)
+          && quantity(range.high, name === 'buy_shares' || name === 'sell_shares' ? 100 : 0)
+          && quantity(range.step, 100) && range.low <= range.high
+      if (!valid) merged.ranges[name] = { ...defaults.ranges[name] }
+    }
+  }
+  return validResearchDefaults(merged) ? merged : defaults
 }
 
 export function validWorkbenchGroup<K extends WorkbenchGroup>(group: K, value: unknown): value is WorkbenchDefaults[K] {
@@ -95,8 +147,12 @@ export function normalizeWorkbenchDefaults(value: unknown): WorkbenchDefaults {
     grid: validWorkbenchGroup('grid', item?.grid) ? structuredClone(item.grid) : defaults.grid,
     position: validWorkbenchGroup('position', item?.position) ? structuredClone(item.position) : defaults.position,
     dca: validWorkbenchGroup('dca', item?.dca) ? structuredClone(item.dca) : defaults.dca,
-    research: validWorkbenchGroup('research', item?.research) ? structuredClone(item.research) : defaults.research,
+    research: structuredClone(normalizeResearchDefaults(item?.research)),
   }
+}
+
+export function normalizeRememberedResearchDefaults(value: unknown): ResearchDefaults {
+  return structuredClone(normalizeResearchDefaults(value))
 }
 
 export function strategyDefaults(config: BacktestConfig): Pick<WorkbenchDefaults, StrategyDefaultsGroup> {

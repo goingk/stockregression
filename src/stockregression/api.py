@@ -16,9 +16,12 @@ from typing import Literal
 from .preview import PreviewManager
 
 from .data import DataService
+from .data_diagnostics import derive_source_spans, project_data_diagnostics
+from .quality import QUALITY_RULES_VERSION, _closing_auction_placeholders, minute_slots
 from .jobs import JobManager
 from .models import BacktestConfig, OptimizationConfig, normalize_symbol
 from .rules import instrument_terms
+from .research_preparation import preparation_config
 from .schedule import configure_schedule
 from .settings import PROJECT_ROOT, load_settings, save_settings
 from .storage import Store, dumps, json_safe, now_iso
@@ -43,9 +46,161 @@ class BatchRequest(BaseModel):
     configs: list[BacktestConfig] = Field(min_length=1, max_length=100)
 
 
-def public_result(result: dict) -> dict:
-    """Keep full resolution on disk/export; send daily curves to the browser."""
+_V2_ARCHIVE_FIELDS = {"candidate_archive", "trial_archive", "candidate_archives", "trial_archives"}
+
+
+def _compact_v2_result(value, top_candidates: int, parent_key: str | None = None):
+    """Remove research-only matrices/archives while retaining UI summaries."""
+    if isinstance(value, dict):
+        compact = {}
+        for key, item in value.items():
+            if key in _V2_ARCHIVE_FIELDS:
+                continue
+            if key == "candidate_ids":
+                continue
+            if parent_key == "diagnostics" and key == "costs":
+                # This is the full [candidate][fold] matrix. Top candidates
+                # keep their compact cost_scores, and diagnostics retain the
+                # candidate/evaluation counts needed to interpret the result.
+                continue
+            if key == "candidates" and isinstance(item, list):
+                compact[key] = [_compact_v2_result(row, top_candidates) for row in item[:top_candidates]]
+            else:
+                compact[key] = _compact_v2_result(item, top_candidates, key)
+        return compact
+    if isinstance(value, list):
+        return [_compact_v2_result(item, top_candidates, parent_key) for item in value]
+    if isinstance(value, tuple):
+        return [_compact_v2_result(item, top_candidates, parent_key) for item in value]
+    return value
+
+
+def _quality_dates(result: dict) -> tuple[str | None, str | None]:
+    quality = result.get("quality") if isinstance(result.get("quality"), dict) else {}
+    days = [str(row["date"])[:10] for row in quality.get("days", [])
+            if isinstance(row, dict) and row.get("date")]
+    if days:
+        return min(days), max(days)
+    config = result.get("config") if isinstance(result.get("config"), dict) else {}
+    base = config.get("base") if isinstance(config.get("base"), dict) else config
+    diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
+    return (diagnostics.get("checked_start") or base.get("start_date"),
+            diagnostics.get("checked_end") or result.get("effective_end_date") or base.get("end_date"))
+
+
+def _result_data_metadata(store: Store, result: dict) -> dict | None:
+    """Read provenance for the result's locked snapshot, without market fetches.
+
+    Only a small projection of immutable Parquet columns is read once per
+    version/date range. This does not re-run minute validation or replace the
+    original result's quality report with today's active snapshot.
+    """
+    config = result.get("config") if isinstance(result.get("config"), dict) else {}
+    base = config.get("base") if isinstance(config.get("base"), dict) else config
+    symbol, version = result.get("symbol") or base.get("symbol"), result.get("data_version")
+    if not symbol or not version:
+        return None
+    manifest = store.snapshot(symbol, version)
+    if not manifest:
+        return None
+    start, end = _quality_dates(result)
+    key = f"data-source-spans:v2:q{QUALITY_RULES_VERSION}:{version}:{start or ''}:{end or ''}"
+    cached = store.state(key)
+    if not isinstance(cached, dict) or not isinstance(cached.get("spans"), list):
+        import pyarrow.parquet as pq
+
+        frames = []
+        for relative in manifest["files"].get("minute", []):
+            path = store.root / relative
+            names = set(pq.read_schema(path).names)
+            columns = [name for name in ("timestamp", "source", "source_verified", "is_synthetic", "close") if name in names]
+            if "timestamp" in columns:
+                frames.append(pd.read_parquet(path, columns=columns))
+        minute = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        spans = derive_source_spans(minute, manifest.get("profiles"), start, end)
+        auction_by_day = {}
+        if not minute.empty and "close" in minute:
+            stamps = pd.to_datetime(minute.timestamp)
+            if start:
+                minute = minute[stamps >= pd.Timestamp(start)]
+            if end:
+                minute = minute[pd.to_datetime(minute.timestamp) < pd.Timestamp(end) + pd.Timedelta(days=1)]
+            if "source_verified" not in minute and "source" in minute:
+                minute = minute.assign(source_verified=minute.source.map(
+                    lambda source: bool(manifest.get("profiles", {}).get(source, {}).get("verified", False))))
+            for day, group in minute.groupby(pd.to_datetime(minute.timestamp).dt.normalize()):
+                if len(group) >= 240:
+                    continue
+                indexed = group.drop_duplicates("timestamp", keep="last").set_index("timestamp").reindex(minute_slots(day))
+                count = int(_closing_auction_placeholders(manifest["symbol"], day, indexed, indexed.close.isna().to_numpy()).sum())
+                if count:
+                    auction_by_day[str(day.date())] = count
+        cached = {"spans": spans, "auction_placeholders_by_day": auction_by_day}
+        store.state(key, cached)
+    metadata = dict(manifest.get("metadata") or {})
+    metadata["diagnostics"] = {**metadata.get("diagnostics", {}), "source_spans": cached["spans"]}
+    metadata["_snapshot_profiles"] = manifest.get("profiles", {})
+    metadata["_auction_placeholders_by_day"] = cached.get("auction_placeholders_by_day", {})
+    return metadata
+
+
+def _project_result_quality(result: dict, data_metadata: dict | None) -> dict:
+    quality = result.get("quality")
+    if not isinstance(quality, dict):
+        return result
+    start, end = _quality_dates(result)
+    metadata = dict(data_metadata or {})
+    config = result.get("config") if isinstance(result.get("config"), dict) else {}
+    base = config.get("base") if isinstance(config.get("base"), dict) else config
+    if "requested_frequency" not in quality and base.get("frequency"):
+        quality = {**quality, "requested_frequency": base["frequency"]}
+    # Old results remain immutable. Their display projection can distinguish
+    # known auction grid slots using the exact locked raw snapshot, without
+    # recomputing any historical fills, strategy metrics or parameter choices.
+    auction_by_day = metadata.get("_auction_placeholders_by_day", {})
+    if auction_by_day and isinstance(quality.get("days"), list):
+        projected_days = []
+        for row in quality["days"]:
+            row = dict(row)
+            count = int(auction_by_day.get(str(row.get("date"))[:10], 0))
+            if count and row.get("mode") == "minute" and "missing_data_minutes" not in row:
+                row["auction_placeholders"] = min(count, int(row.get("missing_minutes", 0)))
+                row["missing_data_minutes"] = max(0, int(row.get("missing_minutes", 0)) - row["auction_placeholders"])
+                if not row["missing_data_minutes"] and str(row.get("reason", "")).startswith("少量缺口"):
+                    row["reason"] = "收盘集合竞价无逐分钟成交，占位保留"
+            projected_days.append(row)
+        quality = {**quality, "days": projected_days,
+                   "auction_placeholders": sum(int(row.get("auction_placeholders", 0)) for row in projected_days if row.get("mode") == "minute")}
+    own_diagnostics = result.get("diagnostics")
+    if isinstance(own_diagnostics, dict) and own_diagnostics.get("schema_version") == 1:
+        metadata["diagnostics"] = {**metadata.get("diagnostics", {}), **own_diagnostics}
+    metadata["warnings"] = list(dict.fromkeys([*metadata.get("warnings", []), *result.get("warnings", [])]))
+    metadata["source_events"] = [*metadata.get("source_events", []), *result.get("source_events", [])]
+    metadata["requested_end_date"] = result.get("requested_end_date") or base.get("end_date")
+    # Clean the quality warning list separately, so execution/parameter notices
+    # do not become quality failures while archived provider errors disappear.
+    quality_projection = project_data_diagnostics({}, quality, start, end)
+    metadata["source_events"].extend(quality_projection["source_events"])
+    quality = {**quality, "warnings": quality_projection["current_warnings"]}
+    projection = project_data_diagnostics(metadata, quality, start, end, metadata.get("_snapshot_profiles"))
+    return {**result, "quality": quality, "warnings": projection["current_warnings"],
+            "diagnostics": projection["diagnostics"], "source_events": projection["source_events"]}
+
+
+def public_result(result: dict, full: bool = False, data_metadata: dict | None = None) -> dict:
+    """Send UI-sized results by default, preserving raw data for full requests."""
+    if full:
+        return result
     result = dict(result)
+    config = result.get("config") if isinstance(result.get("config"), dict) else {}
+    is_v2 = result.get("protocol_version") == 2 or config.get("protocol_version") == 2
+    if is_v2:
+        try:
+            top_candidates = max(1, min(100, int(config.get("top_candidates", 20))))
+        except (TypeError, ValueError):
+            top_candidates = 20
+        result = _compact_v2_result(result, top_candidates)
+    result = _project_result_quality(result, data_metadata)
     if "strategies" in result:
         result["equity_frequency"] = "1d"
         strategies = {}
@@ -60,7 +215,10 @@ def public_result(result: dict) -> dict:
         result["strategies"] = strategies
     for mode, key in [("historical", "best_result"), ("robust", "test_result")]:
         if result.get(mode) and result[mode].get(key):
-            result[mode] = {**result[mode], key: public_result(result[mode][key])}
+            result[mode] = {**result[mode], key: public_result(result[mode][key], data_metadata=data_metadata)}
+    for mode in ("fixed", "adaptive"):
+        if result.get(mode) and result[mode].get("test_result"):
+            result[mode] = {**result[mode], "test_result": public_result(result[mode]["test_result"], data_metadata=data_metadata)}
     return result
 
 
@@ -267,7 +425,12 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
 
     @app.post("/api/v1/optimizations")
     def optimization(config: OptimizationConfig):
-        return submit("optimization", {"config": config.model_dump(mode="json"), "version": snapshot_version(config.base)})
+        if config.protocol_version == 2:
+            prepared = preparation_config(store, config.base)
+            version = snapshot_version(prepared)
+        else:
+            version = snapshot_version(config.base)
+        return submit("optimization", {"config": config.model_dump(mode="json"), "version": version})
 
     @app.get("/api/v1/jobs")
     def jobs():
@@ -308,7 +471,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         job = get_job(job_id)
         if not job.get("result_id"):
             raise HTTPException(409, "任务尚无结果")
-        return public_result(store.result(job["result_id"]))
+        result = store.result(job["result_id"])
+        return public_result(result, data_metadata=_result_data_metadata(store, result))
 
     @app.get("/api/v1/results")
     def results():
@@ -319,7 +483,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         result = store.result(result_id)
         if result is None:
             raise HTTPException(404, "结果不存在")
-        return result if full else public_result(result)
+        return public_result(result, full=full, data_metadata=None if full else _result_data_metadata(store, result))
 
     @app.get("/api/v1/results/{result_id}/export")
     def export(result_id: str, kind: str = "json"):
@@ -328,9 +492,19 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             content, extension, media = dumps(result).encode("utf-8"), "json", "application/json"
         elif kind in ("equity", "trades"):
             records = []
-            run = result if "strategies" in result else (result.get("historical", {}).get("best_result") or result.get("robust", {}).get("test_result") or {})
-            for strategy, values in run.get("strategies", {}).items():
-                records.extend({"strategy": strategy, **row} for row in values.get(kind, []))
+            if result.get("protocol_version") == 2:
+                runs = []
+                for name in ("fixed", "adaptive"):
+                    branch = result.get(name)
+                    if isinstance(branch, dict):
+                        runs.append((name, branch.get("test_result") or {}))
+                for selection, run in runs:
+                    for strategy, values in run.get("strategies", {}).items():
+                        records.extend({"selection": selection, "strategy": strategy, **row} for row in values.get(kind, []))
+            else:
+                run = result if "strategies" in result else (result.get("historical", {}).get("best_result") or result.get("robust", {}).get("test_result") or {})
+                for strategy, values in run.get("strategies", {}).items():
+                    records.extend({"strategy": strategy, **row} for row in values.get(kind, []))
             content = pd.DataFrame(records).to_csv(index=False).encode("utf-8-sig")
             extension, media = "csv", "text/csv"
         else:

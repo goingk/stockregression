@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import multiprocessing
 import os
 import threading
@@ -8,7 +10,55 @@ import traceback
 
 from .data import DataService
 from .models import BacktestConfig, OptimizationConfig
+from .research_preparation import prepare_research_bundle
 from .storage import Store
+
+
+def _research_protocol_hash(config: OptimizationConfig) -> str:
+    payload = config.model_dump(mode="json")
+    base = dict(payload.get("base", {}))
+    for key in ("symbol", "start_date", "end_date"):
+        base.pop(key, None)
+    payload["base"] = base
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _validation_intervals(result: dict, start: str, end: str | None) -> list[dict]:
+    intervals: list[dict] = [{"start": start, "end": end or start, "kind": "input_evaluation"}]
+
+    def add(item, kind):
+        if not isinstance(item, dict):
+            return
+        left = item.get("start", item.get("start_date"))
+        right = item.get("end", item.get("end_date"))
+        if left is None or right is None:
+            return
+        intervals.append({"start": str(left)[:10], "end": str(right)[:10], "kind": kind})
+
+    def visit(node, path=()):
+        if isinstance(node, dict):
+            if path and path[-1] in {"final_126_day_check", "test_window", "validation_interval"}:
+                add(node, ".".join(path))
+            for key, value in node.items():
+                if key in {"windows", "validation_windows", "evaluation_windows"} and isinstance(value, list):
+                    for item in value:
+                        add(item, ".".join((*path, key)))
+                visit(value, (*path, key))
+        elif isinstance(node, list):
+            for value in node:
+                visit(value, path)
+
+    visit(result.get("evidence", {}), ("evidence",))
+    return intervals
+
+
+def _scientific_failed(result: dict) -> bool:
+    if result.get("status") in {"failed", "error"}:
+        return True
+    branches = [result.get(name, {}) for name in ("fixed", "adaptive") if isinstance(result.get(name), dict)]
+    statuses = [branch.get("status") for branch in branches if branch.get("status") is not None]
+    return bool(statuses) and all(status in {"failed", "error"} for status in statuses)
 
 
 def execute_job(root: str, job_id: str, observer=None):
@@ -55,13 +105,44 @@ def execute_job(root: str, job_id: str, observer=None):
         elif kind == "optimization":
             from .optimization import optimize
             config = OptimizationConfig.model_validate(payload["config"])
-            progress(0.01, "检查本地行情并准备研究数据")
-            bundle = service.ensure_bundle(config.base, payload.get("version"), lambda fraction, message: progress(0.02 + 0.30 * fraction, message), cancelled)
+            scientific = config.protocol_version == 2
+            progress(0.01, "检查本地行情并准备研究数据" if not scientific else "准备评估区间及前置 504 个交易日")
+            if scientific:
+                bundle = prepare_research_bundle(
+                    service,
+                    config.base,
+                    payload.get("version"),
+                    lambda fraction, message: progress(0.02 + 0.30 * fraction, message),
+                    cancelled,
+                )
+            else:
+                bundle = service.ensure_bundle(config.base, payload.get("version"), lambda fraction, message: progress(0.02 + 0.30 * fraction, message), cancelled)
             payload["version"] = bundle.version
             store.update_job(job_id, payload=payload)
-            progress(0.33, "行情准备完成，开始参数搜索")
+            progress(0.33, "行情准备完成，开始科学参数研究" if scientific else "行情准备完成，开始参数搜索")
             result = optimize(config, bundle, lambda fraction, message: progress(0.33 + 0.67 * fraction, message), cancelled)
-            symbol, title = config.base.symbol, "历史搜索 / 样本外验证"
+            result["diagnostics"] = bundle.metadata.get("diagnostics", {})
+            result["source_events"] = bundle.metadata.get("source_events", [])
+            symbol = config.base.symbol
+            if scientific:
+                audit = store.register_research(
+                    registry_id=job_id,
+                    protocol_hash=_research_protocol_hash(config),
+                    symbol=symbol,
+                    input_start=str(config.base.start_date),
+                    input_end=str(config.base.end_date) if config.base.end_date else str(bundle.calendar.max())[:10] if len(bundle.calendar) else None,
+                    data_version=bundle.version,
+                    validation_intervals=_validation_intervals(
+                        result,
+                        str(config.base.start_date),
+                        str(config.base.end_date) if config.base.end_date else str(bundle.calendar.max())[:10] if len(bundle.calendar) else None,
+                    ),
+                )
+                result["evidence"] = {**(result.get("evidence") if isinstance(result.get("evidence"), dict) else {}), "local_audit": audit}
+                result["protocol_hash"] = audit["protocol_hash"]
+                title = "科学参数研究 · 固定与自适应" if config.selection_target == "both" else f"科学参数研究 · {config.selection_target}"
+            else:
+                title = "历史搜索 / 样本外验证"
         elif kind == "sync":
             result = service.sync(payload.get("symbols", []), payload.get("mode", "daily"), progress, cancelled, scope=payload.get("scope"), resume=payload.get("resume", False), retry_failed=payload.get("retry_failed", False), workers=payload.get("workers", 2))
             symbol, title = ",".join(payload.get("symbols", [])), "数据同步"
@@ -78,14 +159,34 @@ def execute_job(root: str, job_id: str, observer=None):
             raise ValueError("未知任务类型：" + kind)
         if cancelled() and kind != "optimization":
             raise InterruptedError("任务已取消")
-        result_id = store.save_result(kind, result, symbol, title)
         was_cancelled = cancelled()
         failed_sync = kind == "sync" and result.get("status") == "failed"
+        failed_research = kind == "optimization" and payload.get("config", {}).get("protocol_version") == 2 and _scientific_failed(result)
+        result_cancelled = kind == "optimization" and result.get("status") == "cancelled"
+        cancelled_job = was_cancelled or result_cancelled
+        if kind == "optimization" and payload.get("config", {}).get("protocol_version") == 2:
+            if failed_research:
+                title += " · 失败"
+            elif cancelled_job:
+                title += " · 已取消"
+            elif result.get("status") == "partial":
+                title += " · 部分完成"
+        result_id = store.save_result(kind, result, symbol, title)
         sync_error = None
         if failed_sync:
             failures = result.get("failures", [])
             sync_error = "; ".join(f"{item.get('symbol', '标的')}: {item.get('reason', '未知错误')}" for item in failures) or result.get("message") or "所有同步目标失败"
-        store.update_job(job_id, status="cancelled" if was_cancelled else "failed" if failed_sync else "completed", progress=1, message="已取消，已完成的搜索候选保留" if was_cancelled else (f"同步失败：{sync_error}" if failed_sync else result.get("message", "完成")), error=sync_error, result_id=result_id)
+        if cancelled_job:
+            message = "已取消，已完成的搜索候选保留"
+        elif failed_sync:
+            message = f"同步失败：{sync_error}"
+        elif failed_research:
+            message = "科学参数研究失败：" + str(result.get("reason") or result.get("message") or "查看结果中的失败原因")
+        elif kind == "optimization" and payload.get("config", {}).get("protocol_version") == 2 and result.get("status") == "partial":
+            message = "科学参数研究部分完成；已保留已完成的候选与结果"
+        else:
+            message = result.get("message", "完成")
+        store.update_job(job_id, status="cancelled" if cancelled_job else "failed" if failed_sync or failed_research else "completed", progress=1, message=message, error=sync_error or (result.get("reason") if failed_research else None), result_id=result_id)
     except InterruptedError as exc:
         store.update_job(job_id, status="cancelled", message=str(exc))
     except Exception as exc:

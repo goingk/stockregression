@@ -42,6 +42,8 @@ def funding(config, data):
         return round_money(quantity * execution + charge["total"])
     count, remainder = divmod(config.max_shares - config.initial_shares, config.buy_shares)
     reserve = round_money(count * cost(config.buy_shares) + cost(remainder))
+    if getattr(config, "reserve_cash", None) is not None:
+        reserve = round_money(config.reserve_cash)
     return {
         "reserve_cash": reserve,
         "initial_equity": round_money(config.initial_shares * price + reserve),
@@ -146,7 +148,50 @@ def _inputs(config, data):
     return result
 
 
-def run_share_backtest(config, data, progress=None, cancelled=None, summary_only=False, preview=False):
+def _parameter_arrays(config, prepared, parameter_schedule):
+    days, values, normalized = [], [], []
+    for row in parameter_schedule or []:
+        effective = pd.Timestamp(row["effective_date"]).normalize()
+        decision = pd.Timestamp(row["decision_date"]).normalize()
+        if decision >= effective:
+            raise ValueError("换参决策必须早于生效交易日")
+        index = int(prepared["days"].searchsorted(effective))
+        if index >= len(prepared["days"]):
+            continue
+        if days and index <= days[-1]:
+            raise ValueError("换参生效日期必须严格递增")
+        params = dict(row["params"])
+        if "initial_shares" in params and params["initial_shares"] != config.initial_shares:
+            raise ValueError("换参不能改变初始持股")
+        from .models import BacktestConfig
+        candidate = BacktestConfig.model_validate({**config.model_dump(mode="python"), **params})
+        days.append(index)
+        values.append([candidate.min_shares, candidate.max_shares, candidate.buy_step,
+                       candidate.sell_step, candidate.grid_step, candidate.buy_shares, candidate.sell_shares])
+        normalized.append({**row, "effective_date": str(prepared["days"][index].date())})
+    return np.asarray(days, dtype=np.int64), np.asarray(values, dtype=np.float64).reshape((-1, 7)), normalized
+
+
+def _options(config, prepared, money, mode=0, cost_multiplier=1.0):
+    terms, fees = prepared["terms"], config.fees
+    return (money["initial_equity"], money["dca_initial_equity"], money["buy_hold_initial_equity"],
+        float(config.min_shares), float(config.max_shares),
+        {"trailing": 0, "arithmetic": 1, "geometric": 2}[config.grid_mode],
+        config.buy_step, config.sell_step, config.grid_step, money["reference_price"],
+        config.lower_price or 0.0, config.upper_price or 0.0, config.buy_shares, config.sell_shares,
+        2 if terms["board"] == "star" else 0, fees.commission_rate * cost_multiplier,
+        fees.min_commission * cost_multiplier, fees.slippage_bps / 10000 * cost_multiplier,
+        fees.share_face_value, config.initial_shares, money["reserve_cash"], config.dca.initial_shares,
+        config.dca.shares, money["buy_hold_initial_shares"], money["valuation_price"],
+        terms["price_tick"], terms["settlement"] == "T0", mode)
+
+
+def _return_days(prepared):
+    return prepared["days"][np.unique(prepared["arrays"][8][prepared["arrays"][10]])]
+
+
+def run_share_backtest(config, data, progress=None, cancelled=None, summary_only=False, preview=False,
+                       parameter_schedule=None, passive_grid=False, daily_details=False):
     from . import engine
     from .share_kernel import simulate
     if cancelled and cancelled():
@@ -155,16 +200,19 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
     terms, fees = prepared["terms"], config.fees
     if progress:
         progress(0.2, "已载入股数配置与锁定行情")
-    mode = 0 if summary_only else 1 if preview else 2
-    options = (money["initial_equity"], money["dca_initial_equity"], money["buy_hold_initial_equity"], float(config.min_shares), float(config.max_shares), {"trailing": 0, "arithmetic": 1, "geometric": 2}[config.grid_mode], config.buy_step, config.sell_step, config.grid_step, money["reference_price"], config.lower_price or 0.0, config.upper_price or 0.0, config.buy_shares, config.sell_shares, 2 if terms["board"] == "star" else 0, fees.commission_rate, fees.min_commission, fees.slippage_bps / 10000, fees.share_face_value, config.initial_shares, money["reserve_cash"], config.dca.initial_shares, config.dca.shares, money["buy_hold_initial_shares"], money["valuation_price"], terms["price_tick"], terms["settlement"] == "T0", mode)
+    mode = 0 if summary_only else 1 if preview else 3 if daily_details else 2
+    options = _options(config, prepared, money, mode)
+    change_days, change_values, schedule = _parameter_arrays(config, prepared, parameter_schedule)
     runner = simulate if engine._NUMBA_FASTPATH_ENABLED else getattr(simulate, "py_func", simulate)
-    output = runner(*prepared["arrays"], *options)
+    output = runner(*prepared["arrays"], *options, change_days, change_values,
+                    np.full(len(prepared["days"]), -1, dtype=np.int64), 0, False, passive_grid)
     if cancelled and cancelled():
         raise InterruptedError("回测已取消")
-    metrics, eq, cash, shares, drawdown, periods, tb, ta, ts, tq, tp, tf, tc, th, tr, rb, rt, ra, rs, rr, rq, invested = output
+    metrics, eq, cash, shares, drawdown, periods, tb, ta, ts, tq, tp, tf, tc, th, tr, rb, rt, ra, rs, rr, rq, invested, _ = output
     strategies = {}
-    points = prepared["days"] + pd.Timedelta(hours=15) if preview else prepared["stamps"]
-    indices = np.arange(len(points)) if preview else np.flatnonzero(prepared["tradable"])
+    return_days = _return_days(prepared)
+    points = return_days + pd.Timedelta(hours=15) if preview or daily_details else prepared["stamps"]
+    indices = np.arange(len(points)) if preview or daily_details else np.flatnonzero(prepared["tradable"])
     openings = pd.to_datetime(prepared["opens"]).strftime("%Y-%m-%dT%H:%M:%S").tolist() if not summary_only else []
     initial_equities = (money["initial_equity"], money["dca_initial_equity"], money["buy_hold_initial_equity"])
     for account, name in enumerate(("grid", "dca", "buy_hold")):
@@ -180,15 +228,125 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
                 base = invested[i] if account == 1 else initial_equities[account]
                 equity.append({"timestamp": points[i].isoformat(), "equity": float(eq[account, i]), "cash": float(cash[account, i]), "position": float(shares[account, i]), "drawdown": None if account == 1 else float(drawdown[account, i]), "normalized_equity": float(eq[account, i] / base) if base > 0 else None, "total_invested": float(invested[i]) if account == 1 else initial_equities[account]})
         trades = [{"timestamp": openings[int(tb[j])], "side": "buy" if ts[j] == 1 else "sell", "quantity": int(tq[j]), "price": float(tp[j]), "fees": float(tf[j]), "cash": float(tc[j]), "shares": int(th[j]), "reason": engine._TRADE_REASONS[int(tr[j])]} for j in range(len(tb)) if ta[j] == account]
-        rejections = [{"timestamp": pd.Timestamp(rt[j]).isoformat(), "side": "buy" if rs[j] == 1 else "sell", "reason": engine._REJECTION_REASONS[int(rr[j])], "requested_quantity": int(rq[j])} for j in range(len(rb)) if ra[j] == account]
+        rejections = [{"timestamp": pd.Timestamp(rt[j]).isoformat(), "side": "buy" if rs[j] == 1 else "sell", "reason": "parameter_update" if int(rr[j]) == 12 else engine._REJECTION_REASONS[int(rr[j])], "requested_quantity": int(rq[j])} for j in range(len(rb)) if ra[j] == account]
         if account == 1 and not summary_only and not preview:
             bought = {period_key(t["timestamp"], config.dca.frequency) for t in trades}
             for key in dict.fromkeys(prepared["period_keys"]):
                 if key not in bought:
                     day = [d for d, p in zip(prepared["days"], prepared["period_keys"]) if p == key][-1]
                     rejections.append({"timestamp": (day + pd.Timedelta(hours=15)).isoformat(), "side": "buy", "reason": "dca_period_skipped", "requested_quantity": config.dca.shares})
-        returns = [] if account == 1 or summary_only else [{"timestamp": (day + pd.Timedelta(hours=15)).isoformat(), "return": float(periods[account, i])} for i, day in enumerate(prepared["days"])]
-        strategies[name] = {"metrics": metric, "equity": equity, "equity_frequency": "1d" if preview else config.frequency, "trades": trades, "rejections": rejections, "period_returns": returns, "return_basis": "cost" if account == 1 else "initial_equity"}
+        returns = [] if account == 1 or summary_only else [{"timestamp": (day + pd.Timedelta(hours=15)).isoformat(), "return": float(periods[account, i])} for i, day in enumerate(return_days)]
+        strategies[name] = {"metrics": metric, "equity": equity, "equity_frequency": "1d" if preview or daily_details else config.frequency, "trades": trades, "rejections": rejections, "period_returns": returns, "return_basis": "cost" if account == 1 else "initial_equity"}
     if progress:
         progress(1.0, "股数回测完成")
-    return {"schema_version": 2, "accounting_basis": "independent_contributions_v1", "symbol": config.symbol, "config": config.model_dump(mode="json"), "data_version": data.version, "quality": data.quality, "is_demo": bool(data.metadata.get("is_demo")), "funding": money, "requested_end_date": str(config.end_date) if config.end_date else None, "effective_end_date": prepared["end"], "warnings": list(dict.fromkeys([*data.warnings, *data.metadata.get("warnings", [])])), "strategies": strategies}
+    warnings = list(dict.fromkeys([*data.warnings, *data.metadata.get("warnings", [])]))
+    selection_asof = getattr(config, "selection_asof", None)
+    retrospective = bool(selection_asof and config.start_date <= selection_asof)
+    if retrospective:
+        warnings.append(f"参数选定于 {selection_asof}；选参截止日及以前的历史重跑属于样本内回看，不是样本外成绩。")
+    result = {"schema_version": 2, "accounting_basis": "independent_contributions_v1", "symbol": config.symbol, "config": config.model_dump(mode="json"), "data_version": data.version, "quality": data.quality, "is_demo": bool(data.metadata.get("is_demo")), "funding": money, "requested_end_date": str(config.end_date) if config.end_date else None, "effective_end_date": prepared["end"], "warnings": warnings, "strategies": strategies}
+    result["diagnostics"] = data.metadata.get("diagnostics", {})
+    result["source_events"] = data.metadata.get("source_events", [])
+    if schedule:
+        result["parameter_schedule"] = schedule
+    if selection_asof:
+        result["parameter_selection"] = {"as_of": str(selection_asof), "retrospective": retrospective}
+    if passive_grid:
+        result["strategies"]["grid"]["label"] = "同资金同初始持股被动持有"
+    return result
+
+
+def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
+                   cancelled=None, parallel=True):
+    """Compact day-by-candidate returns with exact intrabar fold risk.
+
+    The cash budget is determined once from ``base`` and shared by every row.
+    All folds are measurements on the same continuous candidate ledger.
+    """
+    from . import engine
+    from .models import BacktestConfig
+    from .share_kernel import simulate, simulate_research_batch
+    if base.schema_version != 2:
+        raise ValueError("科学研究需要股数配置")
+    if not math.isfinite(cost_multiplier) or cost_multiplier <= 0:
+        raise ValueError("成本倍数必须为正数")
+    prepared, money = _inputs(base, data), funding(base, data)
+    if money["initial_equity"] <= 0:
+        raise ValueError("研究账户起始资产必须大于零")
+    fold_ids = np.full(len(prepared["days"]), -1, dtype=np.int64)
+    for index, (start, end) in enumerate(fold_ranges):
+        mask = (prepared["days"] >= pd.Timestamp(start)) & (prepared["days"] <= pd.Timestamp(end))
+        if np.any(fold_ids[mask] >= 0):
+            raise ValueError("验证窗口不能重叠")
+        fold_ids[mask] = index
+    rows = []
+    for patch in params:
+        if patch.get("initial_shares", base.initial_shares) != base.initial_shares:
+            raise ValueError("科学研究不能搜索初始持股")
+        if patch.get("reserve_cash", money["reserve_cash"]) != money["reserve_cash"]:
+            raise ValueError("科学研究不能改变现金预算")
+        candidate = BacktestConfig.model_validate({**base.model_dump(mode="python"), **patch})
+        rows.append([candidate.min_shares, candidate.max_shares, candidate.buy_step,
+                     candidate.sell_step, candidate.grid_step, candidate.buy_shares, candidate.sell_shares])
+    values = np.asarray(rows, dtype=np.float64).reshape((-1, 7))
+    dates = _return_days(prepared)
+    returns = np.empty((len(dates), len(values)), dtype=np.float64)
+    metric_values = np.empty((len(values), 11), dtype=np.float64)
+    fold_values = np.empty((len(values), len(fold_ranges), 6), dtype=np.float64)
+    options = _options(base, prepared, money, cost_multiplier=cost_multiplier)
+    empty_days, empty_values = np.zeros(0, dtype=np.int64), np.zeros((0, 7), dtype=np.float64)
+    old_threads = None
+    if engine._NUMBA_FASTPATH_ENABLED and parallel and len(values) > 1:
+        import os
+        from numba import get_num_threads, set_num_threads
+        old_threads = get_num_threads()
+        set_num_threads(min(old_threads, 8, max(1, (os.cpu_count() or 2) // 2)))
+    try:
+        for begin in range(0, len(values), 64):
+            if cancelled and cancelled():
+                raise InterruptedError("研究已取消")
+            end = min(begin + 64, len(values))
+            if old_threads is not None:
+                r, m, f = simulate_research_batch(prepared["arrays"], options, values[begin:end], fold_ids, len(fold_ranges))
+                returns[:, begin:end], metric_values[begin:end], fold_values[begin:end] = r, m, f
+            else:
+                runner = simulate if engine._NUMBA_FASTPATH_ENABLED else getattr(simulate, "py_func", simulate)
+                for index in range(begin, end):
+                    p = values[index]
+                    individual = (*options[:3], p[0], p[1], options[5], p[2], p[3], p[4],
+                                  *options[9:12], int(p[5]), int(p[6]), *options[14:])
+                    output = runner(*prepared["arrays"], *individual, empty_days, empty_values,
+                                    fold_ids, len(fold_ranges), True, False)
+                    returns[:, index], metric_values[index], fold_values[index] = output[5][0], output[0][0], output[-1]
+        if cancelled and cancelled():
+            raise InterruptedError("研究已取消")
+    finally:
+        if old_threads is not None:
+            from numba import set_num_threads
+            set_num_threads(old_threads)
+    metrics = []
+    for row in metric_values:
+        metric = {key: int(round(row[i])) if key in {"trade_count", "buy_count", "sell_count"} else float(row[i]) for i, key in enumerate(engine._METRIC_KEYS)}
+        metric["initial_equity"] = money["initial_equity"]
+        metrics.append(metric)
+    keys = ("max_drawdown", "trade_count", "buy_count", "sell_count", "total_fees", "turnover")
+    fold_metrics = [[{key: int(round(row[j])) if key.endswith("count") else float(row[j]) for j, key in enumerate(keys)} for row in candidate] for candidate in fold_values]
+    return {"dates": dates, "daily_returns": returns, "fold_drawdowns": fold_values[:, :, 0],
+            "fold_metrics": fold_metrics, "metrics": metrics, "funding": money,
+            "backend": "numba_batch" if old_threads is not None else "serial"}
+
+
+def research_passive(config, data):
+    from . import engine
+    from .share_kernel import simulate
+    prepared, money = _inputs(config, data), funding(config, data)
+    runner = simulate if engine._NUMBA_FASTPATH_ENABLED else getattr(simulate, "py_func", simulate)
+    output = runner(*prepared["arrays"], *_options(config, prepared, money),
+                    np.zeros(0, dtype=np.int64), np.zeros((0, 7), dtype=np.float64),
+                    np.full(len(prepared["days"]), -1, dtype=np.int64), 0, True, True)
+    return {"dates": _return_days(prepared), "daily_returns": output[5][0], "funding": money}
+
+
+def run_passive_backtest(config, data, progress=None, cancelled=None, **kwargs):
+    return run_share_backtest(config, data, progress=progress, cancelled=cancelled,
+                              passive_grid=True, **kwargs)

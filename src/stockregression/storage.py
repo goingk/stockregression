@@ -67,6 +67,25 @@ class Store:
                 CREATE TABLE IF NOT EXISTS sync_items(run_key TEXT,symbol TEXT,status TEXT,mode TEXT,daily_through TEXT,minute_through TEXT,error TEXT,updated_at TEXT,PRIMARY KEY(run_key,symbol));
                 CREATE INDEX IF NOT EXISTS sync_items_status ON sync_items(run_key,status);
             """)
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS research_registry(
+                    registry_id TEXT PRIMARY KEY,
+                    protocol_hash TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    input_start TEXT,
+                    input_end TEXT,
+                    data_version TEXT,
+                    validation_intervals TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    overlapping_prior_studies INTEGER NOT NULL DEFAULT 0,
+                    exact_repeat_prior_studies INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS research_registry_symbol ON research_registry(symbol,created_at);
+            """)
+            registry_columns = {row[1] for row in db.execute("PRAGMA table_info(research_registry)")}
+            for column in ("overlapping_prior_studies", "exact_repeat_prior_studies"):
+                if column not in registry_columns:
+                    db.execute(f"ALTER TABLE research_registry ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
             sync_columns = {row[1] for row in db.execute("PRAGMA table_info(sync_items)")}
             for column in ("daily_status", "minute_status"):
                 if column not in sync_columns:
@@ -337,3 +356,97 @@ class Store:
     def results(self):
         with self.db() as db:
             return [dict(r) for r in db.execute("SELECT id,kind,symbol,created_at,title FROM results ORDER BY created_at DESC LIMIT 200")]
+
+    def register_research(
+        self,
+        registry_id: str,
+        protocol_hash: str,
+        symbol: str,
+        input_start: str | None,
+        input_end: str | None,
+        data_version: str | None,
+        validation_intervals: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Record a v2 study and count previously used validation dates.
+
+        The job id is the registry key so a process retry cannot create a second
+        audit event. Interval overlap intentionally ignores protocol hash and
+        snapshot version: reusing the same dates with a changed seed or snapshot
+        is still prior exposure to those dates.
+        """
+        symbol = normalize_symbol(symbol)
+        intervals = []
+        seen = set()
+        for item in validation_intervals:
+            try:
+                start = str(pd.Timestamp(item["start"]).date())
+                end = str(pd.Timestamp(item["end"]).date())
+                if end < start:
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+            key = (start, end)
+            if key in seen:
+                continue
+            seen.add(key)
+            intervals.append({"start": start, "end": end, **({"kind": item["kind"]} if item.get("kind") else {})})
+        intervals.sort(key=lambda item: (item["start"], item["end"], item.get("kind", "")))
+        encoded_intervals = dumps(intervals)
+        with self.db() as db:
+            # Serialize the read/overlap/insert sequence across concurrent jobs.
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute("SELECT * FROM research_registry WHERE registry_id=?", (registry_id,)).fetchone()
+            if existing:
+                intervals = json.loads(existing["validation_intervals"] or "[]")
+                overlap_count = int(existing["overlapping_prior_studies"])
+                exact_count = int(existing["exact_repeat_prior_studies"])
+                return {
+                    "registry_id": existing["registry_id"],
+                    "protocol_hash": existing["protocol_hash"],
+                    "symbol": existing["symbol"],
+                    "input_start": existing["input_start"],
+                    "input_end": existing["input_end"],
+                    "data_version": existing["data_version"],
+                    "validation_intervals": intervals,
+                    "overlapping_prior_studies": overlap_count,
+                    "exact_repeat_prior_studies": exact_count,
+                    "recorded_overlap_status": "overlap_detected" if overlap_count else "no_recorded_overlap",
+                    "human_untouched_verified": False,
+                    "idempotent_replay": True,
+                }
+            prior = db.execute(
+                "SELECT registry_id,validation_intervals FROM research_registry WHERE symbol=?",
+                (symbol,),
+            ).fetchall()
+            current_pairs = {(item["start"], item["end"]) for item in intervals}
+            overlapping = set()
+            exact = set()
+            for row in prior:
+                prior_intervals = json.loads(row["validation_intervals"] or "[]")
+                if any(
+                    pd.Timestamp(old["start"]) <= pd.Timestamp(new["end"])
+                    and pd.Timestamp(new["start"]) <= pd.Timestamp(old["end"])
+                    for old in prior_intervals
+                    for new in intervals
+                ):
+                    overlapping.add(row["registry_id"])
+                if current_pairs.intersection({(item["start"], item["end"]) for item in prior_intervals}):
+                    exact.add(row["registry_id"])
+            db.execute(
+                "INSERT INTO research_registry VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (registry_id, protocol_hash, symbol, input_start, input_end, data_version, encoded_intervals, now_iso(), len(overlapping), len(exact)),
+            )
+        return {
+            "registry_id": registry_id,
+            "protocol_hash": protocol_hash,
+            "symbol": symbol,
+            "input_start": input_start,
+            "input_end": input_end,
+            "data_version": data_version,
+            "validation_intervals": intervals,
+            "overlapping_prior_studies": len(overlapping),
+            "exact_repeat_prior_studies": len(exact),
+            "recorded_overlap_status": "overlap_detected" if overlapping else "no_recorded_overlap",
+            "human_untouched_verified": False,
+            "idempotent_replay": False,
+        }

@@ -72,6 +72,8 @@ class BacktestConfig(BaseModel):
     dca: DcaConfig = Field(default_factory=DcaConfig)
     reference_price_mode: Literal["auto", "manual"] = "auto"
     initial_cash: float = Field(default=100_000, gt=0)
+    reserve_cash: float | None = Field(default=None, ge=0)
+    selection_asof: date | None = None
     initial_position: float = Field(default=0.5, ge=0, le=1)
     min_position: float = Field(default=0, ge=0, le=1)
     max_position: float = Field(default=1, ge=0, le=1)
@@ -111,7 +113,7 @@ class BacktestConfig(BaseModel):
     def serialize_config(self, handler):
         values = handler(self)
         legacy = {"initial_cash", "initial_position", "min_position", "max_position", "buy_quantity", "sell_quantity", "dca_frequency"}
-        modern = {"initial_shares", "min_shares", "max_shares", "buy_shares", "sell_shares", "dca", "reference_price_mode"}
+        modern = {"initial_shares", "min_shares", "max_shares", "buy_shares", "sell_shares", "dca", "reference_price_mode", "reserve_cash", "selection_asof"}
         for key in legacy if self.schema_version == 2 else modern:
             values.pop(key, None)
         if self.schema_version == 2:
@@ -148,6 +150,10 @@ class SearchRange(BaseModel):
 
 class OptimizationConfig(BaseModel):
     base: BacktestConfig
+    protocol_version: Literal[1, 2] = 1
+    selection_target: Literal["fixed", "adaptive", "both"] = "both"
+    rebalance_days: int = Field(default=63, ge=1)
+    bootstrap_reps: int = Field(default=10_000, ge=1)
     mode: Literal["historical", "robust", "both"] = "both"
     n_trials: int = Field(default=200, ge=1, le=5000)
     seed: int = 42
@@ -172,8 +178,14 @@ class OptimizationConfig(BaseModel):
     def share_ranges(cls, values):
         if not isinstance(values, dict) or "base" not in values:
             return values
+        values = dict(values)
+        if values.get("protocol_version", 1) == 2:
+            if "n_trials" not in values:
+                values["n_trials"] = 1000
         base = values["base"]
         base = base if isinstance(base, BacktestConfig) else BacktestConfig.model_validate(base)
+        if values.get("protocol_version", 1) == 2 and base.schema_version != 2:
+            raise ValueError("protocol_version=2 需要 base.schema_version=2")
         if base.schema_version != 2:
             return values
         if "ranges" not in values:

@@ -292,3 +292,123 @@ def test_concurrent_ensure_from_independent_services_downloads_once(tmp_path, mo
         release.set()
     assert sync_calls == ["history"]
     assert bundles[0].version == bundles[1].version == Store(root).snapshot(config.symbol)["version"]
+
+
+@pytest.mark.parametrize("real_gap", [False, True])
+def test_unverified_local_minutes_only_sync_for_actual_missing_bars(tmp_path, monkeypatch, real_gap):
+    calendar, daily, minute, actions, calendar_frame, metadata, _ = market(days=5)
+    minute["source"] = "import"
+    minute["source_verified"] = False
+    if real_gap:
+        stamps = minute.timestamp
+        minute = minute[~((stamps.dt.normalize() == calendar[2]) & (stamps.dt.hour == 10))]
+    metadata.update({"imported": True, "hf_revision": "old-provider-version"})
+    store = Store(tmp_path)
+    manifest = publish(store, "600000.SH", daily, minute, actions, calendar_frame, metadata,
+                       {"import": {"source": "import", "verified": False}})
+    config = config_for(calendar)
+    monkeypatch.setattr("stockregression.data.latest_closed_date", lambda: calendar[-1])
+    calls = []
+
+    def sync(self, symbols, mode, *args, **kwargs):
+        calls.append(mode)
+        return {"status": "completed", "symbols": [{"symbol": config.symbol, "version": manifest["version"]}], "failures": []}
+
+    monkeypatch.setattr(DataService, "sync", sync)
+    service = DataService(store)
+    bundle = service.ensure_bundle(config)
+    assert calls == (["repair"] if real_gap else [])
+    assert bundle.quality["daily_days"] == 4
+    assert bundle.quality["pending_calibration_days"] == (3 if real_gap else 4)
+    assert any("已有本地分钟数据" in warning for warning in bundle.warnings)
+    gaps = service._bundle_gaps(config, manifest, bundle, True)
+    assert bool(gaps) == real_gap
+    if not real_gap:
+        assert service.current_version_if_ready(config) == manifest["version"]
+        service.ensure_bundle(config, version=manifest["version"])
+        assert calls == []
+
+
+def test_complete_imported_snapshot_ignores_stale_provider_failure_and_status(tmp_path, monkeypatch):
+    calendar, daily, minute, actions, calendar_frame, metadata, _ = market(days=5)
+    minute["source"] = "import"
+    minute["source_verified"] = True
+    metadata.update({
+        "imported": True,
+        "hf_revision": "obsolete-provider-revision",
+        "warnings": [
+            "历史分钟下载失败：provider timeout",
+            "ETF 历史分钟库仅覆盖部分标的；其他缺口需导入补齐",
+        ],
+        "source_errors": ["近期分钟源不可用：old endpoint error"],
+        "quality_summary": {"minute_days": 0, "daily_days": 500},
+        "minute_status": "unavailable",
+        "minute_through": "2000-01-01",
+    })
+    store = Store(tmp_path)
+    manifest = publish(store, "600000.SH", daily, minute, actions, calendar_frame, metadata,
+                       {"import": {"source": "import", "verified": True}})
+    config = config_for(calendar, start_offset=1)
+    monkeypatch.setattr("stockregression.data.latest_closed_date", lambda: calendar[-1])
+    calls = []
+
+    def unexpected_sync(self, symbols, mode, *args, **kwargs):
+        calls.append(mode)
+        pytest.fail("现有日期已完整且分钟已校准，不应被旧警告触发重新拉历史")
+
+    monkeypatch.setattr(DataService, "sync", unexpected_sync)
+    service = DataService(store)
+
+    bundle = service.ensure_bundle(config)
+
+    assert calls == []
+    assert bundle.version == manifest["version"]
+    assert bundle.metadata["diagnostics"]["status"] == "complete"
+    assert bundle.metadata["diagnostics"]["minute_days"] == 4
+    assert bundle.metadata["minute_status"] == "available"
+    assert bundle.metadata["minute_through"].startswith(str(calendar[-1].date()))
+    assert not any("provider timeout" in warning or "old endpoint error" in warning for warning in bundle.warnings)
+    assert any("provider timeout" in event["message"] for event in bundle.metadata["source_events"])
+
+
+def test_sync_refreshes_quality_and_keeps_import_source_spans(tmp_path, monkeypatch):
+    import stockregression.data as module
+
+    calendar, daily, minute, actions, calendar_frame, metadata, _ = market(days=5)
+    imported = minute[minute.timestamp.dt.normalize() < calendar[-1]].copy()
+    imported["source"] = "import"
+    imported["source_verified"] = True
+    old_metadata = {
+        **metadata,
+        "imported": True,
+        "warnings": ["历史分钟下载失败：obsolete source failure"],
+        "quality_summary": {"minute_days": 0, "daily_days": 99},
+        "minute_status": "unavailable",
+        "minute_through": "2000-01-01",
+    }
+    store = Store(tmp_path)
+    publish(store, "600000.SH", daily.iloc[:-1], imported, actions, calendar_frame.iloc[:-1], old_metadata,
+            {"import": {"source": "import", "verified": True}})
+    monkeypatch.setattr(module, "fetch_auxiliary", lambda *args, **kwargs: (
+        daily.copy(), actions.copy(), calendar_frame.copy(), metadata.copy()
+    ))
+    monkeypatch.setattr(module, "fetch_tdx", lambda *args, **kwargs: minute[minute.timestamp.dt.normalize() == calendar[-1]].copy())
+    monkeypatch.setattr(module, "fetch_sina", lambda *args, **kwargs: pytest.fail("TDX fixture is available"))
+    monkeypatch.setattr(module, "infer_profile", lambda *_args, **_kwargs: {
+        "source": "tdx", "verified": True, "convention": "end", "volume_multiplier": 1,
+    })
+    service = DataService(store)
+
+    result = service._sync_one("600000.SH", "daily", lambda *_: None, lambda: False)
+    active = store.snapshot("600000.SH")
+    spans = active["metadata"]["diagnostics"]["source_spans"]
+
+    assert result["version"] == active["version"]
+    assert active["metadata"]["quality_summary"]["minute_days"] == 5
+    assert active["metadata"]["quality_summary"]["daily_days"] == 0
+    assert active["metadata"]["minute_status"] == "available"
+    assert active["metadata"]["minute_through"].startswith(str(calendar[-1].date()))
+    assert {span["source"] for span in spans} == {"import", "tdx"}
+    assert any(span["source_kind"] == "import" for span in spans)
+    assert any("obsolete source failure" in event["message"] for event in active["metadata"]["source_events"])
+    assert not any("obsolete source failure" in warning for warning in active["metadata"]["warnings"])

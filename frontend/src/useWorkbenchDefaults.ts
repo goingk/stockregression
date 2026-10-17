@@ -1,6 +1,6 @@
 import { useEffect, useSyncExternalStore } from 'react'
 import { get, request } from './api'
-import { defaultWorkbenchDefaults, normalizeWorkbenchDefaults, validWorkbenchGroup } from './workbenchDefaults'
+import { defaultWorkbenchDefaults, normalizeRememberedResearchDefaults, normalizeWorkbenchDefaults, validWorkbenchGroup } from './workbenchDefaults'
 import type { WorkbenchDefaults, WorkbenchGroup } from './workbenchDefaults'
 
 const CACHE_KEY = 'stockregression-workbench-defaults-v1'
@@ -12,7 +12,12 @@ function readCache(): { value: WorkbenchDefaults; pending: Pending } {
     const cached = JSON.parse(localStorage.getItem(CACHE_KEY) ?? 'null')
     if (cached?.version === 1) {
       const pending: Pending = {}
-      for (const group of groups) if (validWorkbenchGroup(group, cached.pending?.[group])) Object.assign(pending, { [group]: cached.pending[group] })
+      for (const group of groups) {
+        const pendingValue = cached.pending?.[group]
+        if (group === 'research' && pendingValue && typeof pendingValue === 'object') {
+          Object.assign(pending, { research: normalizeRememberedResearchDefaults(pendingValue) })
+        } else if (validWorkbenchGroup(group, pendingValue)) Object.assign(pending, { [group]: pendingValue })
+      }
       return { value: normalizeWorkbenchDefaults(cached.value), pending }
     }
   } catch { /* A missing or damaged cache uses the built-in defaults. */ }

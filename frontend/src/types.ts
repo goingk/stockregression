@@ -29,6 +29,10 @@ export interface BacktestConfig {
   dca: { frequency: 'daily' | 'weekly' | 'monthly'; shares: number; initial_shares: number }
   reference_price_mode: 'auto' | 'manual'
   initial_cash?: number
+  /** Cash reserved outside the strategy; fixed when loading a research candidate. */
+  reserve_cash?: number | null
+  /** Parameter selection cutoff associated with a loaded research candidate. */
+  selection_asof?: string | null
   grid_mode: 'trailing' | 'arithmetic' | 'geometric'
   buy_step: number
   sell_step: number
@@ -53,6 +57,45 @@ export interface WatchItem extends Instrument {
   coverage?: Record<string, unknown>
 }
 
+export interface DataSourceSpan {
+  source?: string | null
+  source_kind?: string | null
+  start?: string | null
+  end?: string | null
+  days?: number | null
+  verified?: boolean | null
+}
+
+export interface DataSourceEvent {
+  kind?: string | null
+  source?: string | null
+  message?: string | null
+  status?: 'historical' | 'resolved' | string | null
+  at?: string | null
+}
+
+export interface DataDiagnostics {
+  schema_version?: number
+  status?: 'complete' | 'partial' | 'unavailable' | string
+  requested_frequency?: string | null
+  minute_quality_applicable?: boolean | null
+  checked_start?: string | null
+  checked_end?: string | null
+  daily_days?: number
+  minute_days?: number
+  total_days?: number
+  pending_calibration_days?: number
+  minute_ratio?: number | null
+  minute_through?: string | null
+  daily_through?: string | null
+  auction_placeholders?: number
+  missing_raw_minutes?: number
+  repaired_days?: number
+  raw_complete?: boolean | null
+  source_spans?: DataSourceSpan[]
+  current_warnings?: string[]
+}
+
 export interface Job {
   id: string
   kind: string
@@ -62,6 +105,8 @@ export interface Job {
   error?: unknown
   result_id?: string
   created_at?: string
+  updated_at?: string
+  cancel_requested?: boolean
   payload?: Record<string, unknown>
 }
 
@@ -117,6 +162,8 @@ export interface BacktestResult {
   is_demo?: boolean
   config: BacktestConfig
   data_version?: string
+  diagnostics?: DataDiagnostics
+  source_events?: DataSourceEvent[]
   equity_frequency?: string
   quality?: Record<string, unknown>
   warnings?: string[]
@@ -140,7 +187,9 @@ export interface Coverage {
   minute_ratio?: number
   synthetic_bars?: number
   is_demo?: boolean
-  days?: Array<{ date: string; mode?: string; missing_minutes?: number; reason?: string | null }>
+  diagnostics?: DataDiagnostics
+  source_events?: DataSourceEvent[]
+  days?: Array<{ date: string; mode?: string; missing_minutes?: number; missing_data_minutes?: number; auction_placeholders?: number; reason?: string | null }>
   warnings?: string[]
   profiles?: unknown[] | Record<string, unknown>
   bytes?: number

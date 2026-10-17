@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 import type { EChartsCoreOption, EChartsType } from 'echarts/core'
 import echarts from './chartSetup'
 
-export default function ChartView({ option, height }: { option: EChartsCoreOption; height: number }) {
+export default function ChartView({ option, height, stretch = false }: { option: EChartsCoreOption; height: number; stretch?: boolean }) {
   const element = useRef<HTMLDivElement>(null)
   const instance = useRef<EChartsType | null>(null)
   useEffect(() => {
@@ -27,5 +27,5 @@ export default function ChartView({ option, height }: { option: EChartsCoreOptio
     anchor.remove()
     setTimeout(() => URL.revokeObjectURL(url), 60_000)
   }
-  return <div style={{ position: 'relative' }}><div ref={element} style={{ width: '100%', height }} role='img' aria-label='数据图表' /><button type='button' className='chart-download' aria-label='下载图表 PNG' onClick={() => void exportChart()}>导出 PNG</button></div>
+  return <div className={`chart-view ${stretch ? 'chart-stretch' : ''}`} style={{ position: 'relative', minHeight: height }}><div ref={element} style={{ width: '100%', height: stretch ? '100%' : height, minHeight: height }} role='img' aria-label='数据图表' /><button type='button' className='chart-download' aria-label='下载图表 PNG' onClick={() => void exportChart()}>导出 PNG</button></div>
 }

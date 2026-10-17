@@ -103,3 +103,111 @@ def test_import_without_explicit_label_is_not_silently_verified(tmp_path):
     assert not result["profiles"]["import"]["verified"]
     explicit = service.import_files({"symbol": "600000.SH", "daily_path": str(daily_path), "minute_path": str(minute_path), "calendar_path": str(calendar_path), "label_convention": "end"})
     assert explicit["profiles"]["import"]["verified"]
+
+
+@pytest.mark.parametrize("existing", ["none", "partial", "complete", "demo"])
+def test_minute_only_import_syncs_missing_daily(tmp_path, monkeypatch, existing):
+    from stockregression.providers import normalize_actions
+    from stockregression.rules import instrument_terms
+
+    days = pd.bdate_range("2026-01-05", periods=3)
+    minute_path = tmp_path / "159611.SZ.parquet"
+    index_clock_minute(days).to_parquet(minute_path)
+    daily = daily_fixture(days)
+    calendar = pd.DataFrame({"date": days})
+    actions = normalize_actions(pd.DataFrame())
+    store = Store(tmp_path / "data")
+    if existing != "none":
+        prior = daily.iloc[:1] if existing == "partial" else daily
+        store.publish("159611.SZ", pd.DataFrame(), prior, actions, calendar,
+                      instrument_terms("159611.SZ", {"is_demo": existing == "demo", "actions_verified": True}), {})
+    calls = []
+
+    def fetch(symbol, start, end, cancelled):
+        calls.append((symbol, start, end))
+        return daily, actions, calendar, {"actions_verified": False, "actions_unverified_years": [2026], "warnings": ["分红资料待核验"]}
+
+    monkeypatch.setattr("stockregression.data.fetch_auxiliary", fetch)
+    monkeypatch.setattr("baostock.login", lambda: pytest.fail("已有或刚获取的交易日历应直接复用"))
+    payload = {"symbol": "159611.SZ", "minute_path": str(minute_path), "label_convention": "end"}
+    result = DataService(store).import_files(payload)
+    assert len(calls) == (0 if existing == "complete" else 1)
+    if calls:
+        assert calls[0] == ("159611.SZ", days[1] if existing == "partial" else days.min(), days.max())
+    snapshot = store.snapshot("159611.SZ", result["version"])
+    assert len(store.read_files(snapshot["files"]["daily"])) == 3
+    assert len(store.read_files(snapshot["files"]["minute"])) == 720
+    assert not snapshot["metadata"]["is_demo"]
+    if calls:
+        assert snapshot["metadata"]["actions_verified"] is False
+        assert "分红资料待核验" in snapshot["metadata"]["warnings"]
+
+
+@pytest.mark.parametrize("failure", ["network", "empty", "incomplete", "cancelled"])
+def test_minute_only_import_does_not_publish_when_daily_sync_fails(tmp_path, monkeypatch, failure):
+    from stockregression.providers import normalize_actions
+
+    days = pd.bdate_range("2026-01-05", periods=3)
+    minute_path = tmp_path / "minute.parquet"
+    index_clock_minute(days).to_parquet(minute_path)
+    store = Store(tmp_path / "data")
+
+    def fetch(*args):
+        if failure == "network":
+            raise RuntimeError("connection refused")
+        if failure == "cancelled":
+            raise InterruptedError("任务已取消")
+        daily = daily_fixture(days[:1]) if failure == "incomplete" else pd.DataFrame()
+        return daily, normalize_actions(pd.DataFrame()), pd.DataFrame({"date": days}), {}
+
+    monkeypatch.setattr("stockregression.data.fetch_auxiliary", fetch)
+    expected = InterruptedError if failure == "cancelled" else DataQualityError
+    with pytest.raises(expected, match="任务已取消" if failure == "cancelled" else "自动同步日线失败"):
+        DataService(store).import_files({"symbol": "159611.SZ", "minute_path": str(minute_path)})
+    assert store.snapshot("159611.SZ") is None
+
+
+@pytest.mark.parametrize("kind", ["minute", "daily"])
+def test_import_rejects_mismatched_file_symbol_before_network(tmp_path, monkeypatch, kind):
+    days = pd.bdate_range("2026-01-05", periods=3)
+    frame = index_clock_minute(days) if kind == "minute" else daily_fixture(days).assign(ts_code="159611.SZ")
+    path = tmp_path / "input.parquet"
+    frame.to_parquet(path)
+    store = Store(tmp_path / "data")
+    monkeypatch.setattr("stockregression.data.fetch_auxiliary", lambda *args: pytest.fail("代码不一致时不得联网"))
+    with pytest.raises(DataQualityError, match="195611.SZ.*159611.SZ.*不一致"):
+        DataService(store).import_files({"symbol": "195611.SZ", kind + "_path": str(path)})
+    assert store.snapshot("195611.SZ") is None
+
+
+def test_opening_auction_is_allocated_once_to_first_end_labelled_bar():
+    from stockregression.quality import align_minutes
+    day = pd.Timestamp("2026-01-05")
+    raw = canonical_frame(index_clock_minute(pd.DatetimeIndex([day])))
+    auction = raw.iloc[[0]].copy()
+    auction["timestamp"] = day + pd.Timedelta(hours=9, minutes=30)
+    auction["open"], auction["high"], auction["low"] = 9.95, 10.2, 9.8
+    auction["volume"], auction["turnover"] = 500.0, 5000.0
+    aligned = align_minutes(pd.concat([auction, auction, raw], ignore_index=True), "end")
+    assert len(aligned) == 240
+    assert aligned.volume.sum() == 24500
+    first = aligned.iloc[0]
+    assert first.open == 9.95 and first.high == 10.2 and first.low == 9.8
+    assert first.close == 10.0 and first.volume == 600
+    assert first.raw_volume == 600 and first.opening_auction_volume == 500
+
+
+@pytest.mark.parametrize("error,expected", [(1e-14, "minute"), (0.01, "daily")])
+def test_minute_high_low_check_tolerates_only_float_noise(error, expected):
+    from stockregression.quality import prepare_bundle
+    from stockregression.providers import normalize_actions
+    day = pd.Timestamp("2026-01-05")
+    minute = canonical_frame(index_clock_minute(pd.DatetimeIndex([day])))
+    minute["source_verified"] = True
+    minute["high"] = 10.0 - error
+    minute["low"] = 10.0 + error
+    daily = daily_fixture(pd.DatetimeIndex([day])).assign(high=10.0, low=10.0)
+    bundle = prepare_bundle("159611.SZ", minute, daily, normalize_actions(pd.DataFrame()),
+                            pd.DataFrame({"date": [day]}), day, day, "1m", "test",
+                            {"asset_type": "etf", "price_tick": 0.001}, {})
+    assert bundle.quality["days"][0]["mode"] == expected

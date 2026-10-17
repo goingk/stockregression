@@ -117,10 +117,11 @@ def test_ensure_bundle_retries_degraded_snapshot_after_source_failure_backoff(tm
     first = service.ensure_bundle(config)
     assert first.version == manifest["version"]
     assert first.quality["daily_days"] == len(first.quality["days"])
-    assert any("mock network timeout" in warning for warning in first.warnings)
+    assert not any("mock network timeout" in warning for warning in first.warnings)
+    assert any("mock network timeout" in event["message"] for event in first.metadata["source_events"])
     cached = DataService(store).ensure_bundle(config)
     assert calls == ["repair"]
-    assert any("60 秒后可重试" in warning for warning in cached.warnings)
+    assert any("mock network timeout" in event["message"] for event in cached.metadata["source_events"])
 
     original_time = data_module.time.time
     monkeypatch.setattr(data_module.time, "time", lambda: original_time() + 61)
@@ -371,6 +372,164 @@ def test_load_bundle_rejects_calendar_trading_day_without_daily(tmp_path):
         DataService(store).load_bundle(config, version=manifest["version"])
 
 
+def test_load_bundle_does_not_warn_for_weekend_after_latest_closed_session(tmp_path, monkeypatch):
+    store = Store(tmp_path / "weekend-request")
+    config, manifest = _daily_only_snapshot(store)
+    old = store.snapshot(config.symbol, manifest["version"])
+    manifest = store.publish(
+        config.symbol,
+        store.read_files(old["files"]["minute"]),
+        store.read_files(old["files"]["daily"]),
+        store.read_files(old["files"]["actions"]),
+        store.read_files(old["files"]["calendar"]),
+        {
+            **old["metadata"],
+            "requested_end_date": "2024-01-06",
+            "warnings": ["请求截至 2024-01-06，实际本地已收盘数据截至 2024-01-05"],
+        },
+        old["profiles"],
+    )
+    config = config.model_copy(update={
+        "schema_version": 2,
+        "frequency": "1d",
+        "start_date": date(2024, 1, 3),
+        "end_date": date(2024, 1, 6),  # Saturday; the fixture ends Friday.
+    })
+    monkeypatch.setattr("stockregression.data.latest_closed_date", lambda: pd.Timestamp("2024-01-05"))
+
+    bundle = DataService(store).load_bundle(config, version=manifest["version"])
+
+    assert bundle.bars.timestamp.dt.normalize().max() == pd.Timestamp("2024-01-05")
+    assert not any("请求截至 2024-01-06" in warning for warning in bundle.warnings)
+
+
+@pytest.mark.parametrize("frequency", ["1m", "5m"])
+@pytest.mark.parametrize("verified", [True, False])
+def test_market_bars_excludes_only_verified_sz_closing_auction_slots(tmp_path, frequency, verified):
+    minute, daily, _, calendar = _market(days=1)
+    minute["source_verified"] = verified
+    closing_slots = minute_slots(calendar[0])[[237, 238]]
+    minute = minute[~minute.timestamp.isin(closing_slots)].copy()
+    symbol = "000001.SZ"
+    store = Store(tmp_path / frequency)
+    manifest = store.publish(
+        symbol,
+        minute,
+        daily,
+        normalize_actions(pd.DataFrame()),
+        pd.DataFrame({"date": calendar}),
+        instrument_terms(symbol, {"actions_verified": True}),
+        {"hf": {"verified": verified, "source_kind": "provider"}},
+    )
+
+    result = DataService(store).market_bars(symbol, frequency=frequency, limit=300)
+
+    assert result["version"] == manifest["version"]
+    incomplete = any("K 线内缺少分钟" in warning or "此前分钟有缺口" in warning for warning in result["warnings"])
+    assert incomplete is not verified
+    if verified:
+        assert all(bar["missing_minutes"] == 0 for bar in result["bars"])
+
+
+def test_market_bars_keeps_other_verified_minute_gaps_visible(tmp_path):
+    minute, daily, _, calendar = _market(days=1)
+    minute["source_verified"] = True
+    # 14:56 is an ordinary continuous-session bar, not an auction placeholder.
+    minute = minute[~minute.timestamp.isin([minute_slots(calendar[0])[235], minute_slots(calendar[0])[237], minute_slots(calendar[0])[238]])].copy()
+    symbol = "000001.SZ"
+    store = Store(tmp_path / "real-gap")
+    store.publish(
+        symbol, minute, daily, normalize_actions(pd.DataFrame()), pd.DataFrame({"date": calendar}),
+        instrument_terms(symbol, {"actions_verified": True}),
+        {"hf": {"verified": True, "source_kind": "provider"}},
+    )
+
+    result = DataService(store).market_bars(symbol, frequency="5m", limit=300)
+
+    assert any("K 线内缺少分钟" in warning for warning in result["warnings"])
+    assert max(bar["missing_minutes"] for bar in result["bars"]) == 1
+
+
+def test_market_bars_rebuilds_legacy_status_without_coverage_page(tmp_path):
+    from stockregression.quality import QUALITY_RULES_VERSION
+
+    minute, daily, _, calendar = _market(days=1)
+    minute["volume"] *= 100
+    minute["turnover"] *= 100
+    minute["source_verified"] = True
+    symbol = "600000.SH"
+    store = Store(tmp_path / "first-chart")
+    manifest = store.publish(
+        symbol,
+        minute,
+        daily,
+        normalize_actions(pd.DataFrame()),
+        pd.DataFrame({"date": calendar}),
+        instrument_terms(symbol, {"actions_verified": True, "quality_summary": {"minute_days": 0, "daily_days": 1}}),
+        {"hf": {"verified": True, "source_kind": "provider"}},
+    )
+    # A legacy cache with a valid-looking diagnostics shape must not be reused.
+    store.state("coverage:" + manifest["version"], {
+        "diagnostics": {"schema_version": 1, "status": "unavailable"},
+        "source_events": [],
+        "quality_rules_version": 1,
+        "sentinel": "stale",
+    })
+
+    result = DataService(store).market_bars(symbol, frequency="1m", limit=300)
+    projection = store.state(f"coverage:{manifest['version']}:q{QUALITY_RULES_VERSION}")
+
+    assert result["diagnostics"]["status"] == "complete"
+    assert result["diagnostics"]["minute_days"] == 1
+    assert result["diagnostics"]["quality_rules_version"] == QUALITY_RULES_VERSION
+    assert projection["diagnostics"]["status"] == "complete"
+    assert projection["diagnostics"]["minute_through"].startswith(str(calendar[-1].date()))
+    assert projection["diagnostics"]["daily_through"] == str(calendar[-1].date())
+    assert projection.get("sentinel") is None
+
+
+def test_load_bundle_projects_fresh_watermarks_before_diagnostics(tmp_path, monkeypatch):
+    import stockregression.data as module
+
+    raw, daily, _, calendar = _market(days=4)
+    raw["volume"] *= 100
+    raw["turnover"] *= 100
+    raw["source_verified"] = True
+    symbol = "600000.SH"
+    metadata = instrument_terms(symbol, {
+        "actions_verified": True,
+        "daily_through": "2000-01-01",
+        "minute_through": "2000-01-01",
+        "diagnostics": {"quality_rules_version": 1, "status": "unavailable"},
+    })
+    store = Store(tmp_path / "watermarks")
+    manifest = store.publish(
+        symbol, raw, daily, normalize_actions(pd.DataFrame()), pd.DataFrame({"date": calendar}), metadata,
+        {"hf": {"verified": True, "source_kind": "provider"}},
+    )
+    config = BacktestConfig(
+        schema_version=2,
+        symbol=symbol,
+        start_date=calendar[1].date(),
+        end_date=calendar[-1].date(),
+        frequency="1m",
+    )
+    monkeypatch.setattr(module, "latest_closed_date", lambda: calendar[-1])
+    observed = {}
+    original = module.project_data_diagnostics
+
+    def inspect(metadata, *args, **kwargs):
+        observed["daily_through"] = metadata.get("daily_through")
+        observed["minute_through"] = metadata.get("minute_through")
+        return original(metadata, *args, **kwargs)
+
+    monkeypatch.setattr(module, "project_data_diagnostics", inspect)
+    DataService(store).load_bundle(config, version=manifest["version"])
+
+    assert observed["daily_through"] == str(daily.date.max().date())
+    assert observed["minute_through"].startswith(str(calendar[-1].date()))
+
+
 @pytest.mark.parametrize("convention", ["start", "end"])
 def test_independent_minute_reference_calibrates_labels_and_volume_100(convention):
     raw, daily, reference, _ = _market(convention=convention)
@@ -469,3 +628,32 @@ def test_settings_environment_override_and_nested_schedule_save(tmp_path, monkey
     assert saved.schedule.daily_time == "18:30"
     assert reloaded.schedule.enabled is True
     assert settings_path.is_file()
+
+
+def test_auto_import_reuses_cached_independent_reference_without_sync(tmp_path, monkeypatch):
+    raw, daily, reference, calendar = _volatile_market()
+    store = Store(tmp_path / "store")
+    store.publish("600000.SH", pd.DataFrame(), daily, normalize_actions(pd.DataFrame()),
+                  pd.DataFrame({"date": calendar}), instrument_terms("600000.SH", {"actions_verified": True}), {})
+    cached = _aggregate_five_minute_reference(reference, calendar)
+    reference_path = store.root / "reference.parquet"
+    cached.to_parquet(reference_path)
+    store.state("import-reference:600000.SH", {"path": "reference.parquet", "frequency": "5m", "source": "independent fixture"})
+    minute_path = tmp_path / "minute.parquet"
+    raw.to_parquet(minute_path)
+    monkeypatch.setattr("stockregression.data.fetch_auxiliary", lambda *args: pytest.fail("complete local data must not sync"))
+    monkeypatch.setattr("baostock.login", lambda: pytest.fail("cached calendar must not sync"))
+    result = DataService(store).import_files({"symbol": "600000.SH", "minute_path": str(minute_path)})
+    profile = result["profiles"]["import"]
+    assert profile["verified"] and profile["convention"] == "end"
+    assert profile["reference_frequency"] == "5m"
+    assert profile["reference_source"] == "independent fixture"
+    active = store.snapshot("600000.SH")
+    assert result["diagnostics"]["status"] == "complete"
+    assert active["metadata"]["minute_status"] == "available"
+    assert active["metadata"]["minute_through"].startswith(str(calendar[-1].date()))
+    assert active["metadata"]["quality_summary"]["minute_days"] == len(calendar)
+    assert active["metadata"]["quality_summary"]["daily_days"] == 0
+    assert len(active["metadata"]["diagnostics"]["source_spans"]) == 1
+    assert active["metadata"]["diagnostics"]["source_spans"][0]["source"] == "hf"
+    assert active["metadata"]["diagnostics"]["source_spans"][0]["verified"] is True
