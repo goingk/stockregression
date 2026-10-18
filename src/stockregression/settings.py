@@ -130,22 +130,28 @@ class WorkbenchDefaults(_WorkbenchPreference):
 
 class Settings(BaseModel):
     data_dir: str = str(PROJECT_ROOT / "data")
+    package_dir: str | None = None
     schedule: ScheduleSettings = Field(default_factory=ScheduleSettings)
     fee_defaults: FeeDefaults = Field(default_factory=FeeDefaults)
     workbench_defaults: WorkbenchDefaults = Field(default_factory=WorkbenchDefaults)
     host: str = "127.0.0.1"
     port: int = 8000
     max_workers: int = Field(default=2, ge=1, le=8)
-    hf_revision: str = "ba589a11534825044fe5a6b84838f50ba8d8d188"
-    etf_hf_revision: str = "4b7e48c1e8265cc7d25baee55879dd5bbb24f74d"
+    market_cache_mb: int = Field(default=256, ge=0, le=16384)
+    recent_minute_source: Literal["sina", "tdx"] = "sina"
+    etf_daily_source: Literal["baostock", "eastmoney"] = "baostock"
 
 
 def load_settings() -> Settings:
     values = json.loads(SETTINGS_FILE.read_text(encoding="utf-8")) if SETTINGS_FILE.exists() else {}
     if os.environ.get("STOCKREGRESSION_DATA_DIR"):
         values["data_dir"] = os.environ["STOCKREGRESSION_DATA_DIR"]
+    if os.environ.get("STOCKREGRESSION_PACKAGE_DIR"):
+        values["package_dir"] = os.environ["STOCKREGRESSION_PACKAGE_DIR"]
     settings = Settings.model_validate(values)
     settings.data_dir = str(Path(settings.data_dir).expanduser().resolve())
+    if settings.package_dir:
+        settings.package_dir = str(Path(settings.package_dir).expanduser().resolve())
     return settings
 
 
@@ -176,6 +182,8 @@ def save_settings(values: dict) -> Settings:
             values["workbench_defaults"] = merged_defaults
         settings = Settings.model_validate({**previous, **values})
         settings.data_dir = str(Path(settings.data_dir).expanduser().resolve())
+        if settings.package_dir:
+            settings.package_dir = str(Path(settings.package_dir).expanduser().resolve())
         temporary = SETTINGS_FILE.with_suffix(".writing")
         temporary.write_text(settings.model_dump_json(indent=2), encoding="utf-8")
         temporary.replace(SETTINGS_FILE)

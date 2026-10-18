@@ -13,6 +13,7 @@ from stockregression.api import create_app
 from stockregression.data import DataService
 from stockregression.jobs import execute_job
 from stockregression.models import BacktestConfig
+from stockregression.quality import DataQualityError
 from stockregression.providers import normalize_actions
 from stockregression.rules import instrument_terms
 from stockregression.settings import load_settings
@@ -67,7 +68,7 @@ def market(symbol="600000.SH", days=5):
         "name": "固定测试夹具",
         "listing_date": str(calendar[0].date()),
         "actions_verified": True,
-        "hf_revision": load_settings().hf_revision,
+        "source_policy_version": "market-sources-v1",
     })
     profile = {"tdx": {"source": "tdx", "verified": True, "convention": "end", "volume_multiplier": 1}}
     return calendar, daily, minute, actions, calendar_frame, metadata, profile
@@ -92,18 +93,17 @@ def install_mock_providers(monkeypatch, end_date, source):
 
     calendar, daily, minute, actions, calendar_frame, metadata, _ = source
     monkeypatch.setattr(module, "latest_closed_date", lambda: pd.Timestamp(end_date))
-    monkeypatch.setattr(module, "fetch_hf", lambda *args, **kwargs: pd.DataFrame())
-    monkeypatch.setattr(module, "fetch_auxiliary", lambda *args, **kwargs: (
+    monkeypatch.setattr(module, "fetch_auxiliary_routed", lambda *args, **kwargs: (
         daily.copy(), actions.copy(), calendar_frame.copy(), metadata.copy()
     ))
-    monkeypatch.setattr(module, "fetch_tdx", lambda *args, **kwargs: minute.copy())
-    monkeypatch.setattr(module, "fetch_sina", lambda *args, **kwargs: pytest.fail("successful TDX fixture should not request Sina"))
+    monkeypatch.setattr(module, "fetch_tdx", lambda *args, **kwargs: pytest.fail("default source should not request TDX"))
+    monkeypatch.setattr(module, "fetch_sina", lambda *args, **kwargs: minute.copy())
     monkeypatch.setattr(module, "infer_profile", lambda frame, *_args, **_kwargs: {
-        "source": "tdx", "verified": True, "convention": "end", "volume_multiplier": 1,
+        "source": "sina", "verified": True, "convention": "end", "volume_multiplier": 1,
     })
 
 
-def test_empty_store_prepares_data_for_backtest_worker_and_preview(tmp_path, monkeypatch):
+def test_empty_store_backtest_reports_local_gap_without_network(tmp_path, monkeypatch):
     source = market(days=5)
     calendar, *_ = source
     install_mock_providers(monkeypatch, calendar[-1], source)
@@ -122,11 +122,10 @@ def test_empty_store_prepares_data_for_backtest_worker_and_preview(tmp_path, mon
     job_id = worker_store.new_job("backtest", {"config": config.model_dump(mode="json"), "version": None})
     execute_job(str(worker_root), job_id)
     worker_job = worker_store.job(job_id)
-    active = worker_store.snapshot(config.symbol)
-    assert worker_job["status"] == "completed", worker_job["error"]
-    assert worker_job["payload"]["version"] == active["version"]
-    assert worker_store.result(worker_job["result_id"])["data_version"] == active["version"]
-    assert sync_calls == ["history"]
+    assert worker_job["status"] == "failed"
+    assert "数据管理" in worker_job["error"]
+    assert worker_store.snapshot(config.symbol) is None
+    assert sync_calls == []
 
     preview_root = tmp_path / "preview"
     with TestClient(create_app(str(preview_root), start_jobs=False)) as client:
@@ -135,32 +134,9 @@ def test_empty_store_prepares_data_for_backtest_worker_and_preview(tmp_path, mon
             "revision": 1,
             "config": config.model_dump(mode="json"),
         })
-        assert response.status_code == 200
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            state = client.get("/api/v1/backtests/preview/empty-store-preview").json()
-            if state["status"] in {"completed", "failed"}:
-                break
-            time.sleep(.02)
-        assert state["status"] == "completed", state
-        assert state["version"] == Store(preview_root).snapshot(config.symbol)["version"]
-        assert sync_calls == ["history", "history"]
-        changed = config.model_dump(mode="json")
-        changed["buy_shares"] = 200
-        again = client.post("/api/v1/backtests/preview", json={
-            "session_id": "empty-store-preview",
-            "revision": 2,
-            "config": changed,
-        })
-        assert again.status_code == 200
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            state = client.get("/api/v1/backtests/preview/empty-store-preview").json()
-            if state["revision"] == 2 and state["status"] in {"completed", "failed"}:
-                break
-            time.sleep(.02)
-        assert state["revision"] == 2 and state["status"] == "completed", state
-        assert sync_calls == ["history", "history"]
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "DATA_NOT_READY"
+        assert sync_calls == []
         assert client.get("/api/v1/jobs").json() == []
         assert client.get("/api/v1/results").json() == []
 
@@ -201,10 +177,10 @@ def test_tail_daily_gap_selects_daily_increment(tmp_path, monkeypatch):
     import stockregression.data as module
     monkeypatch.setattr(module, "latest_closed_date", lambda: calendar[-1])
 
-    bundle = DataService(store).ensure_bundle(config)
-    assert calls == ["daily"]
-    assert bundle.daily.date.max().normalize() == calendar[-1]
-    assert store.snapshot(config.symbol)["version"] != old_manifest["version"]
+    with pytest.raises(DataQualityError, match="数据管理"):
+        DataService(store).ensure_bundle(config)
+    assert calls == []
+    assert store.snapshot(config.symbol)["version"] == old_manifest["version"]
 
 
 def test_known_minute_quality_gap_is_attempted_once_then_reused(tmp_path, monkeypatch):
@@ -220,12 +196,10 @@ def test_known_minute_quality_gap_is_attempted_once_then_reused(tmp_path, monkey
         return {"status": "completed", "symbols": [{"symbol": symbols[0], "version": manifest["version"]}], "failures": []}
 
     monkeypatch.setattr(DataService, "sync", known_gap)
-    first = DataService(store).ensure_bundle(config)
-    second = DataService(store).ensure_bundle(config)
-    assert first.version == second.version == manifest["version"]
-    assert first.quality["daily_days"] == len(calendar)
-    assert any("分钟数据源补数后仍存在缺口" in warning for warning in second.warnings)
-    assert calls == ["repair"]
+    with pytest.raises(DataQualityError, match="数据管理"):
+        DataService(store).ensure_bundle(config)
+    assert calls == []
+    assert store.snapshot(config.symbol)["version"] == manifest["version"]
 
 
 def test_invalid_sync_candidate_does_not_replace_active_snapshot(tmp_path, monkeypatch):
@@ -238,7 +212,7 @@ def test_invalid_sync_candidate_does_not_replace_active_snapshot(tmp_path, monke
     invalid_daily = daily.iloc[[-1]].copy()
     invalid_daily.loc[invalid_daily.index[0], "close"] = 0.0
     monkeypatch.setattr(module, "latest_closed_date", lambda: calendar[-1])
-    monkeypatch.setattr(module, "fetch_auxiliary", lambda *args, **kwargs: (
+    monkeypatch.setattr(module, "fetch_auxiliary_routed", lambda *args, **kwargs: (
         invalid_daily.copy(), actions.copy(), calendar_frame.iloc[[-1]].copy(), metadata.copy()
     ))
     monkeypatch.setattr(module, "fetch_tdx", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("mock TDX unavailable")))
@@ -280,18 +254,12 @@ def test_concurrent_ensure_from_independent_services_downloads_once(tmp_path, mo
     root = tmp_path / "shared"
     config = config_for(calendar)
     services = [DataService(Store(root)), DataService(Store(root))]
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            first = pool.submit(services[0].ensure_bundle, config)
-            assert started.wait(3)
-            second = pool.submit(services[1].ensure_bundle, config)
-            time.sleep(.1)
-            release.set()
-            bundles = [first.result(timeout=10), second.result(timeout=10)]
-    finally:
-        release.set()
-    assert sync_calls == ["history"]
-    assert bundles[0].version == bundles[1].version == Store(root).snapshot(config.symbol)["version"]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(services[0].ensure_bundle, config), pool.submit(services[1].ensure_bundle, config)]
+        for future in futures:
+            with pytest.raises(DataQualityError):
+                future.result(timeout=10)
+    assert sync_calls == [] and not started.is_set()
 
 
 @pytest.mark.parametrize("real_gap", [False, True])
@@ -316,17 +284,15 @@ def test_unverified_local_minutes_only_sync_for_actual_missing_bars(tmp_path, mo
 
     monkeypatch.setattr(DataService, "sync", sync)
     service = DataService(store)
-    bundle = service.ensure_bundle(config)
-    assert calls == (["repair"] if real_gap else [])
-    assert bundle.quality["daily_days"] == 4
-    assert bundle.quality["pending_calibration_days"] == (3 if real_gap else 4)
-    assert any("已有本地分钟数据" in warning for warning in bundle.warnings)
-    gaps = service._bundle_gaps(config, manifest, bundle, True)
-    assert bool(gaps) == real_gap
-    if not real_gap:
-        assert service.current_version_if_ready(config) == manifest["version"]
-        service.ensure_bundle(config, version=manifest["version"])
-        assert calls == []
+    if real_gap:
+        with pytest.raises(DataQualityError, match="数据管理"):
+            service.ensure_bundle(config)
+    else:
+        bundle = service.ensure_bundle(config)
+        assert bundle.quality["daily_days"] == 4
+        assert bundle.quality["pending_calibration_days"] == 4
+        assert any("已有本地分钟数据" in warning for warning in bundle.warnings)
+    assert calls == []
 
 
 def test_complete_imported_snapshot_ignores_stale_provider_failure_and_status(tmp_path, monkeypatch):
@@ -389,13 +355,15 @@ def test_sync_refreshes_quality_and_keeps_import_source_spans(tmp_path, monkeypa
     store = Store(tmp_path)
     publish(store, "600000.SH", daily.iloc[:-1], imported, actions, calendar_frame.iloc[:-1], old_metadata,
             {"import": {"source": "import", "verified": True}})
-    monkeypatch.setattr(module, "fetch_auxiliary", lambda *args, **kwargs: (
+    monkeypatch.setattr(module, "fetch_auxiliary_routed", lambda *args, **kwargs: (
         daily.copy(), actions.copy(), calendar_frame.copy(), metadata.copy()
     ))
-    monkeypatch.setattr(module, "fetch_tdx", lambda *args, **kwargs: minute[minute.timestamp.dt.normalize() == calendar[-1]].copy())
-    monkeypatch.setattr(module, "fetch_sina", lambda *args, **kwargs: pytest.fail("TDX fixture is available"))
+    monkeypatch.setattr(module, "fetch_tdx", lambda *args, **kwargs: pytest.fail("default source should not request TDX"))
+    tail = minute[minute.timestamp.dt.normalize() == calendar[-1]].copy()
+    tail["source"] = "sina"
+    monkeypatch.setattr(module, "fetch_sina", lambda *args, **kwargs: tail)
     monkeypatch.setattr(module, "infer_profile", lambda *_args, **_kwargs: {
-        "source": "tdx", "verified": True, "convention": "end", "volume_multiplier": 1,
+        "source": "sina", "verified": True, "convention": "end", "volume_multiplier": 1,
     })
     service = DataService(store)
 
@@ -408,7 +376,7 @@ def test_sync_refreshes_quality_and_keeps_import_source_spans(tmp_path, monkeypa
     assert active["metadata"]["quality_summary"]["daily_days"] == 0
     assert active["metadata"]["minute_status"] == "available"
     assert active["metadata"]["minute_through"].startswith(str(calendar[-1].date()))
-    assert {span["source"] for span in spans} == {"import", "tdx"}
+    assert {span["source"] for span in spans} == {"import", "sina"}
     assert any(span["source_kind"] == "import" for span in spans)
     assert any("obsolete source failure" in event["message"] for event in active["metadata"]["source_events"])
     assert not any("obsolete source failure" in warning for warning in active["metadata"]["warnings"])

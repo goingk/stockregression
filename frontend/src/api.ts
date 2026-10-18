@@ -28,15 +28,20 @@ function formatDetail(detail: unknown): string {
   if (detail && typeof detail === 'object') {
     const item = detail as Record<string, unknown>
     if ('message' in item || 'error' in item) return String(item.message ?? item.error)
+    if (item.code === 'DATA_NOT_READY' && Array.isArray(item.gaps)) {
+      const messages = item.gaps.map(gap => gap && typeof gap === 'object' ? String((gap as Record<string, unknown>).message ?? '') : String(gap)).filter(Boolean)
+      if (messages.length) return '本地数据尚未就绪：' + messages.join('；')
+    }
     return JSON.stringify(detail)
   }
   return ''
 }
 
 export async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const isFormData = typeof FormData !== 'undefined' && init?.body instanceof FormData
   const response = await fetch(`${API_ROOT}${path}`, {
     ...init,
-    headers: { ...(init?.body ? { 'Content-Type': 'application/json' } : {}), ...init?.headers },
+    headers: { ...(init?.body && !isFormData ? { 'Content-Type': 'application/json' } : {}), ...init?.headers },
   })
   const contentType = response.headers.get('content-type') ?? ''
   const payload: unknown = contentType.includes('application/json') ? await response.json() : await response.text()
@@ -51,6 +56,7 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const get = <T,>(path: string) => request<T>(path)
 export const post = <T,>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) })
+export const postForm = <T,>(path: string, body: FormData) => request<T>(path, { method: 'POST', body })
 export const put = <T,>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) })
 export const del = <T,>(path: string) => request<T>(path, { method: 'DELETE' })
 

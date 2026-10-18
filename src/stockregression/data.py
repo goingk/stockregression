@@ -13,10 +13,10 @@ import numpy as np
 import pandas as pd
 
 from .models import BacktestConfig, normalize_symbol
-from .providers import fetch_auxiliary, fetch_hf, fetch_instruments, fetch_tdx, fetch_sina, fetch_reference_5m, fetch_latest_trading_date, latest_closed_date, normalize_actions
+from .providers import fetch_instruments, fetch_tdx, fetch_sina, fetch_reference_5m, fetch_latest_trading_date, latest_closed_date, normalize_actions
+from .source_health import SOURCE_POLICY_VERSION, SourceRouter, fetch_auxiliary_routed, market_for_symbol
 from .quality import QUALITY_RULES_VERSION, DataQualityError, _closing_auction_placeholders, align_minutes, canonical_frame, infer_profile, minute_slots, prepare_bundle
 from .data_diagnostics import add_source_events, derive_source_spans, project_data_diagnostics
-from .settings import load_settings
 from .storage import Store
 from .rules import instrument_terms
 
@@ -94,8 +94,8 @@ class DataService:
             self.store.sync_item(run_key, symbol, **values)
 
     def refresh_instruments(self, progress=lambda *_: None, cancelled=lambda: False):
-        progress(0.1, "下载固定版本的证券覆盖清单")
-        records = fetch_instruments(load_settings().hf_revision)
+        progress(0.1, "刷新 AKShare 股票与新浪 ETF 证券目录")
+        records = fetch_instruments()
         for record in records:
             if cancelled():
                 raise InterruptedError("任务已取消")
@@ -109,7 +109,7 @@ class DataService:
         if scope == "market":
             if symbols:
                 raise ValueError("全市场范围不能同时指定代码")
-            if not retry_failed or not self.store.instruments(limit=1):
+            if not self.store.instruments(limit=1):
                 self.refresh_instruments(progress, cancelled)
             symbols = [row["symbol"] for row in self.store.instruments(limit=None)]
         elif not symbols:
@@ -124,19 +124,11 @@ class DataService:
                 cutoff = fetch_latest_trading_date(str(cutoff.date()))
             except Exception as exc:
                 calendar_warning = "最新交易日预检暂不可用，各标的仍须获取真实交易日历：" + str(exc)
-        estimate = None
-        estimate_warning = None
-        if scope == "market" and mode == "history":
-            try:
-                from .providers import estimate_history_bytes
-                estimate = estimate_history_bytes(symbols, load_settings())
-            except Exception as exc:
-                estimate_warning = "无法取得精确下载量估算：" + str(exc)
         free = shutil.disk_usage(self.store.root).free
-        preflight = {"target_count": len(symbols), "source_bytes": estimate, "free_bytes": free, "warning": estimate_warning, "closed_through": str(cutoff.date()), "calendar_warning": calendar_warning}
+        preflight = {"target_count": len(symbols), "free_bytes": free, "warning": None, "closed_through": str(cutoff.date()), "calendar_warning": calendar_warning}
         self.store.state("sync:preflight", preflight)
-        progress(0.0, f"目标 {len(symbols)} 个标的 · 历史源约 {estimate / 1024 ** 3:.2f} GiB · 可用 {free / 1024 ** 3:.1f} GiB" if estimate is not None else f"目标 {len(symbols)} 个标的 · 可用空间 {free / 1024 ** 3:.1f} GiB；历史源需数十 GB，另预留缓存及分区空间")
-        run_key = f"{scope}:{mode}:" + (f"{load_settings().hf_revision}:{load_settings().etf_hf_revision}" if mode == "history" else str(cutoff.date()))
+        progress(0.0, f"目标 {len(symbols)} 个标的 · 可用空间 {free / 1024 ** 3:.1f} GiB")
+        run_key = f"{scope}:{mode}:" + (SOURCE_POLICY_VERSION if mode == "history" else str(cutoff.date()))
         results, failures, skipped = [], [], []
         targets = []
         for symbol in symbols:
@@ -164,19 +156,7 @@ class DataService:
                     with report_lock:
                         progress((completed + fraction) / max(1, len(targets)), f"{completed}/{len(targets)} · {symbol}：{message}")
                 with FileLock(str(self.store.root / f"sync-{symbol}.lock"), timeout=60):
-                    for attempt in range(3):
-                        try:
-                            result = self._sync_one(symbol, mode, report, cancelled)
-                            break
-                        except InterruptedError:
-                            raise
-                        except Exception:
-                            if attempt == 2:
-                                raise
-                            for _ in range(5 * (attempt + 1)):
-                                if cancelled():
-                                    raise InterruptedError("任务已取消")
-                                time.sleep(0.2)
+                    result = self._sync_one(symbol, mode, report, cancelled)
                 self.store.sync_item(run_key, symbol, status="completed", daily_status="completed", minute_status=result.get("minute_status", "available" if result.get("minute_through") else "unavailable"), daily_through=result.get("last_date"), minute_through=result.get("minute_through"), error=None)
                 self.store.state(f"sync:{symbol}", {"mode": mode, "result": result, "error": None})
                 return result
@@ -213,6 +193,10 @@ class DataService:
         manifest = self.store.snapshot(config.symbol)
         if not manifest:
             return None
+        if manifest.get("market_data"):
+            from .market_data import MarketDataService
+            readiness = MarketDataService(self.store).readiness(config)
+            return manifest["version"] if readiness.get("ready") else None
         request, context_key = self._preparation_request(config, check_minutes=True)
         cache_key = "ready:" + context_key
         cached = self.store.state(cache_key)
@@ -242,6 +226,16 @@ class DataService:
         never replaced by a newer active snapshot. New requests pass ``None`` when
         their current snapshot needs preparation, then lock the exact resolved version.
         """
+        manifest = self.store.snapshot(config.symbol, version)
+        if manifest and manifest.get("market_data"):
+            from .market_data import MarketDataService
+            market = MarketDataService(self.store)
+            readiness = market.readiness(config, manifest["version"])
+            if not readiness.get("ready"):
+                details = "；".join(item.get("message", "") for item in readiness.get("gaps", []))
+                raise DataQualityError("本地数据尚不能用于回测：" + (details or "存在待核验事项"))
+            progress(0.1, "读取本地行情数据库并锁定版本")
+            return market.load_backtest_bundle(config, manifest["version"])
         if version is not None:
             progress(0.02, "读取已锁定的数据版本")
             if cancelled():
@@ -254,6 +248,25 @@ class DataService:
                 except DataQualityError as exc:
                     raise DataQualityError(f"锁定的数据版本 {version} 不满足本次配置：{exc}") from exc
             return self._add_preparation_warnings(bundle, [])
+
+        # Calculation paths are strictly local. Missing data is reported with
+        # actionable ranges; preparation is an explicit data-manager task.
+        try:
+            local_bundle, local_gaps, local_error = self._probe_bundle(
+                config, (manifest or {}).get("version"), check_minutes
+            )
+        except DataQualityError as exc:
+            local_bundle, local_gaps, local_error = None, [], str(exc)
+        local_gaps = self._ignore_demo_gaps(manifest or {}, local_gaps)
+        if local_bundle is not None and not local_gaps and not local_error:
+            return self._add_preparation_warnings(local_bundle, [])
+        details = [str(item.get("reason") or item.get("kind") or item) if isinstance(item, dict) else str(item) for item in local_gaps]
+        if local_error:
+            details.insert(0, local_error)
+        raise DataQualityError(
+            "所选区间缺少本地行情或质量尚待核验；请先在“数据管理”中准备对应周期："
+            + ("；".join(details[:8]) if details else "没有可用的本地数据版本")
+        )
 
         progress(0.01, "检查本地数据覆盖")
         if cancelled():
@@ -395,10 +408,8 @@ class DataService:
             pd.Timestamp(config.end_date or latest_closed_date()).normalize(),
             pd.Timestamp(latest_closed_date()).normalize(),
         )
-        settings = load_settings()
         source_versions = {
-            "stock_history": settings.hf_revision,
-            "etf_history": settings.etf_hf_revision,
+            "source_policy": SOURCE_POLICY_VERSION,
             "preparation": 3,
             "quality_rules": QUALITY_RULES_VERSION,
         }
@@ -558,15 +569,7 @@ class DataService:
         old_daily = self.store.read_files(old_files.get("daily", []), "date", end - pd.Timedelta(days=45))
         warnings = []
         source_errors = []
-        hf = pd.DataFrame()
         profiles = dict(previous.get("profiles", {})) if previous else {}
-        if mode == "history" or previous is None:
-            progress(0.05, "按股票下载历史分钟 Parquet")
-            try:
-                hf = fetch_hf(symbol, self.store.root, load_settings().hf_revision)
-            except Exception as exc:
-                warnings.append("历史分钟下载失败：" + str(exc))
-                source_errors.append("历史分钟下载失败：" + str(exc))
         known = self.store.instrument(symbol) or {}
         if old_daily.empty and previous:
             # A long-offline database must resume from its own watermark.
@@ -574,7 +577,9 @@ class DataService:
             old_daily = self.store.read_files(paths[-1:] if paths else [])
         start = (old_daily.date.max() - pd.Timedelta(days=30)) if mode != "history" and not old_daily.empty else pd.Timestamp(known.get("listing_date") or "1990-01-01")
         progress(0.25, "获取不复权日线、交易日历和公司行动")
-        daily, actions, calendar, metadata = fetch_auxiliary(symbol, start, end, cancelled)
+        daily, actions, calendar, metadata = fetch_auxiliary_routed(
+            self.store, symbol, start, end, cancelled
+        )
         self._sync_stage(symbol, daily_status="fetched", daily_through=str(daily.date.max().date()))
         incoming_daily = daily
         # A history calibration needs the daily history, an increment needs only
@@ -588,60 +593,47 @@ class DataService:
         metadata = instrument_terms(symbol, {**known, **metadata})
         if not metadata.get("listing_date") and start.year <= 1990:
             metadata["listing_date"] = str(daily.date.min().date())
-        metadata["hf_revision"] = load_settings().etf_hf_revision if metadata["asset_type"] == "etf" else load_settings().hf_revision
+        metadata["source_policy_version"] = SOURCE_POLICY_VERSION
         metadata["is_demo"] = False
         if metadata.get("listing_date"):
             calendar = calendar[calendar.date >= pd.Timestamp(metadata["listing_date"])].reset_index(drop=True)
         if metadata.get("delisting_date"):
             calendar = calendar[calendar.date < pd.Timestamp(metadata["delisting_date"])].reset_index(drop=True)
-        progress(0.55, "采集通达信分钟窗口并核对标签与单位")
+        progress(0.55, "采集近期分钟窗口并核对标签与单位")
         recent = pd.DataFrame()
         raw_cache = []
         earliest = end - pd.Timedelta(days=14) if mode == "daily" and previous else None
         try:
-            recent_raw = fetch_tdx(symbol, earliest, cancelled)
-            profiles["tdx"] = infer_profile(recent_raw, daily, "tdx", price_tick=metadata.get("price_tick", .01))
-            recent = align_minutes(recent_raw, profiles["tdx"]["convention"], profiles["tdx"]["volume_multiplier"])
-            recent["source_verified"] = profiles["tdx"]["verified"]
-            raw_cache.append(("tdx", recent_raw))
-        except InterruptedError:
-            raise
-        except Exception as exc:
-            warnings.append("近期分钟源不可用：" + str(exc))
-            source_errors.append("近期分钟源不可用：" + str(exc))
-            progress(0.62, "通达信不可用，尝试新浪近期分钟备源")
-            try:
-                recent_raw = fetch_sina(symbol)
+            recent_raw, recent_source, route = SourceRouter(self.store).call(
+                "recent_minute", market_for_symbol(symbol),
+                {
+                    "sina": lambda: fetch_sina(symbol),
+                    "tdx": lambda: fetch_tdx(symbol, earliest, cancelled),
+                },
+            )
+            if recent_source == "sina":
                 reference = fetch_reference_5m(symbol, recent_raw.timestamp.max().normalize() - pd.Timedelta(days=21), recent_raw.timestamp.max().normalize())
                 profiles["sina"] = infer_profile(recent_raw, daily, "sina", reference=reference, reference_frequency="5m", price_tick=metadata.get("price_tick", .01))
                 recent = align_minutes(recent_raw, profiles["sina"]["convention"], profiles["sina"]["volume_multiplier"])
                 recent["source_verified"] = profiles["sina"]["verified"]
-                raw_cache.append(("sina", recent_raw))
-            except Exception as backup_error:
-                warnings.append("新浪分钟备源不可用或未校准：" + str(backup_error))
-                source_errors.append("新浪分钟备源不可用或未校准：" + str(backup_error))
-        if not hf.empty:
-            profiles["hf"] = infer_profile(hf, daily, "hf", recent if not recent.empty and profiles.get("tdx", {}).get("verified") else None, price_tick=metadata.get("price_tick", .01))
-            if not profiles["hf"]["verified"]:
-                progress(0.72, "用独立历史5分钟行情核验历史分钟时间标签")
-                try:
-                    reference_end = hf.timestamp.max().normalize() - pd.Timedelta(days=1)
-                    reference = fetch_reference_5m(symbol, reference_end - pd.Timedelta(days=21), reference_end)
-                    # Only the bounded reference window is needed for calibration.
-                    sample = hf[hf.timestamp.between(reference.timestamp.min() - pd.Timedelta(minutes=5), reference.timestamp.max())]
-                    profiles["hf"] = infer_profile(sample, daily, "hf", reference=reference, reference_frequency="5m", price_tick=metadata.get("price_tick", .01))
-                except Exception as exc:
-                    warnings.append("历史分钟独立校验失败：" + str(exc))
-                    source_errors.append("历史分钟独立校验失败：" + str(exc))
-            hf = align_minutes(hf, profiles["hf"]["convention"], profiles["hf"]["volume_multiplier"])
-            hf["source_verified"] = profiles["hf"]["verified"]
-        # Prefer the explicitly calibrated recent provider in its overlap window.
-        minute = merge_frames(hf, recent, "timestamp")
+            else:
+                profiles["tdx"] = infer_profile(recent_raw, daily, "tdx", price_tick=metadata.get("price_tick", .01))
+                recent = align_minutes(recent_raw, profiles["tdx"]["convention"], profiles["tdx"]["volume_multiplier"])
+                recent["source_verified"] = profiles["tdx"]["verified"]
+            raw_cache.append((recent_source, recent_raw))
+            metadata["recent_minute_route"] = route
+            if route.get("fallback"):
+                warnings.append(route.get("reason") or "可选分钟来源不可用，已回退默认来源")
+        except InterruptedError:
+            raise
+        except Exception as exc:
+            warnings.append("近期分钟来源不可用：" + str(exc))
+            source_errors.append("近期分钟来源不可用：" + str(exc))
+        minute = recent
         if not minute.empty:
             minute = minute[minute.timestamp < end + pd.Timedelta(days=1)].copy()
         source_warnings = [*warnings, *(metadata.get("warnings") or [])]
-        if metadata.get("asset_type") == "etf":
-            source_warnings.append("ETF 历史分钟库仅覆盖部分标的；新浪 1 分钟备源仅覆盖近期约 8 个交易日，其他缺口需导入补齐")
+        source_warnings.append("新浪 1 分钟只覆盖近期窗口；更早历史分钟须从本地数据包登记或导入")
         if cancelled():
             raise InterruptedError("任务已取消")
         progress(0.80, "检查日线、日历、公司行动和分钟质量")
@@ -732,6 +724,9 @@ class DataService:
         manifest = self.store.snapshot(config.symbol, version)
         if not manifest:
             raise DataQualityError("该股票尚无本地数据，请先下载、导入或生成演示数据")
+        if manifest.get("market_data"):
+            from .market_data import MarketDataService
+            return MarketDataService(self.store).load_backtest_bundle(config, version or manifest["version"])
         files, metadata = manifest["files"], manifest["metadata"]
         daily_all = self.store.read_files(files["daily"])
         if daily_all.empty:
@@ -812,7 +807,15 @@ class DataService:
         manifest = self.store.snapshot(normalize_symbol(symbol), version)
         if not manifest:
             raise DataQualityError("尚无本地数据，请先同步该标的")
-        daily = self.store.read_files(manifest["files"]["daily"], "date", end=pd.Timestamp(start_date) - pd.Timedelta(days=1))
+        if manifest.get("market_data"):
+            from .market_data.repository import MarketDataRepository
+            daily_version = int((manifest.get("market_versions", {}).get("1day") or {}).get("version"))
+            daily = MarketDataRepository(self.store.root).bars(
+                symbol, "1day",
+                end=pd.Timestamp(start_date) - pd.Timedelta(days=1), version=daily_version,
+            ).rename(columns={"timestamp": "date"})
+        else:
+            daily = self.store.read_files(manifest["files"]["daily"], "date", end=pd.Timestamp(start_date) - pd.Timedelta(days=1))
         available = daily[(daily.tradestatus == 1) & (daily.volume > 0) & (daily.close > 0)].sort_values("date") if not daily.empty else daily
         if available.empty:
             raise DataQualityError("开始日期前缺少有效交易日收盘价，请补齐历史或调整开始日期")
@@ -931,6 +934,9 @@ class DataService:
         if not manifest:
             projection = project_data_diagnostics({}, {}, None, None)
             return {"symbol": symbol, "version": None, "rows": 0, "days": [], "profiles": {}, "warnings": ["尚未下载本地数据"], "diagnostics": projection["diagnostics"], "source_events": [], "bytes": 0}
+        if manifest.get("market_data"):
+            from .market_data import MarketDataService
+            return MarketDataService(self.store).compatibility_coverage(symbol)
         cache_key = f"coverage:{manifest['version']}:q{QUALITY_RULES_VERSION}"
         cache = self.store.state(cache_key)
         if cache and cache.get("quality_rules_version") == QUALITY_RULES_VERSION and (cache.get("diagnostics") or {}).get("schema_version") == 1 and "source_events" in cache:
@@ -1012,7 +1018,9 @@ class DataService:
                         if cancelled():
                             raise InterruptedError("任务已取消")
                         start, end = minute_days[gap[0]], minute_days[gap[-1]]
-                        incoming_daily, incoming_actions, incoming_calendar, incoming_metadata = fetch_auxiliary(symbol, start, end, cancelled)
+                        incoming_daily, incoming_actions, incoming_calendar, incoming_metadata = fetch_auxiliary_routed(
+                            self.store, symbol, start, end, cancelled
+                        )
                         if incoming_daily.empty:
                             raise ValueError("日线接口未返回数据")
                         daily = merge_frames(daily, incoming_daily, "date")

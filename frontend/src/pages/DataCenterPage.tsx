@@ -9,9 +9,9 @@ import Disclosure from '../Disclosure'
 import { useTasks } from '../TaskCenter'
 import type { Coverage, DataDiagnostics, Instrument, WatchItem } from '../types'
 
-type SettingsResponse = { data_dir?: string; active_data_dir?: string; restart_required?: boolean; schedule?: { enabled?: boolean; daily_time?: string; weekly_day?: string; weekly_time?: string }; [key: string]: unknown }
+type SettingsResponse = { data_dir?: string; active_data_dir?: string; active_package_dir?: string; package_dir?: string | null; restart_required?: boolean; market_cache_mb?: number; market_cache?: { used_bytes?: number; budget_bytes?: number; hits?: number; misses?: number }; schedule?: { enabled?: boolean; daily_time?: string; weekly_day?: string; weekly_time?: string }; [key: string]: unknown }
 type ScheduleDraft = { daily_time: string; weekly_day: string; weekly_time: string }
-const JOB_TERMINAL = new Set(['completed', 'failed', 'cancelled'])
+const JOB_TERMINAL = new Set(['completed', 'partial', 'failed', 'cancelled'])
 
 function prettyBytes(value?: number) {
   if (value == null) return '—'
@@ -50,8 +50,11 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
   const [settings, setSettings] = useState<SettingsResponse>({ schedule: { enabled: false, daily_time: '18:30', weekly_day: 'SAT', weekly_time: '10:00' } })
   const [scheduleDraft, setScheduleDraft] = useState<Partial<ScheduleDraft>>({})
   const [dataDirDraft, setDataDirDraft] = useState<string | null>(null)
+  const [cacheMbDraft, setCacheMbDraft] = useState<number | null>(null)
   const dataDirDraftEdited = useRef(false)
-  const [syncMode, setSyncMode] = useState<'history' | 'daily' | 'repair'>('history')
+  const [syncMode, setSyncMode] = useState<'history' | 'daily' | 'repair'>('daily')
+  const [syncTimeframe, setSyncTimeframe] = useState('1day')
+  const [syncRange, setSyncRange] = useState({ start_date: '', end_date: '' })
   const [selectedSymbols, setSelectedSymbols] = useState<string[]>([])
   const [importForm, setImportForm] = useState({ symbol: '', minute_path: '', daily_path: '', actions_path: '', calendar_path: '', label_convention: 'auto', etf_category: '' })
   const [demoForm, setDemoForm] = useState({ symbol: '000001.SZ', days: 780 })
@@ -67,12 +70,13 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
       const [items, config] = await Promise.all([get<WatchItem[]>('/watchlist'), get<SettingsResponse>('/settings')])
       setWatchlist(items); setSettings(config)
       if (!dataDirDraftEdited.current) setDataDirDraft(config.data_dir ?? '')
+      setCacheMbDraft(current => current ?? Number(config.market_cache_mb ?? 256))
       setActiveSymbol((old) => old || items[0]?.symbol || '')
     } catch (e) { setError(err(e)) } finally { setLoading(false) }
   }, [err])
 
   useEffect(() => { void refresh() }, [refresh])
-  const completedDataJobs = jobs.filter(job => ['sync', 'instruments', 'import', 'demo'].includes(job.kind) && JOB_TERMINAL.has(job.status)).map(job => `${job.id}:${job.status}`).join(',')
+  const completedDataJobs = jobs.filter(job => ['sync', 'instruments', 'import', 'demo', 'market_sync', 'market_import', 'market_import_batch', 'market_validate', 'market_aggregate', 'market_migrate'].includes(job.kind) && JOB_TERMINAL.has(job.status)).map(job => `${job.id}:${job.status}`).join(',')
   useEffect(() => { void refresh() }, [refresh, completedDataJobs])
   useEffect(() => {
     const timer = window.setInterval(() => { void refresh() }, 5000)
@@ -116,18 +120,23 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
 
   const syncData = () => {
     if (!symbolsToSync.length) { setError('请先选择一只股票，或在自选列表中勾选要同步的股票。'); return }
-    void runAction('sync', () => post<{ job_id?: string }>('/data/sync', { symbols: symbolsToSync, mode: syncMode }), () => '已提交' + modeLabel(syncMode) + '任务。')
+    if (syncMode !== 'daily' && !syncRange.start_date) { setError('历史导入和缺口修补需要填写开始日期。'); return }
+    void runAction('sync', () => post<{ job_id?: string }>('/data/sync', { symbols: symbolsToSync, timeframe: syncTimeframe, mode: syncMode === 'daily' ? 'incremental' : syncMode, resume: true, start_date: syncRange.start_date || null, end_date: syncRange.end_date || null }), () => `已提交 ${syncTimeframe} ` + modeLabel(syncMode) + '任务。')
   }
   const importData = () => {
     if (!importForm.symbol.trim()) { setError('导入前请填写股票代码。'); return }
-    const body: Record<string, string> = { symbol: importForm.symbol.trim().toUpperCase(), label_convention: importForm.label_convention }
-    if (importForm.etf_category) body.etf_category = importForm.etf_category
-    if (importForm.minute_path.trim()) body.minute_path = importForm.minute_path.trim()
-    if (importForm.daily_path.trim()) body.daily_path = importForm.daily_path.trim()
-    if (importForm.actions_path.trim()) body.actions_path = importForm.actions_path.trim()
-    if (importForm.calendar_path.trim()) body.calendar_path = importForm.calendar_path.trim()
-    if (!body.minute_path && !body.daily_path && !body.actions_path) { setError('请至少填写一个本地 CSV 或 Parquet 文件路径。'); return }
-    void runAction('import', () => post('/data/import', body), () => '本地文件导入任务已提交。')
+    if (!importForm.daily_path.trim() && !importForm.minute_path.trim()) { setError('请至少填写日线或分钟线文件路径。'); return }
+    const common = {
+      symbol: importForm.symbol.trim().toUpperCase(),
+      ...(importForm.etf_category ? { etf_category: importForm.etf_category } : {}),
+      ...(importForm.calendar_path.trim() ? { calendar_path: importForm.calendar_path.trim() } : {}),
+    }
+    void runAction('import', async () => {
+      const jobs = []
+      if (importForm.daily_path.trim()) jobs.push(await post('/data/import', { ...common, timeframe: '1day', path: importForm.daily_path.trim(), label_convention: 'end', ...(importForm.actions_path.trim() ? { actions_path: importForm.actions_path.trim() } : {}) }))
+      if (importForm.minute_path.trim()) jobs.push(await post('/data/import', { ...common, timeframe: '1min', path: importForm.minute_path.trim(), label_convention: importForm.label_convention }))
+      return { job_ids: jobs.map((job) => (job as { job_id: string }).job_id) }
+    }, () => '日线和分钟线已作为独立周期任务提交，不会自动下载其他周期。')
   }
   const schedule = settings.schedule ?? {}
   const scheduleToSave = () => ({
@@ -159,6 +168,10 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
       setDataDirDraft(saved.data_dir ?? path)
       return saved
     }, () => '数据目录设置已保存。重启后生效，旧数据不会自动迁移。')
+  }
+  const saveCacheBudget = () => {
+    const value = Math.max(0, Math.round(Number(cacheMbDraft ?? settings.market_cache_mb ?? 256)))
+    void runAction('cache', () => put<SettingsResponse>('/settings', { market_cache_mb: value }), () => `行情与预览缓存上限已设为 ${value} MiB。`)
   }
   const profiles = useMemo(() => {
     const value = coverage?.profiles
@@ -212,23 +225,26 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
           </>}
         </Card>
         <Card title="数据同步" subtitle="按需历史导入、日常增量更新或窗口缺口修补。" className="sync-card">
-          <div className="sync-controls"><Field label="任务类型"><SelectInput value={syncMode} onChange={(e) => setSyncMode(e.target.value as typeof syncMode)}><option value="history">历史数据导入</option><option value="daily">日常增量更新</option><option value="repair">窗口缺口修补</option></SelectInput></Field><div className="sync-target"><span>同步目标</span><strong>{symbolsToSync.length ? symbolsToSync.join('、') : '未选择股票'}</strong><small>未勾选列表时，使用当前选中标的</small></div><Button busy={busy === 'sync'} onClick={syncData}><Download size={15} />提交同步任务</Button></div>
+          <div className="sync-controls"><Field label="数据周期"><SelectInput value={syncTimeframe} onChange={(e) => setSyncTimeframe(e.target.value)}><option value="1day">日线</option><option value="1min">1 分钟</option><option value="5min">5 分钟</option><option value="15min">15 分钟</option><option value="30min">30 分钟</option><option value="60min">60 分钟</option><option value="1week">周线</option><option value="1month">月线</option></SelectInput></Field><Field label="任务类型"><SelectInput value={syncMode} onChange={(e) => setSyncMode(e.target.value as typeof syncMode)}><option value="history">历史数据导入</option><option value="daily">日常增量更新</option><option value="repair">窗口缺口修补</option></SelectInput></Field><Field label="开始日期"><TextInput type="date" value={syncRange.start_date} disabled={syncMode === 'daily'} onChange={(e) => setSyncRange({ ...syncRange, start_date: e.target.value })} /></Field><Field label="结束日期"><TextInput type="date" value={syncRange.end_date} disabled={syncMode === 'daily'} onChange={(e) => setSyncRange({ ...syncRange, end_date: e.target.value })} /></Field><div className="sync-target"><span>同步目标</span><strong>{symbolsToSync.length ? symbolsToSync.join('、') : '未选择股票'}</strong><small>本次只处理 {syncTimeframe}</small></div><Button busy={busy === 'sync'} onClick={syncData}><Download size={15} />提交同步任务</Button></div>
           <div className="inline-note"><span className="info-dot">i</span><span>任务进度显示在右下角，历史和报告可从顶部任务入口查看。</span></div>
         </Card>
       </div>
       <aside className="side-column">
         <Card title="本地文件导入" subtitle="读取用户本机 CSV 或 Parquet 文件路径。" action={<Badge>手动</Badge>}>
-          <div className="form-grid one"><Field label="证券代码"><TextInput value={importForm.symbol} onChange={(e) => setImportForm({ ...importForm, symbol: e.target.value.toUpperCase() })} placeholder="600000.SH" /></Field><Field label="ETF 类型（股票可忽略）"><SelectInput value={importForm.etf_category} onChange={event => setImportForm({ ...importForm, etf_category: event.target.value })}><option value="">按证券清单识别</option><option value="stock">股票 ETF（T+1）</option><option value="bond">债券 ETF（T+0）</option><option value="crossborder">跨境 ETF（T+0）</option><option value="commodity">黄金 / 商品 ETF（T+0）</option><option value="money">货币 ETF（T+0）</option></SelectInput></Field><Field label="分钟线文件路径"><TextInput value={importForm.minute_path} onChange={(e) => setImportForm({ ...importForm, minute_path: e.target.value })} placeholder="D:\\market\\600000_1m.parquet" /></Field><Field label="日线文件路径" hint="可留空：优先复用本地日线，不足时按分钟文件日期范围自动同步；自备日线需 preclose、tradestatus，股票另需 is_st/isST"><TextInput value={importForm.daily_path} onChange={(e) => setImportForm({ ...importForm, daily_path: e.target.value })} placeholder="CSV / Parquet 路径" /></Field><Field label="分红送转文件路径"><TextInput value={importForm.actions_path} onChange={(e) => setImportForm({ ...importForm, actions_path: e.target.value })} placeholder="可选公司行动文件" /></Field><Field label="交易日历文件路径" hint="需为真实交易日；未填时将尝试在线获取"><TextInput value={importForm.calendar_path} onChange={(e) => setImportForm({ ...importForm, calendar_path: e.target.value })} placeholder="真实交易日列表，列名 date" /></Field><Field label="分钟线时间标签" hint="不确定时保持自动；如已核对数据源，再选择开始或结束时间标签。"><SelectInput value={importForm.label_convention} onChange={(e) => setImportForm({ ...importForm, label_convention: e.target.value })}><option value="auto">自动核验（无法确认时按日线）</option><option value="end">我确认：结束时间标签</option><option value="start">我确认：开始时间标签</option></SelectInput></Field></div>
+          <div className="form-grid one"><Field label="证券代码"><TextInput value={importForm.symbol} onChange={(e) => setImportForm({ ...importForm, symbol: e.target.value.toUpperCase() })} placeholder="600000.SH" /></Field><Field label="ETF 类型（股票可忽略）"><SelectInput value={importForm.etf_category} onChange={event => setImportForm({ ...importForm, etf_category: event.target.value })}><option value="">按证券清单识别</option><option value="stock">股票 ETF（T+1）</option><option value="bond">债券 ETF（T+0）</option><option value="crossborder">跨境 ETF（T+0）</option><option value="commodity">黄金 / 商品 ETF（T+0）</option><option value="money">货币 ETF（T+0）</option></SelectInput></Field><Field label="1 分钟文件路径（可选）"><TextInput value={importForm.minute_path} onChange={(e) => setImportForm({ ...importForm, minute_path: e.target.value })} placeholder="D:\\market\\600000_1m.parquet" /></Field><Field label="日线文件路径（可选）" hint="日线与 1 分钟会作为两个独立任务提交；更粗周期请在“数据管理”中明确选择并导入。严格回测需 preclose、tradestatus，股票另需 is_st/isST"><TextInput value={importForm.daily_path} onChange={(e) => setImportForm({ ...importForm, daily_path: e.target.value })} placeholder="CSV / Parquet 路径" /></Field><Field label="分红送转文件路径"><TextInput value={importForm.actions_path} onChange={(e) => setImportForm({ ...importForm, actions_path: e.target.value })} placeholder="可选公司行动文件" /></Field><Field label="交易日历文件路径" hint="需为真实交易日；留空时数据仍可入库，但会标记质量待核验"><TextInput value={importForm.calendar_path} onChange={(e) => setImportForm({ ...importForm, calendar_path: e.target.value })} placeholder="真实交易日列表，列名 date" /></Field><Field label="分钟线时间标签" hint="不确定时保持自动；数据先入库并标记待核验，之后可在数据管理页确认标签。"><SelectInput value={importForm.label_convention} onChange={(e) => setImportForm({ ...importForm, label_convention: e.target.value })}><option value="auto">自动 / 先标记待核验</option><option value="end">我确认：结束时间标签</option><option value="start">我确认：开始时间标签</option></SelectInput></Field></div>
           <div className="card-bottom"><Button busy={busy === 'import'} onClick={importData}><FileUp size={15} />提交导入</Button></div>
         </Card>
         <Card title="生成演示数据" subtitle="用于首次体验流程，演示数据由本机生成。" action={<Badge tone="amber">演示</Badge>}>
           <div className="demo-callout"><Sparkles size={17} /><span>所有演示数据会明确标记，不能代表真实行情。</span></div><div className="form-grid two"><Field label="证券代码"><TextInput value={demoForm.symbol} onChange={(e) => setDemoForm({ ...demoForm, symbol: e.target.value.toUpperCase() })} /></Field><Field label="交易日数量"><TextInput type="number" min={20} max={1600} value={demoForm.days} onChange={(e) => setDemoForm({ ...demoForm, days: Number(e.target.value) })} /></Field></div><div className="card-bottom"><Button variant="secondary" busy={busy === 'demo'} onClick={() => void runAction('demo', () => post('/data/demo', { symbol: demoForm.symbol || undefined, days: demoForm.days }), () => `已提交 ${demoForm.symbol} 的演示数据任务。`)}><Sparkles size={15} />生成演示数据</Button></div>
         </Card>
         <Card title="本机存储与计划" subtitle="存储和定时更新配置保存在本地。" action={<Badge tone="blue">本机</Badge>}>
-          <div className="storage-path"><Database size={16} /><div><small>当前活动数据目录</small><strong title={settings.active_data_dir}>{settings.active_data_dir ?? '读取中或未配置'}</strong><small>本次运行正在使用的目录</small></div></div>
+          <div className="storage-path"><Database size={16} /><div><small>当前活动数据包</small><strong title={settings.active_package_dir}>{settings.active_package_dir ?? '读取中或未配置'}</strong><small>行情、辅助资料和历史版本的唯一正式来源</small></div></div>
+          <div className="storage-path"><Database size={16} /><div><small>应用数据目录</small><strong title={settings.active_data_dir}>{settings.active_data_dir ?? '读取中或未配置'}</strong><small>任务、配置、结果和可重建索引</small></div></div>
           <div className="schedule-box">
             <Field label="下次启动的数据目录" hint={settings.restart_required ? '已设置的新目录需要重启后生效；旧数据不会自动迁移。' : '保存不同的数据目录后需重启生效；旧数据不会自动迁移。'}><TextInput value={dataDirDraft ?? settings.data_dir ?? ''} onChange={(e) => { dataDirDraftEdited.current = true; setDataDirDraft(e.target.value) }} placeholder="例如 D:\\stockregression\\data" /></Field>
             <div className="card-bottom"><Button variant="secondary" busy={busy === 'data-dir'} onClick={saveDataDirectory}>保存数据目录</Button></div>
+            <Field label="行情与预览缓存上限（MiB）" hint="按需使用，不会启动时预分配；0 表示关闭跨请求缓存。回测任务工作内存单独计算。"><TextInput type="number" min={0} max={16384} value={cacheMbDraft ?? settings.market_cache_mb ?? 256} onChange={e => setCacheMbDraft(Number(e.target.value))} /></Field>
+            <div className="card-bottom"><Button variant="quiet" busy={busy === 'cache'} onClick={saveCacheBudget}>保存缓存设置</Button><span className="muted-copy">{settings.market_cache ? `已用 ${prettyBytes(settings.market_cache.used_bytes)} / ${prettyBytes(settings.market_cache.budget_bytes)}` : ''}</span></div>
           </div>
           <div className="schedule-box"><div className="schedule-head"><div><strong>自动更新计划</strong><small>{schedule.enabled ? '当前已启用' : '当前已停用'}</small></div><Badge tone={schedule.enabled ? 'green' : 'neutral'}>{schedule.enabled ? '启用' : '停用'}</Badge></div>
             <div className="schedule-grid"><Field label="每日时间"><TextInput type="time" value={scheduleDraft.daily_time ?? schedule.daily_time ?? '18:30'} onInput={(e) => setScheduleValue('daily_time', e.currentTarget.value)} onChange={(e) => setScheduleValue('daily_time', e.target.value)} /></Field><Field label="每周星期"><SelectInput value={scheduleDraft.weekly_day ?? schedule.weekly_day ?? 'SAT'} onChange={(e) => setScheduleValue('weekly_day', e.target.value)}>{[['MON', '周一'], ['TUE', '周二'], ['WED', '周三'], ['THU', '周四'], ['FRI', '周五'], ['SAT', '周六'], ['SUN', '周日']].map(([v, l]) => <option key={v} value={v}>{l}</option>)}</SelectInput></Field><Field label="每周时间"><TextInput type="time" value={scheduleDraft.weekly_time ?? schedule.weekly_time ?? '10:00'} onInput={(e) => setScheduleValue('weekly_time', e.currentTarget.value)} onChange={(e) => setScheduleValue('weekly_time', e.target.value)} /></Field></div>

@@ -66,6 +66,11 @@ class Store:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS sync_items(run_key TEXT,symbol TEXT,status TEXT,mode TEXT,daily_through TEXT,minute_through TEXT,error TEXT,updated_at TEXT,PRIMARY KEY(run_key,symbol));
                 CREATE INDEX IF NOT EXISTS sync_items_status ON sync_items(run_key,status);
+                CREATE TABLE IF NOT EXISTS market_auxiliary(
+                    symbol TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL,
+                    version TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL, PRIMARY KEY(symbol,kind)
+                );
             """)
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS research_registry(
@@ -176,6 +181,21 @@ class Store:
             row = db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
             return json.loads(row[0]) if row else None
 
+    def save_market_auxiliary(self, symbol: str, kind: str, payload: Any, *, version="local", verified=False):
+        with self.db() as db:
+            db.execute(
+                "INSERT OR REPLACE INTO market_auxiliary(symbol,kind,payload,version,verified,updated_at) VALUES(?,?,?,?,?,?)",
+                (normalize_symbol(symbol), kind, dumps(payload), version, int(verified), now_iso()),
+            )
+
+    def market_auxiliary(self, symbol: str, kind: str):
+        with self.db() as db:
+            row = db.execute(
+                "SELECT * FROM market_auxiliary WHERE symbol=? AND kind=?",
+                (normalize_symbol(symbol), kind),
+            ).fetchone()
+        return {**dict(row), "payload": json.loads(row["payload"])} if row else None
+
     def write_frame(self, symbol: str, kind: str, frame: pd.DataFrame, date_column: str) -> list[str]:
         if frame.empty:
             return []
@@ -200,6 +220,23 @@ class Store:
     def read_files(self, files: list[str], column: str | None = None, start=None, end=None) -> pd.DataFrame:
         if not files:
             return pd.DataFrame()
+        virtual = [name for name in files if str(name).startswith("market:")]
+        if virtual:
+            parts = []
+            for name in virtual:
+                pieces = str(name).split(":")
+                if len(pieces) != 3:
+                    raise ValueError("无效的市场数据库引用：" + str(name))
+                timeframe, symbol = pieces[1], pieces[2]
+                from .market_data.repository import MarketDataRepository
+                part = MarketDataRepository(self.root).bars(
+                    symbol, timeframe, start=start, end=end
+                )
+                if not part.empty:
+                    if column == "date" or timeframe in {"1day", "1week", "1month"}:
+                        part["date"] = pd.to_datetime(part.timestamp).dt.normalize()
+                    parts.append(part)
+            return pd.concat(parts, ignore_index=True).sort_values(column or "timestamp").reset_index(drop=True) if parts else pd.DataFrame()
         paths = [str(self.root / name) for name in files]
         with duckdb.connect() as connection:
             relation = connection.read_parquet(paths, union_by_name=True)
@@ -241,13 +278,48 @@ class Store:
             db.execute("INSERT OR REPLACE INTO active_snapshots VALUES(?,?)", (symbol, version))
         return self.snapshot(symbol, version)
 
+    def put_market_snapshot(self, manifest: dict, symbol: str):
+        """Register a snapshot whose bar payload lives in frequency databases."""
+        symbol = normalize_symbol(symbol)
+        version = manifest["version"]
+        created = manifest.get("created_at") or now_iso()
+        manifest = {**manifest, "created_at": created}
+        with self.db() as db:
+            db.execute("INSERT OR IGNORE INTO snapshots VALUES(?,?,?,?)", (version, symbol, created, dumps(manifest)))
+            db.execute("INSERT OR REPLACE INTO active_snapshots VALUES(?,?)", (symbol, version))
+        return self.snapshot(symbol, version)
+
     def snapshot(self, symbol: str, version: str | None = None) -> dict | None:
+        symbol = normalize_symbol(symbol)
         with self.db() as db:
             if version:
-                row = db.execute("SELECT manifest FROM snapshots WHERE symbol=? AND version=?", (normalize_symbol(symbol), version)).fetchone()
+                row = db.execute("SELECT manifest FROM snapshots WHERE symbol=? AND version=?", (symbol, version)).fetchone()
             else:
-                row = db.execute("SELECT s.manifest FROM snapshots s JOIN active_snapshots a USING(version) WHERE a.symbol=?", (normalize_symbol(symbol),)).fetchone()
-        return json.loads(row[0]) if row else None
+                row = db.execute("SELECT s.manifest FROM snapshots s JOIN active_snapshots a USING(version) WHERE a.symbol=?", (symbol,)).fetchone()
+        if row:
+            manifest = json.loads(row[0])
+            if version is None and manifest.get("market_data"):
+                from .market_data.repository import MarketDataRepository
+                live = MarketDataRepository(self.root).active_manifest(symbol)
+                if live and live.get("version") != manifest.get("version"):
+                    instrument = self.instrument(symbol) or {"symbol": symbol, "name": symbol}
+                    live["metadata"] = {**instrument, "is_demo": False, "warnings": []}
+                    self.put_market_snapshot(live, symbol)
+                    return live
+            return manifest
+        if version is None:
+            from .market_data.repository import MarketDataRepository
+            live = MarketDataRepository(self.root).active_manifest(symbol)
+            if live:
+                # A live manifest can be returned to an API caller and then
+                # stored in a job payload. Persist it before handing it out so
+                # ``snapshot(symbol, version)`` can resolve the same version in
+                # the worker process.
+                instrument = self.instrument(symbol) or {"symbol": symbol, "name": symbol}
+                live["metadata"] = {**instrument, "is_demo": False, "warnings": []}
+                self.put_market_snapshot(live, symbol)
+            return live
+        return None
 
     def new_job(self, kind: str, payload: dict) -> str:
         job_id = uuid.uuid4().hex

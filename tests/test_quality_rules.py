@@ -123,11 +123,11 @@ def test_minute_only_import_syncs_missing_daily(tmp_path, monkeypatch, existing)
                       instrument_terms("159611.SZ", {"is_demo": existing == "demo", "actions_verified": True}), {})
     calls = []
 
-    def fetch(symbol, start, end, cancelled):
+    def fetch(store, symbol, start, end, cancelled):
         calls.append((symbol, start, end))
         return daily, actions, calendar, {"actions_verified": False, "actions_unverified_years": [2026], "warnings": ["分红资料待核验"]}
 
-    monkeypatch.setattr("stockregression.data.fetch_auxiliary", fetch)
+    monkeypatch.setattr("stockregression.data.fetch_auxiliary_routed", fetch)
     monkeypatch.setattr("baostock.login", lambda: pytest.fail("已有或刚获取的交易日历应直接复用"))
     payload = {"symbol": "159611.SZ", "minute_path": str(minute_path), "label_convention": "end"}
     result = DataService(store).import_files(payload)
@@ -160,7 +160,7 @@ def test_minute_only_import_does_not_publish_when_daily_sync_fails(tmp_path, mon
         daily = daily_fixture(days[:1]) if failure == "incomplete" else pd.DataFrame()
         return daily, normalize_actions(pd.DataFrame()), pd.DataFrame({"date": days}), {}
 
-    monkeypatch.setattr("stockregression.data.fetch_auxiliary", fetch)
+    monkeypatch.setattr("stockregression.data.fetch_auxiliary_routed", fetch)
     expected = InterruptedError if failure == "cancelled" else DataQualityError
     with pytest.raises(expected, match="任务已取消" if failure == "cancelled" else "自动同步日线失败"):
         DataService(store).import_files({"symbol": "159611.SZ", "minute_path": str(minute_path)})
@@ -174,7 +174,7 @@ def test_import_rejects_mismatched_file_symbol_before_network(tmp_path, monkeypa
     path = tmp_path / "input.parquet"
     frame.to_parquet(path)
     store = Store(tmp_path / "data")
-    monkeypatch.setattr("stockregression.data.fetch_auxiliary", lambda *args: pytest.fail("代码不一致时不得联网"))
+    monkeypatch.setattr("stockregression.data.fetch_auxiliary_routed", lambda *args: pytest.fail("代码不一致时不得联网"))
     with pytest.raises(DataQualityError, match="195611.SZ.*159611.SZ.*不一致"):
         DataService(store).import_files({"symbol": "195611.SZ", kind + "_path": str(path)})
     assert store.snapshot("195611.SZ") is None

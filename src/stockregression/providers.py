@@ -7,22 +7,18 @@ from __future__ import annotations
 
 import contextlib
 import io
-import time
 import threading
 from functools import wraps, lru_cache
 from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import httpx
 import pandas as pd
 
 from .models import normalize_symbol
 from .quality import canonical_frame
 
-HF_REPO = "neigezhu/china-a-share-1min-ohlcv"
-ETF_HF_REPO = "neigezhu/china-etf-1min-ohlcv"
 _BAOSTOCK_LOCK = threading.RLock()
+_AKSHARE_HTTP_LOCK = threading.RLock()
 
 
 def serialized_baostock(function):
@@ -32,6 +28,24 @@ def serialized_baostock(function):
             return function(*args, **kwargs)
     return call
 TDX_SERVERS = [("180.153.18.170", 7709), ("180.153.18.172", 80), ("202.108.253.139", 80), ("60.191.117.167", 7709)]
+
+
+@contextlib.contextmanager
+def bounded_akshare_http(timeout: float = 15):
+    """Give AKShare's network calls a bounded timeout without global process settings."""
+    import requests
+
+    original = requests.sessions.Session.request
+    with _AKSHARE_HTTP_LOCK:
+        def request_with_timeout(session, *args, **kwargs):
+            kwargs.setdefault("timeout", timeout)
+            return original(session, *args, **kwargs)
+
+        requests.sessions.Session.request = request_with_timeout
+        try:
+            yield
+        finally:
+            requests.sessions.Session.request = original
 
 
 def latest_closed_date():
@@ -68,70 +82,14 @@ def fetch_latest_trading_date(as_of: str):
             bs.logout()
 
 
-def fetch_hf(symbol: str, root: Path, revision: str) -> pd.DataFrame:
-    from huggingface_hub import hf_hub_download
-    code, exchange = normalize_symbol(symbol).split(".")
-    etf = code.startswith(("1", "5"))
-    if etf:
-        from .settings import load_settings
-        revision = load_settings().etf_hf_revision
-    repo = ETF_HF_REPO if etf else HF_REPO
-    inventory = fetch_history_instruments(revision, repo)
-    if symbol not in {item["symbol"] for item in inventory}:
-        raise RuntimeError("固定历史库未覆盖此标的，将使用近期分钟来源并明确报告历史缺口")
-    filename = f"data/{'etf' if etf else 'stock'}_1m/{exchange}/{code}.parquet"
-    path = hf_hub_download(repo_id=ETF_HF_REPO if etf else HF_REPO, repo_type="dataset", filename=filename,
-                           revision=revision, cache_dir=str(root / "raw" / "huggingface"))
-    return canonical_frame(pd.read_parquet(path), source="hf")
-
-
-@lru_cache(maxsize=4)
-def fetch_history_instruments(revision: str, repo: str = HF_REPO) -> list[dict]:
-    url = f"https://huggingface.co/datasets/{repo}/resolve/{revision}/metadata/coverage_by_instrument.csv"
-    response = httpx.get(url, follow_redirects=True, timeout=30)
-    response.raise_for_status()
-    frame = pd.read_csv(io.StringIO(response.text), dtype=str)
-    records = []
-    for _, row in frame.iterrows():
-        code = row.get("symbol", row.get("stock_code", ""))
-        exchange = row.get("exchange", "")
-        if exchange not in ("SH", "SZ"):
-            continue
-        try:
-            symbol = normalize_symbol(f"{code}.{exchange}")
-        except ValueError:
-            continue
-        records.append({"symbol": symbol, "name": str(row.get("name", row.get("stock_name", symbol))),
-                        "listing_date": row.get("listing_date") if pd.notna(row.get("listing_date")) else None, "delisting_date": row.get("delisting_date") if pd.notna(row.get("delisting_date")) else None})
-    return records
-
-
-def estimate_history_bytes(symbols, settings):
-    from huggingface_hub import HfApi
-    wanted = set(symbols)
-    total = 0
-    for repo, revision, folder in [(HF_REPO, settings.hf_revision, "stock_1m"), (ETF_HF_REPO, settings.etf_hf_revision, "etf_1m")]:
-        info = HfApi().dataset_info(repo, revision=revision, files_metadata=True, timeout=15)
-        for file in info.siblings:
-            parts = file.rfilename.split("/")
-            if len(parts) == 4 and parts[0] == "data" and parts[1] == folder and f"{parts[3].removesuffix('.parquet')}.{parts[2]}" in wanted:
-                total += file.size or 0
-    return total
-
-
-def fetch_instruments(revision: str) -> list[dict]:
+def fetch_instruments(_legacy_revision: str | None = None) -> list[dict]:
+    """Refresh names from AKShare; history comes exclusively from the local package."""
     from .rules import instrument_terms
-    from .settings import load_settings
     records, failures = {}, []
-    for repo, pin in [(HF_REPO, revision), (ETF_HF_REPO, load_settings().etf_hf_revision)]:
-        try:
-            for item in fetch_history_instruments(pin, repo):
-                records[item["symbol"]] = item
-        except Exception as exc:
-            failures.append(f"{repo}: {exc}")
     try:
         import akshare as ak
-        names = ak.stock_info_a_code_name()
+        with bounded_akshare_http():
+            names = ak.stock_info_a_code_name()
         for item in names.to_dict("records"):
             try:
                 symbol = normalize_symbol(str(item["code"]).zfill(6))
@@ -142,19 +100,13 @@ def fetch_instruments(revision: str) -> list[dict]:
         failures.append(f"最新股票清单: {exc}")
     try:
         import akshare as ak
-        for item in ak.fund_etf_spot_em().to_dict("records"):
-            symbol = normalize_symbol(str(item["代码"]).zfill(6))
+        with bounded_akshare_http():
+            etf_frame = ak.fund_etf_category_sina(symbol="ETF基金")
+        for item in etf_frame.to_dict("records"):
+            symbol = normalize_symbol(str(item["代码"]))
             records[symbol] = {**records.get(symbol, {}), "symbol": symbol, "name": item["名称"], "asset_type": "etf"}
     except Exception as exc:
-        failures.append(f"最新 ETF 清单: {exc}")
-        try:
-            import akshare as ak
-            for item in ak.fund_etf_category_sina(symbol="ETF基金").to_dict("records"):
-                symbol = normalize_symbol(str(item["代码"]))
-                records[symbol] = {**records.get(symbol, {}), "symbol": symbol, "name": item["名称"], "asset_type": "etf"}
-            failures.append("ETF 清单已使用新浪备源；历史覆盖仍按逐标的报告核对")
-        except Exception as backup_error:
-            failures.append(f"ETF 清单备源也不可用，本次证券范围可能不完整: {backup_error}")
+        failures.append(f"新浪 ETF 清单不可用: {exc}")
     if not records:
         raise RuntimeError("证券清单获取失败：" + "；".join(failures))
     return [instrument_terms(symbol, {**item, "catalog_warnings": failures}) for symbol, item in sorted(records.items())]
@@ -168,7 +120,7 @@ def fetch_tdx(symbol: str, earliest=None, cancelled=lambda: False) -> pd.DataFra
     for host, port in TDX_SERVERS:
         if cancelled():
             raise InterruptedError("任务已取消")
-        api = TdxHq_API(heartbeat=False, auto_retry=False)
+        api = TdxHq_API(heartbeat=False, auto_retry=False, raise_exception=True)
         try:
             if not api.connect(host, port, time_out=4):
                 failures.append(f"{host}:{port}连接失败")
@@ -177,15 +129,7 @@ def fetch_tdx(symbol: str, earliest=None, cancelled=lambda: False) -> pd.DataFra
             for offset in range(0, 24800, 800):
                 if cancelled():
                     raise InterruptedError("任务已取消")
-                batch = None
-                for attempt in range(3):
-                    try:
-                        batch = api.get_security_bars(8, market, code, offset, 800)
-                        break
-                    except Exception:
-                        if attempt == 2:
-                            raise
-                        time.sleep(0.3 * (attempt + 1))
+                batch = api.get_security_bars(8, market, code, offset, 800)
                 if not batch:
                     break
                 bars.extend(batch)
@@ -199,7 +143,11 @@ def fetch_tdx(symbol: str, earliest=None, cancelled=lambda: False) -> pd.DataFra
         except InterruptedError:
             raise
         except Exception as exc:
-            failures.append(f"{host}:{port} {exc}")
+            original = getattr(exc, "original_exception", None)
+            detail = f"{type(exc).__name__}: {exc}"
+            if original is not None:
+                detail += f"；{type(original).__name__}: {original}"
+            failures.append(f"{host}:{port} {detail}")
         finally:
             api.disconnect()
     raise RuntimeError("通达信节点不可用：" + "；".join(failures))
@@ -212,7 +160,8 @@ def fetch_sina(symbol: str) -> pd.DataFrame:
     # 0.000 open for every historical session (observed for ETFs on
     # 2026-10-12..15). The Sina minute feed returns full OHLC for stocks and
     # ETFs alike, so both go through it.
-    frame = ak.stock_zh_a_minute(symbol=exchange.lower() + code, period="1", adjust="")
+    with bounded_akshare_http():
+        frame = ak.stock_zh_a_minute(symbol=exchange.lower() + code, period="1", adjust="")
     if frame is None or frame.empty:
         raise RuntimeError("新浪未返回近期分钟行情")
     frame = canonical_frame(frame, source="sina")
@@ -249,9 +198,7 @@ def fetch_reference_5m(symbol: str, start, end) -> pd.DataFrame:
 
 
 @serialized_baostock
-def fetch_auxiliary(symbol: str, start, end, cancelled=lambda: False):
-    if symbol.startswith(("1", "5")):
-        return fetch_etf_auxiliary(symbol, start, end, cancelled)
+def fetch_stock_daily(symbol: str, start, end, cancelled=lambda: False):
     import baostock as bs
     code, exchange = normalize_symbol(symbol).split(".")
     bs_code = exchange.lower() + "." + code
@@ -285,69 +232,90 @@ def fetch_auxiliary(symbol: str, start, end, cancelled=lambda: False):
             if daily.empty:
                 raise RuntimeError("BaoStock 未返回所选股票的日线")
             daily = canonical_frame(daily, daily=True)
-            calendar = rows(bs.query_trade_dates(start_date=start, end_date=end))
-            calendar = pd.DataFrame({"date": pd.to_datetime(calendar.loc[calendar.is_trading_day == "1", "calendar_date"])})
-            action_frames = []
-            for year in range(daily.date.min().year, pd.Timestamp(end).year + 1):
-                action_frames.append(rows(bs.query_dividend_data(bs_code, year=str(year), yearType="operate")))
-            actions = normalize_actions(pd.concat(action_frames, ignore_index=True)) if action_frames else normalize_actions(pd.DataFrame())
-            metadata["actions_verified"] = True
-            return daily, actions, calendar, metadata
+            return daily, metadata
         finally:
             bs.logout()
+
+
+@serialized_baostock
+def fetch_etf_daily(symbol: str, start, end, source: str = "baostock", cancelled=lambda: False) -> pd.DataFrame:
+    code, exchange = normalize_symbol(symbol).split(".")
+    if source == "eastmoney":
+        import akshare as ak
+        with bounded_akshare_http():
+            frame = ak.fund_etf_hist_em(
+                symbol=code, period="daily",
+                start_date=pd.Timestamp(start).strftime("%Y%m%d"),
+                end_date=pd.Timestamp(end).strftime("%Y%m%d"), adjust="",
+            )
+        if frame is None or frame.empty:
+            raise RuntimeError("东方财富 ETF 日线未返回所选区间数据")
+        if "涨跌额" in frame:
+            frame["preclose"] = (pd.to_numeric(frame["收盘"]) - pd.to_numeric(frame["涨跌额"])).round(3)
+        daily = canonical_frame(frame, daily=True)
+        daily["volume"] *= 100  # Eastmoney reports lots.
+        return daily
+    if source != "baostock":
+        raise ValueError("未知 ETF 日线来源：" + source)
+    import baostock as bs
+    with contextlib.redirect_stdout(io.StringIO()):
+        login = bs.login()
+        if login.error_code != "0":
+            raise RuntimeError("BaoStock ETF 日线登录失败：" + login.error_msg)
+        try:
+            result = bs.query_history_k_data_plus(
+                exchange.lower() + "." + code,
+                "date,open,high,low,close,preclose,volume,amount,tradestatus",
+                start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date()),
+                frequency="d", adjustflag="3",
+            )
+            if result.error_code != "0":
+                raise RuntimeError("BaoStock ETF 日线失败：" + result.error_msg)
+            rows = []
+            while result.next():
+                if cancelled():
+                    raise InterruptedError("任务已取消")
+                rows.append(result.get_row_data())
+        finally:
+            bs.logout()
+    if not rows:
+        raise RuntimeError("BaoStock ETF 日线未返回所选区间数据")
+    return canonical_frame(pd.DataFrame(rows, columns=result.fields), daily=True)
+
+
+def fetch_auxiliary(symbol: str, start, end, cancelled=lambda: False):
+    """Compatibility adapter for callers that need all auxiliary files at once."""
+    if symbol.startswith(("1", "5")):
+        daily = fetch_etf_daily(symbol, start, end, "baostock", cancelled)
+        calendar = fetch_market_calendar(start, end, cancelled)
+        actions, metadata = fetch_market_actions(symbol, start, end, cancelled)
+        return daily, actions, calendar, metadata
+    daily, metadata = fetch_stock_daily(symbol, start, end, cancelled)
+    calendar = fetch_market_calendar(start, end, cancelled)
+    actions, action_metadata = fetch_market_actions(symbol, start, end, cancelled)
+    metadata = {**metadata, **action_metadata}
+    metadata["actions_verified"] = bool(action_metadata.get("actions_verified")) and not action_metadata.get("actions_unverified_years")
+    return daily, actions, calendar, metadata
 
 
 @lru_cache(maxsize=48)
 def _fund_actions(year: int, as_of: str):
     import akshare as ak
-    return ak.fund_fh_em(year=str(year)), ak.fund_cf_em(year=str(year))
+    with bounded_akshare_http():
+        return ak.fund_fh_em(year=str(year)), ak.fund_cf_em(year=str(year))
 
 
-def fetch_etf_auxiliary(symbol, start, end, cancelled=lambda: False):
-    import akshare as ak
-    import baostock as bs
-    from .rules import instrument_terms
+def fetch_etf_auxiliary(symbol, start, end, cancelled=lambda: False, daily_source="baostock"):
     code, exchange = normalize_symbol(symbol).split(".")
     daily_notes = []
-    with contextlib.redirect_stdout(io.StringIO()):
-        login = bs.login()
-        if login.error_code != "0":
-            raise RuntimeError("交易日历登录失败")
-        try:
-            try:
-                frame = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=pd.Timestamp(start).strftime("%Y%m%d"), end_date=pd.Timestamp(end).strftime("%Y%m%d"), adjust="")
-                if frame is None or frame.empty:
-                    raise RuntimeError("ETF 日线来源未返回数据")
-                if "涨跌额" in frame:
-                    frame["preclose"] = (pd.to_numeric(frame["收盘"]) - pd.to_numeric(frame["涨跌额"])).round(3)
-                daily = canonical_frame(frame, daily=True)
-                daily["volume"] *= 100  # Eastmoney reports lots; canonical ETF volume is units.
-            except Exception as exc:
-                # EastMoney's push2his host rate-limits or refuses connections at
-                # times; BaoStock serves the same unadjusted ETF daily in units.
-                fallback = bs.query_history_k_data_plus(exchange.lower() + "." + code,
-                    "date,open,high,low,close,preclose,volume,amount,tradestatus",
-                    start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date()),
-                    frequency="d", adjustflag="3")
-                if fallback.error_code != "0":
-                    raise RuntimeError(f"ETF 日线来源均不可用：东财 {exc}；BaoStock {fallback.error_msg}")
-                rows = []
-                while fallback.next():
-                    rows.append(fallback.get_row_data())
-                daily = canonical_frame(pd.DataFrame(rows, columns=fallback.fields), daily=True)
-                if daily.empty:
-                    raise RuntimeError("ETF 日线来源均未返回数据：" + str(exc))
-                daily_notes.append("东财 ETF 日线不可用，已改用 BaoStock 不复权日线：" + str(exc))
-            result = bs.query_trade_dates(str(pd.Timestamp(start).date()), str(pd.Timestamp(end).date()))
-            if result.error_code != "0":
-                raise RuntimeError(result.error_msg)
-            rows = []
-            while result.next():
-                rows.append(result.get_row_data())
-            dates = pd.DataFrame(rows, columns=result.fields)
-            calendar = pd.DataFrame({"date": pd.to_datetime(dates.loc[dates.is_trading_day == "1", "calendar_date"])})
-        finally:
-            bs.logout()
+    try:
+        daily = fetch_etf_daily(symbol, start, end, daily_source, cancelled)
+    except Exception as exc:
+        if daily_source == "baostock":
+            raise
+        daily = fetch_etf_daily(symbol, start, end, "baostock", cancelled)
+        daily_notes.append("东方财富 ETF 日线不可用，已改用 BaoStock：" + str(exc))
+    calendar = fetch_market_calendar(start, end, cancelled)
     records, warnings, unverified = [], [], []
     for year in range(daily.date.min().year, pd.Timestamp(end).year + 1):
         if cancelled():
@@ -363,6 +331,104 @@ def fetch_etf_auxiliary(symbol, start, end, cancelled=lambda: False):
             unverified.append(year)
     metadata = {"actions_verified": not warnings, "actions_checked_years": list(range(daily.date.min().year, pd.Timestamp(end).year + 1)), "actions_unverified_years": unverified, "warnings": [*daily_notes, *warnings]}
     return daily, normalize_actions(pd.DataFrame(records)), calendar, metadata
+
+
+@serialized_baostock
+def fetch_market_calendar(start, end, cancelled=lambda: False) -> pd.DataFrame:
+    """Fetch the exchange calendar without requesting a security's daily bars."""
+    import baostock as bs
+    with contextlib.redirect_stdout(io.StringIO()):
+        login = bs.login()
+        if login.error_code != "0":
+            raise RuntimeError("交易日历登录失败：" + login.error_msg)
+        try:
+            result = bs.query_trade_dates(
+                start_date=str(pd.Timestamp(start).date()),
+                end_date=str(pd.Timestamp(end).date()),
+            )
+            if result.error_code != "0":
+                raise RuntimeError("交易日历失败：" + result.error_msg)
+            records = []
+            while result.next():
+                if cancelled():
+                    raise InterruptedError("任务已取消")
+                records.append(result.get_row_data())
+        finally:
+            bs.logout()
+    frame = pd.DataFrame(records, columns=result.fields)
+    if frame.empty:
+        return pd.DataFrame({"date": pd.to_datetime([])})
+    return pd.DataFrame({
+        "date": pd.to_datetime(
+            frame.loc[frame.is_trading_day == "1", "calendar_date"]
+        )
+    })
+
+
+@serialized_baostock
+def fetch_market_actions(symbol, start, end, cancelled=lambda: False) -> tuple[pd.DataFrame, dict]:
+    """Fetch only corporate/fund actions for an already selected date range."""
+    symbol = normalize_symbol(symbol)
+    code, exchange = symbol.split(".")
+    years = list(range(pd.Timestamp(start).year, pd.Timestamp(end).year + 1))
+    records = []
+    warnings = []
+    if symbol.startswith(("1", "5")):
+        for year in years:
+            if cancelled():
+                raise InterruptedError("任务已取消")
+            try:
+                dividends, splits = _fund_actions(year, str(pd.Timestamp(end).date()))
+                for row in dividends.loc[
+                    dividends["基金代码"].astype(str).str.zfill(6) == code
+                ].to_dict("records"):
+                    records.append({
+                        "record_date": row["权益登记日"], "ex_date": row["除息日期"],
+                        "pay_date": row["分红发放日"], "cash_per_share": row["分红"],
+                        "bonus_ratio": 0,
+                    })
+                for row in splits.loc[
+                    splits["基金代码"].astype(str).str.zfill(6) == code
+                ].to_dict("records"):
+                    records.append({
+                        "record_date": row["拆分折算日"], "ex_date": row["拆分折算日"],
+                        "stock_date": row["拆分折算日"], "cash_per_share": 0,
+                        "bonus_ratio": 0,
+                        "unsupported_reason": "ETF 拆分资料缺少登记日及精确份额处理，请导入核实后的公司行动",
+                    })
+            except Exception as exc:
+                warnings.append(f"{year} ETF 分红/拆分资料未核验：{exc}")
+    else:
+        import baostock as bs
+        bs_code = exchange.lower() + "." + code
+        with contextlib.redirect_stdout(io.StringIO()):
+            login = bs.login()
+            if login.error_code != "0":
+                raise RuntimeError("公司行动登录失败：" + login.error_msg)
+            try:
+                for year in years:
+                    if cancelled():
+                        raise InterruptedError("任务已取消")
+                    result = bs.query_dividend_data(
+                        bs_code, year=str(year), yearType="operate"
+                    )
+                    if result.error_code != "0":
+                        warnings.append(f"{year} 公司行动失败：{result.error_msg}")
+                        continue
+                    while result.next():
+                        records.append(result.get_row_data())
+            finally:
+                bs.logout()
+    metadata = {
+        "actions_verified": not warnings,
+        "actions_checked_years": years,
+        "actions_unverified_years": [
+            year for year in years
+            if any(str(year) in warning for warning in warnings)
+        ],
+        "warnings": warnings,
+    }
+    return normalize_actions(pd.DataFrame(records)), metadata
 
 
 def normalize_actions(frame: pd.DataFrame) -> pd.DataFrame:

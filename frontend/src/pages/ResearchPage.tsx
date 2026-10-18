@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { EChartsOption } from 'echarts'
 import { FlaskConical, RefreshCw, RotateCcw } from 'lucide-react'
-import { get, post } from '../api'
+import { ApiError, get, post } from '../api'
 import ChartView from '../ChartView'
 import EquityCurve from '../EquityCurve'
 import DataDiagnosticsPanel from '../DataDiagnosticsPanel'
@@ -9,7 +9,7 @@ import Disclosure from '../Disclosure'
 import { useTasks } from '../TaskCenter'
 import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, Field, Loading, NumField, PageHeader, SelectInput, configError, configPayload, loadConfig, percent, revealConfigError, useErrorMessage } from '../components'
 import { formatPValue, reviewBootstrapEvidence } from '../researchEvidence'
-import type { BacktestConfig, BacktestResult, DataDiagnostics, DataSourceEvent, Job } from '../types'
+import type { BacktestConfig, BacktestResult, DataDiagnostics, DataPreparationRequest, DataSourceEvent, Job } from '../types'
 import { defaultSearchRanges, percentageRanges as pctRange, rangeNames, researchRangesForSymbol, validResearchDefaults } from '../workbenchDefaults'
 import type { ResearchDefaults, SearchRange as Range } from '../workbenchDefaults'
 
@@ -39,6 +39,7 @@ export type Props = {
   onFeeDefaultsEdit?: (defaults: { commission_rate: number; min_commission: number }) => void
   onDefaultsEdit?: (group: 'grid' | 'position' | 'dca', config: BacktestConfig) => void
   onRestore?: () => void
+  onPrepareData?: (request: DataPreparationRequest) => void
 }
 const labels: Record<string, string> = { buy_step: '买入步长', sell_step: '卖出步长', grid_step: '网格间距', buy_ratio: '旧版买入比例', sell_ratio: '旧版卖出比例', initial_position: '旧版初始仓位', min_position: '旧版最小仓位', max_position: '旧版最大仓位', buy_shares: '每次买入股数', sell_shares: '每次卖出股数', initial_shares: '初始持股', min_shares: '最低持股', max_shares: '最高持股' }
 function revealDisclosure(id: string) {
@@ -295,7 +296,7 @@ function constraintLabel(value: boolean | undefined) {
   return value === true ? '满足约束' : value === false ? '未满足约束' : '未提供约束状态'
 }
 
-export default function ResearchPage({ base, settings, onSettingsChange, onBaseChange, onLoadConfig, requestedJobId, onRequestHandled, onSelectedJobChange, onFeeDefaultsEdit, onDefaultsEdit, onRestore }: Props) {
+export default function ResearchPage({ base, settings, onSettingsChange, onBaseChange, onLoadConfig, requestedJobId, onRequestHandled, onSelectedJobChange, onFeeDefaultsEdit, onDefaultsEdit, onRestore, onPrepareData }: Props) {
   const { protocol_version: protocolVersion, selection_target: selectionTarget, rebalance_days: rebalanceDays, bootstrap_reps: bootstrapReps, mode, n_trials: trials, seed, top_candidates: topCandidates, max_drawdown: maxDrawdown, min_trades: minTrades, min_history_days: minHistoryDays, min_minute_ratio: minMinuteRatio } = settings
   const tasks = useTasks()
   const researchJobs = useMemo(() => tasks.jobs.filter(isOptimizationJob), [tasks.jobs])
@@ -308,6 +309,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const [resultLoading, setResultLoading] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [dataIssue, setDataIssue] = useState<DataPreparationRequest | null>(null)
   const [curveMode, setCurveMode] = useState<'fixed' | 'adaptive'>('fixed')
   const jobRequests = useRef(new Map<string, Promise<Job>>())
   const resultRequests = useRef(new Map<string, Promise<OptimizationResult>>())
@@ -384,7 +386,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
       revealDisclosure('research-search-ranges')
       return
     }
-    setBusy(true); setError('')
+    setBusy(true); setError(''); setDataIssue(null)
     try {
       const submittedRanges = Object.fromEntries(Object.entries(ranges).filter(([name]) => {
         if (protocolVersion === 2 && name === 'initial_shares') return false
@@ -399,7 +401,10 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
         : { ...common, mode, min_history_days: minHistoryDays }
       const response = await tasks.run('参数研究', () => post<{ job_id: string }>('/optimizations', request))
       selectStudy(response.job_id)
-    } catch (cause) { setError(err(cause)) } finally { setBusy(false) }
+    } catch (cause) {
+      setError(err(cause))
+      if (cause instanceof ApiError && cause.status === 409 && cause.detail && typeof cause.detail === 'object' && (cause.detail as Record<string, unknown>).code === 'DATA_NOT_READY') setDataIssue(cause.detail as DataPreparationRequest)
+    } finally { setBusy(false) }
   }
   const loadLegacy = (which: 'historical' | 'robust') => {
     if (!result) return
@@ -530,6 +535,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
       </Disclosure>
     </div>
     {error && <ErrorBox message={error} onClose={() => setError('')} />}
+    {dataIssue && <div className='notice'><span>本次研究缺少本地行情或质量依据。请在数据管理中显式准备所需周期和前置历史。</span><Button variant='secondary' onClick={() => onPrepareData?.(dataIssue)}>去准备数据</Button></div>}
     <div className='research-workspace'>
       <aside className='research-config-column'>
         <Card title='研究对象' subtitle='所选日期是样本外评估期，系统另取之前的历史训练。'>

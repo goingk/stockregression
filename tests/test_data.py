@@ -83,7 +83,7 @@ def _profiles_for_import():
 def _daily_only_snapshot(store: Store, symbol="600000.SH"):
     _, daily, _, calendar = _market(4)
     daily["preclose"] = daily.close.shift(1).fillna(daily.close.iloc[0])
-    metadata = instrument_terms(symbol, {"actions_verified": True, "hf_revision": load_settings().hf_revision})
+    metadata = instrument_terms(symbol, {"actions_verified": True, "source_policy_version": "market-sources-v1"})
     manifest = store.publish(
         symbol,
         pd.DataFrame(),
@@ -97,9 +97,7 @@ def _daily_only_snapshot(store: Store, symbol="600000.SH"):
     return config, manifest
 
 
-def test_ensure_bundle_retries_degraded_snapshot_after_source_failure_backoff(tmp_path, monkeypatch):
-    import stockregression.data as data_module
-
+def test_ensure_bundle_reports_local_minute_gap_without_network(tmp_path, monkeypatch):
     store = Store(tmp_path)
     config, manifest = _daily_only_snapshot(store)
     calls = []
@@ -113,25 +111,13 @@ def test_ensure_bundle_retries_degraded_snapshot_after_source_failure_backoff(tm
         }
 
     monkeypatch.setattr(DataService, "sync", fail_sync)
-    service = DataService(store)
-    first = service.ensure_bundle(config)
-    assert first.version == manifest["version"]
-    assert first.quality["daily_days"] == len(first.quality["days"])
-    assert not any("mock network timeout" in warning for warning in first.warnings)
-    assert any("mock network timeout" in event["message"] for event in first.metadata["source_events"])
-    cached = DataService(store).ensure_bundle(config)
-    assert calls == ["repair"]
-    assert any("mock network timeout" in event["message"] for event in cached.metadata["source_events"])
-
-    original_time = data_module.time.time
-    monkeypatch.setattr(data_module.time, "time", lambda: original_time() + 61)
-    DataService(store).ensure_bundle(config)
-    assert calls == ["repair", "repair"]
+    with pytest.raises(DataQualityError, match="数据管理"):
+        DataService(store).ensure_bundle(config)
+    assert calls == []
+    assert store.snapshot(config.symbol)["version"] == manifest["version"]
 
 
-def test_ensure_bundle_retries_missing_snapshot_after_source_failure_backoff(tmp_path, monkeypatch):
-    import stockregression.data as data_module
-
+def test_ensure_bundle_rejects_missing_snapshot_without_network(tmp_path, monkeypatch):
     store = Store(tmp_path)
     config = BacktestConfig(symbol="600000.SH", start_date=date(2024, 1, 2), end_date=date(2024, 1, 5), frequency="1m")
     calls = []
@@ -141,17 +127,9 @@ def test_ensure_bundle_retries_missing_snapshot_after_source_failure_backoff(tmp
         return {"status": "failed", "symbols": [], "failures": [{"symbol": config.symbol, "reason": "mock history endpoint unavailable"}]}
 
     monkeypatch.setattr(DataService, "sync", fail_sync)
-    with pytest.raises(DataQualityError, match="mock history endpoint unavailable"):
+    with pytest.raises(DataQualityError, match="数据管理"):
         DataService(store).ensure_bundle(config)
-    with pytest.raises(DataQualityError, match="mock history endpoint unavailable"):
-        DataService(store).ensure_bundle(config)
-    assert calls == ["history"]
-
-    original_time = data_module.time.time
-    monkeypatch.setattr(data_module.time, "time", lambda: original_time() + 61)
-    with pytest.raises(DataQualityError, match="mock history endpoint unavailable"):
-        DataService(store).ensure_bundle(config)
-    assert calls == ["history", "history"]
+    assert calls == []
 
 
 def test_submission_readiness_probe_is_cached_for_same_immutable_request(tmp_path, monkeypatch):
@@ -641,7 +619,7 @@ def test_auto_import_reuses_cached_independent_reference_without_sync(tmp_path, 
     store.state("import-reference:600000.SH", {"path": "reference.parquet", "frequency": "5m", "source": "independent fixture"})
     minute_path = tmp_path / "minute.parquet"
     raw.to_parquet(minute_path)
-    monkeypatch.setattr("stockregression.data.fetch_auxiliary", lambda *args: pytest.fail("complete local data must not sync"))
+    monkeypatch.setattr("stockregression.data.fetch_auxiliary_routed", lambda *args: pytest.fail("complete local data must not sync"))
     monkeypatch.setattr("baostock.login", lambda: pytest.fail("cached calendar must not sync"))
     result = DataService(store).import_files({"symbol": "600000.SH", "minute_path": str(minute_path)})
     profile = result["profiles"]["import"]

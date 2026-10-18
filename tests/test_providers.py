@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 import sys
 import types
 
@@ -90,6 +91,29 @@ def fake_baostock(monkeypatch, daily_rows=(), calendar_rows=()):
     return queries
 
 
+def test_tdx_protocol_error_preserves_original_parser_message(monkeypatch):
+    from pytdx.errors import TdxFunctionCallError
+
+    class FakeApi:
+        def __init__(self, **_kwargs):
+            pass
+
+        def connect(self, *args, **kwargs):
+            return True
+
+        def get_security_bars(self, *args):
+            error = TdxFunctionCallError("calling function error")
+            error.original_exception = struct.error("unpack requires a buffer of 4 bytes")
+            raise error
+
+        def disconnect(self):
+            pass
+
+    monkeypatch.setattr("pytdx.hq.TdxHq_API", FakeApi)
+    with pytest.raises(RuntimeError, match="unpack requires a buffer of 4 bytes"):
+        providers.fetch_tdx("600000.SH")
+
+
 def test_fetch_reference_5m_uses_baostock_for_etf(monkeypatch):
     rows = [["2024-01-02", "20240102093500000", "1.030", "1.035", "1.028", "1.033", "120000", "123000"]]
     queries = fake_baostock(monkeypatch, daily_rows=rows)
@@ -134,7 +158,7 @@ def test_fetch_etf_auxiliary_falls_back_to_baostock_daily(monkeypatch):
     assert daily.close.tolist() == [1.033]
     assert calendar.date.tolist() == [pd.Timestamp("2024-01-02")]
     assert metadata["actions_verified"] is True
-    assert any("BaoStock" in warning for warning in metadata["warnings"])
+    assert not any("东方财富" in warning for warning in metadata["warnings"])
 
 
 def test_fetch_etf_auxiliary_prefers_eastmoney_daily(monkeypatch):
@@ -148,7 +172,9 @@ def test_fetch_etf_auxiliary_prefers_eastmoney_daily(monkeypatch):
     ))
     queries = fake_baostock(monkeypatch, calendar_rows=[["2024-01-02", "1"]])
 
-    daily, actions, calendar, metadata = providers.fetch_etf_auxiliary("159611.SZ", "2024-01-02", "2024-01-02")
+    daily, actions, calendar, metadata = providers.fetch_etf_auxiliary(
+        "159611.SZ", "2024-01-02", "2024-01-02", daily_source="eastmoney"
+    )
 
     assert queries == []
     assert daily.volume.tolist() == [120000]  # Eastmoney lots converted to units

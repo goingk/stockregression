@@ -4,14 +4,39 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shutil
 import threading
 import time
 import traceback
+from pathlib import Path
 
 from .data import DataService
 from .models import BacktestConfig, OptimizationConfig
+from .market_data import MarketDataService
+from .market_data.aggregation import AggregationService
+from .market_data.migration import LegacyMigration
+from .market_data.package import import_etf_package, index_etf_package_direct
+from .market_data.maintenance import rebuild_state, update_rebuild_state
+from .market_data.preparation import MarketPreparationService
+from .market_data.sync import MarketDataSyncService
 from .research_preparation import prepare_research_bundle
+from .source_health import probe_source
 from .storage import Store
+
+
+def _cleanup_uploaded_input(store: Store, job_id: str):
+    job = store.job(job_id) or {}
+    payload = job.get("payload") or {}
+    directories = payload.get("upload_dirs") or ([payload["upload_dir"]] if payload.get("upload_dir") else [])
+    allowed = [
+        (store.root / "imports").resolve(),
+        MarketDataService(store).repository.package.staging_dir.resolve(),
+    ]
+    for relative in directories:
+        path = Path(relative)
+        target = path.resolve() if path.is_absolute() else (store.root / path).resolve()
+        if any(target.is_relative_to(root) for root in allowed) and target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
 
 
 def _research_protocol_hash(config: OptimizationConfig) -> str:
@@ -152,6 +177,150 @@ def execute_job(root: str, job_id: str, observer=None):
         elif kind == "import":
             result = service.import_files(payload, progress, cancelled)
             symbol, title = payload["symbol"], "本地数据导入"
+        elif kind == "market_import":
+            market = MarketDataService(store)
+            result = market.import_file(
+                payload["symbol"], payload["timeframe"], payload["path"],
+                label_convention=payload.get("label_convention", "auto"),
+                adjustment=payload.get("adjustment", "none"), etf_category=payload.get("etf_category"),
+                calendar_path=payload.get("calendar_path"), actions_path=payload.get("actions_path"),
+                skip_invalid_rows=payload.get("skip_invalid_rows", False),
+                import_mode=payload.get("import_mode", "merge"),
+                progress=progress, cancelled=cancelled,
+            )
+            symbol, title = payload["symbol"], f"导入 {payload['timeframe']} 行情"
+        elif kind == "market_import_batch":
+            market = MarketDataService(store)
+            result = market.import_folder(
+                payload["folder"], payload["timeframe"], recursive=payload.get("recursive", False),
+                label_convention=payload.get("label_convention", "auto"),
+                adjustment=payload.get("adjustment", "none"), etf_category=payload.get("etf_category"),
+                resume=payload.get("resume", True), calendar_path=payload.get("calendar_path"),
+                workers=payload.get("workers", 2), skip_invalid_rows=payload.get("skip_invalid_rows", False),
+                import_mode=payload.get("import_mode", "merge"),
+                progress=progress, cancelled=cancelled,
+            )
+            symbol, title = "", f"批量导入 {payload['timeframe']}"
+        elif kind == "market_import_package":
+            market = MarketDataService(store)
+            update_rebuild_state(store, stage="importing")
+            result = import_etf_package(
+                market, payload["folder"], timeframes=payload.get("timeframes"),
+                symbols=payload.get("symbols"),
+                label_convention=payload.get("label_convention", "auto"),
+                resume=payload.get("resume", True), workers=payload.get("workers", 2),
+                skip_invalid_rows=payload.get("skip_invalid_rows", False),
+                progress=progress, cancelled=cancelled,
+            )
+            update_rebuild_state(store, stage="finished", result=result)
+            symbol, title = "", "ETF 数据包导入"
+        elif kind == "market_index_package":
+            update_rebuild_state(store, stage="indexing")
+            result = index_etf_package_direct(
+                MarketDataService(store), payload["folder"],
+                timeframes=payload.get("timeframes"), symbols=payload.get("symbols"),
+                progress=progress, cancelled=cancelled,
+            )
+            update_rebuild_state(store, stage="finished", result=result)
+            symbol, title = "", "登记 ETF 原始 Parquet 数据包"
+        elif kind == "market_sync":
+            timeframes = payload.get("timeframes") or [payload["timeframe"]]
+            symbols = payload.get("symbols", [])
+            scope = payload.get("scope")
+            if "1min" in timeframes and payload.get("mode") == "history":
+                raise ValueError("1 分钟历史行情只从本地数据包读取；请先登记数据包或导入文件，近期缺口使用缺口修补。")
+            if "1min" in timeframes and scope == "market" and payload.get("initialize"):
+                raise ValueError("1 分钟行情不支持全市场在线初始化；请登记本地数据包或导入文件。")
+            combined = []
+            failures = []
+            for timeframe in sorted(set(timeframes), key=lambda value: 0 if value == "1day" else 1):
+                selected = list(symbols)
+                if scope == "market":
+                    if payload.get("initialize"):
+                        service.refresh_instruments(progress, cancelled)
+                        selected = [row["symbol"] for row in store.instruments(limit=None)]
+                    else:
+                        selected = MarketDataService(store).repository.symbols_for_timeframe(timeframe)
+                elif scope == "watchlist":
+                    selected = [row["symbol"] for row in store.watches()]
+                one = MarketDataSyncService(MarketDataService(store)).sync(
+                    selected, timeframe, payload.get("mode", "incremental"),
+                    start=payload.get("start_date"), end=payload.get("end_date"),
+                    resume=payload.get("resume", False), retry_failed=payload.get("retry_failed", False),
+                    workers=payload.get("workers", 2),
+                    progress=progress, cancelled=cancelled,
+                )
+                combined.append(one)
+                failures.extend(one.get("failures", []))
+            result = {
+                "status": "completed" if not failures else "partial",
+                "timeframes": sorted(set(timeframes)),
+                "runs": combined, "failures": failures,
+                "message": f"完成 {len(combined)} 个基础周期更新",
+            }
+            symbol, title = ",".join(symbols), f"基础行情同步 · {', '.join(sorted(set(timeframes)))}"
+        elif kind == "market_source_probe":
+            result = probe_source(
+                store, payload["source"], payload["capability"],
+                payload.get("market", "all"), cancelled,
+            )
+            symbol, title = "", f"数据源探测 · {payload['source']}"
+        elif kind == "market_validate":
+            result = MarketDataService(store).revalidate(
+                payload["symbol"], payload["timeframe"],
+                label_convention=payload.get("label_convention"),
+                mode=payload.get("mode", "incremental"),
+                start=payload.get("start_date"), end=payload.get("end_date"),
+            )
+            symbol, title = payload["symbol"], f"校验 {payload['timeframe']} 行情"
+        elif kind == "market_archive":
+            market = MarketDataService(store)
+            values = []
+            for symbol in payload.get("symbols", []):
+                values.append(market.repository.archive_dataset(
+                    symbol, payload["timeframe"], progress=progress, cancelled=cancelled,
+                ))
+            result = {
+                "status": "completed", "timeframe": payload["timeframe"],
+                "symbols": values,
+            }
+            symbol, title = ",".join(payload.get("symbols", [])), "保护历史行情快照"
+        elif kind == "market_prepare":
+            market = MarketDataService(store)
+            config = BacktestConfig.model_validate(payload["config"])
+            result = MarketPreparationService(market).execute(
+                config, progress=progress, cancelled=cancelled,
+            )
+            symbol, title = config.symbol, f"准备 {config.frequency} 行情"
+        elif kind == "market_aggregate":
+            market = MarketDataService(store)
+            aggregated = AggregationService(market)
+            values = []
+            aggregate_failures = []
+            for symbol in payload["symbols"]:
+                if cancelled():
+                    raise InterruptedError("任务已取消")
+                try:
+                    values.append(aggregated.aggregate(
+                        symbol, payload["source_timeframe"], payload["target_timeframe"],
+                        start=payload.get("start_date"), end=payload.get("end_date"),
+                        progress=progress, cancelled=cancelled,
+                    ))
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    aggregate_failures.append({"symbol": symbol, "reason": str(exc)})
+            failures = [*aggregate_failures, *[item for item in values if item.get("status") == "failed"]]
+            result = {"status": "completed" if not failures else "partial", "results": values,
+                      "targets": len(payload["symbols"]), "completed": len(values) - len(failures),
+                      "failures": failures, "message": f"聚合完成 {len(values) - len(failures)} 个标的"}
+            symbol, title = ",".join(payload["symbols"]), f"本地聚合 {payload['source_timeframe']} → {payload['target_timeframe']}"
+        elif kind == "market_migrate":
+            result = LegacyMigration(store).run(
+                dry_run=payload.get("dry_run", False), resume=payload.get("resume", True),
+                progress=progress, cancelled=cancelled,
+            )
+            symbol, title = "", "旧行情迁移"
         elif kind == "instruments":
             result = service.refresh_instruments(progress, cancelled)
             symbol, title = "", "证券清单更新"
@@ -160,7 +329,7 @@ def execute_job(root: str, job_id: str, observer=None):
         if cancelled() and kind != "optimization":
             raise InterruptedError("任务已取消")
         was_cancelled = cancelled()
-        failed_sync = kind == "sync" and result.get("status") == "failed"
+        failed_sync = kind in {"sync", "market_sync", "market_source_probe", "market_import", "market_import_batch", "market_import_package", "market_index_package", "market_aggregate", "market_migrate", "market_prepare", "market_archive"} and result.get("status") == "failed"
         failed_research = kind == "optimization" and payload.get("config", {}).get("protocol_version") == 2 and _scientific_failed(result)
         result_cancelled = kind == "optimization" and result.get("status") == "cancelled"
         cancelled_job = was_cancelled or result_cancelled
@@ -186,7 +355,8 @@ def execute_job(root: str, job_id: str, observer=None):
             message = "科学参数研究部分完成；已保留已完成的候选与结果"
         else:
             message = result.get("message", "完成")
-        store.update_job(job_id, status="cancelled" if cancelled_job else "failed" if failed_sync or failed_research else "completed", progress=1, message=message, error=sync_error or (result.get("reason") if failed_research else None), result_id=result_id)
+        partial = result.get("status") == "partial" and kind != "optimization"
+        store.update_job(job_id, status="cancelled" if cancelled_job else "failed" if failed_sync or failed_research else "partial" if partial else "completed", progress=1, message=message, error=sync_error or (result.get("reason") if failed_research else None), result_id=result_id)
     except InterruptedError as exc:
         store.update_job(job_id, status="cancelled", message=str(exc))
     except Exception as exc:
@@ -194,6 +364,8 @@ def execute_job(root: str, job_id: str, observer=None):
         folder.mkdir(exist_ok=True)
         (folder / f"{job_id}.log").write_text(traceback.format_exc(), encoding="utf-8")
         store.update_job(job_id, status="failed", message="任务失败，查看原因后可重试", error=str(exc))
+    finally:
+        _cleanup_uploaded_input(store, job_id)
 
 
 class JobManager:

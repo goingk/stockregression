@@ -35,7 +35,9 @@ def configure_schedule(install: bool) -> dict:
             (TASK_NAMES[0], "daily", settings.schedule.daily_time, "Monday,Tuesday,Wednesday,Thursday,Friday"),
             (TASK_NAMES[1], "repair", settings.schedule.weekly_time, weekday),
         ]:
-            arguments = f'-m stockregression.cli sync --mode {mode} --scope market --resume'
+            sync_mode = "incremental" if mode == "daily" else "repair"
+            frequencies = "--frequency 1day --frequency 1min" if mode == "daily" else "--frequency 1day"
+            arguments = f"-m stockregression.cli data sync {frequencies} --mode {sync_mode} --scope market --resume"
             commands += [
                 "$taskAction = New-ScheduledTaskAction -Execute " + _powershell_literal(sys.executable) + " -Argument " + _powershell_literal(arguments) + " -WorkingDirectory " + _powershell_literal(PROJECT_ROOT),
                 "$taskTrigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek " + days + " -At " + _powershell_literal(schedule_time),

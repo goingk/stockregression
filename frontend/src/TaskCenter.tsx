@@ -46,7 +46,7 @@ export function TaskProvider({ children, onOpenResult }: { children: ReactNode; 
       }
       for (const job of changed) merged.set(job.id, {
         id: job.id, label: taskLabel(job), job,
-        expiresAt: isActiveJob(job) || job.status === 'failed' ? undefined : Date.now() + 6000,
+        expiresAt: isActiveJob(job) || job.status === 'failed' || job.status === 'partial' ? undefined : Date.now() + 6000,
       })
       return [...merged.values()]
     })
@@ -153,10 +153,10 @@ export function TaskProvider({ children, onOpenResult }: { children: ReactNode; 
     {historyOpen && <div className="task-drawer-overlay" onMouseDown={event => { if (event.target === event.currentTarget) setHistoryOpen(false) }}>
       <section ref={drawer} className="task-drawer" role="dialog" aria-modal="true" aria-labelledby="task-center-title">
         <div className="task-drawer-head"><div><h2 id="task-center-title">任务中心</h2><p>进度、历史记录与结果入口</p></div><button className="icon-button" onClick={() => setHistoryOpen(false)} aria-label="关闭任务中心"><X size={20} /></button></div>
-        <div className="task-drawer-tools"><select className="input" aria-label="筛选任务" value={filter} onChange={event => setFilter(event.target.value)}><option value="all">全部任务</option><option value="active">正在运行</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option></select><Button variant="quiet" onClick={() => void refresh()}><RefreshCw size={14} />刷新</Button></div>
+        <div className="task-drawer-tools"><select className="input" aria-label="筛选任务" value={filter} onChange={event => setFilter(event.target.value)}><option value="all">全部任务</option><option value="active">正在运行</option><option value="completed">已完成</option><option value="partial">部分完成</option><option value="failed">失败</option><option value="cancelled">已取消</option></select><Button variant="quiet" onClick={() => void refresh()}><RefreshCw size={14} />刷新</Button></div>
         {error && <p className="task-connection-note" role="status">{error}</p>}
         <div className="task-drawer-list">{!visibleJobs.length ? <Empty title={loading ? '正在读取任务…' : '暂无任务'} /> : visibleJobs.map(job => <article className="task-history-item" key={job.id}>
-          <div className="task-history-heading"><strong>{taskLabel(job)}</strong><Badge tone={job.status === 'failed' ? 'red' : job.status === 'completed' ? 'green' : isActiveJob(job) ? 'blue' : 'neutral'}>{taskStatusLabel(job.status)}</Badge></div>
+          <div className="task-history-heading"><strong>{taskLabel(job)}</strong><Badge tone={job.status === 'failed' ? 'red' : job.status === 'partial' ? 'amber' : job.status === 'completed' ? 'green' : isActiveJob(job) ? 'blue' : 'neutral'}>{taskStatusLabel(job.status)}</Badge></div>
           <small>{job.created_at ? new Date(job.created_at).toLocaleString('zh-CN', { hour12: false }) : ''} · {job.id.slice(0, 12)}</small>
           <JobProgress progress={job.progress} status={job.status} /><p>{job.message || '等待处理'}</p>
           {job.error != null && <details className="task-error"><summary>错误详情</summary><pre>{typeof job.error === 'string' ? job.error : JSON.stringify(job.error, null, 2)}</pre></details>}{jobActions(job)}

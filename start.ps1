@@ -23,4 +23,7 @@ if ($needsBuild) {
         if ($LASTEXITCODE -ne 0) { throw '前端构建失败。' }
     } finally { Pop-Location }
 }
-& uv run --frozen stockregression serve --open-browser
+$servePort = if ($env:STOCKREGRESSION_SERVE_PORT) { [int]$env:STOCKREGRESSION_SERVE_PORT } else { 8000 }
+$serveArgs = @('run', '--frozen', 'stockregression', 'serve', '--port', $servePort)
+if ($env:STOCKREGRESSION_NO_BROWSER -ne '1') { $serveArgs += '--open-browser' }
+& uv @serveArgs

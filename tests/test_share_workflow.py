@@ -198,16 +198,9 @@ def test_v2_api_preview_does_not_persist_jobs_or_results(tmp_path, monkeypatch):
         raw = config.model_dump(mode="json")
         raw["end_date"] = "2024-01-31"
         response = client.post("/api/v1/backtests/preview", json={"session_id": "test", "revision": 1, "config": raw})
-        assert response.status_code == 200
-        deadline = time.monotonic() + 25
-        while time.monotonic() < deadline:
-            state = client.get("/api/v1/backtests/preview/test").json()
-            if state["status"] in {"completed", "failed"}:
-                break
-            time.sleep(.05)
-        assert state["status"] == "completed", state
-        assert state["result"]["effective_end_date"] == str(bundle.calendar[-1].date())
-        assert sync_calls == [([config.symbol], "daily")]
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "DATA_NOT_READY"
+        assert sync_calls == []
         assert client.get("/api/v1/jobs").json() == []
         assert client.get("/api/v1/results").json() == []
 
@@ -253,8 +246,7 @@ def test_initial_holding_receives_first_day_dividend_without_nav_jump():
 def test_market_sync_uses_full_catalog_and_can_resume_failures(tmp_path, monkeypatch):
     import stockregression.data as module
     records = [{"symbol": f"{600000 + index}.SH", "name": str(index)} for index in range(125)] + [{"symbol": "159915.SZ", "name": "创业板 ETF"}]
-    monkeypatch.setattr(module, "fetch_instruments", lambda revision: records)
-    monkeypatch.setattr("stockregression.providers.estimate_history_bytes", lambda symbols, settings: 1000)
+    monkeypatch.setattr(module, "fetch_instruments", lambda *args: records)
     monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
     service = DataService(Store(tmp_path))
     attempts = []
@@ -463,11 +455,10 @@ def test_market_dry_run_reports_universe_without_creating_data_job(tmp_path, mon
     from stockregression import cli
     from stockregression.settings import Settings
     monkeypatch.setattr(cli, "load_settings", lambda: Settings(data_dir=str(tmp_path)))
-    monkeypatch.setattr("stockregression.providers.fetch_instruments", lambda revision: [{"symbol": "600000.SH"}, {"symbol": "510300.SH"}])
-    monkeypatch.setattr("stockregression.providers.estimate_history_bytes", lambda symbols, settings: 2 ** 30)
+    monkeypatch.setattr("stockregression.providers.fetch_instruments", lambda *args: [{"symbol": "600000.SH"}, {"symbol": "510300.SH"}])
     result = CliRunner().invoke(cli.app, ["sync", "--scope", "market", "--mode", "history", "--dry-run"])
     assert result.exit_code == 0, result.output
-    assert "ETF 1" in result.output and "1.00 GiB" in result.output
+    assert "ETF 1" in result.output
     assert not (tmp_path / "catalog.sqlite").exists()
 
 

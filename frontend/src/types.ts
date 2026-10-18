@@ -1,4 +1,174 @@
 export type Frequency = '1m' | '5m' | '15m' | '30m' | '60m' | '1d'
+export type DataTimeframe = '1min' | '5min' | '15min' | '30min' | '60min' | '1day' | '1week' | '1month'
+
+export interface DataSourceHealth {
+  source: string
+  capability: string
+  market: 'stock' | 'etf'
+  status: 'unknown' | 'passed' | 'failed' | 'cancelled'
+  rows?: number | null
+  coverage_start?: string | null
+  coverage_end?: string | null
+  duration_seconds?: number | null
+  last_checked_at?: string | null
+  last_success_at?: string | null
+  last_failure_at?: string | null
+  cooldown_until?: string | null
+  error_category?: string | null
+  error?: string | null
+}
+
+export interface DataSourceOption {
+  source: string
+  label: string
+  role: 'default' | 'optional'
+  selected: boolean
+  selectable: boolean
+  states: DataSourceHealth[]
+}
+
+export interface DataSourceCapability {
+  capability: 'recent_minute' | 'etf_daily'
+  label: string
+  description: string
+  configured: string
+  default: string
+  optional: string
+  routes: Array<{ market: 'stock' | 'etf'; configured: string; effective: string; fallback: boolean; reason?: string | null }>
+  sources: DataSourceOption[]
+}
+
+export interface DataSourcesResponse {
+  policy_version: string
+  cooldown_hours: number
+  capabilities: DataSourceCapability[]
+}
+
+export interface DataDataset {
+  symbol: string
+  timeframe: DataTimeframe
+  adjustment: string
+  current_version: number
+  first_time?: string | null
+  last_time?: string | null
+  completed_through?: string | null
+  latest_record_time?: string | null
+  verified_from?: string | null
+  verified_through?: string | null
+  row_count: number
+  raw_rows: number
+  synthetic_rows: number
+  status: 'ready' | 'partial' | 'pending_validation' | 'legacy' | string
+  reason?: string | null
+  updated_at?: string | null
+  metadata?: Record<string, unknown>
+  storage?: string
+}
+
+export interface DataPreparationRequest {
+  symbol?: string
+  frequency?: string
+  start?: string | null
+  end?: string | null
+  gaps?: Array<{ kind?: string; timeframe?: string; message?: string }>
+  config?: BacktestConfig
+  checked_start?: string | null
+  checked_end?: string | null
+  package_id?: string
+  origin?: 'backtest' | 'research'
+}
+
+export interface DataPeriodSummary {
+  symbol: string
+  timeframe: DataTimeframe
+  current_version: number
+  first_time?: string | null
+  last_time?: string | null
+  completed_through?: string | null
+  latest_record_time?: string | null
+  verified_through?: string | null
+  row_count: number
+  synthetic_rows: number
+  status: string
+  quality_status: 'passed' | 'pending' | 'failed' | string
+  coverage_status: 'complete' | 'partial' | 'unknown' | string
+  file_status: 'readable' | 'missing' | 'changed' | string
+  ready: boolean
+  reason?: string | null
+  updated_at?: string | null
+  metadata?: Record<string, unknown>
+  validation?: {
+    rules_version?: number
+    validated_days?: number
+    pending?: string[]
+    failed?: string[]
+    calendar_available?: boolean
+  }
+  increment_count?: number
+  archive?: {
+    protected: boolean
+    sources: Array<{ path: string; size: number; archived: boolean; archive_path?: string | null; archived_at?: string | null }>
+  }
+}
+
+export interface DataInventoryItem {
+  symbol: string
+  name: string
+  asset_type: 'stock' | 'etf' | string
+  periods: Partial<Record<DataTimeframe, DataPeriodSummary>>
+  updated_at?: string | null
+}
+
+export interface DataInventoryResponse {
+  items: DataInventoryItem[]
+  count: number
+  dataset_count: number
+  total_symbols: number
+  stats: { symbols: number; datasets: number; ready: number; pending: number; rows: number; bytes: number }
+  limit: number
+  offset: number
+}
+
+export interface DataPackageInfo {
+  package_id: string
+  package_version: number
+  schema_version: number
+  path: string
+  status: string
+  readable: boolean
+  manifest_ready?: boolean
+  bytes: number
+  file_count: number
+  updated_at?: string | null
+  pending_recovery?: number
+}
+
+export interface DataPreparationStep {
+  kind: 'auxiliary' | 'bars' | 'validate' | string
+  symbol: string
+  timeframe?: string
+  mode?: string
+  start?: string
+  end?: string
+  reason: string
+  status?: string
+  error?: string
+  result?: unknown
+}
+
+export interface DataPreparationPlan {
+  symbol: string
+  frequency: string
+  asset_type?: string
+  ready: boolean
+  checked_start?: string | null
+  checked_end?: string | null
+  package_id: string
+  package_version: number
+  gaps: Array<{ kind?: string; timeframe?: string; message?: string }>
+  steps: DataPreparationStep[]
+  config: BacktestConfig
+}
 export type QuantityMode = 'shares' | 'cash' | 'equity_ratio'
 export interface FeeConfig {
   commission_rate: number
@@ -99,7 +269,7 @@ export interface DataDiagnostics {
 export interface Job {
   id: string
   kind: string
-  status: 'queued' | 'running' | 'completed' | 'failed' | 'cancelled' | string
+  status: 'queued' | 'running' | 'completed' | 'partial' | 'failed' | 'cancelled' | string
   progress: number
   message: string
   error?: unknown

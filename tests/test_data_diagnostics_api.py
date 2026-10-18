@@ -237,7 +237,7 @@ def test_result_get_uses_locked_rows_without_network_or_prepare_and_marketbars_s
 
     monkeypatch.setattr(DataService, "sync", forbidden, raising=False)
     monkeypatch.setattr(DataService, "ensure_bundle", forbidden)
-    for name in ("fetch_auxiliary", "fetch_hf", "fetch_tdx", "fetch_sina", "fetch_reference_5m", "fetch_latest_trading_date"):
+    for name in ("fetch_auxiliary_routed", "fetch_tdx", "fetch_sina", "fetch_reference_5m", "fetch_latest_trading_date"):
         monkeypatch.setattr(data_module, name, forbidden)
 
     with TestClient(app) as client:

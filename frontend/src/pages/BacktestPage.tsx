@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Copy, FlaskConical, Play, Plus, RefreshCw, Save, Trash2 } from 'lucide-react'
-import { del, get, post } from '../api'
+import { ApiError, del, get, post } from '../api'
 import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, Loading, PageHeader, configError, configPayload, loadConfig, revealConfigError, useErrorMessage } from '../components'
 import Disclosure from '../Disclosure'
 import EquityPreview from '../EquityPreview'
 import { useTasks } from '../TaskCenter'
 import { useWorkspaces } from '../WorkbenchState'
-import type { BacktestConfig, ConfigRecord } from '../types'
+import type { BacktestConfig, ConfigRecord, DataPreparationRequest } from '../types'
 
-export default function BacktestPage({ onResearch }: { onResearch: (config: BacktestConfig) => void }) {
+export default function BacktestPage({ onResearch, onPrepareData }: { onResearch: (config: BacktestConfig) => void; onPrepareData?: (request: DataPreparationRequest) => void }) {
   const workspace = useWorkspaces()
   const { backtest: config, updateBacktest: updateConfig } = workspace
   const tasks = useTasks()
@@ -22,6 +22,7 @@ export default function BacktestPage({ onResearch }: { onResearch: (config: Back
   const [saveDialog, setSaveDialog] = useState<{ copy: boolean; name: string } | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<ConfigRecord | null>(null)
   const [dialogError, setDialogError] = useState('')
+  const [dataIssue, setDataIssue] = useState<DataPreparationRequest | null>(null)
   const err = useErrorMessage()
   const refresh = useCallback(async () => {
     try { setRecords(await get<ConfigRecord[]>('/configs')) }
@@ -50,9 +51,12 @@ export default function BacktestPage({ onResearch }: { onResearch: (config: Back
   }
   const runOne = async () => {
     if (!config || !validate()) return
-    setBusy(true); setError(''); setNotice('')
+    setBusy(true); setError(''); setNotice(''); setDataIssue(null)
     try { await tasks.run('策略回测', () => post<{ job_id: string }>('/backtests', configPayload(config))) }
-    catch (cause) { setError(err(cause)) } finally { setBusy(false) }
+    catch (cause) {
+      setError(err(cause))
+      if (cause instanceof ApiError && cause.status === 409 && cause.detail && typeof cause.detail === 'object' && (cause.detail as Record<string, unknown>).code === 'DATA_NOT_READY') setDataIssue(cause.detail as DataPreparationRequest)
+    } finally { setBusy(false) }
   }
   const runBatch = async () => {
     const chosen = records.filter(item => selected.includes(item.id))
@@ -90,6 +94,7 @@ export default function BacktestPage({ onResearch }: { onResearch: (config: Back
   return <div className="backtest-page">
     <PageHeader eyebrow="STRATEGY BACKTEST" title="策略回测" description="调整网格与账户，实时比较网格、全仓持有和定投的收益率。" action={<Button variant="secondary" onClick={() => { workspace.restore('backtest'); setFormRevision(current => current + 1); setNotice('已恢复上次有效参数，标的已清空。') }}><RefreshCw size={15} />恢复上次参数</Button>} />
     {error && <ErrorBox message={error} onClose={() => setError('')} />}
+    {dataIssue && <div className="notice"><span>本次区间缺少本地数据。可在数据管理中显式准备该标的和周期；系统不会在后台自动下载。</span><Button variant="secondary" onClick={() => onPrepareData?.(dataIssue)}>去准备数据</Button></div>}
     {workspace.error && <ErrorBox message={workspace.error} />}
     {notice && <div className="notice success"><span>{notice}</span><button className="text-link" onClick={() => setNotice('')}>收起</button></div>}
     {config.selection_asof && <div className="selection-context"><Badge tone="amber">研究参数</Badge><span>选参截止 {config.selection_asof}{config.start_date < config.selection_asof ? ' · 当前区间为样本内历史回看' : ''}</span></div>}

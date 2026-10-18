@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -20,10 +21,18 @@ from .data_diagnostics import derive_source_spans, project_data_diagnostics
 from .quality import QUALITY_RULES_VERSION, _closing_auction_placeholders, minute_slots
 from .jobs import JobManager
 from .models import BacktestConfig, OptimizationConfig, normalize_symbol
+from .market_data import MarketDataService
+from .market_data.aggregation import AggregationService
+from .market_data.models import DataVersionNotFound, MarketDataError
+from .market_data.cache import cache_settings, configure_cache
+from .market_data.package import scan_etf_package
+from .market_data.preparation import MarketPreparationService
+from .market_data.timeframes import normalize_timeframe, public_timeframe
 from .rules import instrument_terms
 from .research_preparation import preparation_config
 from .schedule import configure_schedule
 from .settings import PROJECT_ROOT, load_settings, save_settings
+from .source_health import configured_sources, validate_source_settings
 from .storage import Store, dumps, json_safe, now_iso
 
 
@@ -34,6 +43,127 @@ class SyncRequest(BaseModel):
     resume: bool = False
     retry_failed: bool = False
     workers: int = Field(default=2, ge=1, le=4)
+
+
+class MarketSyncRequest(BaseModel):
+    symbols: list[str] = Field(default_factory=list)
+    timeframe: str | None = None
+    frequency: str | None = None
+    timeframes: list[str] = Field(default_factory=list)
+    mode: Literal["history", "incremental", "daily", "repair"] = "incremental"
+    scope: Literal["market", "watchlist", "selected"] | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    resume: bool = False
+    retry_failed: bool = False
+    initialize: bool = False
+    workers: int = Field(default=2, ge=1, le=4)
+
+
+class MarketImportRequest(BaseModel):
+    symbol: str
+    timeframe: str | None = None
+    frequency: str | None = None
+    path: str | None = None
+    label_convention: Literal["auto", "start", "end"] = "auto"
+    adjustment: str = "none"
+    etf_category: str | None = None
+    calendar_path: str | None = None
+    actions_path: str | None = None
+    skip_invalid_rows: bool = False
+    import_mode: Literal["merge", "snapshot"] = "merge"
+
+
+class MarketBatchRequest(BaseModel):
+    folder: str | None = None
+    timeframe: str | None = None
+    frequency: str | None = None
+    recursive: bool = False
+    label_convention: Literal["auto", "start", "end"] = "auto"
+    adjustment: str = "none"
+    etf_category: str | None = None
+    resume: bool = True
+    calendar_path: str | None = None
+    workers: int = Field(default=2, ge=1, le=4)
+    skip_invalid_rows: bool = False
+    import_mode: Literal["merge", "snapshot"] = "merge"
+
+
+class MarketPackageRequest(BaseModel):
+    folder: str
+    format: Literal["etf", "stock", "package"] = "package"
+    timeframes: list[str] | None = None
+    symbols: list[str] | None = None
+    label_convention: Literal["auto", "start", "end"] = "auto"
+    resume: bool = True
+    workers: int = Field(default=2, ge=1, le=4)
+    skip_invalid_rows: bool = False
+
+
+class MarketValidateRequest(BaseModel):
+    symbol: str
+    timeframe: str | None = None
+    frequency: str | None = None
+    label_convention: Literal["auto", "start", "end"] | None = None
+    mode: Literal["incremental", "full"] = "incremental"
+    start_date: str | None = None
+    end_date: str | None = None
+
+
+class MarketArchiveRequest(BaseModel):
+    symbols: list[str] = Field(default_factory=list)
+    timeframe: str | None = None
+    frequency: str | None = None
+
+
+class MarketAggregateRequest(BaseModel):
+    symbols: list[str] = Field(min_length=1)
+    source_timeframe: str
+    target_timeframe: str
+    start_date: str | None = None
+    end_date: str | None = None
+
+
+class MarketPreparationRequest(BaseModel):
+    config: BacktestConfig
+    version: str | None = None
+
+
+class MarketSourceProbeRequest(BaseModel):
+    source: Literal["sina", "tdx", "baostock", "eastmoney"]
+    capability: Literal["recent_minute", "etf_daily"]
+    market: Literal["all", "stock", "etf"] = "all"
+
+
+class RestartRequest(BaseModel):
+    force: bool = False
+
+
+def _safe_upload_path(name: str) -> Path:
+    raw = str(name or "upload.csv").replace("\\", "/")
+    pure = PurePosixPath(raw)
+    parts = [part for part in pure.parts if part not in {"", "."}]
+    if pure.is_absolute() or not parts or any(part == ".." or ":" in part for part in parts):
+        raise ValueError("上传文件名包含不安全路径")
+    if parts[-1].lower().rsplit(".", 1)[-1] not in {"csv", "parquet"}:
+        raise ValueError("仅支持上传 CSV 和 Parquet 文件")
+    return Path(*parts)
+
+
+async def _save_upload(upload: UploadFile, destination: Path) -> int:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    size = 0
+    try:
+        with destination.open("wb") as output:
+            while chunk := await upload.read(1024 * 1024):
+                output.write(chunk)
+                size += len(chunk)
+    finally:
+        await upload.close()
+    if size == 0:
+        destination.unlink(missing_ok=True)
+        raise ValueError("上传文件为空")
+    return size
 
 
 class PreviewRequest(BaseModel):
@@ -107,15 +237,31 @@ def _result_data_metadata(store: Store, result: dict) -> dict | None:
     key = f"data-source-spans:v2:q{QUALITY_RULES_VERSION}:{version}:{start or ''}:{end or ''}"
     cached = store.state(key)
     if not isinstance(cached, dict) or not isinstance(cached.get("spans"), list):
-        import pyarrow.parquet as pq
-
         frames = []
-        for relative in manifest["files"].get("minute", []):
-            path = store.root / relative
-            names = set(pq.read_schema(path).names)
-            columns = [name for name in ("timestamp", "source", "source_verified", "is_synthetic", "close") if name in names]
-            if "timestamp" in columns:
-                frames.append(pd.read_parquet(path, columns=columns))
+        if manifest.get("market_data"):
+            market_versions = manifest.get("market_versions", {})
+            minute_name = next(
+                (name for name in ("1min", "5min", "15min", "30min", "60min")
+                 if name in market_versions), None,
+            )
+            if minute_name:
+                frames.append(MarketDataService(store).repository.read_frame(
+                    symbol, minute_name,
+                    version=int(market_versions[minute_name]["version"]),
+                    start=start, end=pd.Timestamp(end) + pd.Timedelta(days=1) if end else None,
+                    fields=("timestamp", "source", "source_verified", "is_synthetic", "close"),
+                ))
+        else:
+            import pyarrow.parquet as pq
+            for relative in manifest.get("files", {}).get("minute", []):
+                path = store.root / relative
+                names = set(pq.read_schema(path).names)
+                columns = [
+                    name for name in ("timestamp", "source", "source_verified", "is_synthetic", "close")
+                    if name in names
+                ]
+                if "timestamp" in columns:
+                    frames.append(pd.read_parquet(path, columns=columns))
         minute = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         spans = derive_source_spans(minute, manifest.get("profiles"), start, end)
         auction_by_day = {}
@@ -222,12 +368,31 @@ def public_result(result: dict, full: bool = False, data_metadata: dict | None =
     return result
 
 
+def _with_data_availability(store: Store, result: dict) -> dict:
+    config = result.get("config") if isinstance(result.get("config"), dict) else {}
+    base = config.get("base") if isinstance(config.get("base"), dict) else config
+    symbol = result.get("symbol") or base.get("symbol")
+    version = result.get("data_version")
+    if not symbol or not version:
+        return result
+    available = store.snapshot(symbol, version) is not None
+    return {
+        **result, "data_version_available": available,
+        "data_version_warning": None if available else "原数据版本已清理，可查看历史结果，但不能按原版本重算",
+    }
+
+
 def create_app(data_dir: str | None = None, start_jobs: bool = True):
     configured = load_settings()
     root = str(Path(data_dir or configured.data_dir).resolve())
+    configure_cache(configured.market_cache_mb)
     store = Store(root)
+    initial_package = configured.package_dir if data_dir is None else None
+    initial_market = MarketDataService(store, package_dir=initial_package)
+    package_dir = str(initial_market.repository.package_dir)
     manager = JobManager(root, configured.max_workers)
     previews = PreviewManager(store)
+    instance_id = uuid.uuid4().hex
 
     @asynccontextmanager
     async def lifespan(app):
@@ -240,7 +405,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
 
     app = FastAPI(title="A 股及 ETF 行情与网格研究台", version="0.1.0", lifespan=lifespan)
     app.state.store = store
+    app.state.package_dir = package_dir
     app.state.previews = previews
+    app.state.instance_id = instance_id
+    app.state.restart_callback = None
     app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
 
     def submit(kind, payload):
@@ -252,9 +420,65 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         # the worker, so the API never blocks on a source download.
         return DataService(store).current_version_if_ready(config)
 
+    def require_ready(config):
+        manifest = store.snapshot(config.symbol)
+        if manifest and manifest.get("market_data"):
+            readiness = MarketDataService(store).readiness(config)
+            if not readiness["ready"]:
+                raise HTTPException(409, detail={
+                    "code": "DATA_NOT_READY", **readiness,
+                    "config": config.model_dump(mode="json"),
+                })
+            return manifest["version"]
+        version = DataService(store).current_version_if_ready(config)
+        if version is None:
+            raise HTTPException(409, detail={
+                "code": "DATA_NOT_READY", "ready": False, "symbol": config.symbol,
+                "frequency": config.frequency,
+                "config": config.model_dump(mode="json"),
+                "gaps": [{"kind": "local", "message": "没有满足本次区间和周期的本地数据；请先在数据管理中准备"}],
+                "preparation": {"symbol": config.symbol, "frequency": config.frequency,
+                                  "start": str(config.start_date), "end": str(config.end_date)},
+            })
+        return version
+
     @app.get("/api/v1/health")
     def health():
-        return {"status": "ok", "data_dir": root, "version": "0.1.0"}
+        return {
+            "status": "ok", "data_dir": root, "package_dir": package_dir,
+            "version": "0.1.0", "instance_id": instance_id,
+            "restart_supported": callable(getattr(app.state, "restart_callback", None)),
+        }
+
+    @app.post("/api/v1/system/restart", status_code=202)
+    def restart_project(payload: RestartRequest = RestartRequest()):
+        callback = getattr(app.state, "restart_callback", None)
+        if not callable(callback):
+            raise HTTPException(409, detail={
+                "code": "RESTART_UNAVAILABLE",
+                "message": "当前进程不是由项目启动脚本托管，无法自动重启。请关闭后重新运行 start.cmd。",
+            })
+        active_jobs = sum(
+            job.get("status") in {"queued", "running"}
+            for job in store.jobs(1000)
+        )
+        if active_jobs and not payload.force:
+            raise HTTPException(409, detail={
+                "code": "RESTART_JOBS_ACTIVE",
+                "message": f"当前有 {active_jobs} 个排队或运行中的任务；确认重启后运行任务会被中断。",
+                "active_jobs": active_jobs,
+            })
+        try:
+            callback(active_jobs)
+        except Exception as exc:
+            raise HTTPException(503, detail={
+                "code": "RESTART_FAILED", "message": "无法启动重启助手：" + str(exc),
+            }) from exc
+        return {
+            "status": "restarting", "active_jobs": active_jobs,
+            "previous_instance_id": instance_id,
+            "message": "服务将重启，运行中的任务会中断",
+        }
 
     @app.get("/api/v1/instruments")
     def instruments(q: str = "", asset_type: Literal["stock", "etf"] | None = None, limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
@@ -303,23 +527,113 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             db.execute("DELETE FROM watchlist WHERE symbol=?", (normalize_symbol(symbol),))
         return {"deleted": True}
 
-    @app.get("/api/v1/data/coverage/{symbol}")
-    def coverage(symbol: str):
+    @app.get("/api/v1/data/frequencies")
+    def data_frequencies():
+        return {"timeframes": MarketDataService(store).frequency_catalog()}
+
+    @app.get("/api/v1/data/package")
+    def data_package():
+        return json_safe(MarketDataService(store).package_info())
+
+    @app.get("/api/v1/data/inventory")
+    def data_inventory(
+        q: str = "", asset_type: Literal["stock", "etf"] | None = None,
+        timeframe: str | None = None, status: str | None = None,
+        limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
+    ):
         try:
+            return json_safe(MarketDataService(store).inventory(
+                query=q, asset_type=asset_type, timeframe=timeframe,
+                status=status, limit=limit, offset=offset,
+            ))
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/data/import-package/scan")
+    def import_package_scan(payload: MarketPackageRequest):
+        try:
+            return json_safe(scan_etf_package(payload.folder))
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/data/import-package")
+    def import_package(payload: MarketPackageRequest):
+        nonlocal package_dir
+        try:
+            values = payload.model_dump()
+            values["timeframes"] = [
+                normalize_timeframe(item) for item in (payload.timeframes or [])
+            ] or None
+            values["symbols"] = [
+                normalize_symbol(item) for item in (payload.symbols or [])
+            ] or None
+            scan_etf_package(payload.folder)
+            market = MarketDataService(store)
+            market.repository.attach_package(payload.folder)
+            package_dir = str(market.repository.package_dir)
+            return submit("market_index_package", values)
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/v1/data/datasets")
+    def data_datasets(timeframe: str | None = None, q: str = "", status: str | None = None, limit: int = Query(200, ge=1, le=1000), offset: int = Query(0, ge=0)):
+        try:
+            return json_safe(MarketDataService(store).datasets(timeframe, q, status, limit, offset))
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/v1/data/coverage/{symbol}")
+    def coverage(symbol: str, timeframe: str | None = None, frequency: str | None = None):
+        try:
+            requested = timeframe or frequency
+            if requested:
+                return json_safe(MarketDataService(store).coverage(normalize_symbol(symbol), normalize_timeframe(requested)))
             return json_safe(DataService(store).coverage(symbol))
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
 
     @app.post("/api/v1/data/sync")
-    def sync_data(payload: SyncRequest):
-        if payload.mode not in ("history", "daily", "repair"):
-            raise HTTPException(422, "未知同步模式")
+    def sync_data(payload: MarketSyncRequest):
         try:
+            requested = payload.timeframes or [payload.timeframe or payload.frequency]
+            requested = [normalize_timeframe(value) for value in requested if value]
+            if not requested:
+                requested = ["1day", "1min"]
+            invalid = [value for value in requested if value not in {"1day", "1min"}]
+            if invalid:
+                raise ValueError("线上更新只支持 1day 和 1min；粗周期由基础行情按需聚合")
+            timeframes = sorted(set(requested), key=lambda value: 0 if value == "1day" else 1)
             values = payload.model_dump()
+            values["timeframe"] = timeframes[0]
+            values["timeframes"] = timeframes
             values["symbols"] = [normalize_symbol(symbol) for symbol in payload.symbols]
+            if "1min" in timeframes and payload.mode == "history":
+                raise ValueError("1 分钟历史行情只从本地数据包读取；请先登记数据包或导入文件，近期缺口使用缺口修补。")
+            if "1min" in timeframes and payload.scope == "market" and payload.initialize:
+                raise ValueError("1 分钟行情不支持全市场在线初始化；请登记本地数据包或导入文件。")
             if payload.scope == "market" and payload.symbols:
                 raise ValueError("全市场范围不能同时指定代码")
-            return submit("sync", values)
+            if payload.scope in ("market", "watchlist"):
+                values["symbols"] = []
+            return submit("market_sync", values)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/v1/data/sources")
+    def data_sources():
+        return configured_sources(store)
+
+    @app.post("/api/v1/data/sources/probe")
+    def probe_data_source(payload: MarketSourceProbeRequest):
+        try:
+            values = payload.model_dump()
+            if payload.capability == "recent_minute" and payload.source not in {"sina", "tdx"}:
+                raise ValueError("近期 1 分钟探测来源应为 sina 或 tdx")
+            if payload.capability == "etf_daily" and payload.source not in {"baostock", "eastmoney"}:
+                raise ValueError("ETF 日线探测来源应为 baostock 或 eastmoney")
+            if payload.capability == "etf_daily" and payload.market == "stock":
+                raise ValueError("ETF 日线探测仅支持 etf 或 all")
+            return submit("market_source_probe", values)
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -336,16 +650,260 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             raise HTTPException(422, str(exc)) from exc
 
     @app.post("/api/v1/data/import")
-    def import_data(payload: dict):
+    def import_data(payload: MarketImportRequest):
         try:
-            payload["symbol"] = normalize_symbol(payload["symbol"])
-            return submit("import", payload)
-        except (ValueError, KeyError) as exc:
+            values = payload.model_dump()
+            values["symbol"] = normalize_symbol(payload.symbol)
+            values["timeframe"] = normalize_timeframe(payload.timeframe or payload.frequency)
+            if not payload.path:
+                raise ValueError("必须提供本地 CSV 或 Parquet 文件路径")
+            return submit("market_import", values)
+        except (ValueError, KeyError, MarketDataError) as exc:
             raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/data/upload")
+    async def upload_import_data(
+        market_file: UploadFile = File(...),
+        symbol: str = Form(...),
+        timeframe: str = Form(...),
+        label_convention: str = Form("auto"),
+        etf_category: str | None = Form(None),
+        calendar_file: UploadFile | None = File(None),
+        actions_file: UploadFile | None = File(None),
+        skip_invalid_rows: bool = Form(False),
+        import_mode: str = Form("merge"),
+    ):
+        try:
+            timeframe = normalize_timeframe(timeframe)
+            symbol = normalize_symbol(symbol)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if label_convention not in {"auto", "start", "end"}:
+            raise HTTPException(422, "时间标签应为 auto/start/end")
+        if import_mode not in {"merge", "snapshot"}:
+            raise HTTPException(422, "导入模式应为 merge/snapshot")
+        market = MarketDataService(store)
+        stage = market.repository.package.staging_dir / "uploads" / timeframe / uuid.uuid4().hex
+        metadata_stage = stage.parent / (stage.name + "-metadata")
+        try:
+            market_path = stage / _safe_upload_path(market_file.filename or "market.csv")
+            size = await _save_upload(market_file, market_path)
+            calendar_path = None
+            if calendar_file is not None and calendar_file.filename:
+                calendar_path = metadata_stage / _safe_upload_path(calendar_file.filename)
+                await _save_upload(calendar_file, calendar_path)
+            actions_path = None
+            if actions_file is not None and actions_file.filename:
+                actions_path = stage / "actions" / _safe_upload_path(actions_file.filename)
+                await _save_upload(actions_file, actions_path)
+            payload = {
+                "symbol": symbol, "timeframe": timeframe, "path": str(market_path),
+                "label_convention": label_convention, "adjustment": "none",
+                "etf_category": etf_category or None,
+                "calendar_path": str(calendar_path) if calendar_path else None,
+                "actions_path": str(actions_path) if actions_path else None,
+                "skip_invalid_rows": skip_invalid_rows,
+                "import_mode": import_mode,
+                "upload_dirs": [
+                    str(stage), str(metadata_stage),
+                ],
+            }
+            submitted = submit("market_import", payload)
+            return {**submitted, "file_name": market_file.filename, "bytes": size, "timeframe": timeframe}
+        except (ValueError, MarketDataError) as exc:
+            shutil.rmtree(stage, ignore_errors=True)
+            shutil.rmtree(metadata_stage, ignore_errors=True)
+            raise HTTPException(422, str(exc)) from exc
+        except Exception:
+            shutil.rmtree(stage, ignore_errors=True)
+            shutil.rmtree(metadata_stage, ignore_errors=True)
+            raise
+
+    @app.post("/api/v1/data/upload-batch")
+    async def upload_import_batch(
+        files: list[UploadFile] = File(...),
+        timeframe: str = Form(...),
+        label_convention: str = Form("auto"),
+        etf_category: str | None = Form(None),
+        calendar_file: UploadFile | None = File(None),
+        skip_invalid_rows: bool = Form(False),
+        import_mode: str = Form("merge"),
+    ):
+        try:
+            timeframe = normalize_timeframe(timeframe)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if label_convention not in {"auto", "start", "end"}:
+            raise HTTPException(422, "时间标签应为 auto/start/end")
+        if import_mode not in {"merge", "snapshot"}:
+            raise HTTPException(422, "导入模式应为 merge/snapshot")
+        if not files:
+            raise HTTPException(422, "请选择至少一个 CSV 或 Parquet 文件")
+        market = MarketDataService(store)
+        stage = market.repository.package.staging_dir / "uploads" / timeframe / uuid.uuid4().hex
+        metadata_stage = stage.parent / (stage.name + "-metadata")
+        count = 0
+        total_bytes = 0
+        try:
+            for upload in files:
+                relative = _safe_upload_path(upload.filename or "upload.csv")
+                destination = stage / relative
+                if destination.exists():
+                    raise ValueError("上传文件存在重复相对路径：" + relative.as_posix())
+                total_bytes += await _save_upload(upload, destination)
+                count += 1
+            calendar_path = None
+            if calendar_file is not None and calendar_file.filename:
+                calendar_path = metadata_stage / _safe_upload_path(calendar_file.filename)
+                await _save_upload(calendar_file, calendar_path)
+            payload = {
+                "folder": str(stage), "timeframe": timeframe, "recursive": True,
+                "label_convention": label_convention, "adjustment": "none",
+                "etf_category": etf_category or None, "resume": True,
+                "calendar_path": str(calendar_path) if calendar_path else None,
+                "skip_invalid_rows": skip_invalid_rows,
+                "import_mode": import_mode,
+                "upload_dirs": [
+                    str(stage), str(metadata_stage),
+                ],
+            }
+            submitted = submit("market_import_batch", payload)
+            return {**submitted, "files": count, "bytes": total_bytes, "timeframe": timeframe}
+        except (ValueError, MarketDataError) as exc:
+            shutil.rmtree(stage, ignore_errors=True)
+            shutil.rmtree(metadata_stage, ignore_errors=True)
+            raise HTTPException(422, str(exc)) from exc
+        except Exception:
+            shutil.rmtree(stage, ignore_errors=True)
+            shutil.rmtree(metadata_stage, ignore_errors=True)
+            raise
+
+    @app.post("/api/v1/data/import-batch/scan")
+    def import_batch_scan(payload: MarketBatchRequest):
+        try:
+            timeframe = normalize_timeframe(payload.timeframe or payload.frequency)
+            folder = payload.folder or str(Path(root) / "imports" / timeframe)
+            return json_safe(MarketDataService(store).preview_folder(folder, timeframe, recursive=payload.recursive))
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/data/import-batch")
+    def import_batch(payload: MarketBatchRequest):
+        try:
+            timeframe = normalize_timeframe(payload.timeframe or payload.frequency)
+            values = payload.model_dump()
+            values["timeframe"] = timeframe
+            values["folder"] = payload.folder or str(Path(root) / "imports" / timeframe)
+            return submit("market_import_batch", values)
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/data/validate")
+    def validate_data(payload: MarketValidateRequest):
+        try:
+            timeframe = normalize_timeframe(payload.timeframe or payload.frequency)
+            return submit("market_validate", {"symbol": normalize_symbol(payload.symbol), "timeframe": timeframe,
+                                             "label_convention": payload.label_convention,
+                                             "mode": payload.mode,
+                                             "start_date": payload.start_date,
+                                             "end_date": payload.end_date})
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/data/archive")
+    def archive_data(payload: MarketArchiveRequest):
+        try:
+            timeframe = normalize_timeframe(payload.timeframe or payload.frequency)
+            return submit("market_archive", {
+                "symbols": [normalize_symbol(value) for value in payload.symbols],
+                "timeframe": timeframe,
+            })
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/v1/data/compliance/{symbol}")
+    def data_compliance(symbol: str):
+        try:
+            market = MarketDataService(store)
+            normalized = normalize_symbol(symbol)
+            return json_safe({
+                timeframe: market.repository.validation_state(normalized, timeframe)
+                for timeframe in ("1day", "1min")
+                if market.repository.dataset(normalized, timeframe)
+            })
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/data/aggregate")
+    def aggregate_data(payload: MarketAggregateRequest):
+        try:
+            values = payload.model_dump()
+            values["symbols"] = [normalize_symbol(symbol) for symbol in payload.symbols]
+            values["source_timeframe"] = normalize_timeframe(payload.source_timeframe)
+            values["target_timeframe"] = normalize_timeframe(payload.target_timeframe)
+            return submit("market_aggregate", values)
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/data/readiness")
+    def data_readiness(config: BacktestConfig, version: str | None = None):
+        try:
+            return json_safe(MarketDataService(store).readiness(config, version))
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/data/preparation/plan")
+    def preparation_plan(payload: MarketPreparationRequest):
+        try:
+            return json_safe(MarketPreparationService(MarketDataService(store)).plan(payload.config))
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/data/preparation")
+    def preparation_submit(payload: MarketPreparationRequest):
+        try:
+            return submit("market_prepare", {
+                "config": payload.config.model_dump(mode="json"),
+                "version": payload.version,
+            })
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/data/migrate-legacy")
+    def migrate_legacy(payload: dict):
+        return submit("market_migrate", {"dry_run": bool(payload.get("dry_run", False)), "resume": bool(payload.get("resume", True))})
 
     @app.get("/api/v1/data/bars/{symbol}")
     def bars(symbol: str, start_date: str | None = None, end_date: str | None = None, frequency: str = "1m", limit: int = Query(1500, ge=1, le=10000), version: str | None = None):
+        normalized = normalize_timeframe(frequency)
+        market = MarketDataService(store)
         manifest = store.snapshot(symbol, version)
+        if version and manifest is None and not str(version).isdigit():
+            raise HTTPException(404, {
+                "code": "DATA_VERSION_NOT_FOUND",
+                "message": f"原数据版本 {version} 已清理，不能按该版本读取",
+            })
+        if market.repository.dataset(normalize_symbol(symbol), normalized) or (manifest and manifest.get("market_data")):
+            try:
+                market_version = None
+                if manifest and manifest.get("market_data"):
+                    reference = (manifest.get("market_versions", {}).get(normalized) or {}).get("version")
+                    if version and reference is None:
+                        return []
+                    market_version = int(reference) if reference is not None else None
+                elif version and str(version).isdigit():
+                    market_version = int(version)
+                payload = market.bars(
+                    symbol, normalized, start=pd.Timestamp(start_date) if start_date else None,
+                    end=pd.Timestamp(end_date) if end_date else None,
+                    version=market_version,
+                    limit=limit,
+                )
+                return json_safe(payload["rows"])
+            except DataVersionNotFound as exc:
+                raise HTTPException(404, {"code": exc.code, "message": str(exc)}) from exc
+            except MarketDataError:
+                return []
         if not manifest:
             return []
         daily = store.read_files(manifest["files"]["daily"])
@@ -361,7 +919,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
 
     @app.post("/api/v1/backtests")
     def backtest(config: BacktestConfig):
-        return submit("backtest", {"config": config.model_dump(mode="json"), "version": snapshot_version(config)})
+        return submit("backtest", {"config": config.model_dump(mode="json"), "version": require_ready(config)})
 
     @app.get("/api/v1/data/reference-price/{symbol}")
     def reference_price(symbol: str, start_date: str):
@@ -373,7 +931,18 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     @app.get("/api/v1/market/bars/{symbol}")
     def market_bars(symbol: str, frequency: str = "1d", start_date: str | None = None, end_date: str | None = None, before: str | None = None, limit: int = Query(600, ge=1, le=5000), ma: str = "5,10,20,60"):
         try:
+            timeframe = normalize_timeframe(frequency)
+            market = MarketDataService(store)
+            manifest = store.snapshot(symbol)
+            if market.repository.dataset(normalize_symbol(symbol), timeframe) or (manifest and manifest.get("market_data")):
+                return json_safe(market.market_bars(
+                    symbol, timeframe, start=start_date, end=end_date, before=before,
+                    limit=limit, ma_periods=[int(value) for value in ma.split(",") if value.strip()],
+                ))
             return json_safe(DataService(store).market_bars(symbol, frequency, start_date, end_date, before, limit, [int(value) for value in ma.split(",") if value.strip()]))
+        except MarketDataError as exc:
+            return {"symbol": normalize_symbol(symbol), "frequency": normalize_timeframe(frequency),
+                    "bars": [], "warnings": [str(exc)], "quality_flags": [str(exc)], "diagnostics": {}, "source_events": []}
         except (ValueError, TypeError) as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -381,9 +950,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     def preview(payload: PreviewRequest):
         if payload.config.schema_version != 2:
             raise HTTPException(422, "请先将旧配置转换为股数配置")
+        version = require_ready(payload.config)
         # Preview is deliberately submitted without a synchronous coverage scan;
         # the worker reports preparation progress and pins the result version.
-        return json_safe(previews.submit(payload.session_id, payload.revision, payload.config, None))
+        return json_safe(previews.submit(payload.session_id, payload.revision, payload.config, version))
 
     @app.get("/api/v1/backtests/preview/{session_id}")
     def preview_status(session_id: str):
@@ -420,16 +990,16 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
 
     @app.post("/api/v1/backtests/batch")
     def batch(payload: BatchRequest):
-        versions = [snapshot_version(config) for config in payload.configs]
+        versions = [require_ready(config) for config in payload.configs]
         return {"job_ids": [submit("backtest", {"config": config.model_dump(mode="json"), "version": version})["job_id"] for config, version in zip(payload.configs, versions)]}
 
     @app.post("/api/v1/optimizations")
     def optimization(config: OptimizationConfig):
         if config.protocol_version == 2:
             prepared = preparation_config(store, config.base)
-            version = snapshot_version(prepared)
+            version = require_ready(prepared)
         else:
-            version = snapshot_version(config.base)
+            version = require_ready(config.base)
         return submit("optimization", {"config": config.model_dump(mode="json"), "version": version})
 
     @app.get("/api/v1/jobs")
@@ -461,7 +1031,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
                 if serialized != previous:
                     yield f"data: {serialized}\n\n"
                     previous = serialized
-                if not job or job["status"] in ("completed", "failed", "cancelled"):
+                if not job or job["status"] in ("completed", "partial", "failed", "cancelled"):
                     break
                 await asyncio.sleep(0.5)
         return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
@@ -472,7 +1042,28 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         if not job.get("result_id"):
             raise HTTPException(409, "任务尚无结果")
         result = store.result(job["result_id"])
-        return public_result(result, data_metadata=_result_data_metadata(store, result))
+        return _with_data_availability(
+            store, public_result(result, data_metadata=_result_data_metadata(store, result))
+        )
+
+    @app.get("/api/v1/jobs/{job_id}/items")
+    def job_items(job_id: str, section: str = "all", offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000)):
+        job = get_job(job_id)
+        if not job.get("result_id"):
+            raise HTTPException(409, "任务尚无结果")
+        result = store.result(job["result_id"])
+        content = result.get("result", result)
+        groups: list[dict] = []
+        for name in ("results", "failures", "skipped_items", "symbols", "skipped"):
+            if section not in ("all", name):
+                continue
+            values = content.get(name, []) if isinstance(content, dict) else []
+            for item in values:
+                groups.append({"section": name, **item} if isinstance(item, dict) else {"section": name, "value": item})
+        if not groups and isinstance(content, dict):
+            groups.append({"section": "result", **content})
+        total = len(groups)
+        return {"items": groups[offset:offset + limit], "total": total, "offset": offset, "limit": limit}
 
     @app.get("/api/v1/results")
     def results():
@@ -483,7 +1074,11 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         result = store.result(result_id)
         if result is None:
             raise HTTPException(404, "结果不存在")
-        return public_result(result, full=full, data_metadata=None if full else _result_data_metadata(store, result))
+        public = public_result(
+            result, full=full,
+            data_metadata=None if full else _result_data_metadata(store, result),
+        )
+        return public if full else _with_data_availability(store, public)
 
     @app.get("/api/v1/results/{result_id}/export")
     def export(result_id: str, kind: str = "json"):
@@ -536,13 +1131,27 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
 
     @app.get("/api/v1/settings")
     def settings():
-        return {**load_settings().model_dump(), "active_data_dir": root, "restart_required": load_settings().data_dir != root}
+        current = load_settings()
+        return {
+            **current.model_dump(), "active_data_dir": root,
+            "active_package_dir": package_dir,
+            "package_dir": current.package_dir or package_dir,
+            "restart_required": current.data_dir != root or bool(current.package_dir and current.package_dir != package_dir),
+            "market_cache": cache_settings(),
+        }
 
     @app.put("/api/v1/settings")
     def update_settings(payload: dict):
         try:
+            validate_source_settings(store, payload)
             values = save_settings(payload)
-            return {**values.model_dump(), "restart_required": values.data_dir != root}
+            configure_cache(values.market_cache_mb)
+            return {
+                **values.model_dump(), "active_data_dir": root,
+                "active_package_dir": package_dir,
+                "restart_required": values.data_dir != root or bool(values.package_dir and values.package_dir != package_dir),
+                "market_cache": cache_settings(),
+            }
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
