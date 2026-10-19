@@ -50,16 +50,18 @@ function same(left: unknown, right: unknown) {
   return Number.isFinite(a) && Number.isFinite(b) ? Math.abs(a - b) < 1e-9 : left === right
 }
 
-export default function ResearchLandscape({ resultId, defaultParams, decisionOptions }: {
+export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, regionOptions = [] }: {
   resultId: string
   defaultParams?: Dict
   decisionOptions: Array<{ value: string; label: string }>
+  regionOptions?: Array<{ value: string; label: string }>
 }) {
   const [decision, setDecision] = useState(decisionOptions[0]?.value ?? 'current')
   const [sample, setSample] = useState<'training' | 'validation'>('validation')
   const [cost, setCost] = useState<'original' | 'stress'>('original')
   const [fold, setFold] = useState('total')
   const [metric, setMetric] = useState<'excess' | 'grid'>('excess')
+  const [region, setRegion] = useState('all')
   const [xName, setXName] = useState('buy_step')
   const [yName, setYName] = useState('sell_step')
   const [data, setData] = useState<LandscapeResponse | null>(null)
@@ -74,12 +76,13 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
     setLoading(true); setError('')
     const query = new URLSearchParams({ decision: decisionKind, decision_index: String(decisionIndex), sample, cost })
     if (fold !== 'total') query.set('fold', fold)
+    if (region !== 'all') query.set('region_id', region)
     void get<LandscapeResponse>(`/results/${encodeURIComponent(resultId)}/landscape?${query}`)
       .then(value => { if (active) setData(value) })
       .catch(cause => { if (active) setError(cause instanceof Error ? cause.message : String(cause)) })
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
-  }, [resultId, decisionKind, decisionIndex, sample, cost, fold])
+  }, [resultId, decisionKind, decisionIndex, sample, cost, fold, region])
 
   const parameters = data?.parameters ?? []
   useEffect(() => {
@@ -148,6 +151,7 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
       <Field label='成本情景'><SelectInput value={cost} onChange={event => setCost(event.target.value as 'original' | 'stress')}><option value='original'>原始成本</option><option value='stress'>双倍压力</option></SelectInput></Field>
       <Field label='验证窗口'><SelectInput value={fold} onChange={event => setFold(event.target.value)} disabled={sample === 'training'}><option value='total'>整个验证段</option>{[0, 1, 2, 3].map(index => <option key={index} value={index}>窗口 {index + 1}</option>)}</SelectInput></Field>
       <Field label='着色指标'><SelectInput value={metric} onChange={event => setMetric(event.target.value as 'excess' | 'grid')}><option value='excess'>相对全仓超额</option><option value='grid'>网格收益</option></SelectInput></Field>
+      {regionOptions.length > 1 && <Field label='推荐区域'><SelectInput value={region} onChange={event => setRegion(event.target.value)}><option value='all'>全部候选</option>{regionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>}
       <Field label='横轴'><SelectInput value={xName} onChange={event => setXName(event.target.value)}>{parameters.map(name => <option key={name} value={name}>{labels[name] ?? name}</option>)}</SelectInput></Field>
       <Field label='纵轴'><SelectInput value={yName} onChange={event => setYName(event.target.value)}>{parameters.map(name => <option key={name} value={name}>{labels[name] ?? name}</option>)}</SelectInput></Field>
     </div>

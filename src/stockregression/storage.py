@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import gzip
 import json
 import sqlite3
 import uuid
@@ -41,6 +42,66 @@ def json_safe(value: Any) -> Any:
 
 def dumps(value: Any) -> str:
     return json.dumps(json_safe(value), ensure_ascii=False, allow_nan=False)
+
+
+_V4_ARCHIVE_FIELDS = (
+    "candidate_archive", "search_candidate_archive", "trial_archive",
+)
+
+
+def _archive_reference(root: Path, relative: str) -> dict[str, str]:
+    return {"__archive__": relative}
+
+
+def _write_archive(root: Path, result_id: str, ordinal: int, kind: str, rows: list) -> dict[str, str]:
+    folder = root / "results" / f"{result_id}.artifacts"
+    folder.mkdir(parents=True, exist_ok=True)
+    name = f"{ordinal:03d}-{kind}.json.gz"
+    target = folder / name
+    with gzip.open(target, "wt", encoding="utf-8") as handle:
+        handle.write(dumps(rows))
+    return _archive_reference(root, target.relative_to(root).as_posix())
+
+
+def _detach_v4_archives(root: Path, result_id: str, result: dict) -> dict:
+    """Keep v4 candidate rows out of the main result JSON."""
+    evidence = result.get("evidence")
+    if not isinstance(evidence, dict):
+        return result
+    ordinal = 0
+    for group_name in ("candidate_archives", "trial_archives", "search_candidate_archives"):
+        group = evidence.get(group_name)
+        if not isinstance(group, dict):
+            continue
+        for branch_name, value in list(group.items()):
+            if isinstance(value, list) and value and all(isinstance(row, dict) for row in value):
+                ordinal += 1
+                group[branch_name] = _write_archive(root, result_id, ordinal, group_name, value)
+            elif isinstance(value, list):
+                for item in value:
+                    if not isinstance(item, dict):
+                        continue
+                    for field in _V4_ARCHIVE_FIELDS:
+                        rows = item.get(field)
+                        if isinstance(rows, list) and rows and all(isinstance(row, dict) for row in rows):
+                            ordinal += 1
+                            item[field] = _write_archive(root, result_id, ordinal, field, rows)
+    return result
+
+
+def _hydrate_v4_archives(root: Path, result: dict) -> dict:
+    def hydrate(value):
+        if isinstance(value, dict):
+            reference = value.get("__archive__")
+            if isinstance(reference, str):
+                with gzip.open(root / reference, "rt", encoding="utf-8") as handle:
+                    return json.load(handle)
+            return {key: hydrate(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [hydrate(item) for item in value]
+        return value
+
+    return hydrate(result)
 
 
 class Store:
@@ -415,7 +476,10 @@ class Store:
         folder = self.root / "results"
         folder.mkdir(exist_ok=True)
         target = folder / f"{result_id}.json"
-        target.write_text(dumps({**result, "id": result_id}), encoding="utf-8")
+        payload = {**result, "id": result_id}
+        if result.get("protocol_version") == 4:
+            payload = _detach_v4_archives(self.root, result_id, payload)
+        target.write_text(dumps(payload), encoding="utf-8")
         with self.db() as db:
             db.execute("INSERT INTO results VALUES(?,?,?,?,?,?)", (result_id, kind, symbol, now_iso(), title, str(target.relative_to(self.root))))
         return result_id
@@ -423,7 +487,10 @@ class Store:
     def result(self, result_id: str) -> dict | None:
         with self.db() as db:
             row = db.execute("SELECT path FROM results WHERE id=?", (result_id,)).fetchone()
-        return json.loads((self.root / row[0]).read_text(encoding="utf-8")) if row else None
+        if not row:
+            return None
+        result = json.loads((self.root / row[0]).read_text(encoding="utf-8"))
+        return _hydrate_v4_archives(self.root, result)
 
     def results(self):
         with self.db() as db:

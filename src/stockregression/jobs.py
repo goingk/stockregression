@@ -48,10 +48,28 @@ def _research_protocol_hash(config: OptimizationConfig) -> str:
             "neighbor_perturbations": "single_and_pairwise_one_step",
             "funding_mode": "top_up_on_fill",
         }
+    elif config.protocol_version == 4:
+        payload["protocol_thresholds"] = {
+            "strategy": config.strategy.model_dump(mode="json"),
+            "grid_mode": "geometric",
+            "grid_step_unit": 0.001,
+            "share_unit": 100,
+            "negative_tolerance": 1e-12,
+            "funding_mode": "top_up_on_fill",
+            "pressure_is_diagnostic_only": True,
+        }
     base = dict(payload.get("base", {}))
     for key in ("symbol", "start_date", "end_date"):
         base.pop(key, None)
+    if config.protocol_version == 4:
+        for key in ("grid_step", "buy_step", "sell_step", "buy_shares", "sell_shares", "min_shares", "max_shares"):
+            base.pop(key, None)
     payload["base"] = base
+    if config.protocol_version == 4 and isinstance(payload.get("research_context"), dict):
+        context = dict(payload["research_context"])
+        for key in ("symbol", "start_date", "end_date"):
+            context.pop(key, None)
+        payload["research_context"] = context
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -137,7 +155,7 @@ def execute_job(root: str, job_id: str, observer=None):
         elif kind == "optimization":
             from .optimization import optimize
             config = OptimizationConfig.model_validate(payload["config"])
-            scientific = config.protocol_version in (2, 3)
+            scientific = config.protocol_version in (2, 3, 4)
             progress(0.01, "检查本地行情并准备研究数据" if not scientific else "准备评估区间及前置 504 个交易日")
             if scientific:
                 bundle = prepare_research_bundle(
@@ -172,7 +190,7 @@ def execute_job(root: str, job_id: str, observer=None):
                 )
                 result["evidence"] = {**(result.get("evidence") if isinstance(result.get("evidence"), dict) else {}), "local_audit": audit}
                 result["protocol_hash"] = audit["protocol_hash"]
-                title = "科学参数研究 · 固定与自适应" if config.selection_target == "both" else f"科学参数研究 · {config.selection_target}"
+                title = ("等比网格多峰研究" if config.protocol_version == 4 else "科学参数研究") + (" · 固定与自适应" if config.selection_target == "both" else f" · {config.selection_target}")
             else:
                 title = "历史搜索 / 样本外验证"
         elif kind == "market_import":
@@ -322,10 +340,10 @@ def execute_job(root: str, job_id: str, observer=None):
             raise InterruptedError("任务已取消")
         was_cancelled = cancelled()
         failed_sync = kind in {"market_sync", "market_source_probe", "market_import", "market_import_batch", "market_import_package", "market_index_package", "market_aggregate", "market_prepare", "market_archive"} and result.get("status") == "failed"
-        failed_research = kind == "optimization" and payload.get("config", {}).get("protocol_version") in (2, 3) and _scientific_failed(result)
+        failed_research = kind == "optimization" and payload.get("config", {}).get("protocol_version") in (2, 3, 4) and _scientific_failed(result)
         result_cancelled = kind == "optimization" and result.get("status") == "cancelled"
         cancelled_job = was_cancelled or result_cancelled
-        if kind == "optimization" and payload.get("config", {}).get("protocol_version") in (2, 3):
+        if kind == "optimization" and payload.get("config", {}).get("protocol_version") in (2, 3, 4):
             if failed_research:
                 title += " · 失败"
             elif cancelled_job:
@@ -343,7 +361,7 @@ def execute_job(root: str, job_id: str, observer=None):
             message = f"同步失败：{sync_error}"
         elif failed_research:
             message = "科学参数研究失败：" + str(result.get("reason") or result.get("message") or "查看结果中的失败原因")
-        elif kind == "optimization" and payload.get("config", {}).get("protocol_version") in (2, 3) and result.get("status") == "partial":
+        elif kind == "optimization" and payload.get("config", {}).get("protocol_version") in (2, 3, 4) and result.get("status") == "partial":
             message = "科学参数研究部分完成；已保留已完成的候选与结果"
         else:
             message = result.get("message", "完成")

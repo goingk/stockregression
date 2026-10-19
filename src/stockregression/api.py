@@ -21,7 +21,7 @@ from .data import DataService
 from .data_diagnostics import derive_source_spans, project_data_diagnostics
 from .quality import QUALITY_RULES_VERSION, _closing_auction_placeholders, minute_slots
 from .jobs import JobManager
-from .models import BacktestConfig, OptimizationConfig, normalize_symbol
+from .models import BacktestConfig, OptimizationConfig, ResearchRequestV4, normalize_symbol
 from .market_data import MarketDataService
 from .market_data.aggregation import AggregationService
 from .market_data.models import DataVersionNotFound, MarketDataError
@@ -343,7 +343,7 @@ def public_result(result: dict, full: bool = False, data_metadata: dict | None =
         return result
     result = dict(result)
     config = result.get("config") if isinstance(result.get("config"), dict) else {}
-    is_v2 = result.get("protocol_version") in (2, 3) or config.get("protocol_version") in (2, 3)
+    is_v2 = result.get("protocol_version") in (2, 3, 4) or config.get("protocol_version") in (2, 3, 4)
     if is_v2:
         try:
             top_candidates = max(1, min(100, int(config.get("top_candidates", 20))))
@@ -993,32 +993,60 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         return {"job_ids": [submit("backtest", {"config": config.model_dump(mode="json"), "version": version})["job_id"] for config, version in zip(payload.configs, versions)]}
 
     @app.post("/api/v1/optimizations")
-    def optimization(config: OptimizationConfig):
+    def optimization(config: OptimizationConfig | ResearchRequestV4):
+        if isinstance(config, ResearchRequestV4):
+            config = config.to_optimization()
         prepared = preparation_config(store, config.base)
         version = require_ready(prepared)
-        if config.protocol_version != 3:
-            raise HTTPException(422, "新研究请先通过配置转换并使用 protocol_version=3")
-        from .scientific import estimate_v3_search
         bundle = DataService(store).load_bundle(prepared, version)
-        preview = estimate_v3_search(config, bundle)
-        if preview.get("status") == "budget_exceeded":
+        if config.protocol_version == 4:
+            from .research_v4 import estimate_search
+            try:
+                preview = estimate_search(config, bundle)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+        elif config.protocol_version == 3:
+            from .scientific import estimate_v3_search
+            preview = estimate_v3_search(config, bundle)
+            if preview.get("status") == "budget_exceeded":
+                raise HTTPException(422, {
+                    "code": "SEARCH_BUDGET_EXCEEDED",
+                    "message": f"局部网格预计 {preview['expected']} 组，超过预算 {preview['budget']}；请调整范围或预算",
+                    **preview,
+                })
+        else:
+            raise HTTPException(422, "新研究请先通过配置转换并使用 protocol_version=3 或 4")
+        if config.protocol_version == 4 and preview.get("status") == "budget_exceeded":
             raise HTTPException(422, {
                 "code": "SEARCH_BUDGET_EXCEEDED",
-                "message": f"局部网格预计 {preview['expected']} 组，超过预算 {preview['budget']}；请调整范围或预算",
+                "message": f"完整枚举需要 {preview.get('legal_combination_count')} 个验证点，超过预算 {preview.get('validation_budget')}",
                 **preview,
             })
         submitted = submit("optimization", {"config": config.model_dump(mode="json"), "version": version})
         return {**submitted, "search_preview": preview}
 
     @app.post("/api/v1/optimizations/preview")
-    def optimization_preview(config: OptimizationConfig):
-        if config.protocol_version != 3:
-            raise HTTPException(422, "搜索预检仅适用于 protocol_version=3")
+    def optimization_preview(config: OptimizationConfig | ResearchRequestV4):
+        if isinstance(config, ResearchRequestV4):
+            config = config.to_optimization()
         prepared = preparation_config(store, config.base)
         version = require_ready(prepared)
-        from .scientific import estimate_v3_search
         bundle = DataService(store).load_bundle(prepared, version)
-        return json_safe(estimate_v3_search(config, bundle))
+        if config.protocol_version == 4:
+            from .research_v4 import estimate_search
+            try:
+                return json_safe(estimate_search(config, bundle))
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+        if config.protocol_version == 3:
+            from .scientific import estimate_v3_search
+            return json_safe(estimate_v3_search(config, bundle))
+        raise HTTPException(422, "搜索预检仅适用于 protocol_version=3 或 4")
+
+    @app.get("/api/v1/research/strategies")
+    def research_strategies():
+        from .research_v4 import strategy_descriptions
+        return strategy_descriptions()
 
     @app.get("/api/v1/jobs")
     def jobs():
@@ -1106,12 +1134,15 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         sample: str = Query("validation", pattern="^(training|validation)$"),
         cost: str = Query("original", pattern="^(original|stress)$"),
         fold: int | None = Query(None, ge=0),
+        region_id: int | None = Query(None, ge=1),
+        offset: int = Query(0, ge=0),
+        limit: int = Query(1000, ge=1, le=10000),
     ):
         result = store.result(result_id)
         if result is None:
             raise HTTPException(404, "结果不存在")
-        if result.get("protocol_version") != 3:
-            raise HTTPException(422, "参数收益分布仅适用于 protocol_version=3")
+        if result.get("protocol_version") not in (3, 4):
+            raise HTTPException(422, "参数收益分布仅适用于 protocol_version=3 或 4")
         evidence = result.get("evidence", {})
         if sample == "training":
             archive = evidence.get("search_candidate_archives", {}).get(decision, [])
@@ -1126,9 +1157,14 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
                     raise HTTPException(404, "研究决策不存在")
                 archive = archive[decision_index].get("candidate_archive", [])
         archive = [row for row in archive if isinstance(row, dict) and isinstance(row.get("params"), dict)]
+        if region_id is not None:
+            archive = [row for row in archive if region_id in (row.get("region_ids") or [])]
+        total_points = len(archive)
+        archive = archive[offset:offset + limit]
         if not archive:
             return {"result_id": result_id, "decision": decision, "sample": sample,
-                    "cost": cost, "fold": fold, "points": [], "pca": None, "bounds": None}
+                    "cost": cost, "fold": fold, "region_id": region_id, "offset": offset,
+                    "limit": limit, "total": total_points, "points": [], "pca": None, "bounds": None}
         config = result.get("config", {})
         base = config.get("base", config)
         active = ["buy_step", "sell_step"] if base.get("grid_mode", "trailing") == "trailing" else ["grid_step"]
@@ -1163,6 +1199,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
                 "neighbor_q25_excess": row.get("neighbor_q25_excess"),
                 "island_suspect": row.get("island_suspect", False),
                 "neighbor_boundary_clipped_count": row.get("neighbor_boundary_clipped_count", 0),
+                "region_ids": row.get("region_ids", []),
             })
         pca = None
         ranges = config.get("ranges", {}) or {}
@@ -1199,7 +1236,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         finite = [float(point["excess_return"]) for point in points if isinstance(point.get("excess_return"), (int, float)) and np.isfinite(float(point["excess_return"]))]
         return {
             "result_id": result_id, "decision": decision, "decision_index": decision_index,
-            "sample": sample, "cost": cost, "fold": fold, "parameters": names,
+            "sample": sample, "cost": cost, "fold": fold, "region_id": region_id,
+            "offset": offset, "limit": limit, "total": total_points, "parameters": names,
             "points": points, "pca": pca,
             "bounds": {"min": min(finite), "max": max(finite)} if finite else None,
             "center_count": sum(bool(point["is_center"]) for point in points),
@@ -1212,7 +1250,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             content, extension, media = dumps(result).encode("utf-8"), "json", "application/json"
         elif kind in ("equity", "trades"):
             records = []
-            if result.get("protocol_version") in (2, 3):
+            if result.get("protocol_version") in (2, 3, 4):
                 runs = []
                 for name in ("fixed", "adaptive"):
                     branch = result.get(name)

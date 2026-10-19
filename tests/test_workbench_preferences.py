@@ -28,7 +28,8 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
     assert defaults["dca"] == {"frequency": "monthly", "shares": 100, "initial_shares": 0}
     assert defaults["research"]["mode"] == "both"
     assert defaults["research"]["n_trials"] == 1000
-    assert defaults["research"]["protocol_version"] == 3
+    assert defaults["research"]["protocol_version"] == 4
+    assert defaults["research"]["ranking_mode"] == "max_volume"
     assert defaults["research"]["local_search_budget"] == 3000
     assert defaults["research"]["selection_target"] == "both"
     assert defaults["research"]["rebalance_days"] == 63

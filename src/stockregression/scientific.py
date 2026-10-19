@@ -1070,7 +1070,7 @@ def _evaluate_family(
     params = [row["params"] for row in family_rows]
     sample_start, sample_end = scoring_dates[0], scoring_dates[-1]
     scoring_base = _base_with(base, start=sample_start, end=sample_end, reserve_cash=reserve_cash)
-    v3_scoring = int(config.protocol_version) == 3
+    v3_scoring = int(config.protocol_version) in (3, 4)
     baseline_folds: list[float] = []
     if v3_scoring:
         baseline_dates, baseline_returns = _buy_hold_returns(scoring_base, scoring_data)
@@ -1650,6 +1650,20 @@ def _select_at(
     progress_start: float = 0.0,
     progress_width: float = 0.0,
 ) -> dict[str, Any]:
+    if int(config.protocol_version) == 4:
+        from .research_v4 import select_at as select_at_v4
+
+        return select_at_v4(
+            config,
+            base,
+            data,
+            asof,
+            seed_offset=seed_offset,
+            progress=progress,
+            cancelled=cancelled,
+            progress_start=progress_start,
+            progress_width=progress_width,
+        )
     if int(config.protocol_version) == 3:
         return _select_at_v3(
             config, base, data, asof, seed_offset=seed_offset, progress=progress,
@@ -2006,7 +2020,7 @@ def evaluate_current_family(
     if not candidates:
         result.update(status="unavailable", reasons=["当前参数族没有完整验证候选"])
         return result
-    names = _v3_names(config.base) if int(config.protocol_version) == 3 else _active_names(config.base)
+    names = _v3_names(config.base) if int(config.protocol_version) in (3, 4) else _active_names(config.base)
     selection_base = _base_with(
         config.base,
         start=history_dates[0],
@@ -2055,7 +2069,7 @@ def evaluate_current_family(
             return result
         dates, matrix = _batch_returns(batch, len(candidates))
         result["matrix_source"] = "recomputed_original_cost_validation_matrix"
-    if int(config.protocol_version) == 3:
+    if int(config.protocol_version) in (3, 4):
         passive_dates, passive_values = _passive_returns(selection_base, selection_data, buy_hold=True)
     else:
         passive_dates, passive_values = _passive_returns(selection_base, selection_data)
@@ -2158,11 +2172,11 @@ def _evaluate_final_126(
         return output
     passive_section = None
     if isinstance(passive_result, dict):
-        passive_section = passive_result.get("strategies", {}).get("buy_hold" if int(config.protocol_version) == 3 else "grid")
+        passive_section = passive_result.get("strategies", {}).get("buy_hold" if int(config.protocol_version) in (3, 4) else "grid")
     if not isinstance(passive_section, dict):
         for _, section, test_result in requested:
             if isinstance(test_result, dict):
-                baseline_key = "buy_hold" if int(config.protocol_version) == 3 else "same_account_passive"
+                baseline_key = "buy_hold" if int(config.protocol_version) in (3, 4) else "same_account_passive"
                 passive_section = test_result.get("strategies", {}).get(baseline_key)
                 if isinstance(passive_section, dict):
                     break
@@ -2170,7 +2184,7 @@ def _evaluate_final_126(
         passive_dates, passive = _returns_from_strategy_result(passive_section)
     else:
         try:
-            if int(config.protocol_version) == 3:
+            if int(config.protocol_version) in (3, 4):
                 passive_dates, passive = _passive_returns(base, data, buy_hold=True)
             else:
                 passive_dates, passive = _passive_returns(base, data)
@@ -2259,8 +2273,8 @@ def optimize_scientific(
     """Run research selection using only information available at each close."""
     if config.base.schema_version not in (2, 3):
         raise ValueError("scientific protocol requires a v2 or v3 share config")
-    if config.protocol_version == 3 and config.base.schema_version != 3:
-        raise ValueError("protocol_version=3 requires schema_version=3")
+    if config.protocol_version in (3, 4) and config.base.schema_version != 3:
+        raise ValueError("protocol_version=3/4 requires schema_version=3")
     if config.protocol_version == 2 and config.base.schema_version != 2:
         raise ValueError("protocol_version=2 requires schema_version=2")
     if not isinstance(data, DataBundle):
@@ -2304,7 +2318,7 @@ def optimize_scientific(
             }
         no_oos = "评估区间没有可回测交易日；没有使用结束日期之后的行情代替样本外数据"
         all_reasons = list(dict.fromkeys([*selection.get("reasons", []), no_oos]))
-        protocol_v3 = int(config.protocol_version) == 3
+        protocol_v3 = int(config.protocol_version) in (3, 4)
         recommended = deepcopy(selection.get("recommended_params")) if protocol_v3 else deepcopy(selection["params"])
         selected = deepcopy(recommended if protocol_v3 else selection["params"])
         fixed = {
@@ -2340,7 +2354,7 @@ def optimize_scientific(
                 "funding_mode": "top_up_on_fill" if protocol_v3 else "configured_reserve",
                 "positive_neighbor_ratio": _V3_POSITIVE_NEIGHBOR_RATIO if protocol_v3 else None,
                 "neighbor_quantile": 0.25 if protocol_v3 else None,
-                "local_search_budget": int(config.local_search_budget) if protocol_v3 else None,
+                "local_search_budget": None if int(config.protocol_version) == 4 else int(config.local_search_budget) if protocol_v3 else None,
                 "training_start": selection.get("diagnostics", {}).get("selection_history_start"),
                 "training_end": selection.get("diagnostics", {}).get("selection_history_end"),
                 "evaluation_start": eval_start.date().isoformat(),
@@ -2361,7 +2375,7 @@ def optimize_scientific(
             },
             "warnings": [*data.warnings, *all_reasons], "data_version": data.version, "quality": quality,
             "is_demo": bool(quality.get("is_demo") or data.metadata.get("is_demo")),
-            "computation": {"n_trials_per_decision": int(config.n_trials) if not protocol_v3 else 0, "local_search_budget": int(config.local_search_budget) if protocol_v3 else None, "rebalance_days": rebalance_days, "decision_count": 0,
+            "computation": {"n_trials_per_decision": int(config.n_trials) if not protocol_v3 else 0, "local_search_budget": None if int(config.protocol_version) == 4 else int(config.local_search_budget) if protocol_v3 else None, "rebalance_days": rebalance_days, "decision_count": 0,
                 "candidate_count": int(selection.get("diagnostics", {}).get("candidate_count", 0)), "cost_evaluations": 0,
                 "bootstrap_reps": bootstrap_reps, "cancelled": bool(_cancelled(cancelled))},
         }
@@ -2371,7 +2385,7 @@ def optimize_scientific(
     locked_funding = _funding_reserve(config.base, data, eval_dates[0])
     reserve_cash = _funding_amount(locked_funding)
     base = _base_with(config.base, start=eval_dates[0], end=eval_dates[-1], reserve_cash=reserve_cash)
-    protocol_v3 = int(config.protocol_version) == 3
+    protocol_v3 = int(config.protocol_version) in (3, 4)
     reasons = []
     if len(eval_dates) < 126:
         reasons.append(f"评估期仅{len(eval_dates)}个交易日，末126日核验不足")
@@ -2404,7 +2418,7 @@ def optimize_scientific(
         candidate_archives["fixed"] = selected["candidate_archive"]
         trial_archives["fixed"] = selected["trial_archive"]
         search_candidate_archives["fixed"] = selected.get("search_candidate_archive", [])
-        protocol_v3 = int(config.protocol_version) == 3
+        protocol_v3 = int(config.protocol_version) in (3, 4)
         recommended = deepcopy(selected.get("recommended_params")) if protocol_v3 else deepcopy(selected["params"])
         if protocol_v3 and recommended is None:
             fixed_config = base.model_copy(update={
@@ -2431,6 +2445,7 @@ def optimize_scientific(
             "test_result": test_result,
             "candidates": selected["candidates"][: int(config.top_candidates)],
             "diagnostics": selected["diagnostics"],
+            "recommendation_regions": deepcopy(selected.get("recommendation_regions", [])),
             "recommendation_status": selected.get("recommendation_status", "qualified" if recommended is not None else "no_qualified"),
         }
     elif selection_target == "adaptive":
@@ -2479,7 +2494,7 @@ def optimize_scientific(
                 "trial_archive": selected["trial_archive"],
             })
             if selected["status"] != "cancelled":
-                protocol_v3 = int(config.protocol_version) == 3
+                protocol_v3 = int(config.protocol_version) in (3, 4)
                 recommended = deepcopy(selected.get("recommended_params")) if protocol_v3 else deepcopy(selected["params"])
                 paused = bool(protocol_v3 and recommended is None)
                 schedule.append({
@@ -2494,7 +2509,7 @@ def optimize_scientific(
                 "decision_date": selected["as_of"],
                 "status": selected["status"],
                 "reused_from_fixed": reused_from_fixed,
-                "selected_params": None if int(config.protocol_version) == 3 and selected.get("recommended_params") is None else deepcopy(selected.get("recommended_params") if int(config.protocol_version) == 3 else selected["params"]),
+                "selected_params": None if int(config.protocol_version) in (3, 4) and selected.get("recommended_params") is None else deepcopy(selected.get("recommended_params") if int(config.protocol_version) in (3, 4) else selected["params"]),
                 "diagnostic_params": deepcopy(selected["params"]),
                 "paused": bool(schedule[-1].get("paused")) if schedule else False,
                 "score": selected["score"],
@@ -2507,6 +2522,7 @@ def optimize_scientific(
                 "neighbor_count": selected["diagnostics"].get("neighbor_count", 0),
                 "windows": selected["diagnostics"].get("validation_folds", []),
                 "diagnostics": selected["diagnostics"],
+                "recommendation_regions": deepcopy(selected.get("recommendation_regions", [])),
                 "candidates": selected["candidates"][: int(config.top_candidates)],
             })
             _emit(progress, 0.28 + 0.5 * (step_number + 1) / max(1, len(step_indices)), f"滚动择参：{step_number + 1}/{len(step_indices)}")
@@ -2567,7 +2583,7 @@ def optimize_scientific(
     candidate_archives["current"] = current["candidate_archive"]
     trial_archives["current"] = current["trial_archive"]
     search_candidate_archives["current"] = current.get("search_candidate_archive", [])
-    protocol_v3 = int(config.protocol_version) == 3
+    protocol_v3 = int(config.protocol_version) in (3, 4)
     current_recommended = deepcopy(current.get("recommended_params")) if protocol_v3 else deepcopy(current["params"])
     fixed["current"] = {
         "params": current_recommended,
@@ -2580,6 +2596,7 @@ def optimize_scientific(
         "reasons": current["reasons"],
         "candidates": current["candidates"][: int(config.top_candidates)],
         "diagnostics": current["diagnostics"],
+        "recommendation_regions": deepcopy(current.get("recommendation_regions", [])),
     }
     if selection_target in ("adaptive", "both"):
         adaptive.update({
@@ -2623,6 +2640,7 @@ def optimize_scientific(
         "selected_eligible": fixed.get("eligible", False),
         "constraint_reasons": fixed.get("reasons", []),
         "windows": fixed.get("diagnostics", {}).get("validation_folds", []),
+        "recommendation_regions": fixed.get("recommendation_regions", []),
         "reasons": fixed.get("reasons", []),
     }
     current_decision = {
@@ -2638,6 +2656,7 @@ def optimize_scientific(
         "selected_eligible": current.get("eligible", False),
         "constraint_reasons": current.get("reasons", []),
         "windows": current.get("diagnostics", {}).get("validation_folds", []),
+        "recommendation_regions": current.get("recommendation_regions", []),
         "reasons": current.get("reasons", []),
     }
     all_selections = [item for item in [fixed.get("diagnostics", {}), current.get("diagnostics", {}), *[
@@ -2673,14 +2692,14 @@ def optimize_scientific(
     _emit(progress, 1.0, "科学参数选择完成")
     computation = {
         "n_trials_per_decision": int(config.n_trials) if not protocol_v3 else 0,
-        "local_search_budget": int(config.local_search_budget) if protocol_v3 else None,
+        "local_search_budget": None if int(config.protocol_version) == 4 else int(config.local_search_budget) if protocol_v3 else None,
         "rebalance_days": rebalance_days,
         "decision_count": len(decisions),
         "candidate_count": total_candidates,
-        "generation_evaluations": total_generated if not protocol_v3 else sum(int(item.get("local_search_unique", 0) or 0) for item in all_selections),
+        "generation_evaluations": sum(int(item.get("training_unique_count", 0) or 0) for item in all_selections) if int(config.protocol_version) == 4 else total_generated if not protocol_v3 else sum(int(item.get("local_search_unique", 0) or 0) for item in all_selections),
         "cost_evaluations": total_evaluations,
         "constraint_failures": int(constraint_failures),
-        "neighborhood_count": sum(1 for archive in unique_archives for candidate in archive if not candidate.get("is_center")),
+        "neighborhood_count": sum(int(item.get("neighbor_count", 0) or 0) for item in all_selections) if int(config.protocol_version) == 4 else sum(1 for archive in unique_archives for candidate in archive if not candidate.get("is_center")),
         "unique_selection_calls": len(all_selections),
         "outer_backtest_runs": int(fixed.get("test_result") is not None) + int(adaptive.get("test_result") is not None) + int(passive_result is not None),
         "bootstrap_reps": bootstrap_reps,
@@ -2706,15 +2725,19 @@ def optimize_scientific(
             "validation_folds": 4,
             "rebalance_days": rebalance_days,
             "cost_multipliers": list(_COST_MULTIPLIERS),
-            "score": ("邻域超额收益第25百分位与跨窗稳健分；分窗 U=超额收益-资金流调整回撤，R=median(U)-0.5*IQR(U)，取双成本中较差结果" if protocol_v3 else "25%四分位邻域稳健分；分窗U=252日年化收益-maxDD，R=median(U)-0.5*IQR(U)，取原成本与双佣金/最低佣金/滑点压力中较差R"),
+            "score": ("等比网格完整区间超额收益 f=网格收益率-全仓收益率；最大正邻域体积排名，邻域内全部合法点均须为正" if int(config.protocol_version) == 4 else "邻域超额收益第25百分位与跨窗稳健分；分窗 U=超额收益-资金流调整回撤，R=median(U)-0.5*IQR(U)，取双成本中较差结果" if protocol_v3 else "25%四分位邻域稳健分；分窗U=252日年化收益-maxDD，R=median(U)-0.5*IQR(U)，取原成本与双佣金/最低佣金/滑点压力中较差R"),
             "bootstrap_reps": bootstrap_reps,
             "bootstrap_block_lengths": [20, 10, 40],
             "reserve_cash": reserve_cash,
             "funding_mode": "top_up_on_fill" if protocol_v3 else "configured_reserve",
-            "local_search_budget": int(config.local_search_budget) if protocol_v3 else None,
-            "positive_neighbor_ratio": _V3_POSITIVE_NEIGHBOR_RATIO if protocol_v3 else None,
-            "neighbor_quantile": 0.25 if protocol_v3 else None,
-            "neighbor_perturbations": "single_and_pairwise_one_step" if protocol_v3 else "single_factor_one_step",
+            "local_search_budget": None if int(config.protocol_version) == 4 else int(config.local_search_budget) if protocol_v3 else None,
+            "strategy": config.strategy.model_dump(mode="json") if int(config.protocol_version) == 4 else None,
+            "grid_mode": "geometric" if int(config.protocol_version) == 4 else config.base.grid_mode,
+            "grid_step_unit": 0.001 if int(config.protocol_version) == 4 else None,
+            "share_unit": 100 if int(config.protocol_version) == 4 else None,
+            "positive_neighbor_ratio": None if int(config.protocol_version) == 4 else _V3_POSITIVE_NEIGHBOR_RATIO if protocol_v3 else None,
+            "neighbor_quantile": None if int(config.protocol_version) == 4 else 0.25 if protocol_v3 else None,
+            "neighbor_perturbations": "all_joint_neighbors_and_complete_boxes" if int(config.protocol_version) == 4 else "single_and_pairwise_one_step" if protocol_v3 else "single_factor_one_step",
             "ranking_baseline": "independent_buy_hold" if protocol_v3 else "same_cash_passive",
         },
         "fixed": fixed,

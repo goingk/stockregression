@@ -91,7 +91,7 @@ _RESEARCH_RANGE_DEFAULTS = {
 
 
 class ResearchDefaults(_WorkbenchPreference):
-    protocol_version: Literal[1, 2, 3] = 3
+    protocol_version: Literal[1, 2, 3, 4] = 4
     selection_target: Literal["fixed", "adaptive", "both"] = "both"
     rebalance_days: int = Field(default=63, ge=1)
     bootstrap_reps: int = Field(default=10_000, ge=1)
@@ -104,6 +104,17 @@ class ResearchDefaults(_WorkbenchPreference):
     min_trades: int = Field(default=10, ge=0)
     min_history_days: int = Field(default=504, ge=20)
     min_minute_ratio: float = Field(default=0.95, ge=0, le=1)
+    ranking_mode: Literal["max_volume", "fixed_mean"] = "max_volume"
+    search_method: Literal["auto", "hierarchical", "exhaustive"] = "auto"
+    training_budget: int = Field(default=20_000, ge=1, le=1_000_000)
+    validation_budget: int = Field(default=100_000, ge=1, le=2_000_000)
+    recommendation_count: int = Field(default=10, ge=1, le=100)
+    max_shares_mode: Literal["search", "unlimited"] = "search"
+    slippage_mode: Literal["configured", "zero"] = "configured"
+    fixed_half_widths: dict[str, float] = Field(default_factory=lambda: {
+        "grid_step": 0.001, "sell_shares": 100, "buy_shares": 100,
+        "min_shares": 100, "max_shares": 100,
+    })
     ranges: dict[str, ResearchRangeDefaults] = Field(default_factory=lambda: {
         key: ResearchRangeDefaults.model_validate(value) for key, value in _RESEARCH_RANGE_DEFAULTS.items()
     })
@@ -111,8 +122,16 @@ class ResearchDefaults(_WorkbenchPreference):
     @model_validator(mode="before")
     @classmethod
     def migrate_protocol(cls, values):
-        if isinstance(values, dict) and values.get("protocol_version") in (1, 2):
-            return {**values, "protocol_version": 3}
+        if isinstance(values, dict):
+            values = dict(values)
+            if isinstance(values.get("fixed_half_widths"), dict):
+                values["fixed_half_widths"] = {
+                    "grid_step": .001, "sell_shares": 100, "buy_shares": 100,
+                    "min_shares": 100, "max_shares": 100,
+                    **values["fixed_half_widths"],
+                }
+            if values.get("protocol_version") in (1, 2, 3):
+                values["protocol_version"] = 4
         return values
 
     @model_validator(mode="after")
@@ -128,6 +147,19 @@ class ResearchDefaults(_WorkbenchPreference):
             else:
                 if value.low <= 0 or value.high > 1:
                     raise ValueError(f"网格步长搜索范围 {name} 必须位于 (0, 1]")
+        return self
+
+    @model_validator(mode="after")
+    def valid_fixed_half_widths(self):
+        allowed = {"grid_step", "sell_shares", "buy_shares", "min_shares", "max_shares"}
+        if set(self.fixed_half_widths) != allowed:
+            raise ValueError("固定邻域半宽必须包含五个 v4 参数")
+        if any(float(value) <= 0 for value in self.fixed_half_widths.values()):
+            raise ValueError("固定邻域半宽必须为正数")
+        if abs(float(self.fixed_half_widths["grid_step"]) / 0.001 - round(float(self.fixed_half_widths["grid_step"]) / 0.001)) > 1e-7:
+            raise ValueError("网格间距半宽必须对齐 0.001")
+        if any(abs(float(self.fixed_half_widths[name]) / 100 - round(float(self.fixed_half_widths[name]) / 100)) > 1e-7 for name in ("sell_shares", "buy_shares", "min_shares", "max_shares")):
+            raise ValueError("数量邻域半宽必须对齐 100")
         return self
 
 

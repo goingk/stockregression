@@ -1,0 +1,32 @@
+{
+  "measured_at": "2026-10-19",
+  "machine": "local development host",
+  "symbol": "159611.SZ",
+  "data_version": "mkt-db1f049ec31807d71aa41ecd",
+  "evaluation_interval": ["2026-04-17", "2026-10-16"],
+  "exhaustive_small_search": {
+    "legal_combinations": 11,
+    "daily": {
+      "data_preparation_seconds": 1.50,
+      "research_seconds": 3.42,
+      "recommendation_status": "no_qualified"
+    },
+    "minute": {
+      "data_preparation_seconds": 8.30,
+      "research_seconds": 8.98,
+      "recommendation_status": "qualified"
+    }
+  },
+  "five_dimensional_hierarchical_smoke": {
+    "frequency": "1d",
+    "legal_combinations": 68250,
+    "training_budget": 1000,
+    "validation_budget": 5000,
+    "training_unique_count": 999,
+    "validation_unique_count": 4989,
+    "research_seconds": 11.54,
+    "coverage_status": "budgeted_freeze",
+    "recommendation_status": "no_qualified"
+  },
+  "notes": "Wall-clock measurements include the full v4 selection, internal family diagnostics and outer fixed replay for the small exhaustive study. They are not a promise for other symbols, frequencies or market-data cache states."
+}

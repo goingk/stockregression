@@ -183,6 +183,16 @@ def test_v3_landscape_endpoint_returns_full_candidates_and_pca(tmp_path):
         assert payload["pca"]["explained_variance"]
 
 
+def test_v4_strategy_catalog_defaults_to_max_volume_geometric_research(tmp_path):
+    with TestClient(create_app(str(tmp_path), start_jobs=False)) as client:
+        response = client.get("/api/v1/research/strategies")
+        assert response.status_code == 200
+        strategy = response.json()["strategies"][0]
+        assert strategy["grid_mode"] == "geometric"
+        assert strategy["default_ranking_mode"] == "max_volume"
+        assert strategy["units"] == {"grid_step": .001, "shares": 100}
+
+
 def test_v2_config_conversion_removes_cash_budget_and_preserves_null_bound(tmp_path):
     store = Store(tmp_path)
     with TestClient(create_app(str(tmp_path), start_jobs=False)) as client:

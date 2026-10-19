@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { defaultWorkbenchDefaults, normalizeRememberedResearchDefaults, normalizeWorkbenchDefaults, researchRangesForSymbol, strategyDefaults, validWorkbenchGroup, workbenchConfig } from '../src/workbenchDefaults.ts'
+import { defaultWorkbenchDefaults, normalizeRememberedResearchDefaults, normalizeWorkbenchDefaults, researchRangesForSymbol, strategyDefaults, validResearchDefaults, validWorkbenchGroup, workbenchConfig } from '../src/workbenchDefaults.ts'
 
 test('all four groups keep valid zero values and independent default copies', () => {
   const value = defaultWorkbenchDefaults()
@@ -23,9 +23,12 @@ test('an empty maximum holding is a valid remembered draft', () => {
   assert.equal(normalizeWorkbenchDefaults(value).position.max_shares, null)
 })
 
-test('new workspaces use the v3 selection protocol defaults', () => {
+test('new workspaces use the v4 geometric neighborhood defaults', () => {
   const research = defaultWorkbenchDefaults().research
-  assert.equal(research.protocol_version, 3)
+  assert.equal(research.protocol_version, 4)
+  assert.equal(research.ranking_mode, 'max_volume')
+  assert.equal(research.training_budget, 20000)
+  assert.equal(research.validation_budget, 100000)
   assert.equal(research.selection_target, 'both')
   assert.equal(research.rebalance_days, 63)
   assert.equal(research.bootstrap_reps, 10000)
@@ -33,13 +36,14 @@ test('new workspaces use the v3 selection protocol defaults', () => {
   assert.equal(research.local_search_budget, 3000)
 })
 
-test('legacy saved research settings fill v3 fields while preserving every remembered range', () => {
+test('legacy saved research settings fill v4 fields while preserving every remembered range', () => {
   const saved = defaultWorkbenchDefaults().research
   saved.ranges.initial_shares = { low: 300, high: 2300, step: 200 }
   saved.ranges.buy_step = { low: .01, high: .15, step: .01 }
   for (const key of ['protocol_version', 'selection_target', 'rebalance_days', 'bootstrap_reps', 'local_search_budget']) delete saved[key]
   const migrated = normalizeWorkbenchDefaults({ research: saved }).research
-  assert.equal(migrated.protocol_version, 3)
+  assert.equal(migrated.protocol_version, 4)
+  assert.equal(migrated.ranking_mode, 'max_volume')
   assert.equal(migrated.selection_target, 'both')
   assert.equal(migrated.rebalance_days, 63)
   assert.equal(migrated.bootstrap_reps, 10000)
@@ -111,4 +115,18 @@ test('STAR minimums affect the displayed and submitted range without overwriting
   memory.research.ranges.buy_shares.high = 100
   assert.deepEqual(researchRangesForSymbol(memory.research.ranges, '689001.SH').buy_shares, { low: 200, high: 200, step: 100 })
   assert.equal(memory.research.ranges.buy_shares.high, 100)
+})
+
+test('v4 research ranges use 0.1 percentage point and 100 share lattice endpoints', () => {
+  const value = defaultWorkbenchDefaults()
+  value.research.ranges.grid_step = { low: .011, high: .021, step: .0005 }
+  assert.equal(validWorkbenchGroup('research', value.research), true)
+  value.research.ranges.grid_step.high = .0215
+  assert.equal(validWorkbenchGroup('research', value.research), false)
+  value.research.ranges.grid_step.high = .021
+  value.research.ranges.buy_shares.high = 1050
+  assert.equal(validWorkbenchGroup('research', value.research), false)
+  const remembered = normalizeWorkbenchDefaults({ research: { ...value.research, ranges: { ...value.research.ranges, grid_step: { low: .0105, high: .021, step: .0005 } } } }).research
+  assert.deepEqual(remembered.ranges.grid_step, { low: .0105, high: .021, step: .0005 })
+  assert.equal(validResearchDefaults(remembered), false)
 })

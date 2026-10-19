@@ -197,7 +197,7 @@ def test_old_research_preferences_fill_new_defaults_and_keep_custom_ranges():
         "n_trials": 321,
         "ranges": ResearchDefaults().model_dump()["ranges"],
     })
-    assert old.protocol_version == 3
+    assert old.protocol_version == 4
     assert old.n_trials == 321
     assert old.mode == "robust"
     assert len(old.ranges) == 8

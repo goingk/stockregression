@@ -815,7 +815,7 @@ def optimize(
     selected parameters once on the untouched test period.
     """
     _check_ranges(config)
-    if config.protocol_version in (2, 3):
+    if config.protocol_version in (2, 3, 4):
         from .scientific import optimize_scientific
 
         return optimize_scientific(config, data, progress, cancelled)

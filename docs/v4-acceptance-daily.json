@@ -1,0 +1,98 @@
+{
+  "measured_at": "2026-10-19 19:43:56",
+  "protocol_version": 4,
+  "symbol": "159611.SZ",
+  "frequency": "1d",
+  "data_version": "mkt-db1f049ec31807d71aa41ecd",
+  "evaluation": {
+    "start": "2026-04-17",
+    "end": "2026-10-16"
+  },
+  "preview": {
+    "status": "ready",
+    "protocol_version": 4,
+    "strategy_id": "geometric_excess_neighborhood",
+    "grid_mode": "geometric",
+    "ranking_mode": "max_volume",
+    "fields": [
+      "grid_step",
+      "sell_shares",
+      "buy_shares",
+      "min_shares",
+      "max_shares"
+    ],
+    "active_fields": [
+      "grid_step"
+    ],
+    "units": {
+      "grid_step": 0.001,
+      "shares": 100
+    },
+    "effective_bounds": {
+      "grid_step": {
+        "low_ticks": 10,
+        "high_ticks": 20,
+        "low": 0.01,
+        "high": 0.02,
+        "fixed": false
+      },
+      "sell_shares": {
+        "low_ticks": 1,
+        "high_ticks": 1,
+        "low": 100,
+        "high": 100,
+        "fixed": true
+      },
+      "buy_shares": {
+        "low_ticks": 1,
+        "high_ticks": 1,
+        "low": 100,
+        "high": 100,
+        "fixed": true
+      },
+      "min_shares": {
+        "low_ticks": 0,
+        "high_ticks": 0,
+        "low": 0,
+        "high": 0,
+        "fixed": true
+      },
+      "max_shares": {
+        "low_ticks": 20,
+        "high_ticks": 20,
+        "low": 2000,
+        "high": 2000,
+        "fixed": true
+      }
+    },
+    "legal_combination_count": 11,
+    "search_method": "exhaustive",
+    "training_budget": 100,
+    "validation_budget": 100,
+    "minimum_neighborhood_size": 3,
+    "decision_count_estimate": 1,
+    "history_days": 504,
+    "training_days": 252,
+    "validation_days": 252,
+    "full_504_day_history": true,
+    "slippage_mode": "configured",
+    "reasons": []
+  },
+  "result": {
+    "status": "completed",
+    "fixed_status": "no_qualified",
+    "recommendation_status": "no_qualified",
+    "recommendation_count": 0,
+    "training_unique_count": 11,
+    "validation_unique_count": 11,
+    "peak_platform_count": 4,
+    "global_exhaustive": true,
+    "coverage_status": "global_exhaustive",
+    "validation_plan_hash": "059ff6447091bc827431ea8981d9461c0e5388dd5b5ca5c59813d724ebd3a308",
+    "regions": []
+  },
+  "timing_seconds": {
+    "data_preparation": 1.4981936999829486,
+    "research": 3.418322000070475
+  }
+}
