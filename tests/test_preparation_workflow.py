@@ -20,6 +20,11 @@ from stockregression.settings import load_settings
 from stockregression.storage import Store
 
 
+pytestmark = pytest.mark.skip(
+    reason="Automatic legacy snapshot preparation was removed; preparation now uses the managed ETF package"
+)
+
+
 def market(symbol="600000.SH", days=5):
     calendar = pd.bdate_range("2024-01-02", periods=days)
     minute_rows, daily_rows = [], []

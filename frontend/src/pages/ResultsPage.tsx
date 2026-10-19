@@ -7,6 +7,7 @@ import Disclosure from '../Disclosure'
 import ResultsCurves from '../ResultsCurves'
 import { resultShareUnit, savedGridParameters } from '../resultPresentation'
 import { Badge, Button, Card, Empty, ErrorBox, Loading, PageHeader, SelectInput, money, percent, useErrorMessage } from '../components'
+import { chartValue } from '../marketValues'
 import type { BacktestResult, EquityPoint, ResultSummary, StrategyResult, Trade } from '../types'
 
 type Props = { requestedResult: string | null; clearRequestedResult: () => void }
@@ -126,6 +127,7 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
   }, [selectedId, err])
   useEffect(() => {
     if (!result?.symbol || !result.config?.start_date || !result.config?.frequency) { setBars([]); setBarsLoading(false); return }
+    if (result.data_version_available === false) { setBars([]); setBarsLoading(false); return }
     let active = true
     setBars([])
     setBarsLoading(true)
@@ -144,7 +146,7 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
   }
 
   const candleOption: EChartsOption = useMemo(() => {
-    const rows = bars.map((b) => [String(b.timestamp ?? '').replace('T', ' ').slice(0, 16), Number(b.open ?? 0), Number(b.close ?? 0), Number(b.low ?? 0), Number(b.high ?? 0)])
+    const rows = bars.map((b) => [String(b.timestamp ?? '').replace('T', ' ').slice(0, 16), chartValue(b.open), chartValue(b.close), chartValue(b.low), chartValue(b.high)])
     const labels = rows.map((row) => String(row[0]))
     const bucketTimes = bars.map((bar) => timestampMs(bar.timestamp))
     const trades = (reference?.value.trades ?? []) as Trade[]
@@ -175,7 +177,8 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
         }).catch((error) => setError(err(error))).finally(() => setLoading(false))
       }}><RefreshCw size={14} /></Button></div>}>
         {loading ? <Loading /> : !results.length ? <Empty title='尚无回测结果' detail='在“回测与研究”中运行回测后，结果会在这里出现。' /> : !result ? <Loading label='正在读取结果…' /> : <>
-          <div className='result-meta'><div><strong>{result.symbol}</strong><span>{result.config?.frequency ?? '—'} · {result.config?.start_date ?? '—'} 至 {result.effective_end_date ?? result.config?.end_date ?? '最新'}</span></div><div>{isDemoResult && <Badge tone='amber'>演示数据</Badge>}<Badge tone='blue'>数据版本 {result.data_version ?? '未知'}</Badge></div></div>
+          <div className='result-meta'><div><strong>{result.symbol}</strong><span>{result.config?.frequency ?? '—'} · {result.config?.start_date ?? '—'} 至 {result.effective_end_date ?? result.config?.end_date ?? '最新'}</span></div><div>{isDemoResult && <Badge tone='amber'>演示数据</Badge>}<Badge tone={result.data_version_available === false ? 'red' : 'blue'}>数据版本 {result.data_version ?? '未知'}</Badge></div></div>
+          {result.data_version_warning && <p className='inline-warning'>{result.data_version_warning}</p>}
           {isDemoResult && <div className='demo-callout'>此结果基于本机生成的演示行情，不代表真实历史数据或投资结论。</div>}
           <div className='strategy-metrics results-metrics'>{strategies.map((strategy) => {
             const metrics = strategy.value.metrics
@@ -185,7 +188,7 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
               <div className='strategy-detail-grid'>{strategy.value.return_basis === 'cost' ? <>
                 <div><small>累计投入</small><strong>{money(metrics?.total_invested)} 元</strong></div><div><small>总手续费</small><strong>{money(metrics?.total_fees)} 元</strong></div><div><small>跳过期数</small><strong>{metrics?.skipped_periods ?? '—'}</strong></div><div><small>成交笔数</small><strong>{metrics?.trade_count ?? '—'}</strong></div>
               </> : <>
-                <div><small>年化收益</small><strong>{percent(metrics?.cagr)}</strong></div><div><small>最大回撤</small><strong className='loss'>{percent(metrics?.max_drawdown)}</strong></div><div><small>夏普比率</small><strong>{metrics?.sharpe == null || !Number.isFinite(metrics.sharpe) ? '—' : metrics.sharpe.toFixed(2)}</strong></div><div><small>成交笔数</small><strong>{metrics?.trade_count ?? '—'}</strong></div>
+                <div><small>{result.schema_version === 3 ? '时间加权年化' : '年化收益'}</small><strong>{percent(metrics?.cagr)}</strong></div><div><small>{result.schema_version === 3 ? '资金流调整回撤' : '最大回撤'}</small><strong className='loss'>{percent(metrics?.max_drawdown)}</strong></div><div><small>夏普比率</small><strong>{metrics?.sharpe == null || !Number.isFinite(metrics.sharpe) ? '—' : metrics.sharpe.toFixed(2)}</strong></div><div><small>成交笔数</small><strong>{metrics?.trade_count ?? '—'}</strong></div>
               </>}</div>
             </div>
           })}</div>
@@ -195,7 +198,7 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
         <Card title='本次网格参数' className='result-parameters' subtitle='来自此结果保存的配置与资金口径'>
           <dl className='result-parameter-list'>{parameters.map((parameter) => <div className='result-parameter' key={parameter.key}><dt>{parameter.label}</dt><dd>{parameter.value}</dd>{parameter.note && <small className='result-parameter-note'>{parameter.note}</small>}</div>)}</dl>
         </Card>
-        <Card title='收益、回撤与网格持仓' className='results-curves-card' subtitle={'收益率 = 资产总值 ÷ 累计实际投入 − 1 · ' + curvePeriod + ' · 三图共享日期、缩放和悬浮值'} action={<Badge tone={result.accounting_basis ? 'blue' : 'amber'}>{result.accounting_basis ? '独立投入' : '历史口径'}</Badge>}>
+        <Card title='收益、回撤与网格持仓' className='results-curves-card' subtitle={(result.schema_version === 3 ? '收益率 = 累计盈利 ÷ 周期峰值净投入 · 风险指标使用资金流调整后的单位净值 · ' : '收益率 = 资产总值 ÷ 累计实际投入 − 1 · ') + curvePeriod + ' · 三图共享日期、缩放和悬浮值'} action={<Badge tone={result.accounting_basis ? 'blue' : 'amber'}>{result.schema_version === 3 ? '峰值本金' : result.accounting_basis ? '独立投入' : '历史口径'}</Badge>}>
           <ResultsCurves result={result} />
         </Card>
       </>}
@@ -205,7 +208,7 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
         <div className='result-details-grid'>
           <Card title={result.funding ? '股数回测口径' : '历史回测口径'}>
             {result.funding ? <>
-              <p>估值日 {result.funding.reference_date ?? '—'} · 网格起始资产 {money(result.funding.initial_equity)} 元 · 网格预留现金 {money(result.funding.reserve_cash)} 元 · 实际截至 {result.effective_end_date ?? '—'}</p>
+              <p>估值日 {result.funding.reference_date ?? '—'} · 网格起始资产 {money(result.funding.initial_equity)} 元 · {result.schema_version === 3 ? `峰值净投入 ${money(result.funding.peak_invested ?? result.funding.initial_equity)} 元 · 累计补款 ${money(result.funding.topups)} 元` : `网格预留现金 ${money(result.funding.reserve_cash)} 元`} · 实际截至 {result.effective_end_date ?? '—'}</p>
               <p>期初持有：网格 {result.config?.initial_shares ?? '—'} {shareUnit} · 全仓 {result.funding.buy_hold_initial_shares ?? '—'} {shareUnit} · 定投 {result.config?.dca?.initial_shares ?? '—'} {shareUnit}。初始资产：全仓 {money(result.funding.buy_hold_initial_equity)} 元 · 定投 {money(result.funding.dca_initial_equity)} 元；定投累计实际投入 {money(result.strategies?.dca?.metrics?.total_invested)} 元，各策略使用独立资产账户。</p>
               <pre className='json-preview'>{JSON.stringify(result.funding, null, 2)}</pre>
             </> : <p>本结果按保存记录中的历史资金口径展示。缺失的参数与投入数据以“—”表示。</p>}
@@ -230,7 +233,7 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
       </Disclosure>
       <Disclosure id='results-candles' title='K 线与成交标记' summary={(result.config?.frequency ?? '频率未知') + ' · ' + (reference?.name ?? '策略')}>
         <Card title={result.symbol + ' K 线与交易'} subtitle={'K 线按时间汇总，买卖点映射到包含成交时刻的区间；标记取自 ' + (reference?.name ?? '策略') + ' 成交记录。'}>
-          {barsLoading ? <Loading label='读取 K 线…' /> : bars.length ? <ChartView option={candleOption} height={410} /> : <Empty title='当前区间没有可用 K 线' detail='成交和净值仍可查看；请确认该标的存在对应频率行情。' />}
+          {result.data_version_available === false ? <Empty title='原行情数据版本已清理' detail='历史结果、成交和净值仍可查看和导出；原 K 线与按原版本重算已停用。' /> : barsLoading ? <Loading label='读取 K 线…' /> : bars.length ? <ChartView option={candleOption} height={410} /> : <Empty title='当前区间没有可用 K 线' detail='成交和净值仍可查看；请确认该标的存在对应频率行情。' />}
         </Card>
       </Disclosure>
       <Disclosure id='results-period-returns' title='年 / 月收益' summary={unit === 'year' ? '年度分解' : '月度分解'}>
@@ -249,6 +252,7 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
         </Card>
       </Disclosure>
       <Disclosure id='results-data-quality' title='数据质量与运行提示' summary={(result.warnings?.length ?? 0) + ' 条提示 · 数据版本 ' + (result.data_version ?? '未知')}>
+        {result.data_version_warning && <div className='warning-list'><span className='warning-dot' />{result.data_version_warning}</div>}
         {result.warnings?.map((warning, index) => <div className='warning-list' key={index}><span className='warning-dot' />{warning}</div>)}
         {result.quality || result.diagnostics || result.source_events?.length ? <pre className='json-preview'>{JSON.stringify({ quality: result.quality, diagnostics: result.diagnostics, source_events: result.source_events }, null, 2)}</pre> : <Empty title='本结果没有保存数据质量明细' />}
       </Disclosure>

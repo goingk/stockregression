@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 import type { EChartsCoreOption, EChartsType } from 'echarts/core'
 import echarts from './chartSetup'
 
-export default function ChartView({ option, height, stretch = false }: { option: EChartsCoreOption; height: number; stretch?: boolean }) {
+export default function ChartView({ option, height, stretch = false, onEvents }: { option: EChartsCoreOption; height: number; stretch?: boolean; onEvents?: Record<string, (params: unknown) => void> }) {
   const element = useRef<HTMLDivElement>(null)
   const instance = useRef<EChartsType | null>(null)
   useEffect(() => {
@@ -14,6 +14,12 @@ export default function ChartView({ option, height, stretch = false }: { option:
     return () => { observer.disconnect(); chart.dispose(); instance.current = null }
   }, [])
   useEffect(() => { instance.current?.setOption(option, { notMerge: true }) }, [option])
+  useEffect(() => {
+    const chart = instance.current
+    if (!chart || !onEvents) return
+    for (const [name, handler] of Object.entries(onEvents)) chart.on(name, handler)
+    return () => { for (const [name, handler] of Object.entries(onEvents)) chart.off(name, handler) }
+  }, [onEvents])
   const exportChart = async () => {
     if (!instance.current) return
     const dataUrl = instance.current.getDataURL({ type: 'png', pixelRatio: 2, backgroundColor: '#fff' })

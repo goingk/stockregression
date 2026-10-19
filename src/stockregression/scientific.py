@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import date
+from itertools import product
 import math
 from typing import Any, Callable
 import zlib
@@ -29,6 +30,8 @@ _LOOKBACK_DAYS = 504
 _FULL_GENERATION_DAYS = 252
 _FOLD_DAYS = 63
 _MIN_SPLIT_DAYS = 168
+_V3_POSITIVE_NEIGHBOR_RATIO = 0.8
+_V3_MAX_VALIDATION_CENTERS = 10
 
 
 def _cancelled(callback: Cancelled | None) -> bool:
@@ -101,7 +104,7 @@ def _base_with(
         values["start_date"] = _date_key(start).date()
     if end is not None:
         values["end_date"] = _date_key(end).date()
-    if reserve_cash is not None and "reserve_cash" in BacktestConfig.model_fields:
+    if reserve_cash is not None and "reserve_cash" in BacktestConfig.model_fields and base.schema_version != 3:
         values["reserve_cash"] = float(reserve_cash)
     return BacktestConfig.model_validate(values)
 
@@ -159,9 +162,10 @@ def _valid_params(params: dict[str, Any], base: BacktestConfig) -> tuple[bool, l
     original = int(base.initial_shares)
     if int(params.get("min_shares", base.min_shares)) > original:
         reasons.append("min_shares 高于固定 initial_shares")
-    if int(params.get("max_shares", base.max_shares)) < original:
+    raw_max = params.get("max_shares", base.max_shares)
+    if raw_max is not None and int(raw_max) < original:
         reasons.append("max_shares 低于固定 initial_shares")
-    if int(params.get("min_shares", base.min_shares)) > int(params.get("max_shares", base.max_shares)):
+    if raw_max is not None and int(params.get("min_shares", base.min_shares)) > int(raw_max):
         reasons.append("min_shares 大于 max_shares")
     try:
         _base_with(base, params)
@@ -176,7 +180,10 @@ def _seed_offset_for_date(value: pd.Timestamp | date | str) -> int:
 
 
 def _normalize_params(params: dict[str, Any], base: BacktestConfig) -> dict[str, Any]:
-    normalized = {name: (int(value) if name.endswith("_shares") else float(value)) for name, value in params.items()}
+    normalized = {
+        name: (None if name == "max_shares" and value is None else int(value) if name.endswith("_shares") else float(value))
+        for name, value in params.items()
+    }
     normalized["initial_shares"] = int(base.initial_shares)
     return normalized
 
@@ -315,14 +322,366 @@ def _trial_params(
     return [row["params"] for row in generated], trial_rows, cancelled_run
 
 
+def _v3_names(base: BacktestConfig) -> tuple[str, ...]:
+    names = list(_active_names(base))
+    if base.schema_version == 3 and base.max_shares is None:
+        names = [name for name in names if name != "max_shares"]
+    return tuple(names)
+
+
+def _range_distance(search_range: SearchRange, name: str) -> float:
+    if search_range.low == search_range.high:
+        return 0.0
+    if name.endswith("_shares"):
+        return float(_share_step(search_range))
+    if search_range.step is not None:
+        return float(search_range.step)
+    return max((float(search_range.high) - float(search_range.low)) * 0.05, 1e-9)
+
+
+def _snap_dimension(value: float, search_range: SearchRange, name: str) -> float:
+    low, high = float(search_range.low), float(search_range.high)
+    bounded = min(high, max(low, float(value)))
+    if name.endswith("_shares"):
+        return float(int(round(bounded / 100.0)) * 100)
+    distance = _range_distance(search_range, name)
+    if distance <= 0:
+        return bounded
+    return float(min(high, max(low, low + round((bounded - low) / distance) * distance)))
+
+
+def _roundtrip_cost_rate(base: BacktestConfig, data: DataBundle, price: float, day: date) -> float:
+    from .rules import commissions_and_taxes, round_money
+
+    quantity = max(100, int(base.buy_shares))
+    notional = round_money(quantity * price)
+    kwargs = {
+        "symbol": base.symbol,
+        "quantity": quantity,
+        "face_value": base.fees.share_face_value,
+        "legacy_sh_transfer_rate": base.fees.legacy_sh_transfer_rate,
+        "legacy_sh_min_transfer": base.fees.legacy_sh_min_transfer,
+        "legacy_sz_transfer_rate": base.fees.legacy_sz_transfer_rate,
+    }
+    charges = 0.0
+    for side in ("buy", "sell"):
+        charge = commissions_and_taxes(
+            notional, side, day, base.fees.commission_rate, base.fees.min_commission, **kwargs
+        )
+        charges += float(charge["total"])
+    return (charges + notional * 2.0 * base.fees.slippage_bps / 10_000.0) / notional if notional > 0 else math.inf
+
+
+def _statistical_profile(base: BacktestConfig, data: DataBundle, dates: pd.DatetimeIndex) -> dict[str, Any]:
+    frame = data.daily.copy()
+    if frame.empty or not len(dates):
+        return {"status": "unavailable", "reason": "候选生成段没有日线行情", "quantiles": {}}
+    frame["date"] = pd.to_datetime(frame["date"], errors="coerce").dt.normalize()
+    frame = frame[frame["date"].between(dates[0], dates[-1])].sort_values("date")
+    if frame.empty:
+        return {"status": "unavailable", "reason": "候选生成段没有有效日线", "quantiles": {}}
+    for name in ("open", "high", "low", "close", "preclose"):
+        if name in frame:
+            frame[name] = pd.to_numeric(frame[name], errors="coerce")
+    frame = frame[(frame["open"] > 0) & (frame["high"] > 0) & (frame["low"] > 0) & (frame["close"] > 0)].copy()
+    if frame.empty:
+        return {"status": "unavailable", "reason": "候选生成段没有有效价格", "quantiles": {}}
+    if "preclose" not in frame or frame["preclose"].isna().any():
+        frame["preclose"] = frame["preclose"].fillna(frame["close"].shift(1)).fillna(frame["open"])
+    frame = frame[(frame["preclose"] > 0)]
+    open_values = frame["open"].to_numpy(dtype=np.float64)
+    high = frame["high"].to_numpy(dtype=np.float64)
+    low = frame["low"].to_numpy(dtype=np.float64)
+    close = frame["close"].to_numpy(dtype=np.float64)
+    preclose = frame["preclose"].to_numpy(dtype=np.float64)
+    returns = close / preclose - 1.0
+    up = np.maximum(0.0, high - open_values) / open_values
+    down = np.maximum(0.0, open_values - low) / open_values
+    true_range = (np.maximum(high, preclose) - np.minimum(low, preclose)) / preclose
+    repair = []
+    for index in np.flatnonzero(returns < 0):
+        if index + 5 >= len(returns):
+            break
+        repair.append(float(np.prod(1.0 + returns[index + 1:index + 6]) - 1.0))
+    x = np.arange(len(close), dtype=np.float64)
+    log_price = np.log(close)
+    trend = float(np.polyfit(x, log_price, 1)[0] * 252.0) if len(close) > 2 else 0.0
+    quantiles = {
+        "up": [float(np.quantile(up, q)) for q in (0.25, 0.5, 0.75)],
+        "down": [float(np.quantile(down, q)) for q in (0.25, 0.5, 0.75)],
+        "range": [float(np.quantile(true_range, q)) for q in (0.25, 0.5, 0.75)],
+    }
+    price = float(np.median(close))
+    tick = max(float(data.metadata.get("price_tick", 0.001) or 0.001), 1e-9)
+    return {
+        "status": "completed",
+        "days": int(len(frame)),
+        "start": frame["date"].iloc[0].date().isoformat(),
+        "end": frame["date"].iloc[-1].date().isoformat(),
+        "trend_strength": trend,
+        "repair_ratio": float(np.median(repair)) if repair else None,
+        "down_repair_samples": len(repair),
+        "roundtrip_cost_rate": _roundtrip_cost_rate(base, data, price, frame["date"].iloc[-1].date()),
+        "tick_excursion": 2.0 * tick / price,
+        "quantile_labels": ["p25", "p50", "p75"],
+        "quantiles": quantiles,
+    }
+
+
+def _statistical_centers(
+    config: OptimizationConfig,
+    base: BacktestConfig,
+    data: DataBundle,
+    generation_dates: pd.DatetimeIndex,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    profile = _statistical_profile(base, data, generation_dates)
+    names = _v3_names(base)
+    baseline = {name: getattr(base, name) for name in names}
+    baseline["initial_shares"] = int(base.initial_shares)
+    if profile.get("status") != "completed":
+        return [], {**profile, "centers": [], "rejected_centers": []}
+    floor = max(2.0 * float(profile["roundtrip_cost_rate"]), float(profile["tick_excursion"]), 0.0)
+    step_names = _ACTIVE_FIELDS[base.grid_mode]
+    centers: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for quantile_index, label in enumerate(profile["quantile_labels"]):
+        params = deepcopy(baseline)
+        details: dict[str, float] = {}
+        reasons: list[str] = []
+        for name in step_names:
+            if name == "buy_step":
+                raw = profile["quantiles"]["down"][quantile_index]
+            elif name == "sell_step":
+                raw = profile["quantiles"]["up"][quantile_index]
+            else:
+                raw = profile["quantiles"]["range"][quantile_index]
+            search_range = _range_for(config, base, name)
+            target = max(float(raw), floor)
+            value = _snap_dimension(target, search_range, name)
+            distance = _range_distance(search_range, name)
+            while value + 1e-12 < floor and distance > 0 and value + distance <= search_range.high + 1e-12:
+                value = _snap_dimension(value + distance, search_range, name)
+            if value < float(search_range.low) - 1e-12 or value > float(search_range.high) + 1e-12:
+                reasons.append(f"{name} 成本下限 {floor:.6f} 超出搜索区间")
+            elif value + 1e-12 < floor:
+                reasons.append(f"{name} 合法刻度无法达到成本下限 {floor:.6f}")
+            params[name] = value
+            details[name] = value
+        key = tuple(float(params[name]) for name in names)
+        if reasons:
+            rejected.append({"quantile": label, "params": params, "reasons": reasons, "steps": details})
+            continue
+        if any(tuple(float(item["params"][name]) for name in names) == key for item in centers):
+            continue
+        centers.append({
+            "statistical_center_id": len(centers) + 1,
+            "quantile": label,
+            "params": params,
+            "steps": details,
+            "status": "completed",
+        })
+    profile.update({"floor": floor, "centers": deepcopy(centers), "rejected_centers": rejected})
+    return centers, profile
+
+
+def _local_grid_rows(
+    config: OptimizationConfig,
+    base: BacktestConfig,
+    centers: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int, bool]:
+    names = _v3_names(base)
+    rows_by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+    total_expected = 0
+    exceeded = False
+    for center in centers:
+        axes: list[list[float]] = []
+        for name in names:
+            current = float(center["params"][name])
+            search_range = _range_for(config, base, name)
+            if search_range.low == search_range.high:
+                axes.append([_snap_dimension(float(search_range.low), search_range, name)])
+                continue
+            distance = _range_distance(search_range, name)
+            values = {_snap_dimension(current + delta, search_range, name) for delta in (-distance, 0.0, distance)}
+            axes.append(sorted(values))
+        count = int(np.prod([len(values) for values in axes], dtype=np.int64)) if axes else 1
+        total_expected += count
+        if total_expected > int(config.local_search_budget):
+            exceeded = True
+            break
+        for combination in product(*axes):
+            params = {name: int(value) if name.endswith("_shares") else float(value) for name, value in zip(names, combination)}
+            params["initial_shares"] = int(base.initial_shares)
+            if base.max_shares is None:
+                params["max_shares"] = None
+            legal, reasons = _valid_params(params, base)
+            if not legal:
+                continue
+            key = _params_key(params, names)
+            if key not in rows_by_key:
+                rows_by_key[key] = {"params": params, "source_center_ids": [], "training_status": "not_evaluated", "reasons": reasons}
+            rows_by_key[key]["source_center_ids"] = sorted(set(rows_by_key[key]["source_center_ids"]) | {center["statistical_center_id"]})
+    ordered = sorted(rows_by_key.items(), key=lambda item: item[0])
+    rows = [{"search_id": index + 1, "key": key, **metadata} for index, (key, metadata) in enumerate(ordered)]
+    return rows, total_expected, exceeded
+
+
+def estimate_v3_search(config: OptimizationConfig, data: DataBundle) -> dict[str, Any]:
+    """Return the statistical-center/local-grid size without running a backtest."""
+    dates = _calendar(data)
+    evaluation_start = _date_key(config.base.start_date)
+    asof = _known_preceding_close(data, evaluation_start)
+    history = dates[dates <= asof][-_LOOKBACK_DAYS:] if asof is not None else pd.DatetimeIndex([])
+    generation, folds, has_oos, reasons = _folds_for_history(history)
+    if not len(generation):
+        return {"status": "insufficient_history", "expected": 0, "budget": int(config.local_search_budget), "reasons": reasons}
+    centers, profile = _statistical_centers(config, config.base, data, generation)
+    _, expected, exceeded = _local_grid_rows(config, config.base, centers)
+    return {
+        "status": "budget_exceeded" if exceeded else "ready",
+        "expected": int(expected),
+        "budget": int(config.local_search_budget),
+        "statistical_center_count": len(centers),
+        "generation_days": int(len(generation)),
+        "validation_fold_count": int(len(folds)),
+        "full_504_day_history": bool(has_oos and len(history) >= _LOOKBACK_DAYS),
+        "profile": profile,
+        "reasons": reasons,
+    }
+
+
+def _compound_daily(values: np.ndarray) -> float:
+    values = np.asarray(values, dtype=np.float64)
+    growth = 1.0 + values
+    if not len(values) or np.any(growth <= 0) or not np.isfinite(growth).all():
+        return math.nan
+    return float(np.prod(growth) - 1.0)
+
+
+def _buy_hold_returns(base: BacktestConfig, data: DataBundle) -> tuple[pd.DatetimeIndex, np.ndarray]:
+    from .share_engine import research_buy_hold
+
+    result = research_buy_hold(base, data)
+    dates = pd.DatetimeIndex(pd.to_datetime(result["dates"])).normalize()
+    values = np.asarray(result["daily_returns"], dtype=np.float64)
+    if len(dates) != len(values):
+        raise ValueError("buy_hold dates do not align with daily_returns")
+    return dates, values
+
+
+def _score_training_rows(
+    config: OptimizationConfig,
+    base: BacktestConfig,
+    data: DataBundle,
+    generation_dates: pd.DatetimeIndex,
+    rows: list[dict[str, Any]],
+    cancelled: Cancelled | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if not rows:
+        return rows, {"status": "empty", "evaluations": 0}
+    start, end = pd.Timestamp(generation_dates[0]), pd.Timestamp(generation_dates[-1])
+    training_base = _base_with(base, start=start, end=end)
+    params = [row["params"] for row in rows]
+    result = _research_batch(
+        training_base,
+        data,
+        params,
+        [(start.date().isoformat(), end.date().isoformat())],
+        cost_multiplier=1.0,
+        cancelled=cancelled,
+    )
+    fold_rows = _metric_fold_rows(result, len(rows), 1)
+    baseline_dates, baseline_returns = _buy_hold_returns(training_base, data)
+    mask = (baseline_dates >= start) & (baseline_dates <= end)
+    baseline_return = _compound_daily(baseline_returns[mask])
+    for index, row in enumerate(rows):
+        evidence = fold_rows[index][0]
+        principal = float(evidence.get("principal", 0.0) or 0.0)
+        profit = float(evidence.get("profit", 0.0) or 0.0)
+        drawdown = float(evidence.get("max_drawdown", math.inf) or math.inf)
+        grid_return = profit / principal if principal > 0 else math.nan
+        excess = grid_return - baseline_return if math.isfinite(grid_return) else math.nan
+        score = excess - drawdown if math.isfinite(excess) else -math.inf
+        row.update({
+            "training_status": "completed",
+            "training_return": grid_return,
+            "training_baseline_return": baseline_return,
+            "training_excess_return": excess,
+            "training_drawdown": drawdown,
+            "training_score": score,
+            "training_trade_count": int(evidence.get("trade_count", 0)),
+        })
+    return rows, {
+        "status": "completed",
+        "evaluations": len(rows),
+        "baseline_return": baseline_return,
+        "start": start.date().isoformat(),
+        "end": end.date().isoformat(),
+    }
+
+
+def _center_distance(left: dict[str, Any], right: dict[str, Any], config: OptimizationConfig, base: BacktestConfig, names: tuple[str, ...]) -> float:
+    squared = 0.0
+    for name in names:
+        distance = _range_distance(_range_for(config, base, name), name)
+        if distance <= 0:
+            continue
+        squared += ((float(left[name]) - float(right[name])) / distance) ** 2
+    return math.sqrt(squared)
+
+
+def _training_centers(
+    config: OptimizationConfig,
+    base: BacktestConfig,
+    rows: list[dict[str, Any]],
+    statistical_centers: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    names = _v3_names(base)
+    completed = [row for row in rows if row.get("training_status") == "completed" and math.isfinite(float(row.get("training_score", -math.inf)))]
+    selected: list[dict[str, Any]] = []
+    by_center: dict[int, list[dict[str, Any]]] = {}
+    for row in completed:
+        for center_id in row.get("source_center_ids", []):
+            by_center.setdefault(int(center_id), []).append(row)
+    for center in statistical_centers:
+        candidates = sorted(by_center.get(int(center["statistical_center_id"]), []), key=lambda row: (-float(row["training_score"]), row["search_id"]))
+        if not candidates:
+            continue
+        best = candidates[0]
+        selected.append({
+            "params": deepcopy(best["params"]),
+            "training_score": float(best["training_score"]),
+            "training_excess_return": float(best.get("training_excess_return", math.nan)),
+            "source_center_ids": list(best.get("source_center_ids", [])),
+            "selection_kind": "statistical_best",
+            "quantile": center.get("quantile"),
+        })
+    for row in sorted(completed, key=lambda item: (-float(item["training_score"]), item["search_id"])):
+        if len(selected) >= _V3_MAX_VALIDATION_CENTERS:
+            break
+        if any(_center_distance(row["params"], item["params"], config, base, names) < 2.0 for item in selected):
+            continue
+        selected.append({
+            "params": deepcopy(row["params"]),
+            "training_score": float(row["training_score"]),
+            "training_excess_return": float(row.get("training_excess_return", math.nan)),
+            "source_center_ids": list(row.get("source_center_ids", [])),
+            "selection_kind": "complementary",
+            "quantile": None,
+        })
+    return selected
+
+
 def _candidate_family(
     sampled: list[dict[str, Any]],
     config: OptimizationConfig,
     base: BacktestConfig,
     names: tuple[str, ...],
     source_trials: dict[tuple[Any, ...], list[int]] | None = None,
+    pairwise: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[tuple[Any, ...], list[tuple[Any, ...]]]]:
     candidates: dict[tuple[Any, ...], dict[str, Any]] = {}
+    clipped_neighbor_keys: set[tuple[Any, ...]] = set()
     domains = {name: _range_for(config, base, name) for name in names}
     center_keys: set[tuple[Any, ...]] = set()
 
@@ -384,11 +743,36 @@ def _candidate_family(
                     continue
             for direction in (-1, 1):
                 neighbor = deepcopy(center)
-                proposed = max(r.low, min(r.high, center[name] + direction * distance))
+                requested_value = center[name] + direction * distance
+                proposed = max(r.low, min(r.high, requested_value))
                 if name.endswith("_shares"):
                     proposed = int(round(float(proposed) / 100) * 100)
                 neighbor[name] = proposed
-                add(neighbor)
+                neighbor_key = add(neighbor)
+                if neighbor_key is not None and abs(float(proposed) - float(requested_value)) > 1e-12:
+                    clipped_neighbor_keys.add(neighbor_key)
+        if pairwise:
+            for left_index, left_name in enumerate(names):
+                for right_name in names[left_index + 1:]:
+                    left_range = domains[left_name]
+                    right_range = domains[right_name]
+                    left_distance = _range_distance(left_range, left_name)
+                    right_distance = _range_distance(right_range, right_name)
+                    if left_distance <= 0 or right_distance <= 0:
+                        continue
+                    for left_direction, right_direction in product((-1, 1), repeat=2):
+                        neighbor = deepcopy(center)
+                        left_value = max(left_range.low, min(left_range.high, center[left_name] + left_direction * left_distance))
+                        right_value = max(right_range.low, min(right_range.high, center[right_name] + right_direction * right_distance))
+                        if left_name.endswith("_shares"):
+                            left_value = int(round(float(left_value) / 100.0) * 100)
+                        if right_name.endswith("_shares"):
+                            right_value = int(round(float(right_value) / 100.0) * 100)
+                        neighbor[left_name] = left_value
+                        neighbor[right_name] = right_value
+                        neighbor_key = add(neighbor)
+                        if neighbor_key is not None and (abs(float(left_value) - float(center[left_name] + left_direction * left_distance)) > 1e-12 or abs(float(right_value) - float(center[right_name] + right_direction * right_distance)) > 1e-12):
+                            clipped_neighbor_keys.add(neighbor_key)
 
     ordered = sorted(candidates.items(), key=lambda item: item[0])
     rows = [
@@ -423,15 +807,45 @@ def _candidate_family(
                 neighbor_key = _params_key(_normalize_params(neighbor, base), names)
                 if neighbor_key in known:
                     adjacent.add(neighbor_key)
+        if pairwise:
+            for left_index, left_name in enumerate(names):
+                for right_name in names[left_index + 1:]:
+                    left_range = domains[left_name]
+                    right_range = domains[right_name]
+                    left_distance = _range_distance(left_range, left_name)
+                    right_distance = _range_distance(right_range, right_name)
+                    if left_distance <= 0 or right_distance <= 0:
+                        continue
+                    for left_direction, right_direction in product((-1, 1), repeat=2):
+                        neighbor = deepcopy(center)
+                        left_value = max(left_range.low, min(left_range.high, center[left_name] + left_direction * left_distance))
+                        right_value = max(right_range.low, min(right_range.high, center[right_name] + right_direction * right_distance))
+                        if left_name.endswith("_shares"):
+                            left_value = int(round(float(left_value) / 100.0) * 100)
+                        if right_name.endswith("_shares"):
+                            right_value = int(round(float(right_value) / 100.0) * 100)
+                        neighbor[left_name] = left_value
+                        neighbor[right_name] = right_value
+                        neighbor_key = _params_key(_normalize_params(neighbor, base), names)
+                        if neighbor_key in known:
+                            adjacent.add(neighbor_key)
         links[key] = sorted(adjacent)
     for row in rows:
         key = row["key"]
+        if row.get("is_center"):
+            variable_names = [name for name in names if domains[name].low != domains[name].high]
+            expected_neighbors = 2 * len(variable_names) + (4 * len(variable_names) * (len(variable_names) - 1) // 2 if pairwise else 0)
+            row["neighbor_expected_count"] = int(expected_neighbors)
+        else:
+            row["neighbor_expected_count"] = 0
         row["neighbor_candidate_ids"] = [candidate_ids[item] for item in links.get(key, []) if item in candidate_ids]
         row["neighbor_of_candidate_ids"] = [
             candidate_ids[center_key]
             for center_key, neighbor_keys in links.items()
             if key in neighbor_keys and center_key in candidate_ids and center_key != key
         ]
+        row["neighbor_boundary_clipped"] = row["key"] in clipped_neighbor_keys
+        row["neighbor_boundary_clipped_count"] = sum(item in clipped_neighbor_keys and item != row["key"] for item in links.get(row["key"], []))
     # Baseline is intentionally included even if no TPE trial sampled it.
     if baseline_key is not None:
         candidates[baseline_key]["is_baseline"] = True
@@ -656,9 +1070,18 @@ def _evaluate_family(
     params = [row["params"] for row in family_rows]
     sample_start, sample_end = scoring_dates[0], scoring_dates[-1]
     scoring_base = _base_with(base, start=sample_start, end=sample_end, reserve_cash=reserve_cash)
+    v3_scoring = int(config.protocol_version) == 3
+    baseline_folds: list[float] = []
+    if v3_scoring:
+        baseline_dates, baseline_returns = _buy_hold_returns(scoring_base, scoring_data)
+        for start, end in folds:
+            mask = (baseline_dates >= start) & (baseline_dates <= end)
+            baseline_folds.append(_compound_daily(baseline_returns[mask]))
     fold_bounds = [(start.date().isoformat(), end.date().isoformat()) for start, end in folds]
     fold_by_cost: dict[str, list[list[float]]] = {}
+    excess_by_cost: dict[str, list[list[float]]] = {}
     evidence_by_cost: dict[str, list[list[dict[str, Any]]]] = {}
+    peak_by_cost: dict[str, list[float]] = {}
     original_daily: tuple[pd.DatetimeIndex, np.ndarray] | None = None
 
     for cost_index, multiplier in enumerate(_COST_MULTIPLIERS):
@@ -750,6 +1173,7 @@ def _evaluate_family(
             raise ValueError("research_batch.fold_drawdowns must have shape [candidates, folds]")
         fold_metrics = _metric_fold_rows(result, len(params), len(folds))
         scores: list[list[float]] = [[] for _ in params]
+        excess_scores: list[list[float]] = [[] for _ in params]
         per_candidate_evidence: list[list[dict[str, Any]]] = [[] for _ in params]
         for candidate_index in range(len(params)):
             for fold_index, (start, end) in enumerate(folds):
@@ -759,14 +1183,29 @@ def _evaluate_family(
                     raise ValueError("validation fold does not overlap research_batch dates")
                 annualized = float(np.expm1(np.clip(np.log1p(sample).sum() * 252.0 / len(sample), -700, 700))) if np.all(sample > -1) else -1.0
                 drawdown = float(drawdowns[candidate_index, fold_index])
-                score = annualized - drawdown
-                scores[candidate_index].append(score)
                 row = fold_metrics[candidate_index][fold_index]
+                if v3_scoring:
+                    principal = float(row.get("principal", 0.0) or 0.0)
+                    profit = float(row.get("profit", 0.0) or 0.0)
+                    grid_return = profit / principal if principal > 0 else -1.0
+                    baseline_return = baseline_folds[fold_index] if fold_index < len(baseline_folds) else math.nan
+                    excess = grid_return - baseline_return if math.isfinite(baseline_return) else math.nan
+                    score = excess - drawdown if math.isfinite(excess) else -1e12
+                    excess_scores[candidate_index].append(excess)
+                else:
+                    grid_return = annualized
+                    baseline_return = math.nan
+                    excess = math.nan
+                    score = annualized - drawdown
+                scores[candidate_index].append(score)
                 per_candidate_evidence[candidate_index].append({
                     "start": start.date().isoformat(),
                     "end": end.date().isoformat(),
                     "days": int(mask.sum()),
                     "annualized_return": annualized,
+                    "grid_return": grid_return,
+                    "baseline_return": baseline_return if math.isfinite(baseline_return) else None,
+                    "excess_return": excess if math.isfinite(excess) else None,
                     "max_drawdown": drawdown,
                     "utility": score,
                     "trade_count": int(row.get("trade_count", int(row.get("buy_count", 0)) + int(row.get("sell_count", 0)))),
@@ -777,7 +1216,10 @@ def _evaluate_family(
                 })
         key = "original_cost" if multiplier == 1.0 else "double_commission_minimum_and_slippage"
         fold_by_cost[key] = scores
+        excess_by_cost[key] = excess_scores
         evidence_by_cost[key] = per_candidate_evidence
+        stats = np.asarray(result.get("funding_stats", []), dtype=np.float64)
+        peak_by_cost[key] = [float(stats[index, 2]) if len(stats) > index and np.isfinite(stats[index, 2]) else math.inf for index in range(len(params))]
         if multiplier == 1.0:
             original_daily = (dates, matrix)
         _emit(progress, progress_start + progress_width * (cost_index + 1) / len(_COST_MULTIPLIERS), f"双成本验证：{cost_index + 1}/{len(_COST_MULTIPLIERS)}")
@@ -795,7 +1237,11 @@ def _evaluate_family(
         original_folds = evidence_by_cost["original_cost"][index]
         stress_folds = evidence_by_cost["double_commission_minimum_and_slippage"][index]
         scores = candidate_scores_by_key[family_row["key"]]
-        raw_score = min(scores) if scores else math.nan
+        if v3_scoring:
+            excess_scores = [_robust_score(values[index]) for values in excess_by_cost.values()]
+            raw_score = min(excess_scores) if excess_scores else math.nan
+        else:
+            raw_score = min(scores) if scores else math.nan
         drawdown = max(
             [float(row["max_drawdown"]) for row in original_folds + stress_folds] or [math.inf]
         )
@@ -814,6 +1260,8 @@ def _evaluate_family(
         if buy_count <= 0 or sell_count <= 0:
             reasons.append("验证折未同时出现买入和卖出")
         eligible = not reasons
+        original_excess = [float(row["excess_return"]) for row in original_folds if row.get("excess_return") is not None]
+        stress_excess = [float(row["excess_return"]) for row in stress_folds if row.get("excess_return") is not None]
         family_row.update({
             "raw_score": float(raw_score),
             "eligible": eligible,
@@ -826,6 +1274,11 @@ def _evaluate_family(
             "folds": original_folds,
             "stress_folds": stress_folds,
             "cost_scores": {key: _robust_score(values[index]) for key, values in fold_by_cost.items()},
+            "validation_excess_original": _robust_score(original_excess),
+            "validation_excess_stress": _robust_score(stress_excess),
+            "validation_return_original": _robust_score([float(row["grid_return"]) for row in original_folds if row.get("grid_return") is not None]),
+            "validation_return_stress": _robust_score([float(row["grid_return"]) for row in stress_folds if row.get("grid_return") is not None]),
+            "peak_invested": min([values[index] for values in peak_by_cost.values() if index < len(values)] or [math.inf]),
             "evaluation_status": "completed",
         })
         if original_daily is not None:
@@ -851,8 +1304,82 @@ def _evaluate_family(
 def _rank_family(
     rows: list[dict[str, Any]],
     neighborhoods: dict[tuple[Any, ...], list[tuple[Any, ...]]],
+    protocol_version: int = 1,
+    full_history: bool = True,
 ) -> list[dict[str, Any]]:
     by_key = {row["key"]: row for row in rows}
+    if int(protocol_version) == 3:
+        for row in rows:
+            row["constraint_eligible"] = bool(row.get("eligible", False))
+            if not row.get("is_center"):
+                row["neighbor_scores"] = []
+                row["neighbor_count"] = 0
+                row["selection_score"] = None
+                row["score"] = None
+                row["recommendation_eligible"] = False
+                row["eligible"] = False
+                continue
+            expected = list(dict.fromkeys(neighborhoods.get(row["key"], [row["key"]])))
+            neighbor_keys = [key for key in expected if key != row["key"]]
+            neighbor_rows = [by_key[key] for key in neighbor_keys if key in by_key]
+            values_original = [float(item["validation_excess_original"]) for item in neighbor_rows if item.get("evaluation_status") == "completed" and item.get("validation_excess_original") is not None and math.isfinite(float(item["validation_excess_original"]))]
+            values_stress = [float(item["validation_excess_stress"]) for item in neighbor_rows if item.get("evaluation_status") == "completed" and item.get("validation_excess_stress") is not None and math.isfinite(float(item["validation_excess_stress"]))]
+            complete = len(neighbor_rows) == len(neighbor_keys) and len(values_original) == len(neighbor_keys) and len(values_stress) == len(neighbor_keys)
+            positive_ratio = float(np.mean(np.asarray(values_original) > 0.0)) if values_original else 0.0
+            stress_positive_ratio = float(np.mean(np.asarray(values_stress) > 0.0)) if values_stress else 0.0
+            q25_original = float(np.quantile(values_original, 0.25)) if values_original else math.nan
+            q25_stress = float(np.quantile(values_stress, 0.25)) if values_stress else math.nan
+            center_excess_original = row.get("validation_excess_original")
+            center_excess_stress = row.get("validation_excess_stress")
+            center_positive = center_excess_original is not None and center_excess_stress is not None and float(center_excess_original) > 0 and float(center_excess_stress) > 0
+            constraints_ok = bool(row.get("constraint_eligible", row.get("eligible", False)))
+            has_neighbors = bool(neighbor_keys)
+            robust = bool(
+                complete and has_neighbors and full_history and constraints_ok and center_positive and not row.get("is_baseline")
+                and positive_ratio >= _V3_POSITIVE_NEIGHBOR_RATIO and stress_positive_ratio >= _V3_POSITIVE_NEIGHBOR_RATIO
+                and math.isfinite(q25_original) and q25_original > 0 and math.isfinite(q25_stress) and q25_stress > 0
+            )
+            row.update({
+                "neighbor_count": len(neighbor_keys),
+                "neighbor_scores": values_original,
+                "neighbor_scores_stress": values_stress,
+                "neighbor_positive_ratio": positive_ratio,
+                "neighbor_positive_ratio_stress": stress_positive_ratio,
+                "neighbor_q25_excess": q25_original,
+                "neighbor_q25_excess_stress": q25_stress,
+                "neighbor_median_excess": float(np.median(values_original)) if values_original else math.nan,
+                "neighbor_worst_excess": float(np.min(values_original)) if values_original else math.nan,
+                "negative_neighbor_count": int(np.sum(np.asarray(values_original) <= 0.0)) if values_original else 0,
+                "neighbor_evaluation_complete": complete,
+                "robustness_status": "passed" if robust else "failed" if complete and has_neighbors else "unavailable",
+                "robustness_reasons": [] if robust else [
+                    reason for reason, failed in (
+                        ("完整历史不足", not full_history),
+                        ("邻域未完整计算", not complete),
+                        ("没有真实邻点", not has_neighbors),
+                        ("中心参数未满足硬约束", not constraints_ok),
+                        ("中心超额收益未同时为正", not center_positive),
+                        ("正超额邻点占比不足 80%", positive_ratio < _V3_POSITIVE_NEIGHBOR_RATIO or stress_positive_ratio < _V3_POSITIVE_NEIGHBOR_RATIO),
+                        ("邻域第 25 百分位未同时为正", not (math.isfinite(q25_original) and q25_original > 0 and math.isfinite(q25_stress) and q25_stress > 0)),
+                    ) if failed
+                ],
+                "island_suspect": bool(center_positive and complete and 0.0 < positive_ratio < 0.5),
+                "recommendation_eligible": robust,
+                "selection_score": min(q25_original, q25_stress) if math.isfinite(q25_original) and math.isfinite(q25_stress) else math.nan,
+                "score": row.get("raw_score"),
+                "eligible": robust,
+            })
+        return sorted(
+            [row for row in rows if row.get("is_center") and row.get("evaluation_status", "completed") == "completed"],
+            key=lambda row: (
+                -int(bool(row.get("recommendation_eligible"))),
+                -float(row["selection_score"]) if math.isfinite(float(row["selection_score"])) else math.inf,
+                -float(row["raw_score"]) if row.get("raw_score") is not None and math.isfinite(float(row["raw_score"])) else math.inf,
+                float(row["max_drawdown"]),
+                float(row.get("peak_invested", math.inf)),
+                int(row["candidate_id"]),
+            ),
+        )
     for row in rows:
         if not row.get("is_center"):
             row["neighbor_scores"] = []
@@ -911,7 +1438,30 @@ def _public_candidate(row: dict[str, Any]) -> dict[str, Any]:
         "folds": deepcopy(row.get("folds", [])),
         "stress_folds": deepcopy(row.get("stress_folds", [])),
         "cost_scores": deepcopy(row.get("cost_scores", {})),
+        "validation_excess_original": finite_or_none(row.get("validation_excess_original")),
+        "validation_excess_stress": finite_or_none(row.get("validation_excess_stress")),
+        "peak_invested": finite_or_none(row.get("peak_invested")),
+        "training_score": finite_or_none(row.get("training_score")),
+        "training_excess_return": finite_or_none(row.get("training_excess_return")),
+        "statistical_center_id": list(row.get("statistical_center_id", [])),
+        "center_selection_kind": row.get("center_selection_kind"),
+        "constraint_eligible": bool(row.get("constraint_eligible", row.get("eligible", False))),
+        "recommendation_eligible": bool(row.get("recommendation_eligible", False)),
+        "robustness_status": row.get("robustness_status", "not_available"),
+        "robustness_reasons": list(row.get("robustness_reasons", [])),
+        "neighbor_positive_ratio": finite_or_none(row.get("neighbor_positive_ratio")),
+        "neighbor_positive_ratio_stress": finite_or_none(row.get("neighbor_positive_ratio_stress")),
+        "neighbor_q25_excess": finite_or_none(row.get("neighbor_q25_excess")),
+        "neighbor_q25_excess_stress": finite_or_none(row.get("neighbor_q25_excess_stress")),
+        "neighbor_median_excess": finite_or_none(row.get("neighbor_median_excess")),
+        "neighbor_worst_excess": finite_or_none(row.get("neighbor_worst_excess")),
+        "negative_neighbor_count": int(row.get("negative_neighbor_count", 0)),
+        "neighbor_evaluation_complete": bool(row.get("neighbor_evaluation_complete", False)),
+        "island_suspect": bool(row.get("island_suspect", False)),
+        "neighbor_boundary_clipped": bool(row.get("neighbor_boundary_clipped", False)),
+        "neighbor_boundary_clipped_count": int(row.get("neighbor_boundary_clipped_count", 0)),
         "neighbor_count": int(row.get("neighbor_count", 0)),
+        "neighbor_expected_count": int(row.get("neighbor_expected_count", 0)),
         "neighbor_scores": list(row.get("neighbor_scores", [])),
         "is_center": bool(row.get("is_center", False)),
         "is_baseline": bool(row.get("is_baseline", False)),
@@ -920,6 +1470,170 @@ def _public_candidate(row: dict[str, Any]) -> dict[str, Any]:
         "neighbor_of_candidate_ids": list(row.get("neighbor_of_candidate_ids", [])),
         "source_trials": list(row.get("source_trials", [])),
         "evaluation_status": row.get("evaluation_status", "not_evaluated"),
+    }
+
+
+def _select_at_v3(
+    config: OptimizationConfig,
+    base: BacktestConfig,
+    data: DataBundle,
+    asof: pd.Timestamp | None,
+    *,
+    seed_offset: int,
+    progress: Progress | None,
+    cancelled: Cancelled | None,
+    progress_start: float = 0.0,
+    progress_width: float = 0.0,
+) -> dict[str, Any]:
+    dates = _calendar(data)
+    history_dates = dates[dates <= asof] if asof is not None else pd.DatetimeIndex([])
+    history_dates = history_dates[-_LOOKBACK_DAYS:]
+    as_of = history_dates[-1] if len(history_dates) else (_date_key(asof) if asof is not None else None)
+    names = _v3_names(base)
+    reasons: list[str] = []
+    generation_dates, folds, has_oos_split, window_reasons = _folds_for_history(history_dates)
+    reasons.extend(window_reasons)
+    fallback = {name: getattr(base, name) for name in names}
+    fallback["initial_shares"] = int(base.initial_shares)
+    if base.max_shares is None:
+        fallback["max_shares"] = None
+    if len(history_dates) == 0:
+        return {
+            "status": "insufficient_history", "recommendation_status": "no_qualified",
+            "params": fallback, "recommended_params": None, "as_of": as_of.date().isoformat() if as_of is not None else None,
+            "score": None, "raw_score": None, "eligible": False,
+            "reasons": list(dict.fromkeys([*reasons, "没有可用于统计画像的历史行情"])),
+            "candidates": [], "candidate_archive": [], "search_candidate_archive": [], "trial_archive": [],
+            "diagnostics": {"status": "insufficient_history", "candidate_count": 0, "eligible_count": 0, "validation_folds": []},
+            "_ranked_rows": [], "_family_rows": [], "_neighborhoods": {}, "_search_rows": [],
+            "_fold_ranges": [], "_selection_data": None, "_selection_dates": history_dates,
+        }
+    if len(generation_dates) == 0:
+        generation_dates = history_dates
+    gen_start, gen_end = pd.Timestamp(generation_dates[0]), pd.Timestamp(generation_dates[-1])
+    gen_data = legacy_optimization._slice_bundle(data, gen_start, gen_end)
+    _emit(progress, progress_start, "统计画像：波动、趋势、修复与交易成本")
+    statistical_centers, profile = _statistical_centers(config, base, data, generation_dates)
+    local_rows, expected_count, budget_exceeded = _local_grid_rows(config, base, statistical_centers)
+    if budget_exceeded:
+        diagnostic = {
+            "status": "budget_exceeded", "local_search_expected": expected_count,
+            "local_search_budget": int(config.local_search_budget), "statistical_profile": profile,
+        }
+        return {
+            "status": "budget_exceeded", "recommendation_status": "no_qualified",
+            "params": fallback, "recommended_params": None, "as_of": as_of.date().isoformat() if as_of is not None else None,
+            "score": None, "raw_score": None, "eligible": False,
+            "reasons": [*reasons, f"局部网格预计 {expected_count} 组，超过预算 {config.local_search_budget}；请调整范围或预算"],
+            "candidates": [], "candidate_archive": [], "search_candidate_archive": [], "trial_archive": [],
+            "diagnostics": diagnostic,
+            "_ranked_rows": [], "_family_rows": [], "_neighborhoods": {}, "_search_rows": [],
+            "_fold_ranges": folds, "_selection_data": gen_data, "_selection_dates": history_dates,
+        }
+    if _cancelled(cancelled):
+        raise InterruptedError("研究已取消")
+    training_rows, training = _score_training_rows(config, base, gen_data, generation_dates, local_rows, cancelled)
+    selected_centers = _training_centers(config, base, training_rows, statistical_centers)
+    if not selected_centers:
+        selected_centers = [{
+            "params": deepcopy(fallback), "training_score": None,
+            "source_center_ids": [], "selection_kind": "baseline_only", "quantile": None,
+        }]
+        reasons.append("统计中心没有合法局部组合，仅保留原始配置作为研究对照")
+    family_rows, neighborhoods = _candidate_family(
+        [item["params"] for item in selected_centers], config, base, names, pairwise=True
+    )
+    center_meta = {_params_key(_normalize_params(item["params"], base), names): item for item in selected_centers}
+    for row in family_rows:
+        meta = center_meta.get(row["key"])
+        row["statistical_center_id"] = meta.get("source_center_ids") if meta else []
+        row["center_selection_kind"] = meta.get("selection_kind") if meta else None
+        row["training_score"] = meta.get("training_score") if meta else None
+        row["training_excess_return"] = meta.get("training_excess_return") if meta else None
+    scoring_start, scoring_end = history_dates[0], history_dates[-1]
+    scoring_data = legacy_optimization._slice_bundle(data, scoring_start, scoring_end)
+    folds_for_score = folds or [(generation_dates[0], generation_dates[-1])]
+    rows, validation_diagnostic, validation_cancelled = _evaluate_family(
+        family_rows, config, base, scoring_data, history_dates, folds_for_score,
+        reserve_cash=None,
+        progress=progress,
+        cancelled=cancelled,
+        progress_start=progress_start + progress_width * 0.55,
+        progress_width=progress_width * 0.45,
+    )
+    full_history = len(history_dates) >= _LOOKBACK_DAYS
+    ranked = _rank_family(rows, neighborhoods, protocol_version=3, full_history=full_history)
+    if validation_cancelled:
+        reasons.append("双成本验证期间用户取消")
+    recommended = next((row for row in ranked if row.get("recommendation_eligible")), None)
+    relative_best = ranked[0] if ranked else None
+    if recommended is None:
+        reasons.append("暂无合格推荐：没有参数同时满足时间约束、80% 正超额邻点、邻域第 25 百分位为正及双成本条件")
+        recommended_params = None
+    else:
+        recommended_params = deepcopy(recommended["params"])
+    search_archive = []
+    for row in training_rows:
+        search_archive.append({
+            "search_id": int(row["search_id"]),
+            "params": deepcopy(row["params"]),
+            "source_center_ids": list(row.get("source_center_ids", [])),
+            "status": row.get("training_status"),
+            "training_return": row.get("training_return"),
+            "training_baseline_return": row.get("training_baseline_return"),
+            "training_excess_return": row.get("training_excess_return"),
+            "training_drawdown": row.get("training_drawdown"),
+            "training_score": row.get("training_score"),
+        })
+    diagnostic = {
+        **validation_diagnostic,
+        "status": "completed" if not validation_cancelled else "cancelled",
+        "protocol_version": 3,
+        "statistical_profile": profile,
+        "statistical_center_count": len(statistical_centers),
+        "validation_center_count": len(selected_centers),
+        "local_search_expected": expected_count,
+        "local_search_unique": len(local_rows),
+        "local_search_budget": int(config.local_search_budget),
+        "training": training,
+        "candidate_count": len(family_rows),
+        "neighbor_count": sum(max(0, len(value) - 1) for value in neighborhoods.values()),
+        "selectable_center_count": sum(bool(row.get("is_center")) for row in family_rows),
+        "eligible_count": sum(bool(row.get("recommendation_eligible")) for row in ranked),
+        "recommendation_status": "qualified" if recommended_params is not None else "no_qualified",
+        "robustness_enabled": True,
+        "positive_neighbor_ratio": _V3_POSITIVE_NEIGHBOR_RATIO,
+        "neighbor_quantile": 0.25,
+        "full_history": full_history,
+        "validation_folds": [
+            {"start": start.date().isoformat(), "end": end.date().isoformat(), "days": int(((history_dates >= start) & (history_dates <= end)).sum())}
+            for start, end in folds
+        ],
+        "constraints": {"max_drawdown": float(config.max_drawdown), "min_trades": int(config.min_trades)},
+    }
+    best_for_display = recommended or relative_best
+    return {
+        "status": "cancelled" if validation_cancelled else "completed",
+        "recommendation_status": "qualified" if recommended_params is not None else "no_qualified",
+        "params": deepcopy(relative_best["params"]) if relative_best else fallback,
+        "recommended_params": recommended_params,
+        "as_of": as_of.date().isoformat() if as_of is not None else None,
+        "score": float(best_for_display["selection_score"]) if best_for_display and best_for_display.get("selection_score") is not None and math.isfinite(float(best_for_display["selection_score"])) else None,
+        "raw_score": float(best_for_display["raw_score"]) if best_for_display and best_for_display.get("raw_score") is not None else None,
+        "eligible": bool(recommended is not None),
+        "reasons": list(dict.fromkeys(reasons)),
+        "candidates": [_public_candidate(row) for row in ranked],
+        "candidate_archive": [_public_candidate(row) for row in family_rows],
+        "search_candidate_archive": search_archive,
+        "trial_archive": search_archive,
+        "diagnostics": diagnostic,
+        "_ranked_rows": ranked,
+        "_family_rows": family_rows,
+        "_neighborhoods": neighborhoods,
+        "_fold_ranges": folds,
+        "_selection_data": scoring_data,
+        "_selection_dates": history_dates,
+        "_search_rows": training_rows,
     }
 
 
@@ -936,6 +1650,11 @@ def _select_at(
     progress_start: float = 0.0,
     progress_width: float = 0.0,
 ) -> dict[str, Any]:
+    if int(config.protocol_version) == 3:
+        return _select_at_v3(
+            config, base, data, asof, seed_offset=seed_offset, progress=progress,
+            cancelled=cancelled, progress_start=progress_start, progress_width=progress_width,
+        )
     dates = _calendar(data)
     history_dates = dates[dates <= asof] if asof is not None else pd.DatetimeIndex([])
     history_dates = history_dates[-_LOOKBACK_DAYS:]
@@ -1211,7 +1930,9 @@ def _returns_from_strategy_result(section: dict[str, Any]) -> tuple[pd.DatetimeI
     return dates, returns
 
 
-def _passive_returns(base: BacktestConfig, data: DataBundle) -> tuple[pd.DatetimeIndex, np.ndarray]:
+def _passive_returns(base: BacktestConfig, data: DataBundle, buy_hold: bool = False) -> tuple[pd.DatetimeIndex, np.ndarray]:
+    if buy_hold:
+        return _buy_hold_returns(base, data)
     from .share_engine import research_passive
 
     result = research_passive(base, data)
@@ -1285,7 +2006,7 @@ def evaluate_current_family(
     if not candidates:
         result.update(status="unavailable", reasons=["当前参数族没有完整验证候选"])
         return result
-    names = _active_names(config.base)
+    names = _v3_names(config.base) if int(config.protocol_version) == 3 else _active_names(config.base)
     selection_base = _base_with(
         config.base,
         start=history_dates[0],
@@ -1334,7 +2055,10 @@ def evaluate_current_family(
             return result
         dates, matrix = _batch_returns(batch, len(candidates))
         result["matrix_source"] = "recomputed_original_cost_validation_matrix"
-    passive_dates, passive_values = _passive_returns(selection_base, selection_data)
+    if int(config.protocol_version) == 3:
+        passive_dates, passive_values = _passive_returns(selection_base, selection_data, buy_hold=True)
+    else:
+        passive_dates, passive_values = _passive_returns(selection_base, selection_data)
     passive_series = pd.Series(passive_values, index=passive_dates).groupby(level=0).last()
     active_frame = pd.DataFrame(matrix, index=dates, columns=np.arange(matrix.shape[1])).groupby(level=0).last()
     validation_mask = np.zeros(len(active_frame.index), dtype=bool)
@@ -1434,18 +2158,22 @@ def _evaluate_final_126(
         return output
     passive_section = None
     if isinstance(passive_result, dict):
-        passive_section = passive_result.get("strategies", {}).get("grid")
+        passive_section = passive_result.get("strategies", {}).get("buy_hold" if int(config.protocol_version) == 3 else "grid")
     if not isinstance(passive_section, dict):
         for _, section, test_result in requested:
             if isinstance(test_result, dict):
-                passive_section = test_result.get("strategies", {}).get("same_account_passive")
+                baseline_key = "buy_hold" if int(config.protocol_version) == 3 else "same_account_passive"
+                passive_section = test_result.get("strategies", {}).get(baseline_key)
                 if isinstance(passive_section, dict):
                     break
     if isinstance(passive_section, dict):
         passive_dates, passive = _returns_from_strategy_result(passive_section)
     else:
         try:
-            passive_dates, passive = _passive_returns(base, data)
+            if int(config.protocol_version) == 3:
+                passive_dates, passive = _passive_returns(base, data, buy_hold=True)
+            else:
+                passive_dates, passive = _passive_returns(base, data)
         except InterruptedError:
             output.update(status="cancelled", procedures={}, reasons=[*output["reasons"], "同现金被动收益期间用户取消"])
             return output
@@ -1528,9 +2256,13 @@ def optimize_scientific(
     progress: Progress | None = None,
     cancelled: Cancelled | None = None,
 ) -> dict[str, Any]:
-    """Run v2 rolling selection using only information available at each close."""
-    if config.base.schema_version != 2:
-        raise ValueError("scientific protocol requires schema_version=2 share config")
+    """Run research selection using only information available at each close."""
+    if config.base.schema_version not in (2, 3):
+        raise ValueError("scientific protocol requires a v2 or v3 share config")
+    if config.protocol_version == 3 and config.base.schema_version != 3:
+        raise ValueError("protocol_version=3 requires schema_version=3")
+    if config.protocol_version == 2 and config.base.schema_version != 2:
+        raise ValueError("protocol_version=2 requires schema_version=2")
     if not isinstance(data, DataBundle):
         raise TypeError("data must be a DataBundle")
     legacy_optimization._check_ranges(config)
@@ -1572,9 +2304,12 @@ def optimize_scientific(
             }
         no_oos = "评估区间没有可回测交易日；没有使用结束日期之后的行情代替样本外数据"
         all_reasons = list(dict.fromkeys([*selection.get("reasons", []), no_oos]))
-        selected = deepcopy(selection["params"])
+        protocol_v3 = int(config.protocol_version) == 3
+        recommended = deepcopy(selection.get("recommended_params")) if protocol_v3 else deepcopy(selection["params"])
+        selected = deepcopy(recommended if protocol_v3 else selection["params"])
         fixed = {
-            "status": "insufficient_history", "params": selected if selection_target in ("fixed", "both") else None,
+            "status": "insufficient_history" if selected is not None else "no_qualified", "params": selected if selection_target in ("fixed", "both") else None,
+            "diagnostic_params": deepcopy(selection["params"]),
             "as_of": selection.get("as_of"), "score": selection.get("score"), "eligible": bool(selection.get("eligible", False)),
             "reasons": all_reasons, "test_result": None,
             "candidates": selection.get("candidates", [])[: int(config.top_candidates)],
@@ -1594,7 +2329,7 @@ def optimize_scientific(
             adaptive.update({"latest_params": selected, "latest_as_of": selection.get("as_of"), "active_params": None, "active_effective_date": None})
         return {
             "status": "cancelled" if selection.get("status") == "cancelled" or _cancelled(cancelled) else "partial",
-            "protocol_version": 2,
+            "protocol_version": int(config.protocol_version),
             "config": config.model_dump(mode="json"),
             "protocol": {
                 "selection_target": selection_target, "lookback_trading_days": _LOOKBACK_DAYS,
@@ -1602,6 +2337,10 @@ def optimize_scientific(
                 "validation_folds": 4, "rebalance_days": rebalance_days,
                 "cost_multipliers": list(_COST_MULTIPLIERS), "bootstrap_reps": bootstrap_reps,
                 "bootstrap_block_lengths": [20, 10, 40], "reserve_cash": reserve_cash,
+                "funding_mode": "top_up_on_fill" if protocol_v3 else "configured_reserve",
+                "positive_neighbor_ratio": _V3_POSITIVE_NEIGHBOR_RATIO if protocol_v3 else None,
+                "neighbor_quantile": 0.25 if protocol_v3 else None,
+                "local_search_budget": int(config.local_search_budget) if protocol_v3 else None,
                 "training_start": selection.get("diagnostics", {}).get("selection_history_start"),
                 "training_end": selection.get("diagnostics", {}).get("selection_history_end"),
                 "evaluation_start": eval_start.date().isoformat(),
@@ -1610,7 +2349,7 @@ def optimize_scientific(
             "fixed": fixed, "adaptive": adaptive,
             "locked_funding": lock,
             "evidence": {
-                "fixed_decision": {"decision_date": selection.get("as_of"), "status": fixed["status"], "selected_params": fixed.get("params"), "reasons": all_reasons},
+                "fixed_decision": {"decision_date": selection.get("as_of"), "status": fixed["status"], "selected_params": fixed.get("params"), "diagnostic_params": fixed.get("diagnostic_params"), "reasons": all_reasons},
                 "current_decision": {"decision_date": selection.get("as_of"), "status": "insufficient_history", "selected_params": selected, "reasons": all_reasons},
                 "decisions": [], "candidate_archives": {"fixed": selection.get("candidate_archive", []), "current": selection.get("candidate_archive", []), "adaptive": []},
                 "trial_archives": {"fixed": selection.get("trial_archive", []), "current": selection.get("trial_archive", []), "adaptive": []},
@@ -1622,7 +2361,7 @@ def optimize_scientific(
             },
             "warnings": [*data.warnings, *all_reasons], "data_version": data.version, "quality": quality,
             "is_demo": bool(quality.get("is_demo") or data.metadata.get("is_demo")),
-            "computation": {"n_trials_per_decision": int(config.n_trials), "rebalance_days": rebalance_days, "decision_count": 0,
+            "computation": {"n_trials_per_decision": int(config.n_trials) if not protocol_v3 else 0, "local_search_budget": int(config.local_search_budget) if protocol_v3 else None, "rebalance_days": rebalance_days, "decision_count": 0,
                 "candidate_count": int(selection.get("diagnostics", {}).get("candidate_count", 0)), "cost_evaluations": 0,
                 "bootstrap_reps": bootstrap_reps, "cancelled": bool(_cancelled(cancelled))},
         }
@@ -1632,6 +2371,7 @@ def optimize_scientific(
     locked_funding = _funding_reserve(config.base, data, eval_dates[0])
     reserve_cash = _funding_amount(locked_funding)
     base = _base_with(config.base, start=eval_dates[0], end=eval_dates[-1], reserve_cash=reserve_cash)
+    protocol_v3 = int(config.protocol_version) == 3
     reasons = []
     if len(eval_dates) < 126:
         reasons.append(f"评估期仅{len(eval_dates)}个交易日，末126日核验不足")
@@ -1645,6 +2385,7 @@ def optimize_scientific(
     fixed_replay_cancelled = False
     candidate_archives: dict[str, Any] = {"fixed": [], "current": [], "adaptive": []}
     trial_archives: dict[str, Any] = {"fixed": [], "current": [], "adaptive": []}
+    search_candidate_archives: dict[str, Any] = {"fixed": [], "current": [], "adaptive": []}
     if selection_target in ("fixed", "both"):
         initial_asof = _known_preceding_close(data, eval_dates[0])
         selected = _select_at(
@@ -1662,7 +2403,16 @@ def optimize_scientific(
         fixed_selection = selected
         candidate_archives["fixed"] = selected["candidate_archive"]
         trial_archives["fixed"] = selected["trial_archive"]
-        fixed_config = _base_with(base, selected["params"], start=eval_dates[0], end=eval_dates[-1], reserve_cash=reserve_cash)
+        search_candidate_archives["fixed"] = selected.get("search_candidate_archive", [])
+        protocol_v3 = int(config.protocol_version) == 3
+        recommended = deepcopy(selected.get("recommended_params")) if protocol_v3 else deepcopy(selected["params"])
+        if protocol_v3 and recommended is None:
+            fixed_config = base.model_copy(update={
+                "min_shares": int(base.initial_shares),
+                "max_shares": int(base.initial_shares),
+            })
+        else:
+            fixed_config = _base_with(base, recommended or selected["params"], start=eval_dates[0], end=eval_dates[-1], reserve_cash=reserve_cash)
         test_result = None
         if not _cancelled(cancelled):
             try:
@@ -1670,8 +2420,10 @@ def optimize_scientific(
             except InterruptedError:
                 fixed_replay_cancelled = True
         fixed = {
-            "status": selected["status"] if test_result is not None else ("cancelled" if selected["status"] == "cancelled" or fixed_replay_cancelled or _cancelled(cancelled) else "partial"),
-            "params": selected["params"],
+            "status": ("no_qualified" if protocol_v3 and recommended is None else selected["status"]) if test_result is not None else ("cancelled" if selected["status"] == "cancelled" or fixed_replay_cancelled or _cancelled(cancelled) else "partial"),
+            "params": recommended,
+            "recommended_params": recommended,
+            "diagnostic_params": selected["params"],
             "as_of": selected["as_of"],
             "score": selected["score"],
             "eligible": selected["eligible"],
@@ -1679,6 +2431,7 @@ def optimize_scientific(
             "test_result": test_result,
             "candidates": selected["candidates"][: int(config.top_candidates)],
             "diagnostics": selected["diagnostics"],
+            "recommendation_status": selected.get("recommendation_status", "qualified" if recommended is not None else "no_qualified"),
         }
     elif selection_target == "adaptive":
         fixed["status"] = "not_requested"
@@ -1718,6 +2471,7 @@ def optimize_scientific(
                 "effective_date": effective_date.date().isoformat(),
                 "decision_date": selected["as_of"],
                 "candidate_archive": selected["candidate_archive"],
+                "search_candidate_archive": selected.get("search_candidate_archive", []),
             })
             trial_archives["adaptive"].append({
                 "effective_date": effective_date.date().isoformat(),
@@ -1725,23 +2479,30 @@ def optimize_scientific(
                 "trial_archive": selected["trial_archive"],
             })
             if selected["status"] != "cancelled":
+                protocol_v3 = int(config.protocol_version) == 3
+                recommended = deepcopy(selected.get("recommended_params")) if protocol_v3 else deepcopy(selected["params"])
+                paused = bool(protocol_v3 and recommended is None)
                 schedule.append({
                     "effective_date": effective_date.date().isoformat(),
                     "decision_date": selected["as_of"],
-                    "params": deepcopy(selected["params"]),
+                    "params": deepcopy(selected["params"] if paused else recommended),
+                    "paused": paused,
+                    "recommendation_status": selected.get("recommendation_status", "qualified" if not paused else "no_qualified"),
                 })
             decisions.append({
                 "effective_date": effective_date.date().isoformat(),
                 "decision_date": selected["as_of"],
                 "status": selected["status"],
                 "reused_from_fixed": reused_from_fixed,
-                "selected_params": deepcopy(selected["params"]),
+                "selected_params": None if int(config.protocol_version) == 3 and selected.get("recommended_params") is None else deepcopy(selected.get("recommended_params") if int(config.protocol_version) == 3 else selected["params"]),
+                "diagnostic_params": deepcopy(selected["params"]),
+                "paused": bool(schedule[-1].get("paused")) if schedule else False,
                 "score": selected["score"],
                 "reasons": selected["reasons"],
                 "candidate_count": selected["diagnostics"].get("candidate_count", 0),
                 "evaluated_count": selected["diagnostics"].get("candidate_count", 0),
                 "eligible_count": selected["diagnostics"].get("eligible_count", 0),
-                "selected_eligible": selected["eligible"],
+                "selected_eligible": bool(selected["eligible"]),
                 "constraint_reasons": selected["diagnostics"].get("selected_constraint_reasons", selected["reasons"]),
                 "neighbor_count": selected["diagnostics"].get("neighbor_count", 0),
                 "windows": selected["diagnostics"].get("validation_folds", []),
@@ -1771,12 +2532,22 @@ def optimize_scientific(
     passive_result = None
     passive_run_cancelled = False
     if not _cancelled(cancelled) and (fixed.get("test_result") is not None or adaptive.get("test_result") is not None):
-        try:
-            passive_result = _run_passive_backtest(base, data, _mapped_progress(progress, 0.81, 0.02), cancelled)
-        except InterruptedError:
-            passive_run_cancelled = True
-        _attach_passive_strategy(fixed.get("test_result"), passive_result)
-        _attach_passive_strategy(adaptive.get("test_result"), passive_result)
+        if protocol_v3:
+            try:
+                baseline_dates, baseline_values = _buy_hold_returns(base, data)
+                passive_result = {"strategies": {"buy_hold": {"period_returns": [
+                    {"timestamp": (day + pd.Timedelta(hours=15)).isoformat(), "return": float(value)}
+                    for day, value in zip(baseline_dates, baseline_values)
+                ]}}}
+            except InterruptedError:
+                passive_run_cancelled = True
+        else:
+            try:
+                passive_result = _run_passive_backtest(base, data, _mapped_progress(progress, 0.81, 0.02), cancelled)
+            except InterruptedError:
+                passive_run_cancelled = True
+            _attach_passive_strategy(fixed.get("test_result"), passive_result)
+            _attach_passive_strategy(adaptive.get("test_result"), passive_result)
 
     # Current parameters are selected as of the final available evaluation
     # close.  This research is separate from the historical fixed OOS result.
@@ -1795,11 +2566,16 @@ def optimize_scientific(
     )
     candidate_archives["current"] = current["candidate_archive"]
     trial_archives["current"] = current["trial_archive"]
+    search_candidate_archives["current"] = current.get("search_candidate_archive", [])
+    protocol_v3 = int(config.protocol_version) == 3
+    current_recommended = deepcopy(current.get("recommended_params")) if protocol_v3 else deepcopy(current["params"])
     fixed["current"] = {
-        "params": current["params"],
+        "params": current_recommended,
+        "recommended_params": current_recommended,
+        "diagnostic_params": deepcopy(current["params"]),
         "as_of": current["as_of"],
         "score": current["score"],
-        "status": current["status"],
+        "status": "no_qualified" if protocol_v3 and current_recommended is None else current["status"],
         "eligible": current["eligible"],
         "reasons": current["reasons"],
         "candidates": current["candidates"][: int(config.top_candidates)],
@@ -1807,10 +2583,11 @@ def optimize_scientific(
     }
     if selection_target in ("adaptive", "both"):
         adaptive.update({
-            "latest_params": deepcopy(current["params"]),
+            "latest_params": current_recommended,
+            "latest_diagnostic_params": deepcopy(current["params"]),
             "latest_as_of": current["as_of"],
-            "active_params": deepcopy(adaptive["schedule"][-1]["params"]) if adaptive.get("schedule") else None,
-            "active_effective_date": adaptive["schedule"][-1]["effective_date"] if adaptive.get("schedule") else None,
+            "active_params": deepcopy(adaptive["schedule"][-1]["params"]) if adaptive.get("schedule") and not adaptive["schedule"][-1].get("paused") else None,
+            "active_effective_date": adaptive["schedule"][-1]["effective_date"] if adaptive.get("schedule") and not adaptive["schedule"][-1].get("paused") else None,
         })
     current_family_bootstrap = evaluate_current_family(
         config,
@@ -1838,6 +2615,8 @@ def optimize_scientific(
         "decision_date": fixed.get("as_of"),
         "status": fixed.get("status"),
         "selected_params": fixed.get("params"),
+        "diagnostic_params": fixed.get("diagnostic_params"),
+        "recommendation_status": fixed.get("recommendation_status"),
         "score": fixed.get("score"),
         "candidate_count": fixed.get("diagnostics", {}).get("candidate_count", 0),
         "eligible_count": fixed.get("diagnostics", {}).get("eligible_count", 0),
@@ -1850,7 +2629,9 @@ def optimize_scientific(
         "effective_date": None,
         "decision_date": current.get("as_of"),
         "status": current.get("status"),
-        "selected_params": current.get("params"),
+        "selected_params": current_recommended,
+        "diagnostic_params": current.get("params"),
+        "recommendation_status": current.get("recommendation_status", "qualified" if current_recommended is not None else "no_qualified"),
         "score": current.get("score"),
         "candidate_count": current.get("diagnostics", {}).get("candidate_count", 0),
         "eligible_count": current.get("diagnostics", {}).get("eligible_count", 0),
@@ -1891,11 +2672,12 @@ def optimize_scientific(
     result_status = "cancelled" if cancelled_state else "partial" if incomplete else "completed"
     _emit(progress, 1.0, "科学参数选择完成")
     computation = {
-        "n_trials_per_decision": int(config.n_trials),
+        "n_trials_per_decision": int(config.n_trials) if not protocol_v3 else 0,
+        "local_search_budget": int(config.local_search_budget) if protocol_v3 else None,
         "rebalance_days": rebalance_days,
         "decision_count": len(decisions),
         "candidate_count": total_candidates,
-        "generation_evaluations": total_generated,
+        "generation_evaluations": total_generated if not protocol_v3 else sum(int(item.get("local_search_unique", 0) or 0) for item in all_selections),
         "cost_evaluations": total_evaluations,
         "constraint_failures": int(constraint_failures),
         "neighborhood_count": sum(1 for archive in unique_archives for candidate in archive if not candidate.get("is_center")),
@@ -1906,10 +2688,11 @@ def optimize_scientific(
         "fold_count_per_full_window": 4,
         "fold_days_target": _FOLD_DAYS,
         "cancelled": bool(_cancelled(cancelled)),
+        "recommendation_status": "qualified" if (fixed.get("recommendation_status") == "qualified" or current.get("recommendation_status") == "qualified") else "no_qualified",
     }
     return {
         "status": result_status,
-        "protocol_version": 2,
+        "protocol_version": int(config.protocol_version),
         "config": config.model_dump(mode="json"),
         "protocol": {
             "selection_target": selection_target,
@@ -1923,10 +2706,16 @@ def optimize_scientific(
             "validation_folds": 4,
             "rebalance_days": rebalance_days,
             "cost_multipliers": list(_COST_MULTIPLIERS),
-            "score": "25%分位邻域稳健分；单窗U=252交易日年化收益-maxDD；R=median(U)-0.5*IQR(U)；取原成本和双佣金/最低佣金/滑点压力中较差R",
+            "score": ("邻域超额收益第25百分位与跨窗稳健分；分窗 U=超额收益-资金流调整回撤，R=median(U)-0.5*IQR(U)，取双成本中较差结果" if protocol_v3 else "25%四分位邻域稳健分；分窗U=252日年化收益-maxDD，R=median(U)-0.5*IQR(U)，取原成本与双佣金/最低佣金/滑点压力中较差R"),
             "bootstrap_reps": bootstrap_reps,
             "bootstrap_block_lengths": [20, 10, 40],
             "reserve_cash": reserve_cash,
+            "funding_mode": "top_up_on_fill" if protocol_v3 else "configured_reserve",
+            "local_search_budget": int(config.local_search_budget) if protocol_v3 else None,
+            "positive_neighbor_ratio": _V3_POSITIVE_NEIGHBOR_RATIO if protocol_v3 else None,
+            "neighbor_quantile": 0.25 if protocol_v3 else None,
+            "neighbor_perturbations": "single_and_pairwise_one_step" if protocol_v3 else "single_factor_one_step",
+            "ranking_baseline": "independent_buy_hold" if protocol_v3 else "same_cash_passive",
         },
         "fixed": fixed,
         "adaptive": adaptive,
@@ -1937,6 +2726,7 @@ def optimize_scientific(
             "decisions": decisions,
             "candidate_archives": candidate_archives,
             "trial_archives": trial_archives,
+            "search_candidate_archives": search_candidate_archives,
             "final_126_day_check": final_126,
             "current_candidate_family_bootstrap": current_family_bootstrap,
             "data_days": int(len(available_dates)),

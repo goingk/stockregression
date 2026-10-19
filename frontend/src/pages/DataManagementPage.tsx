@@ -17,9 +17,9 @@ const TIMEFRAMES: Array<[DataTimeframe, string]> = [
   ['60min', '60 分钟'], ['1day', '日线'], ['1week', '周线'], ['1month', '月线'],
 ]
 const DATA_JOB_KINDS = new Set([
-  'sync', 'instruments', 'import', 'demo', 'market_sync', 'market_import',
+  'instruments', 'market_sync', 'market_import',
   'market_import_batch', 'market_import_package', 'market_index_package',
-  'market_validate', 'market_aggregate', 'market_migrate', 'market_prepare',
+  'market_validate', 'market_aggregate', 'market_prepare',
   'market_source_probe', 'market_archive',
 ])
 const TERMINAL = new Set(['completed', 'partial', 'failed', 'cancelled'])
@@ -374,7 +374,7 @@ export default function DataManagementPage({
     void run('登记数据包', () => post('/data/import-package', {
       folder: packageFolder.trim(), format: 'package', timeframes: null, symbols: null,
       label_convention: 'auto', resume: true, workers: 2, skip_invalid_rows: false,
-    }), '已提交数据包幂等登记；其他证券和历史版本会保留。')
+    }), '已提交当前数据包的幂等登记；现有数据版本和结果会保留。')
   }
 
   const runAggregate = () => {
@@ -481,9 +481,9 @@ export default function DataManagementPage({
       <details className="advanced-data"><summary>文件夹批量导入</summary><input ref={folderInput} hidden type="file" multiple accept=".csv,.parquet" {...({ webkitdirectory: '', directory: '' } as Record<string, string>)} onChange={event => { chooseBatchFiles(event.target.files); event.currentTarget.value = '' }} /><input ref={filesInput} hidden type="file" multiple accept=".csv,.parquet" onChange={event => { chooseBatchFiles(event.target.files); event.currentTarget.value = '' }} /><input ref={batchCalendarInput} hidden type="file" accept=".csv,.parquet" onChange={event => { setBatchCalendar(event.target.files?.[0] || null); event.currentTarget.value = '' }} /><div className={`upload-drop-zone ${batchDragging ? 'drag-active' : ''}`} onDragOver={event => { event.preventDefault(); setBatchDragging(true) }} onDragLeave={() => setBatchDragging(false)} onDrop={event => { event.preventDefault(); setBatchDragging(false); void collectDrop(event).then(value => { setBatchFiles(value); setScan(null) }) }}><div className="upload-drop-icon"><FolderUp size={22} /></div><div className="upload-drop-copy"><strong>{batchFiles.length ? `已选择 ${batchFiles.length} 个文件` : '拖入文件夹或多个文件'}</strong><span>保留相对路径并识别六位证券代码</span></div><div className="upload-drop-actions"><Button variant="secondary" onClick={() => folderInput.current?.click()}><FolderUp size={14} />选择文件夹</Button><Button variant="quiet" onClick={() => filesInput.current?.click()}><FileUp size={14} />选择文件</Button></div></div><div className="form-grid two"><Field label="本机文件夹"><TextInput value={folder} onChange={event => { setFolder(event.target.value); setScan(null) }} placeholder="D:\imports\1day" /></Field><Field label="分钟标签"><SelectInput value={batchLabel} onChange={event => setBatchLabel(event.target.value)}><option value="auto">自动</option><option value="end">结束</option><option value="start">开始</option></SelectInput></Field><label className="check-line"><input type="checkbox" checked={recursive} onChange={event => setRecursive(event.target.checked)} />递归扫描子目录</label></div><div className="optional-files single"><div><small>批次日历（可选）</small><strong>{batchCalendar?.name || '未选择'}</strong><Button variant="quiet" onClick={() => batchCalendarInput.current?.click()}>选择</Button></div></div><div className="button-row"><Field label="批量导入方式"><SelectInput value={batchImportMode} onChange={event => setBatchImportMode(event.target.value as 'merge' | 'snapshot')}><option value="merge">增量合并</option><option value="snapshot">全量替换</option></SelectInput></Field><Button variant="secondary" busy={busy === '扫描文件夹'} onClick={() => void scanFolder()}><FileSearch size={15} />扫描本机路径</Button><Button busy={busy === '批量导入'} onClick={runBatch} disabled={!batchFiles.length && !scan?.target_count}><FolderOpen size={15} />执行批量导入</Button></div>{batchFiles.length > 0 && <p className="muted-copy">已选择 {batchFiles.length} 个文件，合计 {formatBytes(batchFiles.reduce((sum, item) => sum + item.file.size, 0))}。</p>}{scan && <div className="scan-summary"><strong>{scan.file_count} 个文件 · {scan.target_count} 个标的</strong><span>{scan.invalid_count} 个需修正</span></div>}</details>
     </Card>
 
-    <Card title="数据包目录" subtitle="保留现有 ETF 集中日线和分标的分钟文件；登记只建立和更新索引，不删除其他证券版本。" action={<Badge tone="blue">数据包格式</Badge>}>
-      <div className="form-grid one"><Field label="当前数据包目录"><TextInput value={packageFolder} onChange={event => { setPackageFolder(event.target.value); setPackageScan(null) }} placeholder="D:\market\stockregression-package" /></Field></div>
-      <div className="button-row"><Button variant="secondary" busy={busy === '扫描数据包'} onClick={() => void scanPackage()}><FileSearch size={15} />扫描结构</Button><Button busy={busy === '登记数据包'} disabled={!packageFolder.trim()} onClick={registerPackage}><PackageCheck size={15} />登记并连接</Button>{preparationPlan?.ready && onReturn && <Button variant="quiet" onClick={onReturn}>返回回测<ArrowRight size={14} /></Button>}</div>
+    <Card title="固定数据包" subtitle="正式行情只读取 ETF数据更新至2026.9.30；登记只更新当前包索引，不切换数据源。" action={<Badge tone="blue">唯一来源</Badge>}>
+      <div className="form-grid one"><Field label="当前数据包目录"><TextInput readOnly value={packageFolder} /></Field></div>
+      <div className="button-row"><Button variant="secondary" busy={busy === '扫描数据包'} onClick={() => void scanPackage()}><FileSearch size={15} />扫描结构</Button><Button busy={busy === '登记数据包'} disabled={!packageFolder.trim()} onClick={registerPackage}><PackageCheck size={15} />重新登记当前数据包</Button>{preparationPlan?.ready && onReturn && <Button variant="quiet" onClick={onReturn}>返回回测<ArrowRight size={14} /></Button>}</div>
       {packageScan && <div className="scan-summary"><strong>{compact(packageScan.rows)} 行 · {formatBytes(packageScan.bytes)}</strong><span>{packageScan.errors.length} 个结构问题</span><div className="table-wrap scan-table"><table><thead><tr><th>周期</th><th>文件 / 标的</th><th>行数</th><th>标签</th><th>首末时间</th><th>问题</th></tr></thead><tbody>{Object.entries(packageScan.timeframes).map(([name, item]) => <tr key={name}><td>{name}</td><td>{item.file_count} / {item.symbols}</td><td>{compact(item.rows)}</td><td>{item.label_convention}</td><td>{dateText(item.first_time)} → {dateText(item.last_time)}</td><td>{item.schema_error_count || '—'}</td></tr>)}</tbody></table></div></div>}
     </Card>
 

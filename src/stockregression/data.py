@@ -105,6 +105,41 @@ class DataService:
         return {"count": len(records), "warnings": warnings, "message": f"已更新 {len(records)} 只股票及 ETF；保留来源覆盖的 ST 与退市历史"}
 
     def sync(self, symbols: list[str], mode: str, progress=lambda *_: None, cancelled=lambda: False, scope: str | None = None, resume: bool = False, retry_failed: bool = False, workers: int = 2):
+        """Compatibility entry point that always writes the managed ETF package."""
+        from .market_data import MarketDataService
+        from .market_data.sync import MarketDataSyncService
+
+        scope = scope or ("selected" if symbols else "watchlist")
+        if scope == "market":
+            if symbols:
+                raise ValueError("全市场范围不能同时指定代码")
+            symbols = MarketDataService(self.store).repository.symbols_for_timeframe("1day")
+        elif not symbols:
+            symbols = [row["symbol"] for row in self.store.watches()]
+        if not symbols:
+            return {"status": "completed", "symbols": [], "failures": [], "skipped": [],
+                    "message": "没有需要同步的标的"}
+        timeframe = "1day" if mode == "history" else mode
+        selected = sorted(set(normalize_symbol(value) for value in symbols))
+        runs = []
+        for offset, value in enumerate((["1day"] if mode == "history" else ["1day", "1min"])):
+            runs.append(MarketDataSyncService(MarketDataService(self.store)).sync(
+                selected, value, "incremental" if mode == "daily" else mode,
+                resume=resume, retry_failed=retry_failed, workers=workers,
+                progress=lambda fraction, message, offset=offset: progress(
+                    (offset + float(fraction)) / (1 if mode == "history" else 2), message
+                ), cancelled=cancelled,
+            ))
+        failures = [failure for run in runs for failure in run.get("failures", [])]
+        results = [result for run in runs for result in run.get("symbols", [])]
+        skipped = [result for run in runs for result in run.get("skipped", [])]
+        return {
+            "status": "completed" if not failures else "partial" if results else "failed",
+            "runs": runs, "symbols": results, "failures": failures, "skipped": skipped,
+            "message": f"完成 {len(results)} 项，失败 {len(failures)} 项",
+        }
+
+    def _sync_legacy(self, symbols: list[str], mode: str, progress=lambda *_: None, cancelled=lambda: False, scope: str | None = None, resume: bool = False, retry_failed: bool = False, workers: int = 2):
         scope = scope or ("selected" if symbols else "watchlist")
         if scope == "market":
             if symbols:
@@ -191,7 +226,7 @@ class DataService:
     def current_version_if_ready(self, config: BacktestConfig) -> str | None:
         """Return an immutable submission-time version only when it needs no refresh."""
         manifest = self.store.snapshot(config.symbol)
-        if not manifest:
+        if not manifest or not manifest.get("market_data"):
             return None
         if manifest.get("market_data"):
             from .market_data import MarketDataService
@@ -227,6 +262,8 @@ class DataService:
         their current snapshot needs preparation, then lock the exact resolved version.
         """
         manifest = self.store.snapshot(config.symbol, version)
+        if not manifest or not manifest.get("market_data"):
+            raise DataQualityError("DATA_VERSION_NOT_FOUND: 当前没有该行情数据版本；旧格式快照已停止兼容")
         if manifest and manifest.get("market_data"):
             from .market_data import MarketDataService
             market = MarketDataService(self.store)
@@ -446,7 +483,7 @@ class DataService:
             # a failed tail refresh; all other hard quality failures still stop.
             message = str(exc)
             target_end = min(pd.Timestamp(config.end_date or latest_closed_date()).normalize(), pd.Timestamp(latest_closed_date()).normalize())
-            if config.schema_version == 2 and target_end > daily.date.max() and not any(token in message for token in ("ETF 分红", "参考价发生变化", "没有可回测交易日")):
+            if config.schema_version in (2, 3) and target_end > daily.date.max() and not any(token in message for token in ("ETF 分红", "参考价发生变化", "没有可回测交易日")):
                 clipped = config.model_copy(update={"end_date": daily.date.max().date()})
                 try:
                     bundle = self.load_bundle(clipped, manifest["version"])
@@ -723,16 +760,17 @@ class DataService:
     def load_bundle(self, config: BacktestConfig, version: str | None = None):
         manifest = self.store.snapshot(config.symbol, version)
         if not manifest:
-            raise DataQualityError("该股票尚无本地数据，请先下载、导入或生成演示数据")
+            raise DataQualityError("DATA_VERSION_NOT_FOUND: 该数据版本不存在或已清理")
         if manifest.get("market_data"):
             from .market_data import MarketDataService
             return MarketDataService(self.store).load_backtest_bundle(config, version or manifest["version"])
+        raise DataQualityError("旧 Parquet 快照已取消兼容，请从当前 ETF 数据包读取行情")
         files, metadata = manifest["files"], manifest["metadata"]
         daily_all = self.store.read_files(files["daily"])
         if daily_all.empty:
             raise DataQualityError("本地版本没有日线")
         end = pd.Timestamp(config.end_date) if config.end_date else daily_all.date.max()
-        if config.schema_version == 2:
+        if config.schema_version in (2, 3):
             requested_end = end
             closed_through = pd.Timestamp(latest_closed_date()).normalize()
             expected_end = min(end.normalize(), closed_through)
@@ -815,7 +853,7 @@ class DataService:
                 end=pd.Timestamp(start_date) - pd.Timedelta(days=1), version=daily_version,
             ).rename(columns={"timestamp": "date"})
         else:
-            daily = self.store.read_files(manifest["files"]["daily"], "date", end=pd.Timestamp(start_date) - pd.Timedelta(days=1))
+            raise DataQualityError("旧 Parquet 快照已取消兼容，不能作为参考价来源")
         available = daily[(daily.tradestatus == 1) & (daily.volume > 0) & (daily.close > 0)].sort_values("date") if not daily.empty else daily
         if available.empty:
             raise DataQualityError("开始日期前缺少有效交易日收盘价，请补齐历史或调整开始日期")
@@ -823,6 +861,12 @@ class DataService:
         return {"reference_price": float(row.close), "valuation_price": float(row.close), "reference_date": str(row.date.date()), "data_version": manifest["version"], "asset_type": instrument_terms(symbol, manifest["metadata"])["asset_type"]}
 
     def market_bars(self, symbol, frequency="1d", start_date=None, end_date=None, before=None, limit=600, ma_periods=(5, 10, 20, 60)):
+        from .market_data import MarketDataService
+        from .market_data.timeframes import normalize_timeframe
+        return MarketDataService(self.store).market_bars(
+            symbol, normalize_timeframe(frequency), start=start_date, end=end_date,
+            before=before, limit=limit, ma_periods=ma_periods,
+        )
         symbol = normalize_symbol(symbol)
         manifest = self.store.snapshot(symbol)
         if not manifest:
@@ -929,6 +973,8 @@ class DataService:
         return {"symbol": symbol, "version": manifest["version"], "frequency": frequency, "bars": frame.to_dict("records"), "quote": quote, "has_more": more, "next_before": str(frame.timestamp.iloc[0]) if more else None, "is_demo": bool(manifest["metadata"].get("is_demo")), "warnings": warnings, "quality_flags": flags, "diagnostics": projection["diagnostics"], "source_events": projection["source_events"], "instrument": instrument_terms(symbol, manifest["metadata"])}
 
     def coverage(self, symbol: str):
+        from .market_data import MarketDataService
+        return MarketDataService(self.store).compatibility_coverage(symbol)
         symbol = normalize_symbol(symbol)
         manifest = self.store.snapshot(symbol)
         if not manifest:
@@ -965,6 +1011,33 @@ class DataService:
         return result
 
     def import_files(self, payload: dict, progress=lambda *_: None, cancelled=lambda: False):
+        """Keep the historical import entry point while routing every file to the managed package."""
+        from .market_data import MarketDataService
+
+        market = MarketDataService(self.store)
+        symbol = normalize_symbol(payload["symbol"])
+        results = []
+        for timeframe, key, convention in (
+            ("1day", "daily_path", "end"), ("1min", "minute_path", payload.get("label_convention", "auto")),
+        ):
+            if not payload.get(key):
+                continue
+            results.append(market.import_file(
+                symbol, timeframe, payload[key], label_convention=convention,
+                etf_category=payload.get("etf_category"),
+                calendar_path=payload.get("calendar_path"),
+                actions_path=payload.get("actions_path") if timeframe == "1day" else None,
+                skip_invalid_rows=bool(payload.get("skip_invalid_rows", False)),
+                progress=progress, cancelled=cancelled,
+            ))
+        if not results:
+            raise DataQualityError("请至少提供一个行情文件")
+        return results[0] if len(results) == 1 else {
+            "symbol": symbol, "results": results,
+            "message": f"已导入 {len(results)} 个基础周期",
+        }
+
+    def _import_files_legacy(self, payload: dict, progress=lambda *_: None, cancelled=lambda: False):
         symbol = normalize_symbol(payload["symbol"])
         def read(path, check_symbol=False):
             path = Path(path).expanduser().resolve()
@@ -1154,7 +1227,7 @@ class DataService:
             self.store.state(f"sync:{symbol}", {"mode": "import", "result": result, "error": None})
             return result
 
-    def demo(self, symbol="000001.SZ", days=780, progress=lambda *_: None, cancelled=lambda: False):
+    def _demo_legacy(self, symbol="000001.SZ", days=780, progress=lambda *_: None, cancelled=lambda: False):
         symbol = normalize_symbol(symbol)
         if self.store.snapshot(symbol) and not self.store.snapshot(symbol)["metadata"].get("is_demo"):
             raise ValueError("该股票已有真实数据，不能用演示数据覆盖；请选择无数据股票或独立数据目录")

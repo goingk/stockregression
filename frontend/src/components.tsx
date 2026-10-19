@@ -135,7 +135,7 @@ export function defaultConfig(feeDefaults: FeeDefaults = readFeeDefaults()): Bac
   const month = Number(current.slice(5, 7))
   const day = Math.min(Number(current.slice(8, 10)), new Date(Date.UTC(year, month, 0)).getUTCDate())
   return {
-    schema_version: 2, symbol: '600000.SH', start_date: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`, end_date: current,
+    schema_version: 3, symbol: '600000.SH', start_date: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`, end_date: current,
     frequency: '1m', initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 100,
     grid_mode: 'trailing', buy_step: .03, sell_step: .03, grid_step: .03,
     reference_price: null, reference_price_mode: 'auto', lower_price: null, upper_price: null,
@@ -145,8 +145,7 @@ export function defaultConfig(feeDefaults: FeeDefaults = readFeeDefaults()): Bac
 
 export function configPayload(value: BacktestConfig) {
   const result: Record<string, unknown> = { ...value }
-  // These fields identify the funding lock and selection cutoff for v2 research candidates.
-  if (Object.prototype.hasOwnProperty.call(value, 'reserve_cash')) result.reserve_cash = value.reserve_cash
+  delete result.reserve_cash
   if (Object.prototype.hasOwnProperty.call(value, 'selection_asof')) result.selection_asof = value.selection_asof
   for (const key of ['initial_cash', 'initial_position', 'min_position', 'max_position', 'buy_quantity', 'sell_quantity', 'dca_frequency']) delete result[key]
   for (const key of value.grid_mode === 'trailing' ? ['grid_step'] : ['buy_step', 'sell_step']) delete result[key]
@@ -157,7 +156,6 @@ export async function loadConfig(value: BacktestConfig): Promise<{ config: Backt
   const result = await post<{ config: BacktestConfig; notice: string }>('/configs/convert', value)
   const defaults = defaultConfig()
   const provenance: Partial<BacktestConfig> = {}
-  if (Object.prototype.hasOwnProperty.call(value, 'reserve_cash')) provenance.reserve_cash = value.reserve_cash
   if (Object.prototype.hasOwnProperty.call(value, 'selection_asof')) provenance.selection_asof = value.selection_asof
   return { ...result, config: {
     ...defaults,
@@ -173,12 +171,12 @@ export function configError(value: BacktestConfig): string {
   if (!value.start_date || !value.end_date || value.start_date > value.end_date) return '请填写有效起止日期'
   const isStarBoard = value.symbol.startsWith('688') || value.symbol.startsWith('689')
   const lotSize = 100
-  for (const name of ['initial_shares', 'min_shares', 'max_shares', 'buy_shares', 'sell_shares'] as const) {
+  for (const name of ['initial_shares', 'min_shares', 'buy_shares', 'sell_shares'] as const) {
     const minShares = name === 'buy_shares' ? isStarBoard ? 200 : lotSize : name === 'sell_shares' ? lotSize : 0
     if (!Number.isInteger(value[name]) || value[name] % lotSize !== 0 || value[name] < minShares) return `持股和交易数量应以 ${lotSize} 为单位${name === 'buy_shares' || name === 'sell_shares' ? `，该交易量至少 ${minShares}` : ''}`
   }
-  if (value.min_shares > value.initial_shares || value.initial_shares > value.max_shares) return '最低持股 ≤ 初始持股 ≤ 最高持股'
-  if (value.reserve_cash != null && (!Number.isFinite(value.reserve_cash) || value.reserve_cash < 0)) return '固定可用现金应为不小于 0 的金额，留空可按原公式自动预留'
+  if (value.max_shares != null && (!Number.isInteger(value.max_shares) || value.max_shares % lotSize !== 0 || value.max_shares < 0)) return '最高持股须为 100 的整数倍，留空表示不限制'
+  if (value.min_shares > value.initial_shares || (value.max_shares != null && value.initial_shares > value.max_shares)) return '最低持股 ≤ 初始持股 ≤ 最高持股'
   const minDcaShares = isStarBoard ? 200 : lotSize
   if (!Number.isInteger(value.dca.shares) || value.dca.shares < minDcaShares || value.dca.shares % lotSize !== 0) return `定投数量应为 ${lotSize} 的正整数倍，至少 ${minDcaShares}`
   if (!Number.isInteger(value.dca.initial_shares) || value.dca.initial_shares < 0 || value.dca.initial_shares % lotSize !== 0) return `定投初始持仓应为 ${lotSize} 的整数倍`
@@ -284,8 +282,9 @@ export function ConfigForm({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit,
     return () => { active = false }
   }, [value.symbol, value.start_date, onChange])
   const isStarBoard = value.symbol.startsWith('688') || value.symbol.startsWith('689')
-  const share = (key: 'initial_shares' | 'min_shares' | 'max_shares' | 'buy_shares' | 'sell_shares', label: string) => <NumField key={key} label={label} value={value[key]} onChange={next => next != null && set(key, next)} suffix={unit} min={key === 'buy_shares' ? isStarBoard ? 200 : 100 : key === 'sell_shares' ? 100 : 0} step="100" />
-  const fundingNote = value.reserve_cash != null ? `固定可用现金 ${money(value.reserve_cash)} 元；研究候选会沿用锁定预算` : '留空时现金按原公式自动预留'
+  const share = (key: 'initial_shares' | 'min_shares' | 'buy_shares' | 'sell_shares', label: string) => <NumField key={key} label={label} value={value[key]} onChange={next => next != null && set(key, next)} suffix={unit} min={key === 'buy_shares' ? isStarBoard ? 200 : 100 : key === 'sell_shares' ? 100 : 0} step="100" />
+  const maxShares = <NumField label="最高持股" value={value.max_shares} onChange={next => set('max_shares', next)} suffix={unit} min={0} step="100" hint="留空表示不限制持股数量；买入时按需补足现金。" />
+  const fundingNote = '现金不足时仅在成功买入时补足差额，收益率按峰值净投入计算'
   return <div className="config-form share-config-form">
     <div className="form-section" data-validation-group="symbol"><div className="section-title"><span>01</span><strong>{purpose === 'research' ? '研究对象与评估区间' : '标的与区间'}</strong></div><div className="form-grid two">
       <Field label="股票 / ETF" className="full-width"><SymbolPicker value={value.symbol} onChange={symbol => onChange(previous => ({ ...previous, symbol, reference_price_mode: 'auto', reference_price: null }))} /></Field>
@@ -304,9 +303,8 @@ export function ConfigForm({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit,
     </div></div>
     <div className="form-section" data-validation-group="position"><div className="section-title"><span>03</span><div><strong>{purpose === 'research' ? '固定账户' : '仓位与交易量'}</strong><small>{fundingNote}</small></div></div><div className="form-grid two">
       {share('initial_shares', '初始持股')}
-      <NumField label="固定可用现金" value={value.reserve_cash ?? null} onChange={next => set('reserve_cash', next)} suffix="元" min={0} hint="留空自动预留；载入研究候选后沿用锁定预算。" />
-      {purpose === 'backtest' && <>{share('min_shares', '最低持股')}{share('max_shares', '最高持股')}{share('buy_shares', '每次买入')}{share('sell_shares', '每次卖出')}</>}
-    </div>{purpose === 'research' && <Disclosure id="config-research-baseline-position" title="对照策略仓位与交易量" summary={`${value.min_shares}～${value.max_shares} ${unit}`} className="form-disclosure"><div className="form-grid two">{share('min_shares', '最低持股')}{share('max_shares', '最高持股')}{share('buy_shares', '每次买入')}{share('sell_shares', '每次卖出')}</div></Disclosure>}</div>
+      {purpose === 'backtest' && <>{share('min_shares', '最低持股')}{maxShares}{share('buy_shares', '每次买入')}{share('sell_shares', '每次卖出')}</>}
+    </div>{purpose === 'research' && <Disclosure id="config-research-baseline-position" title="对照策略仓位与交易量" summary={`${value.min_shares}～${value.max_shares ?? '不限'} ${unit}`} className="form-disclosure"><div className="form-grid two">{share('min_shares', '最低持股')}{maxShares}{share('buy_shares', '每次买入')}{share('sell_shares', '每次卖出')}</div></Disclosure>}</div>
     <div data-validation-group="dca"><Disclosure id={`config-${purpose}-dca`} title="定投设置" summary={`${{daily: '每天', weekly: '每周', monthly: '每月'}[value.dca.frequency]} ${value.dca.shares} ${unit}`} className="form-disclosure"><div className="form-grid two">
       <Field label="定投频率"><SelectInput value={value.dca.frequency} onChange={event => set('dca', { ...value.dca, frequency: event.target.value as BacktestConfig['dca']['frequency'] })}><option value="daily">每天</option><option value="weekly">每周</option><option value="monthly">每月</option></SelectInput></Field>
       <NumField label="每期定投" value={value.dca.shares} onChange={next => next != null && set('dca', { ...value.dca, shares: next })} suffix={unit} min={isStarBoard ? 200 : 100} step="100" />

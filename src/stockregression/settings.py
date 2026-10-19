@@ -47,14 +47,16 @@ class GridDefaults(_WorkbenchPreference):
 class PositionDefaults(_WorkbenchPreference):
     initial_shares: int = Field(default=1000, ge=0, multiple_of=100)
     min_shares: int = Field(default=0, ge=0, multiple_of=100)
-    max_shares: int = Field(default=2000, ge=0, multiple_of=100)
+    max_shares: int | None = Field(default=2000, ge=0, multiple_of=100)
     buy_shares: int = Field(default=100, ge=100, multiple_of=100)
     sell_shares: int = Field(default=100, ge=100, multiple_of=100)
 
     @model_validator(mode="after")
     def ordered_positions(self):
-        if not self.min_shares <= self.initial_shares <= self.max_shares:
+        if self.max_shares is not None and not self.min_shares <= self.initial_shares <= self.max_shares:
             raise ValueError("最低持股 ≤ 初始持股 ≤ 最高持股")
+        if self.min_shares > self.initial_shares:
+            raise ValueError("最低持股 ≤ 初始持股")
         return self
 
 
@@ -89,12 +91,13 @@ _RESEARCH_RANGE_DEFAULTS = {
 
 
 class ResearchDefaults(_WorkbenchPreference):
-    protocol_version: Literal[1, 2] = 2
+    protocol_version: Literal[1, 2, 3] = 3
     selection_target: Literal["fixed", "adaptive", "both"] = "both"
     rebalance_days: int = Field(default=63, ge=1)
     bootstrap_reps: int = Field(default=10_000, ge=1)
     mode: Literal["historical", "robust", "both"] = "both"
     n_trials: int = Field(default=1000, ge=1, le=5000)
+    local_search_budget: int = Field(default=3000, ge=1, le=5000)
     seed: int = 42
     top_candidates: int = Field(default=20, ge=1, le=100)
     max_drawdown: float = Field(default=0.2, gt=0, le=1)
@@ -104,6 +107,13 @@ class ResearchDefaults(_WorkbenchPreference):
     ranges: dict[str, ResearchRangeDefaults] = Field(default_factory=lambda: {
         key: ResearchRangeDefaults.model_validate(value) for key, value in _RESEARCH_RANGE_DEFAULTS.items()
     })
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_protocol(cls, values):
+        if isinstance(values, dict) and values.get("protocol_version") in (1, 2):
+            return {**values, "protocol_version": 3}
+        return values
 
     @model_validator(mode="after")
     def valid_ranges(self):
@@ -130,7 +140,9 @@ class WorkbenchDefaults(_WorkbenchPreference):
 
 class Settings(BaseModel):
     data_dir: str = str(PROJECT_ROOT / "data")
-    package_dir: str | None = None
+    package_dir: str | None = str(
+        PROJECT_ROOT / "datasets" / "datasets" / "ETF数据更新至2026.9.30"
+    )
     schedule: ScheduleSettings = Field(default_factory=ScheduleSettings)
     fee_defaults: FeeDefaults = Field(default_factory=FeeDefaults)
     workbench_defaults: WorkbenchDefaults = Field(default_factory=WorkbenchDefaults)

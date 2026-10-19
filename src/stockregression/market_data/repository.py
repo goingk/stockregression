@@ -23,11 +23,12 @@ from .cache import cached
 from .models import DataVersionNotFound, MarketDataError
 from .package_layout import PackageLayout, asset_type_for_symbol, auxiliary_relative_path, package_file_relative_path
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe
+from ..price_validation import details_to_rows, price_issue_details, split_invalid_prices
 
 
-PARSER_VERSION = "market-data-v2-parquet"
+PARSER_VERSION = "market-data-v3-price-validation"
 COMPACTION_THRESHOLD = 8
-VALIDATION_RULES_VERSION = 4
+VALIDATION_RULES_VERSION = 5
 PRICE_FIELDS = ("open", "high", "low", "close", "volume", "turnover")
 TIMEFRAMES = ("1min", "5min", "15min", "30min", "60min", "1day", "1week", "1month")
 PARQUET_SCHEMA_VERSION = "market-bar-v1"
@@ -640,6 +641,19 @@ class MarketDataRepository:
             if MarketDataRepository._same_market_row(old, row):
                 unchanged += 1
                 continue
+            old_issues = price_issue_details(pd.DataFrame([old]))
+            new_issues = price_issue_details(pd.DataFrame([row]))
+            if not new_issues.empty:
+                unchanged += 1
+                conflicts.append({
+                    "timestamp": _time_text(stamp),
+                    "reason": "无效价格记录不会覆盖现有行情：" + str(new_issues.iloc[0]["quality_reason"]),
+                })
+                continue
+            if not old_issues.empty:
+                updated.append(row)
+                existing_by_ts[stamp] = row
+                continue
             old_rank = MarketDataRepository._quality_rank(
                 old.get("source"), old.get("source_verified"), old.get("is_synthetic")
             )
@@ -1146,7 +1160,8 @@ class MarketDataRepository:
                 )
             relation = relation.order("timestamp DESC" if descending else "timestamp ASC")
             if limit is not None:
-                relation = relation.limit(int(limit))
+                cushion = 64 if descending else 0
+                relation = relation.limit(int(limit) + cushion)
             relation = relation.project(", ".join(columns))
             return self._frame_for_consumer(relation.df())
 
@@ -1201,7 +1216,7 @@ class MarketDataRepository:
                 time_column + (" DESC" if descending and limit is not None else " ASC")
             )
             if limit is not None and descending:
-                relation = relation.limit(int(limit) + 4)
+                relation = relation.limit(int(limit) + 64)
             raw = relation.df()
         if raw.empty:
             return pd.DataFrame(columns=list(columns))
@@ -1211,11 +1226,28 @@ class MarketDataRepository:
         raw_flags = raw.get("source_verified")
         raw_synthetic = raw.get("is_synthetic")
         raw_auction = raw.get("is_auction_placeholder")
+        raw_stamps = pd.to_datetime(raw[time_column], errors="coerce")
+
+        def flag_lookup(values):
+            if values is None:
+                return {}
+            series = pd.Series(values, index=raw.index)
+            return {
+                pd.Timestamp(stamp): value
+                for stamp, value in zip(raw_stamps, series)
+                if pd.notna(stamp)
+            }
+
+        flag_by_stamp = flag_lookup(raw_flags)
+        synthetic_by_stamp = flag_lookup(raw_synthetic)
+        auction_by_stamp = flag_lookup(raw_auction)
         label_convention = str(file_metadata.get("label_convention") or "end")
         normalized, _ = normalize_frame(
             raw, timeframe, label_convention=label_convention,
             source=str(file_metadata.get("source") or "package"),
+            skip_invalid_rows=True,
         )
+        normalize_anomalies = normalized.attrs.get("price_anomaly_rows") or []
         if is_daily:
             volume_multiplier = float(file_metadata.get("volume_multiplier", 100.0))
             turnover_multiplier = float(file_metadata.get("turnover_multiplier", 1000.0))
@@ -1228,27 +1260,27 @@ class MarketDataRepository:
             if "tradestatus" in raw:
                 normalized["tradestatus"] = pd.to_numeric(
                     raw["tradestatus"], errors="coerce"
-                ).to_numpy()
+                ).fillna(1).to_numpy()
             else:
                 normalized["tradestatus"] = (
                     pd.to_numeric(normalized.volume, errors="coerce") > 0
                 ).astype(int)
         if raw_flags is not None:
-            normalized["source_verified"] = pd.Series(
-                raw_flags, index=normalized.index
-            ).fillna(False).astype(bool)
+            normalized["source_verified"] = normalized.timestamp.map(
+                flag_by_stamp
+            ).map(lambda value: bool(value) if pd.notna(value) else False).astype(bool)
         else:
             normalized["source_verified"] = bool(
                 file_metadata.get("source_verified", False)
             )
         if raw_synthetic is not None:
-            normalized["is_synthetic"] = pd.Series(
-                raw_synthetic, index=normalized.index
-            ).fillna(False).astype(bool)
+            normalized["is_synthetic"] = normalized.timestamp.map(
+                synthetic_by_stamp
+            ).map(lambda value: bool(value) if pd.notna(value) else False).astype(bool)
         if raw_auction is not None:
-            normalized["is_auction_placeholder"] = pd.Series(
-                raw_auction, index=normalized.index
-            ).fillna(False).astype(bool)
+            normalized["is_auction_placeholder"] = normalized.timestamp.map(
+                auction_by_stamp
+            ).map(lambda value: bool(value) if pd.notna(value) else False).astype(bool)
         if start is not None:
             normalized = normalized[normalized.timestamp >= pd.Timestamp(start)]
         if before is not None:
@@ -1278,7 +1310,17 @@ class MarketDataRepository:
                 normalized[field] = "package" if field == "source" else "{}"
             else:
                 normalized[field] = np.nan
-        return self._frame_for_consumer(normalized[list(columns)])
+        result = self._frame_for_consumer(normalized[list(columns)])
+        if normalize_anomalies:
+            existing = result.attrs.get("price_anomaly_rows") or []
+            merged_rows = {str(row.get("timestamp")): row for row in [*existing, *normalize_anomalies]}
+            result.attrs["price_anomaly_rows"] = sorted(
+                merged_rows.values(), key=lambda row: str(row.get("timestamp") or "")
+            )
+            result.attrs["blocked_timestamps"] = sorted(
+                str(row["timestamp"]) for row in merged_rows.values() if row.get("timestamp")
+            )
+        return result
 
     def _read_version(
         self, symbol: str, timeframe: str, adjustment: str, version: int, *,
@@ -1363,15 +1405,35 @@ class MarketDataRepository:
                     [increment["path"]], start=start, end=end, before=before,
                     fields=columns, limit=limit, descending=descending,
                 ))
+            anomaly_parts = [
+                row
+                for part in frames
+                for row in (part.attrs.get("price_anomaly_rows") or [])
+            ]
             parts = [frame for frame in frames if frame is not None and not frame.empty]
             if not parts:
-                return pd.DataFrame(columns=list(columns))
+                empty = pd.DataFrame(columns=list(columns))
+                if anomaly_parts:
+                    unique = {str(row.get("timestamp")): row for row in anomaly_parts}
+                    empty.attrs["price_anomaly_rows"] = sorted(
+                        unique.values(), key=lambda row: str(row.get("timestamp") or "")
+                    )
+                return empty
             merged = self._prepare_frame(pd.concat(parts, ignore_index=True, sort=False))
+            merged = self._frame_for_consumer(merged[list(columns)])
             if limit is not None:
                 merged = (
                     merged.tail(int(limit)) if descending else merged.head(int(limit))
                 )
-            return self._frame_for_consumer(merged[list(columns)])
+            if anomaly_parts:
+                unique = {str(row.get("timestamp")): row for row in anomaly_parts}
+                merged.attrs["price_anomaly_rows"] = sorted(
+                    unique.values(), key=lambda row: str(row.get("timestamp") or "")
+                )
+                merged.attrs["blocked_timestamps"] = sorted(
+                    str(row["timestamp"]) for row in unique.values() if row.get("timestamp")
+                )
+            return merged
 
         return cached(key, load) if use_cache else load()
 
@@ -1454,8 +1516,12 @@ class MarketDataRepository:
                 )
             return pd.DataFrame(columns=list(self._canonical_fields(fields)))
         selected = int(version) if version is not None else int(dataset["current_version"])
+        exclusive_end = (
+            pd.Timestamp(end).normalize() + pd.Timedelta(days=1)
+            if end is not None else None
+        )
         return self._read_version(
-            symbol, timeframe, adjustment, selected, start=start, end=end, before=before,
+            symbol, timeframe, adjustment, selected, start=start, end=exclusive_end, before=before,
             fields=fields, limit=limit, descending=descending, use_cache=use_cache,
         )
 
@@ -1464,6 +1530,7 @@ class MarketDataRepository:
         if frame.empty:
             return frame
         frame = frame.copy()
+        inherited = frame.attrs.get("price_anomaly_rows") or []
         frame["timestamp"] = pd.to_datetime(frame["timestamp"])
         for field in BOOLEAN_FIELDS:
             if field in frame:
@@ -1474,7 +1541,17 @@ class MarketDataRepository:
             frame["metadata"] = frame["metadata"].map(
                 lambda value: _load(value, {}) if isinstance(value, str) else (value or {})
             )
-        return frame.sort_values("timestamp", kind="stable").reset_index(drop=True)
+        valid, current = split_invalid_prices(frame)
+        anomaly_rows = [*inherited, *details_to_rows(current)]
+        if anomaly_rows:
+            unique = {str(row.get("timestamp")): row for row in anomaly_rows}
+            valid.attrs["price_anomaly_rows"] = sorted(
+                unique.values(), key=lambda row: str(row.get("timestamp") or "")
+            )
+            valid.attrs["blocked_timestamps"] = sorted(
+                str(row["timestamp"]) for row in unique.values() if row.get("timestamp")
+            )
+        return valid.sort_values("timestamp", kind="stable").reset_index(drop=True)
 
     def fingerprint_seen(
         self, symbol: str, timeframe: str, adjustment: str,
@@ -3070,6 +3147,12 @@ class MarketDataRepository:
                 [row.get("date") for row in calendar["payload"]], errors="coerce"
             ).dropna()).normalize().unique().sort_values()
             expected = expected[(expected >= first) & (expected <= last)]
+        if timeframe == "1day" and records:
+            # Daily rows are themselves the local trading series. After full
+            # validation, their persisted day records reconstruct the range
+            # even when a package shipped only an incremental auxiliary calendar.
+            observed = pd.DatetimeIndex(sorted(by_day)).normalize().sort_values()
+            expected = expected.append(observed).unique().sort_values()
         if timeframe in {"1week", "1month"} and records:
             expected = pd.DatetimeIndex(sorted(by_day)).normalize()
         if not len(expected):

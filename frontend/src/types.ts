@@ -186,20 +186,20 @@ export interface QuantityConfig {
 }
 
 export interface BacktestConfig {
-  schema_version: 2
+  schema_version: number
   symbol: string
   start_date: string
   end_date: string | null
   frequency: Frequency
   initial_shares: number
   min_shares: number
-  max_shares: number
+  max_shares: number | null
   buy_shares: number
   sell_shares: number
   dca: { frequency: 'daily' | 'weekly' | 'monthly'; shares: number; initial_shares: number }
   reference_price_mode: 'auto' | 'manual'
   initial_cash?: number
-  /** Cash reserved outside the strategy; fixed when loading a research candidate. */
+  /** Legacy v1/v2 only; new v3 configs do not send this field. */
   reserve_cash?: number | null
   /** Parameter selection cutoff associated with a loaded research candidate. */
   selection_asof?: string | null
@@ -303,6 +303,7 @@ export interface EquityPoint {
   drawdown?: number | null
   normalized_equity?: number | null
   total_invested?: number
+  cumulative_profit?: number | null
 }
 
 export interface Trade {
@@ -332,6 +333,8 @@ export interface BacktestResult {
   is_demo?: boolean
   config: BacktestConfig
   data_version?: string
+  data_version_available?: boolean
+  data_version_warning?: string | null
   diagnostics?: DataDiagnostics
   source_events?: DataSourceEvent[]
   equity_frequency?: string
@@ -339,7 +342,7 @@ export interface BacktestResult {
   warnings?: string[]
   strategies: Record<'grid' | 'dca' | 'buy_hold' | string, StrategyResult>
   schema_version?: number
-  funding?: { reserve_cash: number; initial_equity: number; valuation_price: number; reference_price: number; reference_date: string; dca_initial_equity?: number; buy_hold_initial_shares?: number; buy_hold_initial_equity?: number }
+  funding?: { reserve_cash?: number; initial_equity: number; initial_principal?: number; initial_cash?: number; funding_mode?: string; topups?: number; peak_invested?: number; peak_invested_date?: string | null; final_invested?: number; funding_flows?: Array<{ timestamp: string; amount: number }>; valuation_price: number; reference_price: number; reference_date: string; dca_initial_equity?: number; buy_hold_initial_shares?: number; buy_hold_initial_equity?: number }
   effective_end_date?: string
   accounting_basis?: string
 }

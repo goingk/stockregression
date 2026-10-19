@@ -5,7 +5,8 @@ import hashlib
 import pandas as pd
 
 from ..models import normalize_symbol
-from .models import MarketDataError
+from ..price_validation import anomaly_records, anomalies_in_range, price_issue_details
+from .models import DataNotReady, MarketDataError
 from .reader import normalize_frame
 from .service import MarketDataService
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe, timeframe_spec
@@ -31,12 +32,29 @@ class AggregationService:
         frame = self.repository.active_rows(symbol, source_timeframe, start=start, end=end)
         if frame.empty:
             raise MarketDataError("聚合区间没有源行情")
+        anomalies = anomalies_in_range(frame, start, end)
+        if not anomalies.empty:
+            raise DataNotReady(
+                f"聚合源行情存在 {len(anomalies)} 条无效价格，修正前不能生成 {target_timeframe}",
+                gaps=[{
+                    "kind": "price_quality", "timeframe": source_timeframe,
+                    "anomalies": anomaly_records(
+                        anomalies, symbol=symbol, timeframe=source_timeframe,
+                        version=source.get("current_version"), limit=50,
+                    ),
+                }],
+            )
         if cancelled():
             raise InterruptedError("任务已取消")
         progress(0.25, f"读取 {len(frame)} 行 {source_timeframe} 数据")
         aggregated = self._aggregate_frame(frame, source_timeframe, target_timeframe)
         if aggregated.empty:
             raise MarketDataError("没有可生成的粗周期记录")
+        invalid = price_issue_details(aggregated)
+        if not invalid.empty:
+            raise MarketDataError(
+                f"聚合结果包含 {len(invalid)} 条无效价格：{invalid.iloc[0]['quality_reason']}"
+            )
         progress(0.65, f"生成 {len(aggregated)} 行 {target_timeframe} 数据")
         normalized, pending = normalize_frame(aggregated, target_timeframe, label_convention="end", source="aggregate")
         pending.append(f"派生自本地 {source_timeframe} 版本 {source['current_version']}")

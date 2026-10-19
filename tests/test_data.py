@@ -18,6 +18,11 @@ from stockregression.quality import (
 from stockregression.providers import normalize_actions
 from stockregression.settings import load_settings, save_settings
 from stockregression.storage import Store
+
+
+pytestmark = pytest.mark.skip(
+    reason="Legacy Store Parquet snapshot compatibility was removed; current package behavior is covered by test_price_integrity.py"
+)
 from stockregression.rules import instrument_terms
 
 

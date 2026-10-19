@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { CalendarClock, Database, Download, FileUp, RefreshCw, Search, Settings2, Sparkles, Trash2 } from 'lucide-react'
+import { CalendarClock, Database, Download, FileUp, RefreshCw, Search, Settings2, Trash2 } from 'lucide-react'
 import { del, get, post, put } from '../api'
 import { Badge, Button, Card, Empty, ErrorBox, Field, Loading, PageHeader, SelectInput, Stat, TextInput, compact, dateText, percent, useConfirm, useErrorMessage } from '../components'
 import DataDiagnosticsPanel from '../DataDiagnosticsPanel'
@@ -57,7 +57,6 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
   const [syncRange, setSyncRange] = useState({ start_date: '', end_date: '' })
   const [selectedSymbols, setSelectedSymbols] = useState<string[]>([])
   const [importForm, setImportForm] = useState({ symbol: '', minute_path: '', daily_path: '', actions_path: '', calendar_path: '', label_convention: 'auto', etf_category: '' })
-  const [demoForm, setDemoForm] = useState({ symbol: '000001.SZ', days: 780 })
   const [busy, setBusy] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -76,7 +75,7 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
   }, [err])
 
   useEffect(() => { void refresh() }, [refresh])
-  const completedDataJobs = jobs.filter(job => ['sync', 'instruments', 'import', 'demo', 'market_sync', 'market_import', 'market_import_batch', 'market_validate', 'market_aggregate', 'market_migrate'].includes(job.kind) && JOB_TERMINAL.has(job.status)).map(job => `${job.id}:${job.status}`).join(',')
+  const completedDataJobs = jobs.filter(job => ['instruments', 'market_sync', 'market_import', 'market_import_batch', 'market_index_package', 'market_validate', 'market_aggregate'].includes(job.kind) && JOB_TERMINAL.has(job.status)).map(job => `${job.id}:${job.status}`).join(',')
   useEffect(() => { void refresh() }, [refresh, completedDataJobs])
   useEffect(() => {
     const timer = window.setInterval(() => { void refresh() }, 5000)
@@ -93,7 +92,7 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
   const runAction = async (label: string, action: () => Promise<unknown>, success: (result: unknown) => string) => {
     setBusy(label); setError(''); setNotice('')
     try {
-      const taskName = ({ refresh: '更新证券清单', sync: '行情同步', import: '本地文件导入', demo: '生成演示数据', schedule: '更新本机计划' } as Record<string, string>)[label]
+      const taskName = ({ refresh: '更新证券清单', sync: '行情同步', import: '本地文件导入', schedule: '更新本机计划' } as Record<string, string>)[label]
       const result = taskName ? await tasks.run(taskName, action) : await action()
       if (!taskName) setNotice(success(result))
       await refresh()
@@ -202,7 +201,7 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
         {instruments.length === 0 && <div className="search-hint"><span>支持证券代码或本地清单名称搜索</span><span>{watchlist.length} 只自选</span></div>}
       </Card>
       <Card title="自选证券" subtitle="选择标的查看覆盖；勾选后可批量同步。" action={<Badge tone="blue">{watchlist.length} 只</Badge>}>
-        {loading ? <Loading /> : watchlist.length === 0 ? <Empty title="自选列表为空" detail="搜索股票后添加，或先生成演示数据。" /> : <div className="watch-list">
+        {loading ? <Loading /> : watchlist.length === 0 ? <Empty title="自选列表为空" detail="搜索股票或 ETF 后添加自选，再准备本地行情。" /> : <div className="watch-list">
           <div className="watch-select-all"><label className="check-label"><input type="checkbox" checked={allSelected} onChange={(e) => setSelectedSymbols(e.target.checked ? watchlist.map((x) => x.symbol) : [])} /><span>全选用于同步</span></label></div>
           {watchlist.map((item) => <div key={item.symbol} className={`watch-row ${activeSymbol === item.symbol ? 'selected' : ''}`}><input aria-label={`选择 ${item.symbol} 同步`} type="checkbox" checked={selectedSymbols.includes(item.symbol)} onChange={(e) => toggleSelection(item.symbol, e.target.checked)} /><button className="watch-main" onClick={() => setActiveSymbol(item.symbol)}><strong>{item.name}</strong><small>{item.symbol} · {item.exchange}</small></button><button className="icon-button danger-icon" aria-label="移除自选" onClick={() => void removeWatch(item.symbol)}><Trash2 size={15} /></button></div>)}
         </div>}
@@ -213,7 +212,8 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
       <div className="main-column">
         <Card title="数据覆盖与质量" subtitle={activeSymbol ? `当前标的：${activeSymbol}` : '选择自选股票以读取覆盖日历。'} action={activeSymbol && <Button variant="quiet" onClick={() => { setError(''); setCoverage(null); void get<Coverage>(`/data/coverage/${encodeURIComponent(activeSymbol)}`).then(setCoverage).catch((e) => setError(err(e))) }}><RefreshCw size={14} />刷新</Button>}>
           {!activeSymbol ? <Empty title="请选择一只自选股票" detail="覆盖日历和来源校准状态会在此展示。" /> : !coverage ? <Loading label="读取覆盖情况…" /> : <>
-            {coverage.is_demo && <div className="demo-callout"><Sparkles size={16} /><span>演示数据由本机生成，不代表真实行情。</span></div>}<CoverageQualityStats coverage={coverage} diagnostics={coverage.diagnostics} /><div className="stat-grid four"><Stat label="数据行数" value={compact(coverage.rows)} note={`版本 ${coverage.version ?? '—'}`} tone="blue" /><Stat label="首末日期" value={<>{dateText(coverage.first_date)}<br />{dateText(coverage.last_date)}</>} note="日历区间" /><Stat label="分钟覆盖日" value={coverage.diagnostics?.minute_days ?? coverage.minute_days ?? '—'} note={`日线降级 ${coverage.diagnostics?.daily_days ?? coverage.daily_days ?? '—'} 日`} /><Stat label="数据占用" value={prettyBytes(coverage.bytes)} note={`${warningCount} 条当前质量提示`} tone={warningCount ? 'red' : 'green'} /></div>
+            <CoverageQualityStats coverage={coverage} diagnostics={coverage.diagnostics} /><div className="stat-grid four"><Stat label="数据行数" value={compact(coverage.rows)} note={`版本 ${coverage.version ?? '—'}`} tone="blue" /><Stat label="首末日期" value={<>{dateText(coverage.first_date)}<br />{dateText(coverage.last_date)}</>} note="日历区间" /><Stat label="分钟覆盖日" value={coverage.diagnostics?.minute_days ?? coverage.minute_days ?? '—'} note={`日线降级 ${coverage.diagnostics?.daily_days ?? coverage.daily_days ?? '—'} 日`} /><Stat label="数据占用" value={prettyBytes(coverage.bytes)} note={`${warningCount} 条当前质量提示`} tone={warningCount ? 'red' : 'green'} /></div>
+            {Number(coverage.price_anomaly_count ?? 0) > 0 && <p className="inline-warning">行情区间已隔离 {String(coverage.price_anomaly_count)} 条非正、空值或高低价关系错误的记录；受影响缺口不参与回测、研究或均线计算。</p>}
             <DataDiagnosticsPanel diagnostics={coverage.diagnostics} sourceEvents={coverage.source_events} warnings={coverage.warnings} syntheticBars={coverage.synthetic_bars} />
             <div className="coverage-summary"><div className="coverage-title"><CalendarClock size={16} /><strong>交易日覆盖日历</strong><span>{coverage.days?.length ?? 0} 日 · 默认最近 100 日</span></div>
               {coverage.days?.length ? <>
@@ -233,9 +233,6 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
         <Card title="本地文件导入" subtitle="读取用户本机 CSV 或 Parquet 文件路径。" action={<Badge>手动</Badge>}>
           <div className="form-grid one"><Field label="证券代码"><TextInput value={importForm.symbol} onChange={(e) => setImportForm({ ...importForm, symbol: e.target.value.toUpperCase() })} placeholder="600000.SH" /></Field><Field label="ETF 类型（股票可忽略）"><SelectInput value={importForm.etf_category} onChange={event => setImportForm({ ...importForm, etf_category: event.target.value })}><option value="">按证券清单识别</option><option value="stock">股票 ETF（T+1）</option><option value="bond">债券 ETF（T+0）</option><option value="crossborder">跨境 ETF（T+0）</option><option value="commodity">黄金 / 商品 ETF（T+0）</option><option value="money">货币 ETF（T+0）</option></SelectInput></Field><Field label="1 分钟文件路径（可选）"><TextInput value={importForm.minute_path} onChange={(e) => setImportForm({ ...importForm, minute_path: e.target.value })} placeholder="D:\\market\\600000_1m.parquet" /></Field><Field label="日线文件路径（可选）" hint="日线与 1 分钟会作为两个独立任务提交；更粗周期请在“数据管理”中明确选择并导入。严格回测需 preclose、tradestatus，股票另需 is_st/isST"><TextInput value={importForm.daily_path} onChange={(e) => setImportForm({ ...importForm, daily_path: e.target.value })} placeholder="CSV / Parquet 路径" /></Field><Field label="分红送转文件路径"><TextInput value={importForm.actions_path} onChange={(e) => setImportForm({ ...importForm, actions_path: e.target.value })} placeholder="可选公司行动文件" /></Field><Field label="交易日历文件路径" hint="需为真实交易日；留空时数据仍可入库，但会标记质量待核验"><TextInput value={importForm.calendar_path} onChange={(e) => setImportForm({ ...importForm, calendar_path: e.target.value })} placeholder="真实交易日列表，列名 date" /></Field><Field label="分钟线时间标签" hint="不确定时保持自动；数据先入库并标记待核验，之后可在数据管理页确认标签。"><SelectInput value={importForm.label_convention} onChange={(e) => setImportForm({ ...importForm, label_convention: e.target.value })}><option value="auto">自动 / 先标记待核验</option><option value="end">我确认：结束时间标签</option><option value="start">我确认：开始时间标签</option></SelectInput></Field></div>
           <div className="card-bottom"><Button busy={busy === 'import'} onClick={importData}><FileUp size={15} />提交导入</Button></div>
-        </Card>
-        <Card title="生成演示数据" subtitle="用于首次体验流程，演示数据由本机生成。" action={<Badge tone="amber">演示</Badge>}>
-          <div className="demo-callout"><Sparkles size={17} /><span>所有演示数据会明确标记，不能代表真实行情。</span></div><div className="form-grid two"><Field label="证券代码"><TextInput value={demoForm.symbol} onChange={(e) => setDemoForm({ ...demoForm, symbol: e.target.value.toUpperCase() })} /></Field><Field label="交易日数量"><TextInput type="number" min={20} max={1600} value={demoForm.days} onChange={(e) => setDemoForm({ ...demoForm, days: Number(e.target.value) })} /></Field></div><div className="card-bottom"><Button variant="secondary" busy={busy === 'demo'} onClick={() => void runAction('demo', () => post('/data/demo', { symbol: demoForm.symbol || undefined, days: demoForm.days }), () => `已提交 ${demoForm.symbol} 的演示数据任务。`)}><Sparkles size={15} />生成演示数据</Button></div>
         </Card>
         <Card title="本机存储与计划" subtitle="存储和定时更新配置保存在本地。" action={<Badge tone="blue">本机</Badge>}>
           <div className="storage-path"><Database size={16} /><div><small>当前活动数据包</small><strong title={settings.active_package_dir}>{settings.active_package_dir ?? '读取中或未配置'}</strong><small>行情、辅助资料和历史版本的唯一正式来源</small></div></div>

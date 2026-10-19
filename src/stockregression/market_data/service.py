@@ -7,14 +7,20 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from ..models import BacktestConfig, normalize_symbol
+from ..quality import QUALITY_RULES_VERSION
+from ..price_validation import (
+    PRICE_VALIDATION_VERSION, anomalies_in_range, anomaly_records, anomaly_summary,
+    details_to_rows, price_issue_details,
+)
 from ..rules import instrument_terms
 from ..storage import Store
-from .models import FileImportResult, MarketDataError
+from .models import DataNotReady, FileImportResult, MarketDataError
 from .quality import validate_and_fill
 from .reader import (
     check_declared_adjustment, check_declared_identity, check_declared_timeframe, file_fingerprint,
@@ -34,6 +40,44 @@ SOURCE_TO_TARGETS = {
     "1min": ("5min", "15min", "30min", "60min"),
     "1day": ("1week", "1month"),
 }
+
+
+def _price_anomaly_rows(frame: pd.DataFrame, start=None, end=None) -> pd.DataFrame:
+    anomalies = anomalies_in_range(frame, start, end)
+    if anomalies.empty:
+        return anomalies
+    return anomalies
+
+
+def _summary_from_anomalies(
+    anomalies: pd.DataFrame, symbol: str, timeframe: str, version=None,
+) -> dict:
+    holder = pd.DataFrame()
+    holder.attrs["price_anomaly_rows"] = details_to_rows(anomalies)
+    return anomaly_summary(holder, symbol=symbol, timeframe=timeframe, version=version)
+
+
+def _raise_price_not_ready(
+    frame: pd.DataFrame,
+    symbol: str,
+    timeframe: str,
+    version=None,
+    *,
+    start=None,
+    end=None,
+    context: str = "行情",
+) -> None:
+    anomalies = _price_anomaly_rows(frame, start, end)
+    if anomalies.empty:
+        return
+    samples = anomaly_records(
+        anomalies, symbol=symbol, timeframe=timeframe, version=version, limit=12
+    )
+    stamps = [str(item["timestamp"]) for item in samples[:6] if item.get("timestamp")]
+    raise DataNotReady(
+        f"{context}仍有 {len(anomalies)} 条无效价格（{', '.join(stamps)}）；请修正源记录后重新校验",
+        gaps=[{"kind": "price_quality", "timeframe": timeframe, "anomalies": samples}],
+    )
 
 
 class MarketDataService:
@@ -81,29 +125,42 @@ class MarketDataService:
         current = self.repository.coverage(symbol, timeframe)
         if current:
             return current
-        # Existing snapshots remain visible until explicitly migrated.
-        legacy_key = "1min" if timeframe == "1min" else "1day" if timeframe == "1day" else None
-        if legacy_key:
-            manifest = self.store.snapshot(symbol)
-            if manifest and manifest.get("market_data") is not True:
-                files = manifest.get("files", {})
-                if files.get("minute" if legacy_key == "1min" else "daily"):
-                    return {
-                        "symbol": symbol, "timeframe": timeframe, "row_count": None,
-                        "status": "legacy", "ready": False, "legacy": True,
-                        "reason": "旧 Parquet 快照；可浏览，迁移后进入受管 Parquet 行情库",
-                        "version": manifest.get("version"), "storage": "legacy_parquet",
-                    }
         raise MarketDataError(f"{symbol} 尚无 {timeframe} 数据")
 
     def compatibility_coverage(self, symbol: str) -> dict:
-        """Project frequency-database state into the legacy coverage response."""
+        """Project the managed package into the single coverage response used by the UI."""
         symbol = normalize_symbol(symbol)
         daily = self.repository.coverage(symbol, "1day")
         minute = self.repository.coverage(symbol, "1min")
         if not daily and not minute:
             raise MarketDataError(f"{symbol} 尚无本地 Parquet 行情")
         primary = daily or minute
+        cache_key = (
+            f"market-coverage:{self.repository.package_id}:{self.repository.generation}:"
+            f"{symbol}:{(daily or {}).get('current_version')}:{(minute or {}).get('current_version')}:"
+            f"{primary.get('status')}:{(daily or {}).get('verified_through')}:"
+            f"{(minute or {}).get('verified_through')}:q{QUALITY_RULES_VERSION}:p{PRICE_VALIDATION_VERSION}"
+        )
+        cached_coverage = self.store.state(cache_key)
+        if isinstance(cached_coverage, dict) and cached_coverage.get("price_validation_version") == PRICE_VALIDATION_VERSION:
+            return cached_coverage
+        quality_fields = ("timestamp", "open", "high", "low", "close", "volume")
+        daily_frame = (
+            self.repository.read_frame(symbol, "1day", fields=quality_fields)
+            if daily else pd.DataFrame()
+        )
+        minute_frame = (
+            self.repository.read_frame(symbol, "1min", fields=quality_fields)
+            if minute else pd.DataFrame()
+        )
+        daily_quality = anomaly_summary(
+            daily_frame, symbol=symbol, timeframe="1day",
+            version=(daily or {}).get("current_version"),
+        )
+        minute_quality = anomaly_summary(
+            minute_frame, symbol=symbol, timeframe="1min",
+            version=(minute or {}).get("current_version"),
+        )
         days = []
         for segment in (daily or primary).get("segments", []):
             report = segment.get("report") or {}
@@ -112,31 +169,61 @@ class MarketDataService:
                 "missing_minutes": report.get("missing_rows", 0), "missing_data_minutes": report.get("unfillable", 0),
                 "auction_placeholders": 0, "reason": f"检查至 {str(segment.get('end_time', ''))[:10]}",
             })
+        anomaly_by_day: dict[str, dict[str, Any]] = {}
+        for timeframe, quality in (("1day", daily_quality), ("1min", minute_quality)):
+            for item in quality.get("samples", []):
+                day = str(item.get("timestamp") or "")[:10]
+                if not day:
+                    continue
+                current = anomaly_by_day.setdefault(day, {"count": 0, "reasons": set(), "timeframes": set()})
+                current["count"] += 1
+                current["reasons"].add(str(item.get("reason") or "价格无效"))
+                current["timeframes"].add(timeframe)
+        for day, item in sorted(anomaly_by_day.items()):
+            days.append({
+                "date": day, "mode": "price_invalid",
+                "missing_minutes": 0, "missing_data_minutes": int(item["count"]),
+                "auction_placeholders": 0,
+                "reason": "无效价格：" + "；".join(sorted(item["reasons"])),
+            })
         bytes_used = 0
         for timeframe in ("1day", "1min"):
             dataset = self.repository.dataset(symbol, timeframe)
             if dataset:
                 bytes_used += int(dataset.get("current_bytes") or 0)
-        daily_days = self.repository.observed_days(symbol, "1day") if daily else 0
-        minute_days = self.repository.observed_days(symbol, "1min") if minute else 0
+        daily_days = int(daily_frame.timestamp.dt.normalize().nunique()) if not daily_frame.empty else 0
+        minute_days = int(minute_frame.timestamp.dt.normalize().nunique()) if not minute_frame.empty else 0
+        price_anomaly_count = daily_quality["count"] + minute_quality["count"]
+        warnings = [primary.get("reason")] if primary.get("reason") else []
+        if price_anomaly_count:
+            warnings.append(
+                f"隔离了 {price_anomaly_count} 条无效价格；受影响区间不能用于回测或研究"
+            )
         diagnostics = {
-            "schema_version": 1, "status": "complete" if primary.get("status") == "ready" else "partial",
+            "schema_version": 1,
+            "status": "failed" if price_anomaly_count else "complete" if primary.get("status") == "ready" else "partial",
             "requested_frequency": "1m" if minute else "1d", "minute_quality_applicable": bool(minute),
             "daily_days": daily_days, "minute_days": minute_days,
             "total_days": daily_days, "minute_ratio": 1 if minute and minute.get("status") == "ready" else 0,
             "synthetic_bars": (minute or {}).get("synthetic_rows", 0), "auction_placeholders": 0,
-            "current_warnings": [primary.get("reason")] if primary.get("reason") else [],
+            "price_anomaly_count": price_anomaly_count,
+            "price_quality": {"daily": daily_quality, "minute": minute_quality},
+            "current_warnings": warnings,
         }
-        return {
+        result = {
             "symbol": symbol, "version": primary.get("current_version"), "rows": (minute or daily).get("row_count", 0),
             "first_date": str((daily or minute).get("first_time", ""))[:10], "last_date": str((daily or minute).get("last_time", ""))[:10],
-            "days": days, "profiles": {}, "warnings": diagnostics["current_warnings"],
-            "diagnostics": diagnostics, "source_events": [], "quality_rules_version": 3,
+            "days": days, "profiles": {}, "warnings": warnings,
+            "diagnostics": diagnostics, "source_events": [], "quality_rules_version": QUALITY_RULES_VERSION,
             "is_demo": False, "bytes": bytes_used, "storage": primary.get("storage", "parquet"),
             "minute_days": diagnostics["minute_days"], "daily_days": diagnostics["daily_days"],
             "total_days": diagnostics["total_days"], "minute_ratio": diagnostics["minute_ratio"],
             "synthetic_bars": diagnostics["synthetic_bars"], "auction_placeholders": 0,
+            "price_anomaly_count": price_anomaly_count,
+            "price_validation_version": PRICE_VALIDATION_VERSION,
         }
+        self.store.state(cache_key, result)
+        return result
 
     def ensure_timeframe(
         self, symbol: str, timeframe: str, *, start=None, end=None,
@@ -188,8 +275,15 @@ class MarketDataService:
             and target.get("file_status") == "readable"
             and ((not target.get("derived_stale") and covers_request) or fresh_range)
         ):
+            probe = self.repository.read_frame(
+                symbol, timeframe, start=request_start, end=request_end,
+                fields=("timestamp", "open", "high", "low", "close", "volume"),
+            )
+            _raise_price_not_ready(
+                probe, symbol, timeframe, target.get("current_version"),
+                start=request_start, end=request_end, context="派生周期",
+            )
             return target
-        legacy = bool(target and not derived)
         full_target_range = bool(
             target
             and request_start is not None and request_end is not None
@@ -197,8 +291,17 @@ class MarketDataService:
             and pd.Timestamp(request_start).normalize() <= pd.Timestamp(target["first_time"]).normalize()
             and pd.Timestamp(request_end).normalize() >= pd.Timestamp(target["last_time"]).normalize()
         )
-        snapshot = legacy or bool(target and target.get("derived_stale") and full_target_range)
+        snapshot = bool(target and target.get("derived_stale") and full_target_range)
         from .aggregation import AggregationService
+
+        source_probe = self.repository.read_frame(
+            symbol, source, start=request_start, end=request_end,
+            fields=("timestamp", "open", "high", "low", "close", "volume"),
+        )
+        _raise_price_not_ready(
+            source_probe, symbol, source, source_dataset.get("current_version"),
+            start=request_start, end=request_end, context="聚合源行情",
+        )
 
         result = AggregationService(self).aggregate(
             symbol, source, timeframe, start=request_start, end=request_end,
@@ -214,9 +317,6 @@ class MarketDataService:
             self.ensure_timeframe(symbol, timeframe, start=start, end=end)
         dataset = self.repository.dataset(symbol, timeframe)
         if not dataset:
-            manifest = self.store.snapshot(symbol)
-            if manifest and manifest.get("market_data") is not True and timeframe in {"1min", "1day"}:
-                return self._legacy_bars(symbol, timeframe, start, end, limit)
             raise MarketDataError(f"{symbol} 尚无 {timeframe} 数据")
         if timeframe in DERIVED_SOURCES and version is not None and not dataset.get("derived"):
             raise MarketDataError(
@@ -225,11 +325,13 @@ class MarketDataService:
         frame = self.repository.bars(symbol, timeframe, start=start, end=end, version=version, limit=limit)
         selected = int(version) if version is not None else int(dataset["current_version"])
         detail = self.repository.version_info(symbol, timeframe, selected) if selected != int(dataset["current_version"]) else None
+        quality = anomaly_summary(frame, symbol=symbol, timeframe=timeframe, version=selected)
         return {
             "symbol": symbol, "timeframe": timeframe, "version": selected,
             "rows": frame.to_dict("records"), "count": len(frame),
             "first_time": (detail or dataset)["first_time"], "last_time": (detail or dataset)["last_time"],
             "status": (detail or dataset)["status"], "storage": dataset.get("storage", "parquet"),
+            "quality": quality,
         }
 
     def market_bars(self, symbol: str, timeframe: str, *, start=None, end=None, before=None,
@@ -245,20 +347,38 @@ class MarketDataService:
         upper = before or end
         upper_exclusive = (
             pd.Timestamp(before) if before is not None
-            else pd.Timestamp(end) + pd.Timedelta(nanoseconds=1) if end is not None else None
+            else pd.Timestamp(end).normalize() + pd.Timedelta(days=1) if end is not None else None
         )
-        frame = self.repository.last_bars(
+        fetched = self.repository.last_bars(
             symbol, timeframe, before=upper_exclusive,
             limit=limit + warmup + 1,
         )
+        price_anomalies = _price_anomaly_rows(fetched, start=start, end=upper)
+        frame = fetched
         if start:
             frame = frame[frame.timestamp >= pd.Timestamp(start)]
+        calculation = frame.copy()
+        if not price_anomalies.empty:
+            gaps = price_anomalies[[column for column in ("timestamp",) if column in price_anomalies]].copy()
+            gaps["close"] = np.nan
+            gaps["open"] = np.nan
+            gaps["high"] = np.nan
+            gaps["low"] = np.nan
+            calculation = (
+                gaps if calculation.empty else
+                pd.concat([calculation, gaps], ignore_index=True, sort=False)
+            ).sort_values("timestamp")
         for period in periods:
-            frame[f"ma{period}"] = frame.close.rolling(period, min_periods=period).mean()
+            calculation[f"ma{period}"] = calculation.close.rolling(period, min_periods=period).mean()
+        if not price_anomalies.empty:
+            moving_columns = [f"ma{period}" for period in periods]
+            frame = frame.drop(columns=[column for column in moving_columns if column in frame], errors="ignore").merge(
+                calculation[["timestamp", *moving_columns]], on="timestamp", how="left"
+            )
         more = len(frame) > limit
         frame = frame.tail(limit).copy()
         daily_upper = (
-            pd.Timestamp(upper) + pd.Timedelta(nanoseconds=1)
+            pd.Timestamp(upper).normalize() + pd.Timedelta(days=1)
             if upper is not None and before is None else upper
         )
         daily = self.repository.last_bars(symbol, "1day", before=daily_upper, limit=1)
@@ -266,6 +386,13 @@ class MarketDataService:
         warnings = []
         if dataset["status"] != "ready":
             warnings.append(dataset.get("reason") or f"{timeframe} 数据有待核验事项")
+        quality = _summary_from_anomalies(
+            price_anomalies, symbol, timeframe, dataset["current_version"]
+        )
+        if quality["count"]:
+            warnings.append(
+                f"显示区间隔离了 {quality['count']} 条无效价格记录；均线在该缺口处断开，不能用于计算"
+            )
         frame["frequency"] = timeframe
         if quote:
             quote["timestamp"] = pd.Timestamp(quote["timestamp"]).isoformat()
@@ -275,21 +402,10 @@ class MarketDataService:
             "bars": frame.to_dict("records"), "quote": quote, "has_more": more,
             "next_before": str(frame.timestamp.iloc[0]) if more and len(frame) else None,
             "is_demo": False, "warnings": warnings, "quality_flags": warnings,
+            "price_quality": quality,
             "diagnostics": {}, "source_events": [], "storage": dataset.get("storage", "parquet"),
             "instrument": self.store.instrument(symbol) or instrument_terms(symbol, {"name": symbol}),
         }
-
-    def _legacy_bars(self, symbol, timeframe, start, end, limit):
-        manifest = self.store.snapshot(symbol)
-        files = manifest["files"].get("minute" if timeframe == "1min" else "daily", [])
-        frame = self.store.read_files(files, "timestamp" if timeframe == "1min" else "date", start, end)
-        if limit:
-            frame = frame.tail(limit)
-        column = "timestamp" if timeframe == "1min" else "date"
-        if column in frame:
-            frame["timestamp"] = pd.to_datetime(frame[column])
-        return {"symbol": symbol, "timeframe": timeframe, "version": manifest["version"],
-                "rows": frame.to_dict("records"), "count": len(frame), "status": "legacy", "storage": "legacy_parquet"}
 
     def import_file(
         self,
@@ -361,6 +477,24 @@ class MarketDataService:
         if cancelled():
             raise InterruptedError("任务已取消")
         progress(0.35, "校验时间、价格与交易日覆盖")
+        rejected_prices = price_issue_details(frame)
+        if not rejected_prices.empty:
+            pending.append(
+                f"已隔离 {len(rejected_prices)} 条无效 OHLCV 源记录，未写入可计算行情"
+            )
+            source_metadata = {
+                **(source_metadata or {}),
+                "price_validation": {
+                    "rule_version": PRICE_VALIDATION_VERSION,
+                    "rejected_rows": len(rejected_prices),
+                    "samples": anomaly_records(
+                        rejected_prices, symbol=symbol, timeframe=timeframe, limit=50
+                    ),
+                },
+            }
+            frame = frame.drop(index=rejected_prices.index).copy()
+            if frame.empty:
+                raise MarketDataError("提交内容仅包含无效价格，未写入任何行情")
         calendar = (
             pd.DataFrame(calendar_frame).copy()
             if calendar_frame is not None
@@ -891,9 +1025,17 @@ class MarketDataService:
             raise MarketDataError("没有可校验的本地行情")
         requested_start = start or dataset.get("first_time")
         requested_end = end or dataset.get("last_time")
+        quality_probe = self.repository.bars(
+            symbol, timeframe, adjustment=adjustment,
+            start=requested_start, end=requested_end,
+        )
+        existing_anomalies = _price_anomaly_rows(
+            quality_probe, requested_start, requested_end
+        )
         if (
             mode == "incremental" and label_convention is None
             and self._validation_covers(dataset, requested_start, requested_end)
+            and existing_anomalies.empty
         ):
             state = self.repository.validation_state(
                 symbol, timeframe, adjustment=adjustment,
@@ -971,6 +1113,9 @@ class MarketDataService:
         pending = list(state.get("pending") or [])
         if state.get("failed"):
             pending.append(f"{len(state['failed'])} 个交易日未通过校验")
+        if not existing_anomalies.empty:
+            pending.append(f"存在 {len(existing_anomalies)} 条未解决的无效价格记录")
+            status = "partial"
         validation_report = {
             "status": status,
             "mode": mode,
@@ -980,6 +1125,9 @@ class MarketDataService:
             "verified_through": state.get("verified_through"),
             "failed": state.get("failed", []),
             "pending_validation": pending,
+            "price_anomalies": anomaly_records(
+                existing_anomalies, symbol=symbol, timeframe=timeframe, limit=200
+            ),
             "ledger_changed": ledger_changed,
         }
         return {
@@ -1012,8 +1160,7 @@ class MarketDataService:
             if version and "1day" in market_versions
             else self.repository.dataset(symbol, "1day")
         )
-        legacy = None if version else manifest
-        if not daily and not (legacy and not legacy.get("market_data") and legacy.get("files", {}).get("daily")):
+        if not daily:
             gaps.append({"kind": "daily", "timeframe": "1day", "message": "缺少日线数据，无法确定交易状态和参考价"})
         target = normalize_timeframe(config.frequency)
         requested_end = pd.Timestamp(config.end_date).normalize() if config.end_date else (
@@ -1033,7 +1180,7 @@ class MarketDataService:
                 if version and target in market_versions
                 else self.repository.dataset(symbol, target)
             )
-            if not minute and not (legacy and legacy.get("files", {}).get("minute")):
+            if not minute:
                 gaps.append({"kind": "bars", "timeframe": target, "message": f"缺少 {target} 行情"})
             elif minute and minute.get("file_status") != "readable":
                 message = f"{target} 行情文件缺失" if minute.get("file_status") == "missing" else f"{target} 行情文件已被外部修改，需要重新登记和校验"
@@ -1044,6 +1191,29 @@ class MarketDataService:
             ):
                 gaps.append({"kind": "quality", "timeframe": target,
                              "message": minute.get("reason") or f"{target} 在本次请求区间尚未完成质量核验"})
+            if minute and minute.get("file_status") == "readable":
+                selected_version = (
+                    int(market_versions[target]["version"])
+                    if version and target in market_versions
+                    else int(minute.get("current_version") or 0) or None
+                )
+                minute_probe = self.repository.read_frame(
+                    symbol, target,
+                    version=selected_version, start=requested_start, end=requested_end,
+                    fields=("timestamp", "open", "high", "low", "close", "volume"),
+                )
+                price_issues = _price_anomaly_rows(
+                    minute_probe, requested_start, requested_end
+                )
+                if not price_issues.empty:
+                    gaps.append({
+                        "kind": "price_quality", "timeframe": target,
+                        "message": f"{target} 在请求区间存在 {len(price_issues)} 条无效价格，修正前不能用于计算",
+                        "anomalies": anomaly_records(
+                            price_issues, symbol=symbol, timeframe=target,
+                            version=selected_version, limit=50,
+                        ),
+                    })
         if daily:
             if daily.get("file_status") != "readable":
                 message = "日线行情文件缺失" if daily.get("file_status") == "missing" else "日线行情文件已被外部修改，需要重新登记和校验"
@@ -1056,11 +1226,25 @@ class MarketDataService:
                 gaps.append({"kind": "quality", "timeframe": "1day", "message": daily.get("reason") or "日线在本次请求区间尚未完成质量核验"})
             daily_version = (
                 int(market_versions["1day"]["version"])
-                if version and "1day" in market_versions else None
+                if version and "1day" in market_versions
+                else int(daily.get("current_version") or 0) or None
             )
             daily_rows = self.repository.bars(
-                symbol, "1day", version=daily_version
+                symbol, "1day", version=daily_version,
+                start=requested_start - pd.Timedelta(days=30), end=requested_end,
             )
+            daily_price_issues = _price_anomaly_rows(
+                daily_rows, requested_start, requested_end
+            )
+            if not daily_price_issues.empty:
+                gaps.append({
+                    "kind": "price_quality", "timeframe": "1day",
+                    "message": f"日线在请求区间存在 {len(daily_price_issues)} 条无效价格，修正前不能用于计算",
+                    "anomalies": anomaly_records(
+                        daily_price_issues, symbol=symbol, timeframe="1day",
+                        version=daily_version, limit=50,
+                    ),
+                })
             required = ["open", "high", "low", "close", "volume", "preclose", "tradestatus"]
             missing_fields = [field for field in required if field not in daily_rows or daily_rows[field].isna().any()]
             if missing_fields:
@@ -1111,17 +1295,22 @@ class MarketDataService:
                 "preparation": {"symbol": symbol, "frequency": target,
                 "start": str(config.start_date), "end": str(config.end_date) if config.end_date else None}}
 
-    @staticmethod
-    def _validation_covers(dataset: dict | None, start, end) -> bool:
+    def _validation_covers(self, dataset: dict | None, start, end) -> bool:
         if not dataset:
             return False
-        verified_from = dataset.get("verified_from")
-        verified_through = dataset.get("verified_through")
+        state = self.repository.validation_state(
+            str(dataset.get("symbol")), str(dataset.get("timeframe")),
+            adjustment=str(dataset.get("adjustment") or "none"),
+            start=start, end=end,
+        )
+        verified_from = state.get("verified_from")
+        verified_through = state.get("verified_through")
         if not verified_from or not verified_through:
             return False
         return (
             pd.Timestamp(verified_from).normalize() <= pd.Timestamp(start).normalize()
             and pd.Timestamp(verified_through).normalize() >= pd.Timestamp(end).normalize()
+            and not state.get("failed") and not state.get("pending")
         )
 
     def load_backtest_bundle(self, config: BacktestConfig, version: str | None = None):
@@ -1160,15 +1349,14 @@ class MarketDataService:
             if "date" not in frame:
                 raise MarketDataError("交易日历必须包含 date 列")
             return frame[['date']]
-        legacy = self.store.snapshot(symbol)
-        if legacy and legacy.get("files", {}).get("calendar"):
-            return self.store.read_files(legacy["files"]["calendar"])
         saved = self.repository.auxiliary(symbol, "calendar")
         return pd.DataFrame(saved["payload"]) if saved else None
 
 
 def _params_hash(timeframe, label_convention, adjustment, source, parser_version) -> str:
-    return hashlib.sha256(f"{timeframe}|{label_convention}|{adjustment}|{source}|{parser_version}".encode()).hexdigest()
+    return hashlib.sha256(
+        f"{timeframe}|{label_convention}|{adjustment}|{source}|{parser_version}|price-q{PRICE_VALIDATION_VERSION}".encode()
+    ).hexdigest()
 
 
 def _merge_input_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:

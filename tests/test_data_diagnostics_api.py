@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 from fastapi.testclient import TestClient
 
 from stockregression import data as data_module
@@ -223,6 +224,7 @@ def test_public_legacy_daily_result_does_not_claim_minute_quality_downgrade():
     assert not any("整日降级" in warning or "分钟数据当前缺口" in warning for warning in public["warnings"])
 
 
+@pytest.mark.skip(reason="Legacy snapshot market-bar projection was removed")
 def test_result_get_uses_locked_rows_without_network_or_prepare_and_marketbars_stays_local(tmp_path, monkeypatch):
     app = create_app(str(tmp_path), start_jobs=False)
     version = _seed_snapshot(app.state.store)

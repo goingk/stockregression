@@ -730,6 +730,11 @@ td small.table-sub { display: block; margin-top: 4px; color: #a3adba; font-size:
 .research-scheme-tabs, .research-curve-tabs { display:flex; align-items:center; gap:4px; padding:4px; border-radius:8px; background:#f0f3f8; }
 .research-scheme-tabs button, .research-curve-tabs button { padding:7px 12px; border:0; border-radius:6px; background:transparent; color:#8592a6; font-size:11px; }
 .research-scheme-tabs button.selected, .research-curve-tabs button.selected, .research-curve-tabs button[aria-selected="true"] { color:#2b61bb; background:#fff; box-shadow:0 1px 4px #29436b12; }
+.research-landscape-controls { grid-template-columns:repeat(4, minmax(150px, 1fr)); margin-bottom:14px; }
+.research-landscape-grid { display:grid; grid-template-columns:minmax(0, 1fr) minmax(0, 1fr); gap:18px; }
+.research-landscape-grid h4 { margin:0 0 6px; font-size:13px; color:#42506a; }
+.research-landscape-grid .chart-view { border:1px solid #e4e8f0; border-radius:10px; overflow:hidden; }
+@media (max-width: 1200px) { .research-landscape-controls { grid-template-columns:repeat(2, minmax(140px, 1fr)); } .research-landscape-grid { grid-template-columns:1fr; } }
 .research-parameter-badges { display:flex; flex-wrap:wrap; gap:7px; margin:9px 0; }
 .research-parameter-badges > span { padding:5px 8px; border:1px solid #e8edf4; border-radius:6px; background:#f8faff; color:#53657e; font-size:10px; }
 .research-parameter-badges dt { color:#8c99aa; font-size:10px; }

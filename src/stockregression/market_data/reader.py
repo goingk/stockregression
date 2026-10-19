@@ -10,6 +10,7 @@ import pandas as pd
 
 from .models import MarketDataError
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe, timeframe_spec
+from ..price_validation import details_to_rows, price_issue_details
 
 
 CHUNK_SIZE = 50_000
@@ -79,6 +80,7 @@ def normalize_frame(
     skip_invalid_rows: bool = False,
 ) -> tuple[pd.DataFrame, list[str]]:
     timeframe = normalize_timeframe(timeframe)
+    spec = timeframe_spec(timeframe)
     result = _promote_time_columns(frame)
     missing = [field for field in REQUIRED if field not in result]
     if missing:
@@ -99,20 +101,14 @@ def normalize_frame(
         lambda value: pd.NA if pd.isna(value) else _bool(value)
     )
     result["tradestatus"] = pd.to_numeric(result.get("tradestatus", pd.Series(np.nan, index=result.index)), errors="coerce")
+    if spec.kind != "minute":
+        # A present daily bar is a trading record. Zero volume means no trades,
+        # not suspension; only an explicit status=0 is treated as suspension.
+        result["tradestatus"] = result["tradestatus"].fillna(1).astype(int)
     result["is_synthetic"] = False
     result["is_auction_placeholder"] = False
 
     pending: list[str] = []
-    spec = timeframe_spec(timeframe)
-    if spec.kind == "minute":
-        invalid = (result[["open", "high", "low", "close"]] <= 0).any(axis=1) | result[["open", "high", "low", "close"]].isna().any(axis=1)
-        if invalid.any():
-            if not skip_invalid_rows:
-                raise MarketDataError(f"分钟行情包含 {int(invalid.sum())} 条非正或空价格，开盘/最高/最低/收盘必须为正")
-            pending.append(f"已跳过 {int(invalid.sum())} 条非正或空价格源记录")
-            result = result.loc[~invalid].copy()
-            if result.empty:
-                raise MarketDataError("文件仅包含无效价格记录")
     if spec.kind == "minute":
         result["timestamp"] = result.timestamp.dt.floor("min")
         if (result.timestamp.dt.second != 0).any():
@@ -141,6 +137,21 @@ def normalize_frame(
             if repeated.gt(1).any():
                 labels = [str(value) for value in repeated[repeated.gt(1)].index]
                 raise MarketDataError(f"文件在同一{'周' if spec.kind == 'week' else '月'}内包含多个日期：" + ", ".join(labels[:8]))
+
+    invalid = price_issue_details(result)
+    if not invalid.empty:
+        if not skip_invalid_rows:
+            first = invalid.iloc[0]
+            stamp = first.get("timestamp") if "timestamp" in first else first.get("date")
+            raise MarketDataError(
+                f"行情包含 {len(invalid)} 条无效价格；{stamp}: {first['quality_reason']}"
+            )
+        pending.append(f"已跳过 {len(invalid)} 条无效 OHLCV 源记录并隔离，不自动补价")
+        anomalies = invalid.copy()
+        result = result.drop(index=invalid.index).copy()
+        result.attrs["price_anomaly_rows"] = details_to_rows(anomalies)
+        if result.empty:
+            return result, pending
     if frame_is_daily_only(result) and spec.kind == "minute" and result.timestamp.dt.normalize().nunique() > 1:
         raise MarketDataError("文件的日期没有分钟时间，与所选分钟周期不一致")
 
@@ -156,17 +167,11 @@ def normalize_frame(
     result = result.sort_values("timestamp", kind="stable").drop_duplicates("timestamp", keep="last").reset_index(drop=True)
     if result.empty:
         raise MarketDataError("文件没有可导入的行情记录")
-    if (result[["open", "high", "low", "close"]] <= 0).any().any():
-        raise MarketDataError("开盘、最高、最低、收盘必须为正数")
-    if (result.volume < 0).any():
-        raise MarketDataError("成交量不能为负数")
-    if result.turnover.notna().any() and (result.turnover.fillna(0) < 0).any():
-        raise MarketDataError("成交额不能为负数")
-    if ((result.low > result.high + 1e-8) | (result.open > result.high + 1e-8) | (result.open < result.low - 1e-8) |
-            (result.close > result.high + 1e-8) | (result.close < result.low - 1e-8)).any():
-        raise MarketDataError("OHLC 高低价关系不合法")
-    if result[list(REQUIRED[1:])].isna().any().any():
-        raise MarketDataError("OHLCV 含空值")
+    invalid = price_issue_details(result)
+    if not invalid.empty:
+        raise MarketDataError(
+            f"行情包含 {len(invalid)} 条无效 OHLCV：{invalid.iloc[0]['quality_reason']}"
+        )
     return result, pending
 
 

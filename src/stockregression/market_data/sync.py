@@ -281,6 +281,7 @@ class MarketDataSyncService:
         raw = pd.concat(frames, ignore_index=True)
         normalized, pending = normalize_frame(
             raw, "1day", label_convention=metadata.pop("label_convention", "auto"), source=source,
+            skip_invalid_rows=True,
         )
         normalized = normalized[
             (normalized.timestamp >= request_start)
@@ -390,7 +391,8 @@ class MarketDataSyncService:
         if frame.empty:
             raise MarketDataError("来源没有返回行情；覆盖水位未推进")
         normalized, pending = normalize_frame(
-            frame, timeframe, label_convention=metadata.pop("label_convention", "auto"), source=source
+            frame, timeframe, label_convention=metadata.pop("label_convention", "auto"), source=source,
+            skip_invalid_rows=True,
         )
         normalized = normalized[(normalized.timestamp >= request_start) & (normalized.timestamp <= request_end + pd.Timedelta(days=1))]
         if normalized.empty:

@@ -4,12 +4,13 @@ export type GridDefaults = Pick<BacktestConfig, 'grid_mode' | 'buy_step' | 'sell
 export type PositionDefaults = Pick<BacktestConfig, 'initial_shares' | 'min_shares' | 'max_shares' | 'buy_shares' | 'sell_shares'>
 export type SearchRange = { low: number; high: number; step: number }
 export interface ResearchDefaults {
-  protocol_version: 1 | 2
+  protocol_version: 1 | 2 | 3
   selection_target: 'fixed' | 'adaptive' | 'both'
   rebalance_days: number
   bootstrap_reps: number
   mode: 'historical' | 'robust' | 'both'
   n_trials: number
+  local_search_budget: number
   seed: number
   top_candidates: number
   max_drawdown: number
@@ -50,7 +51,7 @@ export function defaultWorkbenchDefaults(): WorkbenchDefaults {
     grid: { grid_mode: 'trailing', buy_step: .03, sell_step: .03, grid_step: .03, lower_price: null, upper_price: null },
     position: { initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 100 },
     dca: { frequency: 'monthly', shares: 100, initial_shares: 0 },
-    research: { protocol_version: 2, selection_target: 'both', rebalance_days: 63, bootstrap_reps: 10000, mode: 'both', n_trials: 1000, seed: 42, top_candidates: 20, max_drawdown: .2, min_trades: 10, min_history_days: 504, min_minute_ratio: .95, ranges: defaultSearchRanges() },
+    research: { protocol_version: 3, selection_target: 'both', rebalance_days: 63, bootstrap_reps: 10000, mode: 'both', n_trials: 1000, local_search_budget: 3000, seed: 42, top_candidates: 20, max_drawdown: .2, min_trades: 10, min_history_days: 504, min_minute_ratio: .95, ranges: defaultSearchRanges() },
   }
 }
 
@@ -66,9 +67,9 @@ const price = (value: unknown) => value === null || finite(value) && value > 0
 
 export function validResearchDefaults(value: unknown): value is ResearchDefaults {
   const item = record(value)
-  if (!item || ![1, 2].includes(Number(item.protocol_version)) || !['fixed', 'adaptive', 'both'].includes(String(item.selection_target))
+  if (!item || ![1, 2, 3].includes(Number(item.protocol_version)) || !['fixed', 'adaptive', 'both'].includes(String(item.selection_target))
     || !integer(item.rebalance_days, 1, 504) || !integer(item.bootstrap_reps, 100, 100000)
-    || !['historical', 'robust', 'both'].includes(String(item.mode)) || !integer(item.n_trials, 1, 5000)
+    || !['historical', 'robust', 'both'].includes(String(item.mode)) || !integer(item.n_trials, 1, 5000) || !integer(item.local_search_budget, 1, 5000)
     || !integer(item.seed, Number.MIN_SAFE_INTEGER) || !integer(item.top_candidates, 1, 100) || !step(item.max_drawdown)
     || !integer(item.min_trades, 0) || !integer(item.min_history_days, 20) || !fraction(item.min_minute_ratio)) return false
   const ranges = record(item.ranges)
@@ -97,12 +98,13 @@ function normalizeResearchDefaults(value: unknown): ResearchDefaults {
   })) as Record<string, SearchRange>
   const merged: ResearchDefaults = {
     ...defaults,
-    protocol_version: item.protocol_version === 1 || item.protocol_version === 2 ? item.protocol_version : defaults.protocol_version,
+    protocol_version: defaults.protocol_version,
     selection_target: ['fixed', 'adaptive', 'both'].includes(String(item.selection_target)) ? item.selection_target as ResearchDefaults['selection_target'] : defaults.selection_target,
     rebalance_days: integer(item.rebalance_days, 1, 504) ? item.rebalance_days : defaults.rebalance_days,
     bootstrap_reps: integer(item.bootstrap_reps, 100, 100000) ? item.bootstrap_reps : defaults.bootstrap_reps,
     mode: ['historical', 'robust', 'both'].includes(String(item.mode)) ? item.mode as ResearchDefaults['mode'] : defaults.mode,
     n_trials: integer(item.n_trials, 1, 5000) ? item.n_trials : defaults.n_trials,
+    local_search_budget: integer(item.local_search_budget, 1, 5000) ? item.local_search_budget : defaults.local_search_budget,
     seed: integer(item.seed, Number.MIN_SAFE_INTEGER) ? item.seed : defaults.seed,
     top_candidates: integer(item.top_candidates, 1, 100) ? item.top_candidates : defaults.top_candidates,
     max_drawdown: step(item.max_drawdown) ? item.max_drawdown as number : defaults.max_drawdown,
@@ -134,9 +136,9 @@ export function validWorkbenchGroup<K extends WorkbenchGroup>(group: K, value: u
   if (group === 'grid') return ['trailing', 'arithmetic', 'geometric'].includes(String(item.grid_mode))
     && step(item.buy_step) && step(item.sell_step) && step(item.grid_step) && price(item.lower_price) && price(item.upper_price)
     && (item.lower_price == null || item.upper_price == null || (item.lower_price as number) < (item.upper_price as number))
-  if (group === 'position') return quantity(item.initial_shares) && quantity(item.min_shares) && quantity(item.max_shares)
+  if (group === 'position') return quantity(item.initial_shares) && quantity(item.min_shares) && (item.max_shares === null || quantity(item.max_shares))
     && quantity(item.buy_shares, 100) && quantity(item.sell_shares, 100)
-    && (item.min_shares as number) <= (item.initial_shares as number) && (item.initial_shares as number) <= (item.max_shares as number)
+    && (item.min_shares as number) <= (item.initial_shares as number) && (item.max_shares === null || (item.initial_shares as number) <= (item.max_shares as number))
   return ['daily', 'weekly', 'monthly'].includes(String(item.frequency)) && quantity(item.shares, 100) && quantity(item.initial_shares)
 }
 

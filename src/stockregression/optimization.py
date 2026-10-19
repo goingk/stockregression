@@ -46,9 +46,9 @@ def _check_ranges(config: OptimizationConfig) -> None:
         low, high = float(search_range.low), float(search_range.high)
         step = search_range.step
         if name.endswith("_shares"):
-            if config.base.schema_version != 2 or low < (100 if name in {"buy_shares", "sell_shares"} else 0) or any(value % 100 for value in [low, high, step or 100]):
+            if config.base.schema_version not in (2, 3) or low < (100 if name in {"buy_shares", "sell_shares"} else 0) or any(value % 100 for value in [low, high, step or 100]):
                 raise ValueError(f"股数搜索范围 {name} 必须以 100 为单位，交易量至少 100")
-        elif config.base.schema_version == 2 and name in {"buy_ratio", "sell_ratio", "initial_position", "min_position", "max_position"}:
+        elif config.base.schema_version in (2, 3) and name in {"buy_ratio", "sell_ratio", "initial_position", "min_position", "max_position"}:
             raise ValueError("新版配置应搜索股数，不能搜索资金或仓位比例")
         if not math.isfinite(low) or not math.isfinite(high):
             raise ValueError(f"搜索区间 {name} 必须是有限数值")
@@ -815,7 +815,7 @@ def optimize(
     selected parameters once on the untouched test period.
     """
     _check_ranges(config)
-    if config.protocol_version == 2:
+    if config.protocol_version in (2, 3):
         from .scientific import optimize_scientific
 
         return optimize_scientific(config, data, progress, cancelled)

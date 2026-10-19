@@ -16,25 +16,34 @@ test('all four groups keep valid zero values and independent default copies', ()
   assert.equal(defaultWorkbenchDefaults().research.ranges.buy_shares.high, 1000)
 })
 
-test('new workspaces use the v2 selection protocol defaults', () => {
+test('an empty maximum holding is a valid remembered draft', () => {
+  const value = defaultWorkbenchDefaults()
+  value.position.max_shares = null
+  assert.equal(validWorkbenchGroup('position', value.position), true)
+  assert.equal(normalizeWorkbenchDefaults(value).position.max_shares, null)
+})
+
+test('new workspaces use the v3 selection protocol defaults', () => {
   const research = defaultWorkbenchDefaults().research
-  assert.equal(research.protocol_version, 2)
+  assert.equal(research.protocol_version, 3)
   assert.equal(research.selection_target, 'both')
   assert.equal(research.rebalance_days, 63)
   assert.equal(research.bootstrap_reps, 10000)
   assert.equal(research.n_trials, 1000)
+  assert.equal(research.local_search_budget, 3000)
 })
 
-test('legacy saved research settings fill v2 fields while preserving every remembered range', () => {
+test('legacy saved research settings fill v3 fields while preserving every remembered range', () => {
   const saved = defaultWorkbenchDefaults().research
   saved.ranges.initial_shares = { low: 300, high: 2300, step: 200 }
   saved.ranges.buy_step = { low: .01, high: .15, step: .01 }
-  for (const key of ['protocol_version', 'selection_target', 'rebalance_days', 'bootstrap_reps']) delete saved[key]
+  for (const key of ['protocol_version', 'selection_target', 'rebalance_days', 'bootstrap_reps', 'local_search_budget']) delete saved[key]
   const migrated = normalizeWorkbenchDefaults({ research: saved }).research
-  assert.equal(migrated.protocol_version, 2)
+  assert.equal(migrated.protocol_version, 3)
   assert.equal(migrated.selection_target, 'both')
   assert.equal(migrated.rebalance_days, 63)
   assert.equal(migrated.bootstrap_reps, 10000)
+  assert.equal(migrated.local_search_budget, 3000)
   assert.deepEqual(migrated.ranges, saved.ranges)
   assert.deepEqual(normalizeRememberedResearchDefaults(saved).ranges, saved.ranges)
 })

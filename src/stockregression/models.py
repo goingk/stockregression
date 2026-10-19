@@ -58,20 +58,22 @@ class DcaConfig(BaseModel):
 
 class BacktestConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    # Unversioned records retain their original accounting. New clients send 2.
-    schema_version: Literal[1, 2] = 1
+    # Unversioned records retain their original accounting. New clients send 3.
+    schema_version: Literal[1, 2, 3] = 1
     symbol: str
     start_date: date
     end_date: date | None = None
     frequency: Frequency = "1m"
     initial_shares: int = Field(default=1000, ge=0, multiple_of=100)
     min_shares: int = Field(default=0, ge=0, multiple_of=100)
-    max_shares: int = Field(default=2000, ge=0, multiple_of=100)
+    max_shares: int | None = Field(default=2000, ge=0, multiple_of=100)
     buy_shares: int = Field(default=100, ge=100, multiple_of=100)
     sell_shares: int = Field(default=100, ge=100, multiple_of=100)
     dca: DcaConfig = Field(default_factory=DcaConfig)
     reference_price_mode: Literal["auto", "manual"] = "auto"
     initial_cash: float = Field(default=100_000, gt=0)
+    # Kept for reading v1/v2 results and configurations. Version 3 derives
+    # funding from successful buys and never accepts a cash budget.
     reserve_cash: float | None = Field(default=None, ge=0)
     selection_asof: date | None = None
     initial_position: float = Field(default=0.5, ge=0, le=1)
@@ -102,7 +104,7 @@ class BacktestConfig(BaseModel):
                 value["schema_version"] = 2
             if is_etf and value.get("schema_version") == 1:
                 raise ValueError("ETF 请使用 schema_version=2 的股数配置")
-        if isinstance(value, dict) and value.get("schema_version") == 2:
+        if isinstance(value, dict) and value.get("schema_version") in (2, 3):
             value = dict(value)
             inactive = ("grid_step",) if value.get("grid_mode", "trailing") == "trailing" else ("buy_step", "sell_step")
             for key in inactive:
@@ -114,9 +116,11 @@ class BacktestConfig(BaseModel):
         values = handler(self)
         legacy = {"initial_cash", "initial_position", "min_position", "max_position", "buy_quantity", "sell_quantity", "dca_frequency"}
         modern = {"initial_shares", "min_shares", "max_shares", "buy_shares", "sell_shares", "dca", "reference_price_mode", "reserve_cash", "selection_asof"}
-        for key in legacy if self.schema_version == 2 else modern:
+        for key in legacy if self.schema_version in (2, 3) else modern:
             values.pop(key, None)
-        if self.schema_version == 2:
+        if self.schema_version == 3:
+            values.pop("reserve_cash", None)
+        if self.schema_version in (2, 3):
             for key in (("grid_step",) if self.grid_mode == "trailing" else ("buy_step", "sell_step")):
                 values.pop(key, None)
         return values
@@ -127,10 +131,14 @@ class BacktestConfig(BaseModel):
             raise ValueError("结束日期不能早于开始日期")
         if not self.min_position <= self.initial_position <= self.max_position:
             raise ValueError("初始仓位必须位于仓位上下限之间")
-        if self.schema_version == 2 and not self.min_shares <= self.initial_shares <= self.max_shares:
+        if self.schema_version in (2, 3) and self.min_shares > self.initial_shares:
             raise ValueError("持股数量必须满足：最低持股 ≤ 初始持股 ≤ 最高持股")
-        if self.schema_version == 2 and self.symbol.startswith(("688", "689")) and (self.buy_shares < 200 or self.dca.shares < 200):
+        if self.schema_version in (2, 3) and self.max_shares is not None and self.initial_shares > self.max_shares:
+            raise ValueError("持股数量必须满足：最低持股 ≤ 初始持股 ≤ 最高持股")
+        if self.schema_version in (2, 3) and self.symbol.startswith(("688", "689")) and (self.buy_shares < 200 or self.dca.shares < 200):
             raise ValueError("科创板每次买入及定投至少为 200 股")
+        if self.schema_version == 3 and self.reserve_cash is not None:
+            raise ValueError("schema_version=3 已取消固定可用现金；请通过配置转换生成 v3 草稿")
         if self.lower_price and self.upper_price and self.lower_price >= self.upper_price:
             raise ValueError("网格价格下限必须小于上限")
         return self
@@ -150,12 +158,13 @@ class SearchRange(BaseModel):
 
 class OptimizationConfig(BaseModel):
     base: BacktestConfig
-    protocol_version: Literal[1, 2] = 1
+    protocol_version: Literal[1, 2, 3] = 1
     selection_target: Literal["fixed", "adaptive", "both"] = "both"
     rebalance_days: int = Field(default=63, ge=1)
     bootstrap_reps: int = Field(default=10_000, ge=1)
     mode: Literal["historical", "robust", "both"] = "both"
     n_trials: int = Field(default=200, ge=1, le=5000)
+    local_search_budget: int = Field(default=3000, ge=1, le=5000)
     seed: int = 42
     top_candidates: int = Field(default=20, ge=1, le=100)
     max_drawdown: float = Field(default=0.2, gt=0, le=1)
@@ -182,11 +191,15 @@ class OptimizationConfig(BaseModel):
         if values.get("protocol_version", 1) == 2:
             if "n_trials" not in values:
                 values["n_trials"] = 1000
+        if values.get("protocol_version", 1) == 3 and "local_search_budget" not in values:
+            values["local_search_budget"] = 3000
         base = values["base"]
         base = base if isinstance(base, BacktestConfig) else BacktestConfig.model_validate(base)
         if values.get("protocol_version", 1) == 2 and base.schema_version != 2:
             raise ValueError("protocol_version=2 需要 base.schema_version=2")
-        if base.schema_version != 2:
+        if values.get("protocol_version", 1) == 3 and base.schema_version != 3:
+            raise ValueError("protocol_version=3 需要 base.schema_version=3")
+        if base.schema_version not in (2, 3):
             return values
         if "ranges" not in values:
             values = {**values, "ranges": {

@@ -14,7 +14,6 @@ from .data import DataService
 from .models import BacktestConfig, OptimizationConfig
 from .market_data import MarketDataService
 from .market_data.aggregation import AggregationService
-from .market_data.migration import LegacyMigration
 from .market_data.package import import_etf_package, index_etf_package_direct
 from .market_data.maintenance import rebuild_state, update_rebuild_state
 from .market_data.preparation import MarketPreparationService
@@ -41,6 +40,14 @@ def _cleanup_uploaded_input(store: Store, job_id: str):
 
 def _research_protocol_hash(config: OptimizationConfig) -> str:
     payload = config.model_dump(mode="json")
+    if config.protocol_version == 3:
+        payload["protocol_thresholds"] = {
+            "positive_neighbor_ratio": 0.8,
+            "neighbor_quantile": 0.25,
+            "cost_multipliers": [1.0, 2.0],
+            "neighbor_perturbations": "single_and_pairwise_one_step",
+            "funding_mode": "top_up_on_fill",
+        }
     base = dict(payload.get("base", {}))
     for key in ("symbol", "start_date", "end_date"):
         base.pop(key, None)
@@ -126,11 +133,11 @@ def execute_job(root: str, job_id: str, observer=None):
             store.update_job(job_id, payload=payload)
             progress(0.33, "行情准备完成，开始回测")
             result = run_backtest(config, bundle, lambda fraction, message: progress(0.33 + 0.67 * fraction, message), cancelled)
-            symbol, title = config.symbol, "股数网格 / 定投 / 买入持有" if config.schema_version == 2 else "网格 / 定投 / 初始全仓"
+            symbol, title = config.symbol, "现金补足网格 / 定投 / 买入持有" if config.schema_version == 3 else "股数网格 / 定投 / 买入持有" if config.schema_version == 2 else "网格 / 定投 / 初始全仓"
         elif kind == "optimization":
             from .optimization import optimize
             config = OptimizationConfig.model_validate(payload["config"])
-            scientific = config.protocol_version == 2
+            scientific = config.protocol_version in (2, 3)
             progress(0.01, "检查本地行情并准备研究数据" if not scientific else "准备评估区间及前置 504 个交易日")
             if scientific:
                 bundle = prepare_research_bundle(
@@ -168,15 +175,6 @@ def execute_job(root: str, job_id: str, observer=None):
                 title = "科学参数研究 · 固定与自适应" if config.selection_target == "both" else f"科学参数研究 · {config.selection_target}"
             else:
                 title = "历史搜索 / 样本外验证"
-        elif kind == "sync":
-            result = service.sync(payload.get("symbols", []), payload.get("mode", "daily"), progress, cancelled, scope=payload.get("scope"), resume=payload.get("resume", False), retry_failed=payload.get("retry_failed", False), workers=payload.get("workers", 2))
-            symbol, title = ",".join(payload.get("symbols", [])), "数据同步"
-        elif kind == "demo":
-            result = service.demo(payload.get("symbol", "000001.SZ"), payload.get("days", 780), progress, cancelled)
-            symbol, title = result["symbol"], "模拟行情演示"
-        elif kind == "import":
-            result = service.import_files(payload, progress, cancelled)
-            symbol, title = payload["symbol"], "本地数据导入"
         elif kind == "market_import":
             market = MarketDataService(store)
             result = market.import_file(
@@ -315,12 +313,6 @@ def execute_job(root: str, job_id: str, observer=None):
                       "targets": len(payload["symbols"]), "completed": len(values) - len(failures),
                       "failures": failures, "message": f"聚合完成 {len(values) - len(failures)} 个标的"}
             symbol, title = ",".join(payload["symbols"]), f"本地聚合 {payload['source_timeframe']} → {payload['target_timeframe']}"
-        elif kind == "market_migrate":
-            result = LegacyMigration(store).run(
-                dry_run=payload.get("dry_run", False), resume=payload.get("resume", True),
-                progress=progress, cancelled=cancelled,
-            )
-            symbol, title = "", "旧行情迁移"
         elif kind == "instruments":
             result = service.refresh_instruments(progress, cancelled)
             symbol, title = "", "证券清单更新"
@@ -329,11 +321,11 @@ def execute_job(root: str, job_id: str, observer=None):
         if cancelled() and kind != "optimization":
             raise InterruptedError("任务已取消")
         was_cancelled = cancelled()
-        failed_sync = kind in {"sync", "market_sync", "market_source_probe", "market_import", "market_import_batch", "market_import_package", "market_index_package", "market_aggregate", "market_migrate", "market_prepare", "market_archive"} and result.get("status") == "failed"
-        failed_research = kind == "optimization" and payload.get("config", {}).get("protocol_version") == 2 and _scientific_failed(result)
+        failed_sync = kind in {"market_sync", "market_source_probe", "market_import", "market_import_batch", "market_import_package", "market_index_package", "market_aggregate", "market_prepare", "market_archive"} and result.get("status") == "failed"
+        failed_research = kind == "optimization" and payload.get("config", {}).get("protocol_version") in (2, 3) and _scientific_failed(result)
         result_cancelled = kind == "optimization" and result.get("status") == "cancelled"
         cancelled_job = was_cancelled or result_cancelled
-        if kind == "optimization" and payload.get("config", {}).get("protocol_version") == 2:
+        if kind == "optimization" and payload.get("config", {}).get("protocol_version") in (2, 3):
             if failed_research:
                 title += " · 失败"
             elif cancelled_job:
@@ -351,7 +343,7 @@ def execute_job(root: str, job_id: str, observer=None):
             message = f"同步失败：{sync_error}"
         elif failed_research:
             message = "科学参数研究失败：" + str(result.get("reason") or result.get("message") or "查看结果中的失败原因")
-        elif kind == "optimization" and payload.get("config", {}).get("protocol_version") == 2 and result.get("status") == "partial":
+        elif kind == "optimization" and payload.get("config", {}).get("protocol_version") in (2, 3) and result.get("status") == "partial":
             message = "科学参数研究部分完成；已保留已完成的候选与结果"
         else:
             message = result.get("message", "完成")

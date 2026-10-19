@@ -30,7 +30,7 @@ export function savedGridParameters(value: unknown): ResultParameter[] {
   const funding = record(result.funding)
   const unit = resultShareUnit(result.symbol ?? config.symbol)
   const version = config.schema_version ?? result.schema_version
-  const shareBased = version === 2 || (version !== 1 && ['initial_shares', 'min_shares', 'max_shares', 'buy_shares', 'sell_shares'].some((key) => finite(config[key])))
+  const shareBased = typeof version === 'number' && version >= 2 || (version !== 1 && ['initial_shares', 'min_shares', 'max_shares', 'buy_shares', 'sell_shares'].some((key) => finite(config[key])))
   const modeNames: Record<string, string> = { trailing: '移动网格', arithmetic: '等差网格', geometric: '等比网格' }
   const mode = typeof config.grid_mode === 'string' ? config.grid_mode : ''
   const rows: ResultParameter[] = [{ key: 'grid_mode', label: '网格模式', value: modeNames[mode] ?? (mode || '—') }]
@@ -53,9 +53,13 @@ export function savedGridParameters(value: unknown): ResultParameter[] {
       { key: 'sell_shares', label: '每次卖出', value: amountText(config.sell_shares, unit, 0) },
       { key: 'initial_shares', label: '初始持有', value: amountText(config.initial_shares, unit, 0) },
       { key: 'min_shares', label: '最低持有', value: amountText(config.min_shares, unit, 0) },
-      { key: 'max_shares', label: '最高持有', value: amountText(config.max_shares, unit, 0) },
-      { key: 'reserve_cash', label: '网格预留现金', value: amountText(finite(funding.reserve_cash) ? funding.reserve_cash : config.reserve_cash, '元') },
+      { key: 'max_shares', label: '最高持有', value: config.max_shares === null ? '不限' : amountText(config.max_shares, unit, 0) },
+      ...(version !== 3 ? [{ key: 'reserve_cash', label: '网格预留现金', value: amountText(finite(funding.reserve_cash) ? funding.reserve_cash : config.reserve_cash, '元') }] : []),
       { key: 'initial_equity', label: '网格起始资产', value: amountText(funding.initial_equity, '元') },
+      ...(version === 3 ? [
+        { key: 'peak_invested', label: '峰值净投入', value: amountText(funding.peak_invested, '元') },
+        { key: 'topups', label: '累计外部补款', value: amountText(funding.topups, '元') },
+      ] : []),
     )
   } else {
     rows.push(

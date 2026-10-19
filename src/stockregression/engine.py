@@ -1850,7 +1850,7 @@ def run_backtest(
     """Run grid, DCA and buy-and-hold ledgers against one canonical data bundle."""
     if config.symbol != data.symbol:
         raise ValueError(f"回测标的 {config.symbol} 与数据标的 {data.symbol} 不一致")
-    if config.schema_version == 2:
+    if config.schema_version in (2, 3):
         from .share_engine import run_share_backtest
         return run_share_backtest(config, data, progress, cancelled, summary_only, preview)
     fast_inputs = _fast_market_inputs(config, data)

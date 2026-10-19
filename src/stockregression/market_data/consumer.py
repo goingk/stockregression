@@ -5,6 +5,8 @@ import pandas as pd
 
 from ..models import BacktestConfig, DataBundle
 from ..quality import DataQualityError, apply_price_limits, minute_slots, prepare_bundle
+from ..price_validation import anomaly_records, anomalies_in_range
+from .models import DataNotReady
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe, timeframe_spec
 
 
@@ -24,6 +26,10 @@ def load_native_bundle(service, config: BacktestConfig, version: str | None = No
     daily = service.repository.bars(config.symbol, "1day", version=daily_version)
     if daily.empty:
         raise DataQualityError("本地版本没有日线")
+    _reject_invalid_prices(
+        daily, config.symbol, "1day", daily_version,
+        start=config.start_date, end=config.end_date, context="日线",
+    )
     daily = daily.rename(columns={"timestamp": "date"})
     daily["date"] = pd.to_datetime(daily.date).dt.normalize()
     for field, default in (("preclose", np.nan), ("tradestatus", np.nan), ("is_st", pd.NA), ("turnover", np.nan)):
@@ -61,6 +67,10 @@ def load_native_bundle(service, config: BacktestConfig, version: str | None = No
         config.symbol, target, start=start, end=end + pd.Timedelta(days=1),
         version=int(versions[target]["version"]),
     )
+    _reject_invalid_prices(
+        minute, config.symbol, target, int(versions[target]["version"]),
+        start=start, end=end, context=f"{target}",
+    )
     if minute.empty:
         raise DataQualityError(f"所选区间没有 {target} 行情")
     if target == "1min":
@@ -73,6 +83,22 @@ def load_native_bundle(service, config: BacktestConfig, version: str | None = No
     )
 
 
+def _reject_invalid_prices(frame, symbol, timeframe, version, *, start, end, context):
+    anomalies = anomalies_in_range(frame, start, end)
+    if anomalies.empty:
+        return
+    raise DataNotReady(
+        f"{context}存在 {len(anomalies)} 条无效价格，当前版本不能用于计算",
+        gaps=[{
+            "kind": "price_quality", "timeframe": timeframe,
+            "anomalies": anomaly_records(
+                anomalies, symbol=symbol, timeframe=timeframe,
+                version=version, limit=50,
+            ),
+        }],
+    )
+
+
 def _calendar(service, symbol, daily, version=None):
     saved = service.repository.auxiliary(symbol, "calendar", version=version) if version else service.repository.auxiliary(symbol, "calendar")
     if saved:
@@ -80,7 +106,11 @@ def _calendar(service, symbol, daily, version=None):
         if not frame.empty and "date" in frame:
             frame = frame[['date']].copy()
             frame["date"] = pd.to_datetime(frame.date, errors="raise").dt.normalize()
-            return frame
+            # Packaged auxiliary calendars may contain only the incremental
+            # tail. Daily rows remain the authoritative local trading series;
+            # union them so research can reconstruct the full lookback window.
+            observed = pd.DataFrame({"date": pd.DatetimeIndex(daily.date).normalize().unique().sort_values()})
+            return pd.concat([frame, observed], ignore_index=True).drop_duplicates("date").sort_values("date").reset_index(drop=True)
     return pd.DataFrame({"date": pd.DatetimeIndex(daily.date).normalize().unique().sort_values()})
 
 
@@ -123,8 +153,11 @@ def _native_coarse_bundle(config, target, minute, daily, actions, calendar, mani
             raise DataQualityError(f"{day.date()} 缺少日线，无法确认交易状态")
         if isinstance(row, pd.DataFrame):
             row = row.iloc[-1]
-        if int(row.tradestatus) == 0 or row.volume == 0:
-            reports.append({"date": str(day.date()), "mode": "suspended", "missing_minutes": 0, "missing_data_minutes": 0, "auction_placeholders": 0, "reason": "确认停牌或零成交日"})
+        if int(row.tradestatus) == 0:
+            reports.append({"date": str(day.date()), "mode": "suspended", "missing_minutes": 0, "missing_data_minutes": 0, "auction_placeholders": 0, "reason": "确认停牌"})
+            continue
+        if float(row.volume) == 0:
+            reports.append({"date": str(day.date()), "mode": "no_trades", "missing_minutes": 0, "missing_data_minutes": 0, "auction_placeholders": 0, "reason": "交易状态正常但全天无成交量"})
             continue
         part = groups.get(day, pd.DataFrame()).sort_values("timestamp")
         if len(part) != expected:
@@ -148,8 +181,9 @@ def _native_coarse_bundle(config, target, minute, daily, actions, calendar, mani
     mode_minute = sum(item["mode"] == "minute" for item in reports)
     mode_daily = sum(item["mode"] == "daily" for item in reports)
     suspended = sum(item["mode"] == "suspended" for item in reports)
+    no_trades = sum(item["mode"] == "no_trades" for item in reports)
     quality = {"days": reports, "minute_days": mode_minute, "daily_days": mode_daily,
-               "suspended_days": suspended, "total_days": len(reports),
+               "suspended_days": suspended, "no_trade_days": no_trades, "total_days": len(reports),
                "minute_ratio": mode_minute / max(1, mode_minute + mode_daily),
                "synthetic_bars": 0, "auction_placeholders": 0, "is_demo": False,
                "requested_frequency": target, "warnings": []}

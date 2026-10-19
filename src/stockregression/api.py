@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 
 import pandas as pd
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -176,7 +177,10 @@ class BatchRequest(BaseModel):
     configs: list[BacktestConfig] = Field(min_length=1, max_length=100)
 
 
-_V2_ARCHIVE_FIELDS = {"candidate_archive", "trial_archive", "candidate_archives", "trial_archives"}
+_V2_ARCHIVE_FIELDS = {
+    "candidate_archive", "trial_archive", "candidate_archives", "trial_archives",
+    "search_candidate_archive", "search_candidate_archives",
+}
 
 
 def _compact_v2_result(value, top_candidates: int, parent_key: str | None = None):
@@ -248,7 +252,7 @@ def _result_data_metadata(store: Store, result: dict) -> dict | None:
                 frames.append(MarketDataService(store).repository.read_frame(
                     symbol, minute_name,
                     version=int(market_versions[minute_name]["version"]),
-                    start=start, end=pd.Timestamp(end) + pd.Timedelta(days=1) if end else None,
+                    start=start, end=end,
                     fields=("timestamp", "source", "source_verified", "is_synthetic", "close"),
                 ))
         else:
@@ -339,7 +343,7 @@ def public_result(result: dict, full: bool = False, data_metadata: dict | None =
         return result
     result = dict(result)
     config = result.get("config") if isinstance(result.get("config"), dict) else {}
-    is_v2 = result.get("protocol_version") == 2 or config.get("protocol_version") == 2
+    is_v2 = result.get("protocol_version") in (2, 3) or config.get("protocol_version") in (2, 3)
     if is_v2:
         try:
             top_candidates = max(1, min(100, int(config.get("top_candidates", 20))))
@@ -430,17 +434,14 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
                     "config": config.model_dump(mode="json"),
                 })
             return manifest["version"]
-        version = DataService(store).current_version_if_ready(config)
-        if version is None:
-            raise HTTPException(409, detail={
-                "code": "DATA_NOT_READY", "ready": False, "symbol": config.symbol,
-                "frequency": config.frequency,
-                "config": config.model_dump(mode="json"),
-                "gaps": [{"kind": "local", "message": "没有满足本次区间和周期的本地数据；请先在数据管理中准备"}],
-                "preparation": {"symbol": config.symbol, "frequency": config.frequency,
-                                  "start": str(config.start_date), "end": str(config.end_date)},
-            })
-        return version
+        raise HTTPException(409, detail={
+            "code": "DATA_NOT_READY", "ready": False, "symbol": config.symbol,
+            "frequency": config.frequency,
+            "config": config.model_dump(mode="json"),
+            "gaps": [{"kind": "local", "message": "当前有效数据包中没有本次请求的行情；请先登记或同步基础行情"}],
+            "preparation": {"symbol": config.symbol, "frequency": config.frequency,
+                              "start": str(config.start_date), "end": str(config.end_date)},
+        })
 
     @app.get("/api/v1/health")
     def health():
@@ -560,16 +561,22 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     def import_package(payload: MarketPackageRequest):
         nonlocal package_dir
         try:
+            target = Path(payload.folder).expanduser().resolve()
+            if data_dir is None and initial_package and target != Path(initial_package).resolve():
+                raise ValueError(
+                    "项目已固定使用 ETF 数据更新至2026.9.30；如需切换基础数据包，请修改本机设置中的 package_dir 后重启"
+                )
             values = payload.model_dump()
+            values["folder"] = str(target)
             values["timeframes"] = [
                 normalize_timeframe(item) for item in (payload.timeframes or [])
             ] or None
             values["symbols"] = [
                 normalize_symbol(item) for item in (payload.symbols or [])
             ] or None
-            scan_etf_package(payload.folder)
+            scan_etf_package(target)
             market = MarketDataService(store)
-            market.repository.attach_package(payload.folder)
+            market.repository.attach_package(target)
             package_dir = str(market.repository.package_dir)
             return submit("market_index_package", values)
         except (ValueError, MarketDataError) as exc:
@@ -640,14 +647,6 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     @app.get("/api/v1/data/sync-status")
     def sync_status(run_key: str | None = None, status: str | None = None, limit: int = Query(100, ge=1, le=1000), offset: int = Query(0, ge=0)):
         return store.sync_status(run_key, status, limit, offset)
-
-    @app.post("/api/v1/data/demo")
-    def demo(payload: dict):
-        try:
-            payload["symbol"] = normalize_symbol(payload.get("symbol", "000001.SZ"))
-            return submit("demo", payload)
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
 
     @app.post("/api/v1/data/import")
     def import_data(payload: MarketImportRequest):
@@ -869,30 +868,32 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         except (ValueError, MarketDataError) as exc:
             raise HTTPException(422, str(exc)) from exc
 
-    @app.post("/api/v1/data/migrate-legacy")
-    def migrate_legacy(payload: dict):
-        return submit("market_migrate", {"dry_run": bool(payload.get("dry_run", False)), "resume": bool(payload.get("resume", True))})
-
     @app.get("/api/v1/data/bars/{symbol}")
     def bars(symbol: str, start_date: str | None = None, end_date: str | None = None, frequency: str = "1m", limit: int = Query(1500, ge=1, le=10000), version: str | None = None):
         normalized = normalize_timeframe(frequency)
         market = MarketDataService(store)
         manifest = store.snapshot(symbol, version)
-        if version and manifest is None and not str(version).isdigit():
+        if version and manifest is None:
             raise HTTPException(404, {
                 "code": "DATA_VERSION_NOT_FOUND",
                 "message": f"原数据版本 {version} 已清理，不能按该版本读取",
             })
-        if market.repository.dataset(normalize_symbol(symbol), normalized) or (manifest and manifest.get("market_data")):
+        if manifest and not manifest.get("market_data"):
+            raise HTTPException(404, {
+                "code": "DATA_VERSION_NOT_FOUND",
+                "message": f"数据版本 {version or manifest.get('version')} 属于已删除的旧行情格式",
+            })
+        if market.repository.dataset(normalize_symbol(symbol), normalized) or manifest:
             try:
                 market_version = None
                 if manifest and manifest.get("market_data"):
                     reference = (manifest.get("market_versions", {}).get(normalized) or {}).get("version")
                     if version and reference is None:
-                        return []
+                        raise HTTPException(404, {
+                            "code": "DATA_VERSION_NOT_FOUND",
+                            "message": f"数据版本 {version} 没有 {normalized} 行情",
+                        })
                     market_version = int(reference) if reference is not None else None
-                elif version and str(version).isdigit():
-                    market_version = int(version)
                 payload = market.bars(
                     symbol, normalized, start=pd.Timestamp(start_date) if start_date else None,
                     end=pd.Timestamp(end_date) if end_date else None,
@@ -904,22 +905,14 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
                 raise HTTPException(404, {"code": exc.code, "message": str(exc)}) from exc
             except MarketDataError:
                 return []
-        if not manifest:
-            return []
-        daily = store.read_files(manifest["files"]["daily"])
-        if daily.empty:
-            return []
-        bundle = DataService(store).load_bundle(BacktestConfig(symbol=symbol, start_date=pd.Timestamp(start_date or daily.date.min()).date(), end_date=pd.Timestamp(end_date or daily.date.max()).date(), frequency=frequency), version=version)
-        frame = bundle.bars
-        if len(frame) > limit:
-            # Uniformly sized contiguous OHLC buckets preserve all highs/lows.
-            groups = pd.Series(range(len(frame))) // ((len(frame) + limit - 1) // limit)
-            frame = frame.groupby(groups).agg(timestamp=("timestamp", "last"), open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"), volume=("volume", "sum"))
-        return json_safe(frame[[c for c in ("timestamp", "open", "high", "low", "close", "volume", "frequency", "is_synthetic") if c in frame]].to_dict("records"))
+        return []
 
     @app.post("/api/v1/backtests")
     def backtest(config: BacktestConfig):
-        return submit("backtest", {"config": config.model_dump(mode="json"), "version": require_ready(config)})
+        version = require_ready(config)
+        if config.schema_version != 3:
+            raise HTTPException(422, "新回测请先通过配置转换生成 schema_version=3 草稿")
+        return submit("backtest", {"config": config.model_dump(mode="json"), "version": version})
 
     @app.get("/api/v1/data/reference-price/{symbol}")
     def reference_price(symbol: str, start_date: str):
@@ -933,13 +926,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         try:
             timeframe = normalize_timeframe(frequency)
             market = MarketDataService(store)
-            manifest = store.snapshot(symbol)
-            if market.repository.dataset(normalize_symbol(symbol), timeframe) or (manifest and manifest.get("market_data")):
-                return json_safe(market.market_bars(
-                    symbol, timeframe, start=start_date, end=end_date, before=before,
-                    limit=limit, ma_periods=[int(value) for value in ma.split(",") if value.strip()],
-                ))
-            return json_safe(DataService(store).market_bars(symbol, frequency, start_date, end_date, before, limit, [int(value) for value in ma.split(",") if value.strip()]))
+            return json_safe(market.market_bars(
+                symbol, timeframe, start=start_date, end=end_date, before=before,
+                limit=limit, ma_periods=[int(value) for value in ma.split(",") if value.strip()],
+            ))
         except MarketDataError as exc:
             return {"symbol": normalize_symbol(symbol), "frequency": normalize_timeframe(frequency),
                     "bars": [], "warnings": [str(exc)], "quality_flags": [str(exc)], "diagnostics": {}, "source_events": []}
@@ -948,9 +938,9 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
 
     @app.post("/api/v1/backtests/preview")
     def preview(payload: PreviewRequest):
-        if payload.config.schema_version != 2:
-            raise HTTPException(422, "请先将旧配置转换为股数配置")
         version = require_ready(payload.config)
+        if payload.config.schema_version != 3:
+            raise HTTPException(409, "请先将旧配置转换为股数配置")
         # Preview is deliberately submitted without a synchronous coverage scan;
         # the worker reports preparation progress and pins the result version.
         return json_safe(previews.submit(payload.session_id, payload.revision, payload.config, version))
@@ -969,8 +959,14 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
 
     @app.post("/api/v1/configs/convert")
     def convert_config(config: BacktestConfig):
-        if config.schema_version == 2:
+        if config.schema_version == 3:
             return {"config": config.model_dump(mode="json"), "notice": "已载入股数配置"}
+        if config.schema_version == 2:
+            values = config.model_dump(mode="json")
+            values["schema_version"] = 3
+            values.pop("reserve_cash", None)
+            modern = BacktestConfig.model_validate(values)
+            return {"config": modern.model_dump(mode="json"), "notice": "已转换为 v3：取消固定可用现金，买入时按需补足差额，收益率按峰值净投入计算。"}
         try:
             service = DataService(store)
             bundle = service.ensure_bundle(config, check_minutes=False)
@@ -982,7 +978,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
                 amount = value.value if value.mode == "shares" else value.value / price if value.mode == "cash" else config.initial_cash * value.value / price
                 return max(200 if config.symbol.startswith(("688", "689")) else 100, int(amount / 100) * 100)
             values = {key: value for key, value in config.model_dump(mode="json").items() if key not in {"schema_version", "initial_cash", "initial_position", "min_position", "max_position", "buy_quantity", "sell_quantity", "dca_frequency"}}
-            values.update(schema_version=2, initial_shares=shares(config.initial_position), min_shares=shares(config.min_position), max_shares=shares(config.max_position), buy_shares=quantity(config.buy_quantity), sell_shares=quantity(config.sell_quantity), reference_price_mode="manual" if config.reference_price else "auto", dca={"frequency": config.dca_frequency, "shares": 200 if config.symbol.startswith(("688", "689")) else 100})
+            values.pop("reserve_cash", None)
+            values.update(schema_version=3, initial_shares=shares(config.initial_position), min_shares=shares(config.min_position), max_shares=shares(config.max_position), buy_shares=quantity(config.buy_quantity), sell_shares=quantity(config.sell_quantity), reference_price_mode="manual" if config.reference_price else "auto", dca={"frequency": config.dca_frequency, "shares": 200 if config.symbol.startswith(("688", "689")) else 100})
             modern = BacktestConfig.model_validate(values)
             return {"config": modern.model_dump(mode="json"), "reference_date": context["reference_date"], "notice": "旧现金/比例配置已按历史参考价换算为股数草稿；资金按新规则重算，请检查后另存，原配置保持保留。"}
         except ValueError as exc:
@@ -991,16 +988,37 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     @app.post("/api/v1/backtests/batch")
     def batch(payload: BatchRequest):
         versions = [require_ready(config) for config in payload.configs]
+        if any(config.schema_version != 3 for config in payload.configs):
+            raise HTTPException(422, "批量回测请先通过配置转换生成 schema_version=3 草稿")
         return {"job_ids": [submit("backtest", {"config": config.model_dump(mode="json"), "version": version})["job_id"] for config, version in zip(payload.configs, versions)]}
 
     @app.post("/api/v1/optimizations")
     def optimization(config: OptimizationConfig):
-        if config.protocol_version == 2:
-            prepared = preparation_config(store, config.base)
-            version = require_ready(prepared)
-        else:
-            version = require_ready(config.base)
-        return submit("optimization", {"config": config.model_dump(mode="json"), "version": version})
+        prepared = preparation_config(store, config.base)
+        version = require_ready(prepared)
+        if config.protocol_version != 3:
+            raise HTTPException(422, "新研究请先通过配置转换并使用 protocol_version=3")
+        from .scientific import estimate_v3_search
+        bundle = DataService(store).load_bundle(prepared, version)
+        preview = estimate_v3_search(config, bundle)
+        if preview.get("status") == "budget_exceeded":
+            raise HTTPException(422, {
+                "code": "SEARCH_BUDGET_EXCEEDED",
+                "message": f"局部网格预计 {preview['expected']} 组，超过预算 {preview['budget']}；请调整范围或预算",
+                **preview,
+            })
+        submitted = submit("optimization", {"config": config.model_dump(mode="json"), "version": version})
+        return {**submitted, "search_preview": preview}
+
+    @app.post("/api/v1/optimizations/preview")
+    def optimization_preview(config: OptimizationConfig):
+        if config.protocol_version != 3:
+            raise HTTPException(422, "搜索预检仅适用于 protocol_version=3")
+        prepared = preparation_config(store, config.base)
+        version = require_ready(prepared)
+        from .scientific import estimate_v3_search
+        bundle = DataService(store).load_bundle(prepared, version)
+        return json_safe(estimate_v3_search(config, bundle))
 
     @app.get("/api/v1/jobs")
     def jobs():
@@ -1080,6 +1098,113 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         )
         return public if full else _with_data_availability(store, public)
 
+    @app.get("/api/v1/results/{result_id}/landscape")
+    def result_landscape(
+        result_id: str,
+        decision: str = Query("current", pattern="^(current|fixed|adaptive)$"),
+        decision_index: int = Query(0, ge=0),
+        sample: str = Query("validation", pattern="^(training|validation)$"),
+        cost: str = Query("original", pattern="^(original|stress)$"),
+        fold: int | None = Query(None, ge=0),
+    ):
+        result = store.result(result_id)
+        if result is None:
+            raise HTTPException(404, "结果不存在")
+        if result.get("protocol_version") != 3:
+            raise HTTPException(422, "参数收益分布仅适用于 protocol_version=3")
+        evidence = result.get("evidence", {})
+        if sample == "training":
+            archive = evidence.get("search_candidate_archives", {}).get(decision, [])
+            if decision == "adaptive":
+                if not archive or decision_index >= len(archive):
+                    raise HTTPException(404, "研究决策不存在")
+                archive = archive[decision_index].get("search_candidate_archive", [])
+        else:
+            archive = evidence.get("candidate_archives", {}).get(decision, [])
+            if decision == "adaptive":
+                if not archive or decision_index >= len(archive):
+                    raise HTTPException(404, "研究决策不存在")
+                archive = archive[decision_index].get("candidate_archive", [])
+        archive = [row for row in archive if isinstance(row, dict) and isinstance(row.get("params"), dict)]
+        if not archive:
+            return {"result_id": result_id, "decision": decision, "sample": sample,
+                    "cost": cost, "fold": fold, "points": [], "pca": None, "bounds": None}
+        config = result.get("config", {})
+        base = config.get("base", config)
+        active = ["buy_step", "sell_step"] if base.get("grid_mode", "trailing") == "trailing" else ["grid_step"]
+        active += ["min_shares", "max_shares", "buy_shares", "sell_shares"]
+        names = [name for name in active if any(row.get("params", {}).get(name) is not None for row in archive)]
+        points = []
+        for row_index, row in enumerate(archive):
+            params = row.get("params", {})
+            status = row.get("evaluation_status") if sample == "validation" else row.get("status")
+            folds = row.get("folds", []) if sample == "validation" else []
+            if sample == "training":
+                value, grid_value, baseline_value = row.get("training_excess_return"), row.get("training_return"), row.get("training_baseline_return")
+            elif fold is not None and fold < len(folds):
+                evidence_row = folds[fold] or {}
+                value, grid_value, baseline_value = evidence_row.get("excess_return"), evidence_row.get("grid_return"), evidence_row.get("baseline_return")
+            else:
+                value = row.get("validation_excess_stress" if cost == "stress" else "validation_excess_original")
+                grid_value = row.get("validation_return_stress" if cost == "stress" else "validation_return_original")
+                baseline_value = None
+            points.append({
+                "candidate_id": row.get("candidate_id", row.get("search_id", row_index + 1)),
+                "params": params, "is_center": bool(row.get("is_center")),
+                "is_baseline": bool(row.get("is_baseline")), "status": status or "unknown",
+                "excess_return": value, "grid_return": grid_value, "baseline_return": baseline_value,
+                "drawdown": row.get("max_drawdown") if sample == "validation" else row.get("training_drawdown"),
+                "trade_count": row.get("trade_count") if sample == "validation" else row.get("training_trade_count"),
+                "peak_invested": row.get("peak_invested"), "folds": folds,
+                "neighbor_candidate_ids": row.get("neighbor_candidate_ids", []),
+                "neighbor_of_candidate_ids": row.get("neighbor_of_candidate_ids", []),
+                "robustness_status": row.get("robustness_status"),
+                "neighbor_positive_ratio": row.get("neighbor_positive_ratio"),
+                "neighbor_q25_excess": row.get("neighbor_q25_excess"),
+                "island_suspect": row.get("island_suspect", False),
+                "neighbor_boundary_clipped_count": row.get("neighbor_boundary_clipped_count", 0),
+            })
+        pca = None
+        ranges = config.get("ranges", {}) or {}
+        dimensions = []
+        for name in names:
+            values = [float(point["params"][name]) for point in points if isinstance(point["params"].get(name), (int, float)) and np.isfinite(float(point["params"][name]))]
+            if values and max(values) - min(values) > 0:
+                dimensions.append(name)
+        if len(dimensions) >= 2:
+            matrix = []
+            for point in points:
+                vector = []
+                for name in dimensions:
+                    value = float(point["params"].get(name, 0.0))
+                    search_range = ranges.get(name, {}) or {}
+                    low, high = float(search_range.get("low", value)), float(search_range.get("high", value))
+                    vector.append((value - low) / (high - low) if high > low else 0.0)
+                matrix.append(vector)
+            values = np.asarray(matrix, dtype=np.float64)
+            centered = values - values.mean(axis=0, keepdims=True)
+            _, singular, components = np.linalg.svd(centered, full_matrices=False)
+            variance = singular ** 2
+            explained = variance[:2] / variance.sum() if variance.sum() > 0 else np.zeros(2)
+            coords = centered @ components[:2].T
+            if coords.shape[1] < 2:
+                coords = np.column_stack([coords[:, 0], np.zeros(len(coords))])
+            for index, point in enumerate(points):
+                point["pca"] = [float(coords[index, 0]), float(coords[index, 1])]
+            pca = {
+                "parameters": dimensions,
+                "explained_variance": [float(value) for value in explained],
+                "loadings": [[float(value) for value in components[i, :]] for i in range(min(2, len(components)))],
+            }
+        finite = [float(point["excess_return"]) for point in points if isinstance(point.get("excess_return"), (int, float)) and np.isfinite(float(point["excess_return"]))]
+        return {
+            "result_id": result_id, "decision": decision, "decision_index": decision_index,
+            "sample": sample, "cost": cost, "fold": fold, "parameters": names,
+            "points": points, "pca": pca,
+            "bounds": {"min": min(finite), "max": max(finite)} if finite else None,
+            "center_count": sum(bool(point["is_center"]) for point in points),
+        }
+
     @app.get("/api/v1/results/{result_id}/export")
     def export(result_id: str, kind: str = "json"):
         result = get_result(result_id, full=True)
@@ -1087,7 +1212,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             content, extension, media = dumps(result).encode("utf-8"), "json", "application/json"
         elif kind in ("equity", "trades"):
             records = []
-            if result.get("protocol_version") == 2:
+            if result.get("protocol_version") in (2, 3):
                 runs = []
                 for name in ("fixed", "adaptive"):
                     branch = result.get(name)
@@ -1143,6 +1268,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     @app.put("/api/v1/settings")
     def update_settings(payload: dict):
         try:
+            if payload.get("package_dir"):
+                requested = Path(str(payload["package_dir"])).expanduser().resolve()
+                if requested != Path(package_dir).resolve():
+                    raise ValueError("固定数据包目录不能通过设置切换到其他目录")
             validate_source_settings(store, payload)
             values = save_settings(payload)
             configure_cache(values.market_cache_mb)

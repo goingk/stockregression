@@ -5,6 +5,7 @@ import os
 import subprocess
 import webbrowser
 import json
+from datetime import datetime
 from pathlib import Path
 import shutil
 
@@ -16,6 +17,7 @@ from .settings import PROJECT_ROOT, load_settings, save_settings
 from .storage import Store
 from .market_data.package import scan_etf_package
 from .market_data.maintenance import preview_reset, rebuild_state, reset_market_storage
+from .market_data.cleanup import apply_legacy_cleanup, legacy_cleanup_plan
 
 app = typer.Typer(help="本地 A 股及 ETF 行情与网格研究台", no_args_is_help=True)
 schedule_app = typer.Typer(help="安装、移除或查看 Windows 补数计划")
@@ -95,13 +97,13 @@ def sync(mode: str = "daily", symbol: list[str] = typer.Option(None), scope: str
             typer.echo(f"目标：{len(set(symbols))} 个标的")
         typer.echo("预检结束，未下载行情或创建同步任务。目录元数据可能写入来源缓存。")
         return
-    _run("sync", {"mode": mode, "symbols": symbol or [], "scope": scope, "resume": resume, "retry_failed": retry_failed, "workers": workers})
-
-
-@app.command()
-def demo(symbol: str = "000001.SZ", days: int = 780):
-    """生成明确标记的演示数据，含短缺口与按天降级示例。"""
-    _run("demo", {"symbol": symbol, "days": days})
+    timeframes = ["1day"] if mode == "history" else ["1day", "1min"]
+    _run("market_sync", {
+        "mode": "incremental" if mode == "daily" else mode,
+        "symbols": symbol or [], "scope": scope, "resume": resume,
+        "retry_failed": retry_failed, "workers": workers,
+        "timeframe": "1day", "timeframes": timeframes,
+    })
 
 
 @app.command("import-data")
@@ -338,13 +340,24 @@ def data_aggregate(
                              "target_timeframe": target, "start_date": start, "end_date": end})
 
 
-@data_app.command("migrate-legacy")
-def data_migrate_legacy(
-    dry_run: bool = typer.Option(False, "--dry-run"),
-    resume: bool = typer.Option(True, "--resume/--fresh"),
+@data_app.command("cleanup-legacy")
+def data_cleanup_legacy(
+    apply: bool = typer.Option(False, "--apply", help="确认删除旧行情，默认只输出清单"),
 ):
-    """把旧活动 Parquet 快照迁移到周期数据库。"""
-    _run("market_migrate", {"dry_run": dry_run, "resume": resume})
+    """列出并清理旧格式行情；保留结果、任务、配置和自选。"""
+    settings = load_settings()
+    plan = legacy_cleanup_plan(settings.data_dir, current_package_dir=settings.package_dir)
+    if not apply:
+        typer.echo(json.dumps(plan, ensure_ascii=False, indent=2, default=str))
+        return
+    report_path = PROJECT_ROOT / ".local" / (
+        "legacy-cleanup-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".json"
+    )
+    report = apply_legacy_cleanup(
+        settings.data_dir, current_package_dir=settings.package_dir, report_path=report_path,
+    )
+    typer.echo(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    typer.echo(f"清理报告：{report_path}")
 
 
 @schedule_app.command("install")

@@ -4,8 +4,9 @@ import numpy as np
 import pandas as pd
 
 from .models import DataBundle
+from .price_validation import price_issue_details
 
-QUALITY_RULES_VERSION = 2
+QUALITY_RULES_VERSION = 3
 
 MINUTE_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume", "turnover", "source"]
 
@@ -50,22 +51,26 @@ def canonical_frame(frame: pd.DataFrame, daily: bool = False, source: str = "imp
         frame["turnover"] = np.nan
     if daily:
         if "tradestatus" not in frame:
-            # Imported daily rows declare trading activity through positive volume.
-            frame["tradestatus"] = (frame["volume"] > 0).astype(int)
-        frame["tradestatus"] = pd.to_numeric(frame["tradestatus"], errors="coerce").fillna(-1).astype(int)
+            # The presence of a daily bar is a trading-state fact. A zero
+            # volume bar is a no-trade session, not an inferred suspension.
+            frame["tradestatus"] = 1
+        frame["tradestatus"] = pd.to_numeric(frame["tradestatus"], errors="coerce").fillna(1).astype(int)
         if "is_st" not in frame:
             frame["is_st"] = False
         frame["is_st"] = frame["is_st"].astype(str).isin(["1", "True", "true"])
         if "preclose" not in frame:
             frame["preclose"] = frame.sort_values(column)["close"].shift(1)
     else:
-        # A non-positive unadjusted minute price is a source defect (observed
-        # as 0.000 opens), never a tradeable bar; refuse it before calibration.
-        invalid = (frame[["open", "high", "low", "close"]] <= 0).any(axis=1)
-        if invalid.any():
-            raise DataQualityError(f"分钟行情包含 {int(invalid.sum())} 条非正价格，开盘/最高/最低/收盘必须为正")
         frame["source"] = source if "source" not in frame else frame["source"].fillna(source)
-    return frame.sort_values(column, kind="stable").drop_duplicates(column, keep="last").reset_index(drop=True)
+    result = frame.sort_values(column, kind="stable").drop_duplicates(column, keep="last").reset_index(drop=True)
+    invalid = price_issue_details(result)
+    if not invalid.empty:
+        first = invalid.iloc[0]
+        stamp = first.get("timestamp", first.get("date"))
+        raise DataQualityError(
+            f"行情包含 {len(invalid)} 条无效价格（非正价格或 OHLC 关系错误）；{stamp}: {first['quality_reason']}"
+        )
+    return result
 
 
 def minute_slots(day) -> pd.DatetimeIndex:
@@ -279,8 +284,11 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
         status = int(row.tradestatus)
         if status not in (0, 1):
             raise DataQualityError(f"{day.date()} 的交易状态未知")
-        if status == 0 or row.volume == 0:
-            reports.append({"date": str(day.date()), "mode": "suspended", "missing_minutes": 0, "missing_data_minutes": 0, "auction_placeholders": 0, "reason": "确认停牌或零成交日"})
+        if status == 0:
+            reports.append({"date": str(day.date()), "mode": "suspended", "missing_minutes": 0, "missing_data_minutes": 0, "auction_placeholders": 0, "reason": "确认停牌"})
+            continue
+        if float(row.volume) == 0:
+            reports.append({"date": str(day.date()), "mode": "no_trades", "missing_minutes": 0, "missing_data_minutes": 0, "auction_placeholders": 0, "reason": "交易状态正常但全天无成交量"})
             continue
         prices = np.array([row.open, row.high, row.low, row.close], dtype=float)
         if not np.isfinite(prices).all() or (prices <= 0).any() or not np.isfinite(row.volume) or row.volume < 0 or row.high + 0.001 < max(row.open, row.close) or row.low - 0.001 > min(row.open, row.close) or row.high < row.low:
@@ -304,12 +312,11 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
             download_needed = bool(missing_data > 5 or _max_run(data_missing_mask[:120]) > 3 or _max_run(data_missing_mask[120:]) > 3 or missing_mask[0] or missing_mask[120])
             source_verified = part.get("source_verified", pd.Series(False, index=slots)).eq(True)
             observed = part[~part.close.isna()]
-            invalid = observed[["open", "high", "low", "close", "volume"]].isna().any(axis=1)
-            invalid |= (observed.low > observed[["open", "close"]].min(axis=1) + 0.001) | (observed.high < observed[["open", "close"]].max(axis=1) - 0.001) | (observed.low > observed.high + 1e-9) | (observed.close <= 0) | (observed.volume < 0)
+            price_issues = price_issue_details(observed)
             unit_error = abs(observed.volume.sum() / row.volume - 1) if row.volume else 0
             if not source_verified.loc[observed.index].all():
                 reason = "来源分钟标签/单位未校准"
-            elif invalid.any():
+            elif not price_issues.empty:
                 reason = "分钟 OHLC/量额校验失败"
             elif missing_data > 5 or _max_run(data_missing_mask[:120]) > 3 or _max_run(data_missing_mask[120:]) > 3:
                 reason = "分钟缺口超过连续3根或全日5根阈值"
@@ -362,8 +369,9 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
     minute_days = sum(report["mode"] == "minute" for report in reports)
     daily_days = sum(report["mode"] == "daily" for report in reports)
     suspended_days = sum(report["mode"] == "suspended" for report in reports)
+    no_trade_days = sum(report["mode"] == "no_trades" for report in reports)
     pending_calibration_days = sum(report["mode"] == "daily" and report["reason"] == "来源分钟标签/单位未校准" and not report.get("download_needed", False) for report in reports)
-    quality = {"pending_calibration_days": pending_calibration_days, "days": reports, "minute_days": minute_days, "daily_days": daily_days, "suspended_days": suspended_days, "total_days": len(days), "minute_ratio": minute_days / max(1, minute_days + daily_days),
+    quality = {"pending_calibration_days": pending_calibration_days, "days": reports, "minute_days": minute_days, "daily_days": daily_days, "suspended_days": suspended_days, "no_trade_days": no_trade_days, "total_days": len(days), "minute_ratio": minute_days / max(1, minute_days + daily_days),
                "synthetic_bars": sum(report["missing_minutes"] for report in reports if report["mode"] == "minute"),
                "auction_placeholders": sum(report.get("auction_placeholders", 0) for report in reports if report["mode"] == "minute"),
                "is_demo": bool(metadata.get("is_demo")), "requested_frequency": frequency, "warnings": warnings}

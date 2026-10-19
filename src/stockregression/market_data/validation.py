@@ -5,6 +5,7 @@ from typing import Any
 
 import pandas as pd
 
+from ..price_validation import anomalies_from_attrs
 from .models import MarketDataError
 from .quality import validate_and_fill
 from .repository import VALIDATION_RULES_VERSION, _json, _time_text, utc_now
@@ -42,10 +43,15 @@ def _dependency_hash(repository, symbol: str, timeframe: str) -> str:
 
 def _calendar_days(service, symbol: str, start, end) -> pd.DatetimeIndex:
     calendar = service._calendar(symbol)
-    if calendar is None or calendar.empty or "date" not in calendar:
-        return pd.DatetimeIndex([])
-    days = pd.DatetimeIndex(pd.to_datetime(calendar.date, errors="coerce").dropna())
-    return days.normalize().unique().sort_values().intersection(
+    values = pd.DatetimeIndex([])
+    if calendar is not None and not calendar.empty and "date" in calendar:
+        values = pd.DatetimeIndex(pd.to_datetime(calendar.date, errors="coerce").dropna())
+    daily = service.repository.active_rows(
+        symbol, "1day", start=pd.Timestamp(start).normalize(), end=pd.Timestamp(end).normalize()
+    )
+    if not daily.empty and "timestamp" in daily:
+        values = values.append(pd.DatetimeIndex(pd.to_datetime(daily.timestamp, errors="coerce").dropna()))
+    return values.normalize().unique().sort_values().intersection(
         pd.date_range(pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize())
     )
 
@@ -136,6 +142,7 @@ def validate_incremental(
         report: dict[str, Any] = {}
         status = "failed"
         reason = None
+        skip_minute = False
         if timeframe in MINUTE_TIMEFRAMES:
             daily_row = daily_by_day.get(day)
             if daily_row is not None:
@@ -145,20 +152,35 @@ def validate_incremental(
                 daily_volume = pd.to_numeric(
                     pd.Series([daily_row.get("volume")]), errors="coerce"
                 ).iloc[0]
-                if (
-                    pd.notna(daily_status) and int(daily_status) == 0
-                    and (pd.isna(daily_volume) or float(daily_volume) <= 0)
-                ):
+                if pd.notna(daily_status) and int(daily_status) == 0:
                     status = "suspended"
-                    reason = "确认停牌或零成交日"
+                    reason = "确认停牌"
                     report = {"status": "complete", "expected_rows": 0, "observed_rows": 0,
                               "reason": reason}
+                    skip_minute = True
+                elif pd.notna(daily_volume) and float(daily_volume) == 0:
+                    status = "passed"
+                    reason = "交易状态正常但全天无成交量"
+                    report = {"status": "complete", "expected_rows": 0, "observed_rows": 0,
+                              "no_trades": True, "reason": reason}
+                    skip_minute = True
             if status != "suspended" and daily_row is None:
                 reason = "缺少对应日线，无法确认交易状态与分钟依赖"
         part = pd.DataFrame()
-        if status != "suspended":
+        if not skip_minute and status != "suspended":
             part = repository.active_rows(symbol, timeframe, start=day, end=day)
-            if part.empty:
+            price_anomalies = anomalies_from_attrs(part)
+            if not price_anomalies.empty:
+                status = "failed"
+                reason = f"存在 {len(price_anomalies)} 条无效价格，已隔离且禁止补造"
+                report = {
+                    "status": "failed", "expected_rows": 1,
+                    "observed_rows": 0, "gap_count": len(price_anomalies),
+                    "blocked_price_rows": len(price_anomalies),
+                    "price_anomalies": price_anomalies.head(50).astype(str).to_dict("records"),
+                    "reason": reason,
+                }
+            elif part.empty:
                 reason = reason or "交易日没有行情记录"
             elif period_mode:
                 if part.empty:

@@ -12,7 +12,6 @@ from stockregression.jobs import execute_job
 from stockregression.market_data import MarketDataService
 from stockregression.market_data.sync import MarketDataSyncService
 from stockregression.market_data.aggregation import AggregationService
-from stockregression.market_data.migration import LegacyMigration
 from stockregression.market_data.models import MarketDataError
 from stockregression.market_data.quality import validate_and_fill
 from stockregression.market_data.sync import MarketDataSyncService
@@ -583,23 +582,3 @@ def test_folder_upload_accepts_relative_paths_and_keeps_calendar_outside_batch_s
         job = client.get("/api/v1/jobs/" + job_id).json()
         assert job["status"] == "completed", job.get("error")
         assert {row["symbol"] for row in client.get("/api/v1/data/datasets?timeframe=1day").json()["items"]} == {"600000.SH", "000001.SZ"}
-
-
-def test_legacy_migration_is_previewable_and_saved_to_frequency_database(tmp_path):
-    store = Store(tmp_path / "data")
-    days = _days(2)
-    calendar = pd.DataFrame({"date": days})
-    daily = _daily(days)
-    manifest = store.publish(
-        "600000.SH", pd.DataFrame(), daily,
-        pd.DataFrame(columns=["ex_date"]), calendar,
-        {"name": "Fixture", "actions_verified": True, "source_verified": True}, {},
-    )
-    migration = LegacyMigration(store)
-    preview = migration.run(dry_run=True)
-    completed = migration.run()
-    assert preview["targets"] == 1
-    assert completed["migrated"] == 1
-    assert store.snapshot("600000.SH")["market_data"] is True
-    assert MarketDataService(store).repository.dataset("600000.SH", "1day")["row_count"] == 2
-    assert store.snapshot("600000.SH", manifest["version"]) is not None

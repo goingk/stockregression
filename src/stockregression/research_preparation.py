@@ -61,34 +61,43 @@ def prepare_research_bundle(
         manifest = store.snapshot(base.symbol, version)
         if not manifest:
             raise
-        daily = store.read_files(manifest["files"].get("daily", []))
-        if daily.empty or "date" not in daily:
-            raise
-        valid = daily.copy()
-        if "tradestatus" in valid:
-            valid = valid[valid.tradestatus == 1]
-        if "volume" in valid:
-            valid = valid[valid.volume > 0]
-        valid_dates = pd.DatetimeIndex(pd.to_datetime(valid.date, errors="coerce").dropna().dt.normalize().unique()).sort_values()
-        all_dates = pd.DatetimeIndex(pd.to_datetime(daily.date, errors="coerce").dropna().dt.normalize().unique()).sort_values()
-        # load_bundle needs a preceding close for share accounting. Starting at
-        # the second observed day preserves the earliest usable reference.
-        available_start = valid_dates[1] if len(valid_dates) > 1 else all_dates[1] if len(all_dates) > 1 else all_dates[0]
-        latest_available = all_dates.max()
-        if request.start_date < available_start.date() or request.start_date > latest_available.date():
-            start = available_start.date()
+        if manifest.get("market_data"):
+            fallback = base.model_copy(update={"start_date": request.start_date, "end_date": base.end_date})
+            bundle = service.load_bundle(fallback, manifest["version"])
+            message = "自动 504 日准备未完成；已使用锁定快照中可用历史，证据强度可能较弱。"
+            bundle.warnings = list(dict.fromkeys([*(bundle.warnings or []), message]))
+            bundle.metadata = {
+                **bundle.metadata,
+                "warnings": list(dict.fromkeys([*bundle.metadata.get("warnings", []), message])),
+            }
         else:
-            start = request.start_date
-        end = base.end_date
-        if end is not None and end < start:
-            start = available_start.date()
-        fallback = base.model_copy(update={"start_date": start, "end_date": end})
-        bundle = service.load_bundle(fallback, manifest["version"])
-        bundle.warnings = list(dict.fromkeys([*(bundle.warnings or []), "自动补齐 504 个前置交易日未完成；已使用锁定快照中可用历史，证据强度可能较弱。"]))
-        bundle.metadata = {
-            **bundle.metadata,
-            "warnings": list(dict.fromkeys([*bundle.metadata.get("warnings", []), "自动补齐 504 个前置交易日未完成；已使用锁定快照中可用历史，证据强度可能较弱。"])),
-        }
+            daily = store.read_files(manifest["files"].get("daily", []))
+            if daily.empty or "date" not in daily:
+                raise
+            valid = daily.copy()
+            if "tradestatus" in valid:
+                valid = valid[valid.tradestatus == 1]
+            if "volume" in valid:
+                valid = valid[valid.volume > 0]
+            valid_dates = pd.DatetimeIndex(pd.to_datetime(valid.date, errors="coerce").dropna().dt.normalize().unique()).sort_values()
+            all_dates = pd.DatetimeIndex(pd.to_datetime(daily.date, errors="coerce").dropna().dt.normalize().unique()).sort_values()
+            available_start = valid_dates[1] if len(valid_dates) > 1 else all_dates[1] if len(all_dates) > 1 else all_dates[0]
+            latest_available = all_dates.max()
+            if request.start_date < available_start.date() or request.start_date > latest_available.date():
+                start = available_start.date()
+            else:
+                start = request.start_date
+            end = base.end_date
+            if end is not None and end < start:
+                start = available_start.date()
+            fallback = base.model_copy(update={"start_date": start, "end_date": end})
+            bundle = service.load_bundle(fallback, manifest["version"])
+            message = "自动补齐 504 个前置交易日未完成；已使用锁定快照中可用历史，证据强度可能较弱。"
+            bundle.warnings = list(dict.fromkeys([*(bundle.warnings or []), message]))
+            bundle.metadata = {
+                **bundle.metadata,
+                "warnings": list(dict.fromkeys([*bundle.metadata.get("warnings", []), message])),
+            }
 
     if cancelled():
         raise InterruptedError("任务已取消")

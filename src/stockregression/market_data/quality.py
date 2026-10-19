@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from ..quality import _closing_auction_placeholders, minute_slots
+from ..price_validation import anomalies_from_attrs
 from .models import MarketDataError
 from .timeframes import normalize_timeframe, timeframe_spec
 
@@ -61,8 +62,14 @@ def validate_and_fill(
     spec = timeframe_spec(timeframe)
     if frame.empty:
         raise MarketDataError("没有可校验的行情记录")
-    result = frame.copy().sort_values("timestamp", kind="stable").reset_index(drop=True)
     pending = list(dict.fromkeys(pending))
+    blocked = pd.DatetimeIndex(
+        pd.to_datetime(frame.attrs.get("blocked_timestamps", []), errors="coerce").dropna()
+    )
+    price_anomalies = anomalies_from_attrs(frame)
+    if blocked.size:
+        pending.append(f"存在 {blocked.size} 条无效价格记录，相关时间点保持缺口且不自动填充")
+    result = frame.copy().sort_values("timestamp", kind="stable").reset_index(drop=True)
     dates = _calendar_dates(calendar)
     observed_days = pd.DatetimeIndex(result.timestamp.dt.normalize().unique()).sort_values()
     calendar_available = bool(len(dates))
@@ -75,7 +82,9 @@ def validate_and_fill(
     if spec.kind == "minute":
         bar_size = spec.minutes or 1
         if pending or not fill:
-            return _minute_count_validation(result, spec, timeframe, symbol, dates, lower, upper, pending)
+            return _minute_count_validation(
+                result, spec, timeframe, symbol, dates, lower, upper, pending, blocked
+            )
         slots = []
         for day in dates:
             session_slots = minute_slots(day)
@@ -94,6 +103,8 @@ def validate_and_fill(
                     continue
                 placeholders = _closing_auction_placeholders(symbol, day, observed, mask)
                 for timestamp in observed.index[placeholders]:
+                    if timestamp in blocked:
+                        continue
                     previous = observed.loc[observed.index < timestamp, "close"].dropna()
                     if previous.empty:
                         continue
@@ -109,7 +120,7 @@ def validate_and_fill(
         missing = expected.difference(observed)
         filled = 0
         if fill and timeframe == "1min" and bool(result.source_verified.all()) and not pending:
-            result, filled, unfillable = _fill_minutes(result, dates)
+            result, filled, unfillable = _fill_minutes(result, dates, blocked=blocked)
             missing = missing.difference(pd.DatetimeIndex(result.timestamp))
         else:
             unfillable = list(missing)
@@ -120,8 +131,10 @@ def validate_and_fill(
             "missing_rows": len(missing), "synthetic_rows": filled,
             "gap_count": len(gaps), "gaps": gaps[:500], "unfillable": len(unfillable),
             "auction_placeholders": len(auction_rows),
+            "blocked_price_rows": int(len(blocked)),
             "status": "partial" if incomplete else "complete",
         }
+        _attach_price_anomalies(report, price_anomalies)
         if incomplete:
             pending.append(f"存在 {len(unfillable)} 个未补齐的分钟缺口")
     else:
@@ -151,7 +164,9 @@ def validate_and_fill(
             "missing_rows": len(missing_labels), "synthetic_rows": 0,
             "gap_count": len(gaps), "gaps": gaps[:500], "unfillable": len(missing_labels),
             "status": "complete" if not len(missing_labels) and len(pending) == 0 else "partial" if len(missing_labels) else "pending_validation",
+            "blocked_price_rows": int(len(blocked)),
         }
+        _attach_price_anomalies(report, price_anomalies)
         if len(missing_labels):
             pending.append(f"所选区间缺少 {len(missing_labels)} 个{spec.label}记录")
     result["source_verified"] = result.source_verified.map(bool)
@@ -170,6 +185,7 @@ def validate_and_fill(
 def _minute_count_validation(
     result: pd.DataFrame, spec, timeframe: str, symbol: str,
     dates: pd.DatetimeIndex, lower, upper, pending: list[str],
+    blocked: pd.DatetimeIndex,
 ) -> ValidationResult:
     """Fast coverage validation when interpolation is disabled or unavailable."""
     per_day = 240 // (spec.minutes or 1)
@@ -179,6 +195,7 @@ def _minute_count_validation(
         for day, part in result.groupby(result.timestamp.dt.normalize())
     }
     missing_slots = []
+    blocked_slots = []
     auction_placeholders = 0
     expected_count = 0
     for day in expected_days:
@@ -189,6 +206,9 @@ def _minute_count_validation(
         expected_count += len(expected)
         observed = observed_by_day.get(pd.Timestamp(day).normalize(), pd.DatetimeIndex([]))
         missing = expected.difference(observed)
+        day_blocked = missing.intersection(blocked)
+        blocked_slots.extend(day_blocked.tolist())
+        missing = missing.difference(blocked)
         if timeframe == "1min" and len(expected):
             part = pd.DataFrame(index=session_slots)
             part["close"] = np.where(part.index.isin(observed), 1.0, np.nan)
@@ -201,18 +221,23 @@ def _minute_count_validation(
         missing_slots.extend(missing.tolist())
     missing_index = pd.DatetimeIndex(sorted(set(missing_slots)))
     deficit = len(missing_index)
+    blocked_count = len(set(blocked_slots))
     gaps = _group_gaps(missing_index, spec.minutes or 1)
     if deficit:
         pending.append(f"存在 {deficit} 个未补齐的分钟缺口")
+    if blocked.size:
+        pending.append(f"存在 {blocked.size} 条无效价格记录，相关时间点保持缺口")
     report = {
         "expected_rows": expected_count, "observed_rows": len(result),
         "expected_days": len(expected_days),
         "observed_days": int(pd.DatetimeIndex(result.timestamp.dt.normalize().unique()).size),
-        "missing_rows": deficit, "synthetic_rows": 0,
-        "gap_count": len(gaps), "gaps": gaps[:500], "unfillable": deficit,
+        "missing_rows": deficit + blocked_count, "synthetic_rows": 0,
+        "gap_count": len(gaps), "gaps": gaps[:500], "unfillable": deficit + blocked_count,
         "auction_placeholders": auction_placeholders,
-        "status": "partial" if deficit else "pending_validation" if pending else "complete",
+        "blocked_price_rows": int(blocked_count),
+        "status": "partial" if deficit or blocked_count else "pending_validation" if pending else "complete",
     }
+    _attach_price_anomalies(report, anomalies_from_attrs(result))
     output = result.copy()
     output["source_verified"] = output.source_verified.map(bool)
     output["is_synthetic"] = output.is_synthetic.map(bool)
@@ -223,15 +248,29 @@ def _minute_count_validation(
     return ValidationResult(output, report, report["pending_validation"])
 
 
-def _fill_minutes(frame: pd.DataFrame, days: pd.DatetimeIndex):
+def _attach_price_anomalies(report: dict, price_anomalies) -> None:
+    if price_anomalies is None or price_anomalies.empty:
+        return
+    columns = [
+        column for column in ("timestamp", "date", "source", "quality_reason")
+        if column in price_anomalies
+    ]
+    report["price_anomalies"] = price_anomalies.head(200)[columns].astype(str).to_dict("records")
+
+
+def _fill_minutes(frame: pd.DataFrame, days: pd.DatetimeIndex, *, blocked: pd.DatetimeIndex | None = None):
     pieces = []
     filled = 0
     unfillable: list[pd.Timestamp] = []
     grouped = {day.normalize(): part.set_index("timestamp").sort_index() for day, part in frame.groupby(frame.timestamp.dt.normalize())}
+    blocked = pd.DatetimeIndex([] if blocked is None else blocked)
     for day in days:
         observed = grouped.get(day.normalize(), pd.DataFrame())
         aligned = observed.reindex(minute_slots(day))
         missing = aligned.close.isna()
+        blocked_mask = aligned.index.isin(blocked)
+        if blocked_mask.any():
+            unfillable.extend(aligned.index[blocked_mask & missing])
         if int(missing.sum()) > MAX_DAILY_FILL:
             unfillable.extend(aligned.index[missing])
             pieces.append(aligned[aligned.close.notna()].reset_index().rename(columns={"index": "timestamp"}))
@@ -251,7 +290,11 @@ def _fill_minutes(frame: pd.DataFrame, days: pd.DatetimeIndex):
                     pos += 1
                 run = pos - run_start + 1
                 if run <= MAX_RUN_FILL and segment_missing[:run_start].sum() + run <= MAX_DAILY_FILL:
-                    fillable.iloc[start + run_start:start + pos + 1] = True
+                    stretch = aligned.index[start + run_start:start + pos + 1]
+                    if not pd.DatetimeIndex(stretch).isin(blocked).any():
+                        fillable.iloc[start + run_start:start + pos + 1] = True
+                    else:
+                        unfillable.extend(stretch[segment_missing[run_start:pos + 1]])
                 else:
                     unfillable.extend(aligned.index[start + run_start:start + pos + 1])
         if fillable.any():

@@ -58,6 +58,18 @@ test('ETF holdings use fund units and a saved zero cash reserve is preserved', (
   assert.equal(rows.reserve_cash.value, '0.00 元')
 })
 
+test('v3 unlimited holdings hide the removed cash budget and show peak contributions', () => {
+  const rows = parameterMap({
+    symbol: '159611.SZ', schema_version: 3,
+    config: { schema_version: 3, grid_mode: 'trailing', buy_step: .03, sell_step: .03, initial_shares: 1000, min_shares: 0, max_shares: null, buy_shares: 100, sell_shares: 100 },
+    funding: { reference_price: 1, reference_date: '2024-01-02', initial_equity: 1000, peak_invested: 1300, topups: 300 },
+  })
+  assert.equal(rows.max_shares.value, '不限')
+  assert.equal(rows.reserve_cash, undefined)
+  assert.equal(rows.peak_invested.value, '1,300.00 元')
+  assert.equal(rows.topups.value, '300.00 元')
+})
+
 test('aligned curves use equityMath returns and cost-basis drawdowns across contributions', () => {
   const model = buildResultCurveModel({
     symbol: '600000.SH', accounting_basis: 'independent_contributions_v1', config: {},
