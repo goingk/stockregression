@@ -75,6 +75,10 @@ def _empty_result(
         "diagnostics": {
             "status": "insufficient_history",
             "protocol_version": 4,
+            "strategy_version": config.strategy.strategy_version,
+            "geometry": "connected_lattice" if config.strategy.strategy_version == 2 else "symmetric_box",
+            "budget_role": "seed_discovery" if config.strategy.strategy_version == 2 else "evaluation_cap",
+            "expand_until_closed": config.strategy.strategy_version == 2,
             "selection_history_days": int(len(history_dates)),
             "candidate_count": 0,
             "eligible_count": 0,
@@ -117,6 +121,12 @@ def select_at(
     progress_start: float = 0.0,
     progress_width: float = 1.0,
 ) -> dict[str, Any]:
+    if config.strategy.strategy_version == 2:
+        from .connected_selector import select_connected_at
+        return select_connected_at(
+            config, base, data, asof, seed_offset=seed_offset, progress=progress,
+            cancelled=cancelled, progress_start=progress_start, progress_width=progress_width,
+        )
     if int(config.protocol_version) != 4:
         raise ValueError("v4 selector requires protocol_version=4")
     if base.schema_version != 3:
@@ -386,7 +396,10 @@ def estimate_search(config: OptimizationConfig, data: DataBundle) -> dict[str, A
     generation, folds, split, reasons = scientific._folds_for_history(history)
     total = space.size()
     method = _method(config, total)
-    if config.strategy.ranking_mode == "fixed_mean" and movable:
+    if config.strategy.strategy_version == 2:
+        minimum_neighborhood = 1
+        neighborhood_possible = total > 0
+    elif config.strategy.ranking_mode == "fixed_mean" and movable:
         radii = {
             name: value_to_ticks(name, config.strategy.fixed_half_widths.get(name, UNITS[name]))
             for name in movable
@@ -416,6 +429,10 @@ def estimate_search(config: OptimizationConfig, data: DataBundle) -> dict[str, A
         "status": status,
         "protocol_version": 4,
         "strategy_id": config.strategy.strategy_id,
+        "strategy_version": config.strategy.strategy_version,
+        "geometry": "connected_lattice" if config.strategy.strategy_version == 2 else "symmetric_box",
+        "budget_role": "seed_discovery" if config.strategy.strategy_version == 2 else "evaluation_cap",
+        "expand_until_closed": config.strategy.strategy_version == 2,
         "grid_mode": "geometric",
         "ranking_mode": config.strategy.ranking_mode,
         "neighborhood_fields": list(movable),
@@ -452,8 +469,8 @@ def strategy_descriptions() -> dict[str, Any]:
     return {
         "strategies": [{
             "strategy_id": "geometric_excess_neighborhood",
-            "strategy_version": 1,
-            "label": "等比网格正超额邻域",
+            "strategy_version": 2,
+            "label": "等比网格正收益连通域",
             "grid_mode": "geometric",
             "fields": list(FIELDS),
             "units": {**UNITS, "shares": 100},

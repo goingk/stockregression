@@ -32,6 +32,33 @@ def _daily(days):
     })
 
 
+def test_exchange_calendar_parallel_writes_preserve_all_dates(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    service = MarketDataService(Store(tmp_path / "data"))
+    repository = service.repository
+    days = pd.bdate_range("2026-01-05", periods=8)
+    ready = Barrier(len(days))
+
+    def write(index):
+        symbol = f"{159500 + index}.SZ"
+        ready.wait(timeout=15)
+        repository.save_auxiliary(
+            symbol, "calendar", [{"date": days[index]}],
+            version=f"calendar-{index}", verified=True,
+        )
+        # Read alongside the remaining writers, including on Windows where
+        # an open reader can otherwise prevent os.replace from succeeding.
+        assert repository.auxiliary(symbol, "calendar")["payload"]
+
+    with ThreadPoolExecutor(max_workers=len(days)) as pool:
+        list(pool.map(write, range(len(days))))
+    saved = repository.auxiliary("159516.SZ", "calendar")
+    assert pd.DatetimeIndex([item["date"] for item in saved["payload"]]).equals(days)
+    assert not list(repository.package_dir.rglob("*.writing"))
+
+
 def test_repository_writes_parquet_and_cached_results_are_isolated(tmp_path):
     configure_cache(1)
     service = MarketDataService(Store(tmp_path / "data"))

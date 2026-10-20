@@ -19,7 +19,7 @@ LABELS = {
     "min_shares": "最低持股",
     "max_shares": "最高持股",
 }
-UNITS = {"buy_step": 0.001, "sell_step": 0.001, "sell_shares": 100.0, "buy_shares": 100.0, "min_shares": 500.0, "max_shares": 500.0}
+UNITS = {"buy_step": 0.0001, "sell_step": 0.0001, "sell_shares": 100.0, "buy_shares": 100.0, "min_shares": 500.0, "max_shares": 500.0}
 
 
 def _strict_tick(value: float, unit: float, name: str) -> int:
@@ -29,7 +29,7 @@ def _strict_tick(value: float, unit: float, name: str) -> int:
         raise ValueError(f"{LABELS[name]}不是有效数值") from exc
     nearest = int(scaled.to_integral_value())
     if abs(scaled - Decimal(nearest)) > Decimal("0.0000001"):
-        requirement = "0.1 个百分点" if name in {"buy_step", "sell_step"} else f"{int(unit)} 股 / 份"
+        requirement = "0.01 个百分点" if name in {"buy_step", "sell_step"} else f"{int(unit)} 股 / 份"
         raise ValueError(f"{LABELS[name]}必须以 {requirement} 为单位")
     return nearest
 
@@ -83,7 +83,7 @@ class ParameterSpace:
             search_range = raw if isinstance(raw, SearchRange) else SearchRange.model_validate(raw)
             low, high = value_to_ticks(name, search_range.low), value_to_ticks(name, search_range.high)
             if name in {"buy_step", "sell_step"}:
-                minimum, maximum = 1, 1000
+                minimum, maximum = 1, 10000
             elif name in ("sell_shares", "buy_shares"):
                 minimum, maximum = 1, 10**9
             else:

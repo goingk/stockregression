@@ -28,8 +28,8 @@ def config(**updates):
         buy_step=.03, sell_step=.03,
     )
     ranges = {
-        "buy_step": {"low": .001, "high": .005},
-        "sell_step": {"low": .003, "high": .003},
+        "buy_step": {"low": 0.0001, "high": 0.0005},
+        "sell_step": {"low": 0.0003, "high": 0.0003},
         "sell_shares": {"low": 100, "high": 300},
         "buy_shares": {"low": 100, "high": 100},
         "min_shares": {"low": 0, "high": 0},
@@ -38,6 +38,7 @@ def config(**updates):
     values = {
         "base": base.model_dump(mode="python"), "protocol_version": 4,
         "ranges": ranges, "strategy": {
+            "strategy_version": 1,
             "search_method": "exhaustive", "ranking_mode": "max_volume",
             "training_budget": 100, "validation_budget": 100,
         },
@@ -47,11 +48,15 @@ def config(**updates):
 
 
 def test_v4_fixed_units_reject_off_lattice_values():
-    assert value_to_ticks("buy_step", .001) == 1
-    assert value_to_ticks("buy_step", .011) == 11
+    assert value_to_ticks("buy_step", 0.0001) == 1
+    assert value_to_ticks("buy_step", 0.0011) == 11
+    assert value_to_ticks("sell_step", .0001) == 1
+    assert value_to_ticks("buy_step", .001) == 10
+    assert value_to_ticks("buy_step", 1) == 10000
+    assert ResearchStrategySpec(fixed_half_widths={"buy_step": .0001, "sell_step": .0001})
     assert value_to_ticks("buy_shares", 300) == 3
-    with pytest.raises(ValueError, match="0.1"):
-        value_to_ticks("buy_step", .0015)
+    with pytest.raises(ValueError, match="0.01"):
+        value_to_ticks("buy_step", 0.00015)
     with pytest.raises(ValueError, match="100"):
         value_to_ticks("buy_shares", 150)
 
@@ -222,8 +227,8 @@ def test_v4_minimum_box_rejects_deep_joint_negative_points():
 
 def test_v4_three_dimensional_internal_negative_point_breaks_the_box():
     ranges = {
-        "buy_step": {"low": .001, "high": .005},
-        "sell_step": {"low": .003, "high": .003},
+        "buy_step": {"low": 0.0001, "high": 0.0005},
+        "sell_step": {"low": 0.0003, "high": 0.0003},
         "sell_shares": {"low": 100, "high": 300},
         "buy_shares": {"low": 100, "high": 300},
         "min_shares": {"low": 0, "high": 0},
@@ -314,7 +319,7 @@ def test_v4_qualified_region_requires_all_points_complete_and_positive():
 
     rows = _rows(space, value)
     regions, platforms = find_regions(
-        space, rows, ranking_mode="max_volume", fixed_half_widths={"buy_step": .001, "sell_shares": 100},
+        space, rows, ranking_mode="max_volume", fixed_half_widths={"buy_step": 0.0001, "sell_shares": 100},
         max_drawdown=.2, min_trades=10, global_exhaustive=True,
     )
     assert len(regions) == 1
@@ -328,8 +333,8 @@ def test_v4_qualified_region_requires_all_points_complete_and_positive():
 
 def test_v4_max_volume_and_fixed_mean_choose_different_peaks():
     ranges = {
-        "buy_step": {"low": .001, "high": .009},
-        "sell_step": {"low": .003, "high": .003},
+        "buy_step": {"low": 0.0001, "high": 0.0009},
+        "sell_step": {"low": 0.0003, "high": 0.0003},
         "sell_shares": {"low": 100, "high": 500},
         "buy_shares": {"low": 100, "high": 100},
         "min_shares": {"low": 0, "high": 0},
@@ -348,11 +353,11 @@ def test_v4_max_volume_and_fixed_mean_choose_different_peaks():
 
     rows = _rows(space, value)
     volume, _ = find_regions(
-        space, rows, ranking_mode="max_volume", fixed_half_widths={"buy_step": .001, "sell_shares": 100},
+        space, rows, ranking_mode="max_volume", fixed_half_widths={"buy_step": 0.0001, "sell_shares": 100},
         max_drawdown=.2, min_trades=10, global_exhaustive=True,
     )
     fixed, _ = find_regions(
-        space, rows, ranking_mode="fixed_mean", fixed_half_widths={"buy_step": .001, "sell_shares": 100},
+        space, rows, ranking_mode="fixed_mean", fixed_half_widths={"buy_step": 0.0001, "sell_shares": 100},
         max_drawdown=.2, min_trades=10, global_exhaustive=True,
     )
     volume_center = dict(zip(space.fields, volume[0]["center_coordinate"]))
@@ -365,8 +370,8 @@ def test_v4_max_volume_and_fixed_mean_choose_different_peaks():
 
 def test_v4_all_dimensions_fixed_is_a_single_diagnostic_point():
     ranges = {
-        "buy_step": {"low": .03, "high": .03},
-        "sell_step": {"low": .03, "high": .03},
+        "buy_step": {"low": 0.003, "high": 0.003},
+        "sell_step": {"low": 0.003, "high": 0.003},
         "sell_shares": {"low": 100, "high": 100},
         "buy_shares": {"low": 100, "high": 100},
         "min_shares": {"low": 0, "high": 0},

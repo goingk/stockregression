@@ -27,6 +27,7 @@ def main() -> None:
     parser.add_argument("--frequency", choices=("1d", "1m"), default="1d")
     parser.add_argument("--method", choices=("auto", "hierarchical", "exhaustive"), default="exhaustive")
     parser.add_argument("--ranking", choices=("max_volume", "fixed_mean"), default="max_volume")
+    parser.add_argument("--strategy-version", choices=(1, 2), type=int, default=2)
     parser.add_argument("--training-budget", type=int, default=100)
     parser.add_argument("--validation-budget", type=int, default=100)
     parser.add_argument("--bootstrap-reps", type=int, default=100)
@@ -45,7 +46,8 @@ def main() -> None:
         fees=settings.fee_defaults.model_dump(),
     )
     ranges = {
-        "grid_step": {"low": .01, "high": .02},
+        "buy_step": {"low": .01, "high": .02},
+        "sell_step": {"low": .01, "high": .02},
         "sell_shares": {"low": 100, "high": 100},
         "buy_shares": {"low": 100, "high": 100},
         "min_shares": {"low": 0, "high": 0},
@@ -56,6 +58,7 @@ def main() -> None:
         "selection_target": "fixed", "ranges": ranges, "bootstrap_reps": args.bootstrap_reps,
         "min_trades": 0, "max_drawdown": .95, "min_minute_ratio": 0,
         "strategy": {
+            "strategy_version": 1 if args.ranking == "fixed_mean" else args.strategy_version,
             "search_method": args.method, "ranking_mode": args.ranking,
             "training_budget": args.training_budget, "validation_budget": args.validation_budget,
         },
@@ -84,14 +87,20 @@ def main() -> None:
             "recommendation_count": len(fixed.get("recommendation_regions", [])),
             "training_unique_count": diagnostics.get("training_unique_count"),
             "validation_unique_count": diagnostics.get("validation_unique_count"),
-            "peak_platform_count": diagnostics.get("peak_platform_count"),
+            "seed_count": diagnostics.get("seed_count"),
+            "budget_overrun_count": diagnostics.get("budget_overrun_count"),
+            "closed_region_count": diagnostics.get("closed_region_count"),
+            "discovery_complete": diagnostics.get("discovery_complete"),
             "global_exhaustive": diagnostics.get("global_exhaustive"),
             "coverage_status": diagnostics.get("coverage_status"),
-            "validation_plan_hash": diagnostics.get("validation_plan_hash"),
+            "seed_plan_hash": diagnostics.get("seed_plan_hash"),
+            "evaluation_set_hash": diagnostics.get("evaluation_set_hash"),
             "regions": [
                 {
-                    "region_id": item.get("region_id"), "radii": item.get("radii"),
-                    "volume": item.get("normalized_volume"), "points": item.get("combination_count"),
+                    "region_id": item.get("region_id"), "geometry": item.get("geometry"),
+                    "share": item.get("normalized_volume"), "points": item.get("combination_count"),
+                    "stable_margin": (item.get("stable_point") or {}).get("stability_margin"),
+                    "peak_excess_return": (item.get("peak_point") or {}).get("excess_return"),
                     "mean_excess_return": item.get("mean_excess_return"),
                     "min_excess_return": item.get("min_excess_return"),
                 }

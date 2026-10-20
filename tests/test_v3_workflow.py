@@ -282,7 +282,7 @@ def test_v4_strategy_catalog_defaults_to_max_volume_geometric_research(tmp_path)
         assert strategy["grid_mode"] == "geometric"
         assert strategy["default_ranking_mode"] == "max_volume"
         assert strategy["units"] == {
-            "buy_step": .001, "sell_step": .001, "sell_shares": 100.0, "buy_shares": 100.0,
+            "buy_step": .0001, "sell_step": .0001, "sell_shares": 100.0, "buy_shares": 100.0,
             "min_shares": 500.0, "max_shares": 500.0, "shares": 100,
         }
 

@@ -18,6 +18,7 @@ export interface ResearchDefaults {
   min_history_days: number
   min_minute_ratio: number
   ranking_mode: 'max_volume' | 'fixed_mean'
+  strategy_version: 1 | 2
   search_method: 'auto' | 'hierarchical' | 'exhaustive'
   training_budget: number
   validation_budget: number
@@ -70,7 +71,7 @@ export function defaultWorkbenchDefaults(): WorkbenchDefaults {
     grid: { grid_mode: 'trailing', buy_step: .03, sell_step: .03, lower_price: null, upper_price: null },
     position: { initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 100 },
     dca: { frequency: 'monthly', shares: 100, initial_shares: 0 },
-    research: { protocol_version: 4, selection_target: 'both', rebalance_days: 63, bootstrap_reps: 10000, mode: 'both', n_trials: 1000, local_search_budget: 3000, seed: 42, top_candidates: 20, max_drawdown: .2, min_trades: 10, min_history_days: 504, min_minute_ratio: .95, ranking_mode: 'max_volume', search_method: 'auto', training_budget: 20000, validation_budget: 100000, recommendation_count: 10, max_shares_mode: 'search', slippage_mode: 'configured', neighborhood_fields: [...v4NeighborhoodFields], fixed_half_widths: { buy_step: .001, sell_step: .001, sell_shares: 100, buy_shares: 100, min_shares: 500, max_shares: 500 }, ranges: defaultSearchRanges() },
+    research: { protocol_version: 4, strategy_version: 2, selection_target: 'both', rebalance_days: 63, bootstrap_reps: 10000, mode: 'both', n_trials: 1000, local_search_budget: 3000, seed: 42, top_candidates: 20, max_drawdown: .2, min_trades: 10, min_history_days: 504, min_minute_ratio: .95, ranking_mode: 'max_volume', search_method: 'auto', training_budget: 20000, validation_budget: 100000, recommendation_count: 10, max_shares_mode: 'search', slippage_mode: 'configured', neighborhood_fields: [...v4NeighborhoodFields], fixed_half_widths: { buy_step: .001, sell_step: .001, sell_shares: 100, buy_shares: 100, min_shares: 500, max_shares: 500 }, ranges: defaultSearchRanges() },
   }
 }
 
@@ -93,6 +94,8 @@ export function validResearchDefaults(value: unknown): value is ResearchDefaults
     || !integer(item.seed, Number.MIN_SAFE_INTEGER) || !integer(item.top_candidates, 1, 100) || !step(item.max_drawdown)
     || !integer(item.min_trades, 0) || !integer(item.min_history_days, 20) || !fraction(item.min_minute_ratio)
     || !['max_volume', 'fixed_mean'].includes(String(item.ranking_mode))
+    || ![1, 2].includes(Number(item.strategy_version))
+    || (String(item.ranking_mode) === 'fixed_mean' && Number(item.strategy_version) !== 1)
     || !['auto', 'hierarchical', 'exhaustive'].includes(String(item.search_method))
     || !integer(item.training_budget, 1, 1000000) || !integer(item.validation_budget, 1, 2000000)
     || !integer(item.recommendation_count, 1, 100)
@@ -103,7 +106,7 @@ export function validResearchDefaults(value: unknown): value is ResearchDefaults
     || new Set(item.neighborhood_fields).size !== item.neighborhood_fields.length) return false
   const halfWidths = record(item.fixed_half_widths)
   if (!halfWidths || !v4NeighborhoodFields.every(name => finite(halfWidths[name]) && Number(halfWidths[name]) > 0)) return false
-  if (['buy_step', 'sell_step'].some(name => Math.abs(Number(halfWidths[name]) * 1000 - Math.round(Number(halfWidths[name]) * 1000)) > 1e-8)) return false
+  if (['buy_step', 'sell_step'].some(name => Math.abs(Number(halfWidths[name]) * 10000 - Math.round(Number(halfWidths[name]) * 10000)) > 1e-8)) return false
   if (['sell_shares', 'buy_shares', 'min_shares', 'max_shares'].some(name => Math.abs(Number(halfWidths[name]) / researchQuantityUnit(name) - Math.round(Number(halfWidths[name]) / researchQuantityUnit(name))) > 1e-8)) return false
   const ranges = record(item.ranges)
   return ranges != null && rangeNames.every(name => {
@@ -112,7 +115,7 @@ export function validResearchDefaults(value: unknown): value is ResearchDefaults
     if (Number(item.protocol_version) === 4 && ['min_shares', 'max_shares'].includes(name)
       && (range.low % 500 !== 0 || range.high % 500 !== 0)) return false
     if (Number(item.protocol_version) === 4 && percentageRanges.has(name)
-      && (Math.abs(range.low * 1000 - Math.round(range.low * 1000)) > 1e-8 || Math.abs(range.high * 1000 - Math.round(range.high * 1000)) > 1e-8)) return false
+      && (Math.abs(range.low * 10000 - Math.round(range.low * 10000)) > 1e-8 || Math.abs(range.high * 10000 - Math.round(range.high * 10000)) > 1e-8)) return false
     return percentageRanges.has(name)
       ? step(range.low) && step(range.high)
       : quantity(range.low, name === 'buy_shares' || name === 'sell_shares' ? 100 : 0) && quantity(range.high, name === 'buy_shares' || name === 'sell_shares' ? 100 : 0) && quantity(range.step, 100)
@@ -145,6 +148,7 @@ function normalizeResearchDefaults(value: unknown): ResearchDefaults {
     : null
   const merged: ResearchDefaults = {
     ...defaults,
+    strategy_version: item.ranking_mode === 'fixed_mean' ? 1 : 2,
     protocol_version: defaults.protocol_version,
     selection_target: ['fixed', 'adaptive', 'both'].includes(String(item.selection_target)) ? item.selection_target as ResearchDefaults['selection_target'] : defaults.selection_target,
     rebalance_days: integer(item.rebalance_days, 1, 504) ? item.rebalance_days : defaults.rebalance_days,

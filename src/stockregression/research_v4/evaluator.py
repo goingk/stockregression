@@ -51,6 +51,9 @@ class BatchEvaluator:
         self.cancelled = cancelled
         self.progress = progress
         self.chunk_size = 512
+        self.retain_daily_returns = not (
+            config.strategy.strategy_version == 2 and config.strategy.search_method == "hierarchical"
+        )
         self.train_base = self.base.model_copy(update={
             "start_date": self.train_dates[0].date(),
             "end_date": self.train_dates[-1].date(),
@@ -186,8 +189,8 @@ class BatchEvaluator:
                     result["fold_metrics"][index],
                     "original",
                     result["metrics"][index],
-                    dates[mask],
-                    np.asarray(result["daily_returns"][mask, index], dtype=np.float64),
+                    dates[mask] if self.retain_daily_returns else None,
+                    np.asarray(result["daily_returns"][mask, index], dtype=np.float64) if self.retain_daily_returns else None,
                 )
                 output.append(row)
             if self.progress:
@@ -199,7 +202,7 @@ class BatchEvaluator:
         fold_ranges = [(start.date().isoformat(), end.date().isoformat()) for start, end in self._validation_folds]
         if not fold_ranges:
             return output
-        for chunk in _chunks(coordinates, self.chunk_size):
+        for chunk_index, chunk in enumerate(_chunks(coordinates, self.chunk_size)):
             if self.cancelled and self.cancelled():
                 raise InterruptedError("研究已取消")
             params = [self.space.params(item) for item in chunk]
@@ -215,6 +218,8 @@ class BatchEvaluator:
                 output[coordinate] = self._aggregate_validation(
                     coordinate, result["fold_metrics"][index], "stress", result["metrics"][index],
                 )
+            if self.progress:
+                self.progress((chunk_index + 1) * self.chunk_size / max(1, len(coordinates)), "评估双倍成本压力")
         return output
 
 

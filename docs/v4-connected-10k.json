@@ -1,0 +1,18 @@
+{
+  "measured_at": "2026-10-20",
+  "input": "Synthetic 10,000-point evaluated lattice in four movable dimensions; one negative interior point and 9,999 positive members",
+  "evaluated_points": 10000,
+  "positive_members": 9999,
+  "dimensions": 4,
+  "analysis_seconds": 0.080603,
+  "timings_seconds": {
+    "connected_components": 0.069632,
+    "stability_distance": 0.009048
+  },
+  "process_working_set_mib": {
+    "before": 150.36,
+    "after": 155.44
+  },
+  "region_count": 1,
+  "notes": "Measures connected-component grouping and exact normalized boundary-distance calculation after evaluation. It does not measure market-data backtest throughput. The distance query is blocked and uses an exact cKDTree query; no all-pairs distance matrix is built."
+}

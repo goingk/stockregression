@@ -706,6 +706,7 @@ td small.table-sub { display: block; margin-top: 4px; color: #a3adba; font-size:
 .market-admin > .disclosure-body { padding-top:2px; }
 .report-drawer { width:min(760px,65vw) !important; }
 .report-drawer > .card { border:0; box-shadow:none; margin:0; }
+.task-report-reason { white-space:pre-wrap; overflow-wrap:anywhere; min-width:180px; }
 .research-guide { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:12px 16px; margin-bottom:14px; border:1px solid #e1eafa; border-radius:10px; background:#f0f5ff; color:#536d96; font-size:11px; line-height:1.8; }
 .research-guide ol { display:flex; flex-wrap:wrap; gap:10px 25px; padding:0; margin:0; list-style:none; }
 .research-guide strong { color:#365b99; }
@@ -877,3 +878,11 @@ td small.table-sub { display: block; margin-top: 4px; color: #a3adba; font-size:
 .research-config-column .disclosure > summary > small { flex-basis: 100%; margin-left: 24px; text-align: left; }
 .form-disclosure > summary { font-size: 12px; }
 .share-config-form .section-title small { font-size: 11px; line-height: 1.6; }
+
+.connected-region-table td { vertical-align: top; min-width: 120px; }
+.connected-region-table td:nth-child(4), .connected-region-table td:nth-child(5) { min-width: 235px; }
+.connected-region-table small, .connected-region-detail td small { display: block; margin-top: 6px; color: var(--text-muted, #64748b); }
+.connected-region-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.connected-region-detail { margin-top: 22px; padding-top: 18px; border-top: 1px solid #e5eaf1; }
+.connected-region-controls { margin-top: 16px; }
+.connected-region-detail .research-candidate-ranking-head { margin: 20px 0 10px; flex-wrap: wrap; gap: 10px; }

@@ -1972,6 +1972,12 @@ def evaluate_current_family(
     and its result never changes the selected current parameters.
     """
     diagnostics = current.get("diagnostics", {}) if isinstance(current, dict) else {}
+    if diagnostics.get("adaptive_validation_search"):
+        return {
+            "status": "not_applicable", "sample_role": "internal_validation_used_for_selection",
+            "independent_oos": False, "family_count": len(archive or []),
+            "reasons": ["连通域按内部验证收益自适应扩张，未预先冻结完整候选族；不报告固定候选族显著性"],
+        }
     history_days = int(diagnostics.get("selection_history_days", 0) or 0)
     folds_raw = diagnostics.get("validation_folds", [])
     result: dict[str, Any] = {
@@ -2687,9 +2693,11 @@ def optimize_scientific(
         (selection_target in ("adaptive", "both") and len(decisions) < expected_decisions)
         or (selection_target in ("adaptive", "both") and adaptive.get("test_result") is None and not cancelled_state)
         or (selection_target in ("fixed", "both") and fixed.get("test_result") is None and not cancelled_state)
+        or any(item.get("strategy_version") == 2 and item.get("status") in ("partial", "failed")
+               for item in all_selections)
     )
     result_status = "cancelled" if cancelled_state else "partial" if incomplete else "completed"
-    _emit(progress, 1.0, "科学参数选择完成")
+    _emit(progress, 1.0, "科学参数选择完成" if result_status == "completed" else "科学参数选择未完成")
     computation = {
         "n_trials_per_decision": int(config.n_trials) if not protocol_v3 else 0,
         "local_search_budget": None if int(config.protocol_version) == 4 else int(config.local_search_budget) if protocol_v3 else None,
@@ -2725,7 +2733,7 @@ def optimize_scientific(
             "validation_folds": 4,
             "rebalance_days": rebalance_days,
             "cost_multipliers": list(_COST_MULTIPLIERS),
-            "score": ("等比网格完整区间超额收益 f=网格收益率-全仓收益率；最大正邻域体积排名，邻域内全部合法点均须为正" if int(config.protocol_version) == 4 else "邻域超额收益第25百分位与跨窗稳健分；分窗 U=超额收益-资金流调整回撤，R=median(U)-0.5*IQR(U)，取双成本中较差结果" if protocol_v3 else "25%四分位邻域稳健分；分窗U=252日年化收益-maxDD，R=median(U)-0.5*IQR(U)，取原成本与双佣金/最低佣金/滑点压力中较差R"),
+            "score": ("原成本完整验证段 f=网格收益率-全仓收益率；按完整正收益连通域成员数排名，默认使用域内参数最稳定点" if int(config.protocol_version) == 4 and config.strategy.strategy_version == 2 else "等比网格完整区间超额收益 f=网格收益率-全仓收益率；最大正邻域体积排名，邻域内全部合法点均须为正" if int(config.protocol_version) == 4 else "邻域超额收益第25百分位与跨窗稳健分；分窗 U=超额收益-资金流调整回撤，R=median(U)-0.5*IQR(U)，取双成本中较差结果" if protocol_v3 else "25%四分位邻域稳健分；分窗U=252日年化收益-maxDD，R=median(U)-0.5*IQR(U)，取原成本与双佣金/最低佣金/滑点压力中较差R"),
             "bootstrap_reps": bootstrap_reps,
             "bootstrap_block_lengths": [20, 10, 40],
             "reserve_cash": reserve_cash,
@@ -2733,11 +2741,11 @@ def optimize_scientific(
             "local_search_budget": None if int(config.protocol_version) == 4 else int(config.local_search_budget) if protocol_v3 else None,
             "strategy": config.strategy.model_dump(mode="json") if int(config.protocol_version) == 4 else None,
             "grid_mode": "geometric" if int(config.protocol_version) == 4 else config.base.grid_mode,
-            "spacing_unit": 0.001 if int(config.protocol_version) == 4 else None,
+            "spacing_unit": 0.0001 if int(config.protocol_version) == 4 else None,
             "share_unit": 100 if int(config.protocol_version) == 4 else None,
             "positive_neighbor_ratio": None if int(config.protocol_version) == 4 else _V3_POSITIVE_NEIGHBOR_RATIO if protocol_v3 else None,
             "neighbor_quantile": None if int(config.protocol_version) == 4 else 0.25 if protocol_v3 else None,
-            "neighbor_perturbations": "all_joint_neighbors_and_complete_boxes" if int(config.protocol_version) == 4 else "single_and_pairwise_one_step" if protocol_v3 else "single_factor_one_step",
+            "neighbor_perturbations": "axis_one_tick_complete_components" if int(config.protocol_version) == 4 and config.strategy.strategy_version == 2 else "all_joint_neighbors_and_complete_boxes" if int(config.protocol_version) == 4 else "single_and_pairwise_one_step" if protocol_v3 else "single_factor_one_step",
             "ranking_baseline": "independent_buy_hold" if protocol_v3 else "same_cash_passive",
         },
         "fixed": fixed,

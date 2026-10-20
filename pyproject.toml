@@ -9,6 +9,7 @@ dependencies = [
   "pandas>=2.2,<3", "numpy>=2.1,<2.4", "pyarrow>=19,<24",
   "duckdb>=1.2,<2", "numba>=0.61,<1", "optuna>=4,<6",
   "threadpoolctl>=3.5,<4",
+  "scipy>=1.15,<2",
   "httpx>=0.28,<1",
   "baostock>=0.8.9,<1", "akshare>=1.16,<2", "pytdx>=1.72,<2",
   "typer>=0.15,<1", "filelock>=3.17,<4", "python-multipart>=0.0.20,<1",

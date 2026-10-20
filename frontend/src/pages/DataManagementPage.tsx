@@ -7,6 +7,7 @@ import {
 import { get, post, postForm, put } from '../api'
 import { Badge, Button, Card, Empty, ErrorBox, Field, Loading, PageHeader, SelectInput, Stat, TextInput, compact, dateText, useErrorMessage } from '../components'
 import { useTasks } from '../TaskCenter'
+import { DataTaskReport } from '../DataTaskReport'
 import type {
   Coverage, DataInventoryItem, DataInventoryResponse, DataPackageInfo,
   DataPreparationPlan, DataPreparationRequest, DataSourcesResponse, DataTimeframe,
@@ -215,10 +216,12 @@ export default function DataManagementPage({
     return () => { active = false }
   }, [selectedSymbol, selectedTimeframe, selectedItem, errorText])
   useEffect(() => {
-    if (!requestedReport) { setReport(null); return }
+    if (!requestedReport) return
+    let active = true
     get<ReportRecord>(`/results/${encodeURIComponent(requestedReport)}`)
-      .then(value => { setReport(value); onReportHandled?.() })
-      .catch(cause => setError(errorText(cause)))
+      .then(value => { if (active) { setReport(value); onReportHandled?.() } })
+      .catch(cause => { if (active) setError(errorText(cause)) })
+    return () => { active = false }
   }, [requestedReport, onReportHandled, errorText])
 
   const completedDataJobs = tasks.jobs
@@ -410,7 +413,6 @@ export default function DataManagementPage({
   }
 
   const totalPages = Math.max(1, Math.ceil((inventory?.count || 0) / pageSize))
-  const reportSteps = report?.steps as Array<Record<string, unknown>> | undefined
 
   return <>
     <PageHeader eyebrow="DATA PACKAGE" title="数据管理" description="当前数据包是唯一正式行情来源；导入、同步、聚合和公司行动资料都写入这里。" action={<div className="button-row"><Button variant="secondary" busy={busy === '刷新'} onClick={() => void run('刷新', loadInventory, '数据包目录已刷新。')}><RefreshCw size={15} />刷新</Button><Button variant="quiet" onClick={tasks.showHistory}><Database size={15} />任务记录</Button></div>} />
@@ -488,7 +490,7 @@ export default function DataManagementPage({
     </Card>
 
     {report && <div className="task-drawer-overlay" onMouseDown={event => { if (event.target === event.currentTarget) setReport(null) }}><section className="task-drawer report-drawer" role="dialog" aria-modal="true" aria-label="数据任务报告"><Card title="数据任务报告" subtitle={String(report.message ?? report.status ?? '')} action={<Button variant="quiet" onClick={() => setReport(null)}><X size={14} />关闭</Button>}>
-      {reportSteps?.length ? <div className="table-wrap"><table><thead><tr><th>步骤</th><th>状态</th><th>说明</th></tr></thead><tbody>{reportSteps.map((step, index) => <tr key={index}><td>{String(step.kind ?? step.timeframe ?? `步骤 ${index + 1}`)}</td><td>{String(step.status ?? '—')}</td><td>{String(step.error ?? step.reason ?? '')}</td></tr>)}</tbody></table></div> : <p className="muted-copy">新增、修订、未变化、冲突和失败数量可在高级诊断中查看。</p>}
+      <DataTaskReport report={report} />
       <details className="advanced-data"><summary>高级诊断 JSON</summary><pre className="json-preview">{JSON.stringify(report, null, 2)}</pre></details>
     </Card></section></div>}
   </>

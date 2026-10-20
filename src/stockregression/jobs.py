@@ -53,10 +53,12 @@ def _research_protocol_hash(config: OptimizationConfig) -> str:
             "funding_mode": "top_up_on_fill",
         }
     elif config.protocol_version == 4:
+        from .research_v4.space import UNITS
         payload["protocol_thresholds"] = {
             "strategy": config.strategy.model_dump(mode="json"),
             "grid_mode": "geometric",
-            "spacing_unit": 0.001,
+            "spacing_unit": UNITS["buy_step"],
+            "units": UNITS,
             "share_unit": 100,
             "negative_tolerance": 1e-12,
             "funding_mode": "top_up_on_fill",
@@ -64,6 +66,12 @@ def _research_protocol_hash(config: OptimizationConfig) -> str:
             "validation_account_mode": "fresh_initial_config",
             "validation_return_basis": "peak_invested_roi",
         }
+        if config.strategy.strategy_version == 2:
+            payload["protocol_thresholds"].update(
+                geometry="connected_lattice", connectivity="axis_one_tick",
+                stability_metric="normalized_euclidean_to_inner_boundary",
+                closure="expand_discovered_components_until_closed", constraints_role="diagnostic_only",
+            )
     base = dict(payload.get("base", {}))
     for key in ("symbol", "start_date", "end_date"):
         base.pop(key, None)
@@ -299,12 +307,15 @@ def execute_job(root: str, job_id: str, observer=None):
                     progress=progress, cancelled=cancelled,
                 )
                 combined.append(one)
-                failures.extend(one.get("failures", []))
+                failures.extend({**item, "timeframe": timeframe} for item in one.get("failures", []))
+            succeeded = sum(len(run.get("symbols", [])) for run in combined)
+            skipped = sum(len(run.get("skipped", [])) for run in combined)
+            sync_status = "completed" if not failures else "partial" if succeeded or skipped else "failed"
             result = {
-                "status": "completed" if not failures else "partial",
+                "status": sync_status,
                 "timeframes": sorted(set(timeframes)),
                 "runs": combined, "failures": failures,
-                "message": f"完成 {len(combined)} 个基础周期更新",
+                "message": f"处理 {len(combined)} 个基础周期：成功 {succeeded} 项，跳过 {skipped} 项，失败 {len(failures)} 项",
             }
             symbol, title = ",".join(symbols), f"基础行情同步 · {', '.join(sorted(set(timeframes)))}"
         elif kind == "market_source_probe":

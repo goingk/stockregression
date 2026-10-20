@@ -3609,6 +3609,18 @@ class MarketDataRepository:
         self, symbol: str, kind: str, payload: Any, *,
         version: str = "local", verified: bool = False,
     ) -> str:
+        # Calendars are shared by exchange, so different securities must use
+        # the same lock for the entire read/merge/replace operation.
+        path = self.package.absolute(auxiliary_relative_path(symbol, kind))
+        with self.file_lock(path):
+            return self._save_auxiliary_unlocked(
+                symbol, kind, payload, version=version, verified=verified,
+            )
+
+    def _save_auxiliary_unlocked(
+        self, symbol: str, kind: str, payload: Any, *,
+        version: str = "local", verified: bool = False,
+    ) -> str:
         frame = pd.DataFrame(payload if isinstance(payload, list) else payload or [])
         relative = auxiliary_relative_path(symbol, kind)
         destination = self.package.absolute(relative)
@@ -3649,8 +3661,10 @@ class MarketDataRepository:
         relative = auxiliary_relative_path(symbol, kind)
         path = self.package.absolute(relative)
         if version is None and path.is_file():
-            manifest = self.package.manifest().get("auxiliary", {}).get(relative, {})
-            frame = pd.read_parquet(path)
+            # Windows readers also need this lock while a writer replaces it.
+            with self.file_lock(path):
+                manifest = self.package.manifest().get("auxiliary", {}).get(relative, {})
+                frame = pd.read_parquet(path)
             payload = frame.to_dict("records") if not frame.empty else []
             return {
                 "symbol": symbol, "kind": kind,

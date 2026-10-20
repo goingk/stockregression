@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import json
 import logging
 import math
@@ -219,7 +221,8 @@ def _landscape_metric(row: dict, sample: str, cost: str, fold: int | None) -> fl
     if sample == "training":
         value = row.get("training_excess_return")
     elif fold is not None:
-        folds = row.get("folds") if isinstance(row.get("folds"), list) else []
+        field = "stress_folds" if cost == "stress" else "folds"
+        folds = row.get(field) if isinstance(row.get(field), list) else []
         value = folds[fold].get("excess_return") if fold < len(folds) and isinstance(folds[fold], dict) else None
     else:
         value = row.get("validation_excess_stress" if cost == "stress" else "validation_excess_original")
@@ -229,7 +232,7 @@ def _landscape_metric(row: dict, sample: str, cost: str, fold: int | None) -> fl
 
 
 def _landscape_point(row: dict, sample: str, cost: str, fold: int | None, fallback_id: int | None = None) -> dict:
-    folds = row.get("folds", []) if sample == "validation" else []
+    folds = row.get("stress_folds" if cost == "stress" else "folds", []) if sample == "validation" else []
     folds = folds if isinstance(folds, list) else []
     status = row.get("evaluation_status") if sample == "validation" else row.get("status")
     if sample == "training":
@@ -258,6 +261,11 @@ def _landscape_point(row: dict, sample: str, cost: str, fold: int | None, fallba
         "island_suspect": row.get("island_suspect", False),
         "neighbor_boundary_clipped_count": row.get("neighbor_boundary_clipped_count", 0),
         "region_ids": row.get("region_ids", []),
+        "is_stable_point": bool(row.get("is_stable_point")),
+        "is_peak_point": bool(row.get("is_peak_point")),
+        "stability_margin": row.get("stability_margin"),
+        "constraint_eligible": row.get("constraint_eligible"),
+        "constraint_reasons": row.get("constraint_reasons", []),
     }
 
 
@@ -1355,12 +1363,29 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         region_id: int | None = Query(None, ge=1),
         offset: int = Query(0, ge=0),
         limit: int = Query(1000, ge=1, le=10000),
+        view: str = Query("sample", pattern="^(sample|members|slice|projection)$"),
+        x: str | None = None,
+        y: str | None = None,
+        anchor: str = Query("stable", pattern="^(stable|peak)$"),
     ):
         result = store.result(result_id)
         if result is None:
             raise HTTPException(404, "结果不存在")
         if result.get("protocol_version") not in (3, 4):
             raise HTTPException(422, "参数收益分布仅适用于 protocol_version=3 或 4")
+        strategy = result.get("config", {}).get("strategy", {})
+        if sample == "validation" and strategy.get("strategy_version") == 2:
+            from .research_v4.region_api import connected_landscape
+            try:
+                return connected_landscape(
+                    result, decision=decision, decision_index=decision_index, region_id=region_id,
+                    view=view, x=x, y=y, anchor=anchor, offset=offset, limit=limit,
+                    sample=sample, cost=cost, fold=fold, point_factory=_landscape_point,
+                )
+            except LookupError as exc:
+                raise HTTPException(404, str(exc)) from exc
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
         evidence = result.get("evidence", {})
         if sample == "training":
             archive = evidence.get("search_candidate_archives", {}).get(decision, [])
@@ -1455,6 +1480,46 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             "slices": slices,
             "sampled": sampled, "sample_strategy": "even" if sampled else "page",
         }
+
+    @app.get("/api/v1/results/{result_id}/regions/{region_id}/export")
+    def export_region(result_id: str, region_id: int,
+                      decision: str = Query("current", pattern="^(current|fixed|adaptive)$"),
+                      decision_index: int = Query(0, ge=0),
+                      format: str = Query("csv", pattern="^(csv|json)$")):
+        from .research_v4.region_api import decision_archive, decision_context
+        result = store.result(result_id)
+        if result is None:
+            raise HTTPException(404, "结果不存在")
+        try:
+            context = decision_context(result, decision, decision_index)
+            region = next((r for r in context.get("recommendation_regions", []) if r.get("region_id") == region_id), None)
+            if not region or region.get("geometry") != "connected_lattice":
+                raise LookupError("连通参数域不存在")
+            rows = [r for r in decision_archive(result, decision, decision_index) if region_id in r.get("region_ids", [])]
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        rows.sort(key=lambda row: row["candidate_id"])
+        filename = f"{result_id}-{decision}-{decision_index}-region-{region_id}.{format}"
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        if format == "json":
+            return Response(dumps({"region": region, "members": [_landscape_point(r, "validation", "original", None) for r in rows]}),
+                            media_type="application/json", headers=headers)
+
+        def csv_rows():
+            from .research_v4.space import FIELDS
+            output = io.StringIO(newline="")
+            writer = csv.writer(output)
+            writer.writerow(["candidate_id", *FIELDS, "excess_return", "stability_margin", "is_stable_point", "is_peak_point", "constraint_eligible", "constraint_reasons"])
+            yield "\ufeff" + output.getvalue()
+            for row in rows:
+                output.seek(0)
+                output.truncate(0)
+                writer.writerow([row["candidate_id"], *(row["params"].get(name) for name in FIELDS),
+                                 row.get("validation_excess_original"), row.get("stability_margin"),
+                                 bool(row.get("is_stable_point")), bool(row.get("is_peak_point")),
+                                 row.get("constraint_eligible"), "；".join(row.get("constraint_reasons", []))])
+                yield output.getvalue()
+        return StreamingResponse(csv_rows(), media_type="text/csv; charset=utf-8", headers=headers)
 
     @app.get("/api/v1/results/{result_id}/export")
     def export(result_id: str, kind: str = "json"):

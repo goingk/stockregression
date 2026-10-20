@@ -171,7 +171,7 @@ class ResearchStrategySpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     strategy_id: Literal["geometric_excess_neighborhood"] = "geometric_excess_neighborhood"
-    strategy_version: Literal[1] = 1
+    strategy_version: Literal[1, 2] = 2
     search_method: Literal["auto", "hierarchical", "exhaustive"] = "auto"
     ranking_mode: Literal["max_volume", "fixed_mean"] = "max_volume"
     training_budget: int = Field(default=20_000, ge=1, le=1_000_000)
@@ -197,6 +197,8 @@ class ResearchStrategySpec(BaseModel):
         if not isinstance(value, dict):
             return value
         value = dict(value)
+        if "strategy_version" not in value and value.get("ranking_mode") == "fixed_mean":
+            value["strategy_version"] = 1
         fields = value.get("neighborhood_fields")
         if isinstance(fields, list) and "grid_step" in fields:
             migrated: list[str] = []
@@ -218,6 +220,8 @@ class ResearchStrategySpec(BaseModel):
 
     @model_validator(mode="after")
     def valid_half_widths(self):
+        if self.strategy_version == 2 and self.ranking_mode != "max_volume":
+            raise ValueError("连通域策略 v2 仅支持最大正收益连通域；固定邻域请使用策略 v1")
         if not self.neighborhood_fields:
             raise ValueError("细搜索邻域至少需要一个可移动参数")
         if len(set(self.neighborhood_fields)) != len(self.neighborhood_fields):
@@ -229,9 +233,9 @@ class ResearchStrategySpec(BaseModel):
             if float(value) <= 0:
                 raise ValueError("固定邻域半宽必须为正数")
             if name in {"buy_step", "sell_step"}:
-                scaled = round(float(value) / 0.001)
-                if abs(float(value) / 0.001 - scaled) > 1e-7:
-                    raise ValueError("买卖间距半宽必须对齐 0.001")
+                scaled = round(float(value) / 0.0001)
+                if abs(float(value) / 0.0001 - scaled) > 1e-7:
+                    raise ValueError("买卖间距半宽必须对齐 0.0001")
             else:
                 unit = 500 if name in {"min_shares", "max_shares"} else 100
                 if abs(float(value) / unit - round(float(value) / unit)) > 1e-7:

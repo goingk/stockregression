@@ -535,6 +535,35 @@ def test_market_data_api_imports_and_defaults_sync_to_base_timeframes(tmp_path):
         assert client.get("/api/v1/data/coverage/600000.SH?timeframe=1min").status_code == 400
 
 
+@pytest.mark.parametrize("outcome", ["completed", "partial", "failed"])
+def test_sync_job_summary_counts_and_failure_periods(tmp_path, monkeypatch, outcome):
+    def sync(self, symbols, timeframe, mode, **kwargs):
+        failed = outcome == "failed" or (outcome == "partial" and timeframe == "1min")
+        return {
+            "status": "failed" if failed else "completed", "timeframe": timeframe,
+            "symbols": [] if failed else [{"symbol": symbols[0]}],
+            "skipped": [],
+            "failures": [{"symbol": symbols[0], "reason": "calendar write denied"}] if failed else [],
+        }
+    monkeypatch.setattr(MarketDataSyncService, "sync", sync)
+    root = tmp_path / "data"
+    with TestClient(create_app(str(root), start_jobs=False)) as client:
+        job_id = client.post("/api/v1/data/sync", json={
+            "symbols": ["159516.SZ"], "timeframes": ["1day", "1min"],
+        }).json()["job_id"]
+        execute_job(str(root), job_id)
+        job = client.get(f"/api/v1/jobs/{job_id}").json()
+        assert job["status"] == outcome, job
+        report = client.get(f"/api/v1/results/{job['result_id']}").json()
+        assert len(report["runs"]) == 2
+        assert all(item["timeframe"] in {"1day", "1min"} for item in report["failures"])
+        if outcome == "partial":
+            assert "成功 1 项，跳过 0 项，失败 1 项" in job["message"]
+            assert report["failures"][0]["timeframe"] == "1min"
+        if outcome == "failed":
+            assert "calendar write denied" in job["error"]
+
+
 def test_single_upload_picker_path_saves_job_and_removes_staging_files(tmp_path):
     root = tmp_path / "data"
     days = _days(2)

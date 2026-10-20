@@ -140,6 +140,7 @@ class ResearchDefaults(_WorkbenchPreference):
     min_history_days: int = Field(default=504, ge=20)
     min_minute_ratio: float = Field(default=0.95, ge=0, le=1)
     ranking_mode: Literal["max_volume", "fixed_mean"] = "max_volume"
+    strategy_version: Literal[1, 2] = 2
     search_method: Literal["auto", "hierarchical", "exhaustive"] = "auto"
     training_budget: int = Field(default=20_000, ge=1, le=1_000_000)
     validation_budget: int = Field(default=100_000, ge=1, le=2_000_000)
@@ -164,6 +165,7 @@ class ResearchDefaults(_WorkbenchPreference):
     def migrate_protocol(cls, values):
         if isinstance(values, dict):
             values = dict(values)
+            values["strategy_version"] = 1 if values.get("ranking_mode") == "fixed_mean" else 2
             if isinstance(values.get("ranges"), dict):
                 ranges = dict(values["ranges"])
                 legacy = ranges.pop("grid_step", None)

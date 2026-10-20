@@ -43,6 +43,7 @@ test('new workspaces use the v4 geometric neighborhood defaults', () => {
   const research = defaultWorkbenchDefaults().research
   assert.equal(research.protocol_version, 4)
   assert.equal(research.ranking_mode, 'max_volume')
+  assert.equal(research.strategy_version, 2)
   assert.equal(research.training_budget, 20000)
   assert.equal(research.validation_budget, 100000)
   assert.equal(research.selection_target, 'both')
@@ -51,6 +52,15 @@ test('new workspaces use the v4 geometric neighborhood defaults', () => {
   assert.equal(research.n_trials, 1000)
   assert.equal(research.local_search_budget, 3000)
   assert.deepEqual(research.neighborhood_fields, ['buy_step', 'sell_step', 'sell_shares', 'buy_shares', 'min_shares', 'max_shares'])
+})
+
+test('legacy fixed-radius ranking normalizes to strategy version one', () => {
+  const saved = defaultWorkbenchDefaults().research
+  saved.ranking_mode = 'fixed_mean'
+  saved.strategy_version = 2
+  const normalized = normalizeRememberedResearchDefaults(saved)
+  assert.equal(normalized.ranking_mode, 'fixed_mean')
+  assert.equal(normalized.strategy_version, 1)
 })
 
 test('older saved research defaults gain all fine-search fields while empty selections are rejected', () => {
@@ -80,6 +90,7 @@ test('legacy saved research settings fill v4 fields while preserving every remem
   const migrated = normalizeWorkbenchDefaults({ research: saved }).research
   assert.equal(migrated.protocol_version, 4)
   assert.equal(migrated.ranking_mode, 'max_volume')
+  assert.equal(migrated.strategy_version, 2)
   assert.equal(migrated.selection_target, 'both')
   assert.equal(migrated.rebalance_days, 63)
   assert.equal(migrated.bootstrap_reps, 10000)
@@ -153,18 +164,20 @@ test('STAR minimums affect the displayed and submitted range without overwriting
   assert.equal(memory.research.ranges.buy_shares.high, 100)
 })
 
-test('v4 research ranges use 0.1 percentage point and 100 share lattice endpoints', () => {
+test('v4 research ranges use 0.01 percentage point and 100 share lattice endpoints', () => {
   const value = defaultWorkbenchDefaults()
-  value.research.ranges.buy_step = { low: .011, high: .021, step: .0005 }
+  value.research.fixed_half_widths.buy_step = .0001
+  value.research.fixed_half_widths.sell_step = .0001
+  value.research.ranges.buy_step = { low: .0001, high: .0211, step: .0001 }
   assert.equal(validWorkbenchGroup('research', value.research), true)
-  value.research.ranges.buy_step.high = .0215
+  value.research.ranges.buy_step.high = .02155
   assert.equal(validWorkbenchGroup('research', value.research), false)
   value.research.ranges.buy_step.high = .021
   value.research.ranges.buy_shares.high = 1050
   assert.equal(validWorkbenchGroup('research', value.research), false)
-  const remembered = normalizeWorkbenchDefaults({ research: { ...value.research, ranges: { ...value.research.ranges, grid_step: { low: .0105, high: .021, step: .0005 }, buy_step: undefined, sell_step: undefined } } }).research
-  assert.deepEqual(remembered.ranges.buy_step, { low: .0105, high: .021, step: .0005 })
-  assert.deepEqual(remembered.ranges.sell_step, { low: .0105, high: .021, step: .0005 })
+  const remembered = normalizeWorkbenchDefaults({ research: { ...value.research, ranges: { ...value.research.ranges, grid_step: { low: .01055, high: .021, step: .0005 }, buy_step: undefined, sell_step: undefined } } }).research
+  assert.deepEqual(remembered.ranges.buy_step, { low: .01055, high: .021, step: .0005 })
+  assert.deepEqual(remembered.ranges.sell_step, { low: .01055, high: .021, step: .0005 })
   assert.equal(validResearchDefaults(remembered), false)
 })
 

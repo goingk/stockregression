@@ -42,15 +42,16 @@ function pointFromEvent(raw: unknown): LandscapePoint | undefined {
   return ((raw as { data?: { item?: LandscapePoint } }).data ?? {}).item
 }
 
-export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, regionOptions = [], qualified = false }: {
+export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, regionOptions = [], qualified = false, trainingOnly = false }: {
   resultId: string
   defaultParams?: Dict
   decisionOptions: Array<{ value: string; label: string }>
   regionOptions?: Array<{ value: string; label: string }>
   qualified?: boolean
+  trainingOnly?: boolean
 }) {
   const [decision, setDecision] = useState(decisionOptions[0]?.value ?? 'current')
-  const [sample, setSample] = useState<'training' | 'validation'>('validation')
+  const [sample, setSample] = useState<'training' | 'validation'>(trainingOnly ? 'training' : 'validation')
   const [cost, setCost] = useState<'original' | 'stress'>('original')
   const [fold, setFold] = useState('total')
   const [metric, setMetric] = useState<'excess' | 'grid'>('excess')
@@ -182,11 +183,11 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
   const ranking = data.top_candidates.length ? data.top_candidates : data.focus ? [data.focus] : []
   const focusValue = data.focus?.excess_return ?? null
   return <Card
-    title='参数收益分布'
-    subtitle='先看相对最佳参数，再用二维切片判断它周围是否稳定。横纵轴以外的参数固定为相对最佳单点。'
+    title={trainingOnly ? '训练候选收益分布' : '参数收益分布'}
+    subtitle={trainingOnly ? '训练搜索候选仅用于发现入口；正式参数域与两个代表点以内部验证结果为准。' : '先看相对最佳参数，再用二维切片判断它周围是否稳定。横纵轴以外的参数固定为相对最佳单点。'}
     action={<Badge tone='blue'>{loading ? '读取中…' : `${data.total.toLocaleString()} 个候选 · 当前切片 ${slice.length.toLocaleString()}`}</Badge>}
   >
-    {data.focus && <div className={`research-landscape-focus ${qualified ? 'verified' : 'diagnostic'}`}>
+    {data.focus && !trainingOnly && <div className={`research-landscape-focus ${qualified ? 'verified' : 'diagnostic'}`}>
       <div className='research-landscape-focus-copy'>
         <small>{qualified ? '全量候选中的相对最佳单点' : '相对最佳单点 · 仅作研究对照'}</small>
         <strong>相对全仓超额 {ratio(focusValue)}</strong>
@@ -213,7 +214,7 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
 
     <div className='form-grid four research-landscape-controls'>
       <Field label='研究决策'><SelectInput value={decision} onChange={event => setDecision(event.target.value)}>{decisionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>
-      <Field label='样本用途'><SelectInput value={sample} onChange={event => setSample(event.target.value as 'training' | 'validation')}><option value='validation'>内部验证</option><option value='training'>训练搜索</option></SelectInput></Field>
+      <Field label='样本用途'><SelectInput value={sample} disabled={trainingOnly} onChange={event => setSample(event.target.value as 'training' | 'validation')}>{!trainingOnly && <option value='validation'>内部验证</option>}<option value='training'>训练搜索</option></SelectInput></Field>
       <Field label='成本情景'><SelectInput value={cost} onChange={event => setCost(event.target.value as 'original' | 'stress')}><option value='original'>原始成本</option><option value='stress'>双倍压力</option></SelectInput></Field>
       <Field label='验证窗口'><SelectInput value={fold} onChange={event => setFold(event.target.value)} disabled={sample === 'training'}><option value='total'>整个验证段</option>{[0, 1, 2, 3].map(index => <option key={index} value={index}>窗口 {index + 1}</option>)}</SelectInput></Field>
       <Field label='着色指标'><SelectInput value={metric} onChange={event => setMetric(event.target.value as 'excess' | 'grid')}><option value='excess'>相对全仓超额</option><option value='grid'>网格收益</option></SelectInput></Field>
