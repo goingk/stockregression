@@ -45,8 +45,10 @@ def test_performance_api_reports_effective_budget_and_leases(tmp_path, monkeypat
     app = create_app(str(root), start_jobs=False)
     with TestClient(app) as client:
         response = client.get("/api/v1/performance")
+        initial = client.get("/api/v1/settings").json()
         saved = client.put("/api/v1/settings", json={
-            "performance": {"cpu_budget_mode": "custom", "cpu_budget": 6}
+            "base_revision": initial["config_revision"],
+            "performance": {"cpu_budget_mode": "custom", "cpu_budget": 6},
         })
 
     assert response.status_code == 200

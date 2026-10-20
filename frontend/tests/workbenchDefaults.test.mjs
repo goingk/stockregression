@@ -2,12 +2,11 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { defaultWorkbenchDefaults, normalizeRememberedResearchDefaults, normalizeWorkbenchDefaults, researchConfigForSubmission, researchRangesForSymbol, strategyDefaults, validResearchDefaults, validWorkbenchGroup, workbenchConfig } from '../src/workbenchDefaults.ts'
 
-test('v4 holding bounds use 100-share minimum units while default granularity stays 500', () => {
+test('v4 uses the four natural-position axes and aligns quantities to 100 shares', () => {
   const value = defaultWorkbenchDefaults().research
-  value.ranges.min_shares.high = 1500
   value.ranges.buy_shares.low = 200
   assert.equal(validResearchDefaults(value), true)
-  value.ranges.min_shares.high = 1250
+  value.ranges.buy_shares.high = 1050
   assert.equal(validResearchDefaults(value), false)
   const old = defaultWorkbenchDefaults().research
   old.fixed_half_widths.min_shares = 100
@@ -43,12 +42,12 @@ test('new workspaces use the v4 geometric neighborhood defaults', () => {
   const research = defaultWorkbenchDefaults().research
   assert.equal(research.protocol_version, 4)
   assert.equal(research.ranking_mode, 'fixed_mean')
-  assert.equal(research.strategy_version, 3)
+  assert.equal(research.strategy_version, 4)
   assert.equal(research.hypercube_edge, 3)
   assert.deepEqual(research.granularity, {
     buy_step: .0001, sell_step: .0001, sell_shares: 100, buy_shares: 100,
-    min_shares: 500, max_shares: 500,
   })
+  assert.equal(research.max_shares_mode, 'unlimited')
   assert.equal(research.training_budget, 20000)
   assert.equal(research.validation_budget, 100000)
   assert.equal(research.selection_target, 'both')
@@ -56,7 +55,7 @@ test('new workspaces use the v4 geometric neighborhood defaults', () => {
   assert.equal(research.bootstrap_reps, 10000)
   assert.equal(research.n_trials, 1000)
   assert.equal(research.local_search_budget, 3000)
-  assert.deepEqual(research.neighborhood_fields, ['buy_step', 'sell_step', 'sell_shares', 'buy_shares', 'min_shares', 'max_shares'])
+  assert.deepEqual(research.neighborhood_fields, ['buy_step', 'sell_step', 'buy_shares', 'sell_shares'])
 })
 
 test('legacy fixed-radius ranking normalizes to strategy version one', () => {
@@ -71,11 +70,11 @@ test('legacy fixed-radius ranking normalizes to strategy version one', () => {
 test('older saved research defaults gain all fine-search fields while empty selections are rejected', () => {
   const saved = defaultWorkbenchDefaults().research
   delete saved.neighborhood_fields
-  assert.deepEqual(normalizeWorkbenchDefaults({ research: saved }).research.neighborhood_fields, ['buy_step', 'sell_step', 'sell_shares', 'buy_shares', 'min_shares', 'max_shares'])
+  assert.deepEqual(normalizeWorkbenchDefaults({ research: saved }).research.neighborhood_fields, ['buy_step', 'sell_step', 'buy_shares', 'sell_shares'])
   const empty = defaultWorkbenchDefaults().research
   empty.neighborhood_fields = []
   assert.equal(validResearchDefaults(empty), false)
-  assert.deepEqual(normalizeRememberedResearchDefaults(empty).neighborhood_fields, ['buy_step', 'sell_step', 'sell_shares', 'buy_shares', 'min_shares', 'max_shares'])
+  assert.deepEqual(normalizeRememberedResearchDefaults(empty).neighborhood_fields, ['buy_step', 'sell_step', 'buy_shares', 'sell_shares'])
 })
 
 test('v4 submission ignores a stale hidden maximum holding when research mode changes', () => {
@@ -87,9 +86,12 @@ test('v4 submission ignores a stale hidden maximum holding when research mode ch
   assert.equal(searched.max_shares, 100000)
 })
 
-test('legacy saved research settings fill v4 fields while preserving every remembered range', () => {
+test('legacy v3 settings fill extended fields while preserving its seven ranges', () => {
   const saved = defaultWorkbenchDefaults().research
+  saved.strategy_version = 3
   saved.ranges.initial_shares = { low: 300, high: 2300, step: 200 }
+  saved.ranges.min_shares = { low: 0, high: 1000, step: 100 }
+  saved.ranges.max_shares = { low: 1000, high: 5000, step: 100 }
   saved.ranges.buy_step = { low: .01, high: .15, step: .01 }
   for (const key of ['protocol_version', 'selection_target', 'rebalance_days', 'bootstrap_reps', 'local_search_budget']) delete saved[key]
   const migrated = normalizeWorkbenchDefaults({ research: saved }).research
@@ -100,8 +102,10 @@ test('legacy saved research settings fill v4 fields while preserving every remem
   assert.equal(migrated.rebalance_days, 63)
   assert.equal(migrated.bootstrap_reps, 10000)
   assert.equal(migrated.local_search_budget, 3000)
-  assert.deepEqual(migrated.ranges, saved.ranges)
-  assert.deepEqual(normalizeRememberedResearchDefaults(saved).ranges, saved.ranges)
+  assert.equal(Object.keys(migrated.ranges).length, 7)
+  assert.deepEqual(migrated.ranges.buy_step, saved.ranges.buy_step)
+  assert.deepEqual(migrated.ranges.initial_shares, saved.ranges.initial_shares)
+  assert.deepEqual(normalizeRememberedResearchDefaults(saved).ranges, migrated.ranges)
 })
 
 test('invalid remembered groups fall back independently', () => {
@@ -150,9 +154,9 @@ test('invalid numeric drafts and ranges cannot replace valid remembered groups',
   value.research.ranges.buy_step.low = .2
   assert.equal(validWorkbenchGroup('research', value.research), false)
   value.research.ranges.buy_step.low = .005
-  value.research.ranges.buy_shares.step = 0
+  value.research.granularity.buy_shares = 0
   assert.equal(validWorkbenchGroup('research', value.research), false)
-  value.research.ranges.buy_shares.step = 50
+  value.research.granularity.buy_shares = 50
   assert.equal(validWorkbenchGroup('research', value.research), false)
 })
 
@@ -165,7 +169,7 @@ test('STAR minimums affect the displayed and submitted range without overwriting
   assert.equal(edited.ranges.buy_shares.low, 100)
   assert.equal(researchRangesForSymbol(edited.ranges, '600000.SH').buy_shares.low, 100)
   memory.research.ranges.buy_shares.high = 100
-  assert.deepEqual(researchRangesForSymbol(memory.research.ranges, '689001.SH').buy_shares, { low: 200, high: 200, step: 100 })
+  assert.deepEqual(researchRangesForSymbol(memory.research.ranges, '689001.SH').buy_shares, { low: 200, high: 200 })
   assert.equal(memory.research.ranges.buy_shares.high, 100)
 })
 
@@ -181,13 +185,14 @@ test('v4 research ranges use 0.01 percentage point and 100 share lattice endpoin
   value.research.ranges.buy_shares.high = 1050
   assert.equal(validWorkbenchGroup('research', value.research), false)
   const remembered = normalizeWorkbenchDefaults({ research: { ...value.research, ranges: { ...value.research.ranges, grid_step: { low: .01055, high: .021, step: .0005 }, buy_step: undefined, sell_step: undefined } } }).research
-  assert.deepEqual(remembered.ranges.buy_step, { low: .01055, high: .021, step: .0005 })
-  assert.deepEqual(remembered.ranges.sell_step, { low: .01055, high: .021, step: .0005 })
+  assert.deepEqual(remembered.ranges.buy_step, { low: .01055, high: .021 })
+  assert.deepEqual(remembered.ranges.sell_step, { low: .01055, high: .021 })
   assert.equal(validResearchDefaults(remembered), false)
 })
 
 test('legacy single grid settings migrate to separate buy and sell spacing', () => {
   const saved = defaultWorkbenchDefaults().research
+  saved.strategy_version = 1
   delete saved.ranges.buy_step
   delete saved.ranges.sell_step
   saved.ranges.grid_step = { low: .008, high: .024, step: .001 }

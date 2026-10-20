@@ -22,6 +22,7 @@ def test_default_storage_paths_keep_asset_packages_under_data(settings_file):
 def settings_file(tmp_path, monkeypatch):
     path = tmp_path / "settings.json"
     monkeypatch.setattr(settings, "SETTINGS_FILE", path)
+    monkeypatch.setattr(settings, "LEGACY_SETTINGS_FILE", tmp_path / ".local" / "settings.json")
     return path
 
 
@@ -39,26 +40,22 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
     assert defaults["research"]["mode"] == "both"
     assert defaults["research"]["n_trials"] == 1000
     assert defaults["research"]["protocol_version"] == 4
-    assert defaults["research"]["strategy_version"] == 3
+    assert defaults["research"]["strategy_version"] == 4
     assert defaults["research"]["ranking_mode"] == "fixed_mean"
     assert defaults["research"]["hypercube_edge"] == 3
     assert defaults["research"]["granularity"] == {
         "buy_step": 0.0001, "sell_step": 0.0001,
         "sell_shares": 100.0, "buy_shares": 100.0,
-        "min_shares": 500.0, "max_shares": 500.0,
     }
     assert defaults["research"]["local_search_budget"] == 3000
     assert defaults["research"]["selection_target"] == "both"
     assert defaults["research"]["rebalance_days"] == 63
     assert defaults["research"]["bootstrap_reps"] == 10000
     assert defaults["research"]["ranges"] == {
-        "buy_step": {"low": 0.005, "high": 0.1, "step": 0.005},
-        "sell_step": {"low": 0.005, "high": 0.1, "step": 0.005},
-        "buy_shares": {"low": 100.0, "high": 1000.0, "step": 100.0},
-        "sell_shares": {"low": 100.0, "high": 1000.0, "step": 100.0},
-        "initial_shares": {"low": 0.0, "high": 2000.0, "step": 100.0},
-        "min_shares": {"low": 0.0, "high": 1000.0, "step": 100.0},
-        "max_shares": {"low": 1000.0, "high": 5000.0, "step": 100.0},
+        "buy_step": {"low": 0.005, "high": 0.1, "step": None},
+        "sell_step": {"low": 0.005, "high": 0.1, "step": None},
+        "buy_shares": {"low": 100.0, "high": 1000.0, "step": None},
+        "sell_shares": {"low": 100.0, "high": 1000.0, "step": None},
     }
 
     settings.save_settings({
@@ -75,7 +72,7 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
     })
     settings.save_settings({
         "workbench_defaults": {
-            "research": {"ranges": {"buy_step": {"low": 0.01, "high": 0.2, "step": 0.01}}},
+            "research": {"ranges": {"buy_step": {"low": 0.01, "high": 0.2}}},
         },
     })
 
@@ -86,10 +83,10 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
     assert saved.workbench_defaults.position.max_shares == 2000
     assert saved.workbench_defaults.research.n_trials == 75
     assert saved.workbench_defaults.research.ranges["buy_shares"].model_dump() == {
-        "low": 100.0, "high": 2000.0, "step": 100.0,
+        "low": 100.0, "high": 2000.0, "step": None,
     }
     assert saved.workbench_defaults.research.ranges["sell_step"].model_dump() == {
-        "low": 0.005, "high": 0.1, "step": 0.005,
+        "low": 0.005, "high": 0.1, "step": None,
     }
     assert saved.fee_defaults.commission_rate == 0.0008
     assert saved.fee_defaults.min_commission == 0.1
@@ -132,7 +129,7 @@ def test_old_settings_gain_workbench_defaults_without_losing_existing_values(set
     {"research": {"min_minute_ratio": 1.1}},
     {"research": {"ranges": {"buy_shares": {"high": 99}}}},
     {"research": {"ranges": {"buy_step": {"low": 0.2, "high": 0.1}}}},
-    {"research": {"ranges": {"buy_step": {"step": 0}}}},
+    {"research": {"granularity": {"buy_step": 0}}},
     {"research": {"ranges": {"unknown": {"low": 0, "high": 1, "step": 1}}}},
 ])
 def test_invalid_workbench_preferences_do_not_replace_saved_settings(settings_file, patch):
@@ -160,11 +157,10 @@ def test_workbench_preferences_allow_valid_zero_values(settings_file):
                 "min_trades": 0,
                 "min_minute_ratio": 0,
                 "ranges": {
-                    "buy_shares": {"low": 100, "high": 100, "step": 100},
-                    "sell_shares": {"low": 100, "high": 100, "step": 100},
-                    "initial_shares": {"low": 0, "high": 0, "step": 100},
-                    "min_shares": {"low": 0, "high": 0, "step": 100},
-                    "max_shares": {"low": 0, "high": 0, "step": 100},
+                    "buy_step": {"low": 0.005, "high": 0.005},
+                    "sell_step": {"low": 0.005, "high": 0.005},
+                    "buy_shares": {"low": 100, "high": 100},
+                    "sell_shares": {"low": 100, "high": 100},
                 },
             },
         },
@@ -174,7 +170,7 @@ def test_workbench_preferences_allow_valid_zero_values(settings_file):
     assert saved.workbench_defaults.dca.initial_shares == 0
     assert saved.workbench_defaults.research.min_trades == 0
     assert saved.workbench_defaults.research.min_minute_ratio == 0
-    assert saved.workbench_defaults.research.ranges["initial_shares"].low == 0
+    assert saved.workbench_defaults.research.ranges["buy_shares"].low == 100
 
 
 def test_settings_api_merges_workbench_defaults_and_keeps_fee_defaults(settings_file, tmp_path):
@@ -182,9 +178,10 @@ def test_settings_api_merges_workbench_defaults_and_keeps_fee_defaults(settings_
     with TestClient(app) as client:
         initial = client.get("/api/v1/settings").json()
         assert initial["workbench_defaults"]["grid"]["grid_mode"] == "trailing"
-        assert len(initial["workbench_defaults"]["research"]["ranges"]) == 7
+        assert len(initial["workbench_defaults"]["research"]["ranges"]) == 4
 
         response = client.put("/api/v1/settings", json={
+            "base_revision": initial["config_revision"],
             "fee_defaults": {"commission_rate": 0},
             "workbench_defaults": {
                 "grid": {"grid_mode": "geometric", "buy_step": 0.05},
@@ -198,6 +195,7 @@ def test_settings_api_merges_workbench_defaults_and_keeps_fee_defaults(settings_
         assert response.json()["fee_defaults"] == {"commission_rate": 0, "min_commission": 0.1}
 
         invalid = client.put("/api/v1/settings", json={
+            "base_revision": response.json()["config_revision"],
             "workbench_defaults": {"position": {"initial_shares": 5000}},
         })
         assert invalid.status_code == 422

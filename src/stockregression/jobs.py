@@ -22,7 +22,7 @@ from .market_data.sync import MarketDataSyncService
 from .performance import PerformanceTrace, activate_performance, reset_performance
 from .research_preparation import prepare_research_bundle
 from .resources import ResourceLease, clear_stale_leases
-from .settings import load_settings
+from .settings import Settings, load_settings
 from .source_health import probe_source
 from .storage import Store
 
@@ -44,6 +44,7 @@ def _cleanup_uploaded_input(store: Store, job_id: str):
 
 def _research_protocol_hash(config: OptimizationConfig) -> str:
     payload = config.model_dump(mode="json")
+    payload.pop("configuration_revision", None)
     if config.protocol_version == 4 and config.strategy.strategy_version in (1, 2):
         legacy_strategy = dict(payload.get("strategy", {}))
         legacy_strategy.pop("hypercube_edge", None)
@@ -72,7 +73,15 @@ def _research_protocol_hash(config: OptimizationConfig) -> str:
             "validation_account_mode": "fresh_initial_config",
             "validation_return_basis": "peak_invested_roi",
         }
-        if config.strategy.strategy_version == 2:
+        if config.strategy.strategy_version == 4:
+            payload["protocol_thresholds"].update(
+                geometry="robust_j", connectivity="fixed_edge_cube",
+                fields=["buy_step", "sell_step", "buy_shares", "sell_shares"],
+                objective="alpha*R+(1-alpha)*mu-beta*downside-Cpos",
+                natural_position=True, constraints_role="center_qualification",
+                peak_analysis="complete_one_tick_closed_plateaus",
+            )
+        elif config.strategy.strategy_version == 2:
             payload["protocol_thresholds"].update(
                 geometry="connected_lattice", connectivity="axis_one_tick",
                 stability_metric="normalized_euclidean_to_inner_boundary",
@@ -144,7 +153,13 @@ def execute_job(root: str, job_id: str, observer=None):
     job = store.job(job_id)
     if not job:
         return
-    configured = load_settings()
+    frozen = (job.get("payload") or {}).get("configuration_snapshot")
+    frozen_settings = (frozen or {}).get("settings") if isinstance(frozen, dict) else None
+    try:
+        configured = Settings.model_validate(frozen_settings) if isinstance(frozen_settings, dict) else load_settings()
+    except ValueError:
+        configured = load_settings()
+    store = Store(root, settings=configured)
     trace = PerformanceTrace(job_id=job_id)
     lease = ResourceLease(store, job_id, configured.performance)
     cpu_units = lease.acquire()
@@ -167,11 +182,13 @@ def execute_job(root: str, job_id: str, observer=None):
     last_progress = 0.0
     last_cancel_check = 0.0
     cancel_state = False
+    cancel_poll_seconds = max(.05, int(configured.performance.job_cancel_poll_ms) / 1000)
+    progress_update_seconds = max(.05, int(configured.performance.progress_update_ms) / 1000)
 
     def cancelled():
         nonlocal last_cancel_check, cancel_state
         tick = time.monotonic()
-        if tick - last_cancel_check > 0.3:
+        if tick - last_cancel_check > cancel_poll_seconds:
             cancel_state = bool((store.job(job_id) or {}).get("cancel_requested"))
             last_cancel_check = tick
         return cancel_state
@@ -179,7 +196,7 @@ def execute_job(root: str, job_id: str, observer=None):
     def progress(fraction, message):
         nonlocal last_progress
         tick = time.monotonic()
-        if tick - last_progress > 0.4 or fraction <= 0 or fraction >= 1:
+        if tick - last_progress > progress_update_seconds or fraction <= 0 or fraction >= 1:
             rendered = str(message)
             if job.get("kind") in {"backtest", "optimization", "batch", "batch_backtest"} and 0 < fraction < 1:
                 rendered += f" · {max(1, lease.units)} 线程"
@@ -188,7 +205,7 @@ def execute_job(root: str, job_id: str, observer=None):
                 observer(fraction, rendered)
             last_progress = tick
     try:
-        service = DataService(store)
+        service = DataService(store, settings=configured)
         payload, kind = job["payload"], job["kind"]
         if cancelled():
             raise InterruptedError("任务已取消")
@@ -217,7 +234,7 @@ def execute_job(root: str, job_id: str, observer=None):
                         payload.get("version"),
                         lambda fraction, message: progress(0.02 + 0.30 * fraction, message),
                         cancelled,
-                        lookback_days=500 if config.protocol_version == 4 else 504,
+                        lookback_days=(config.strategy.training_max_days if config.protocol_version == 4 and config.strategy.strategy_version == 4 else 500) if config.protocol_version == 4 else 504,
                     )
                 else:
                     bundle = service.ensure_bundle(config.base, payload.get("version"), lambda fraction, message: progress(0.02 + 0.30 * fraction, message), cancelled)
@@ -225,7 +242,11 @@ def execute_job(root: str, job_id: str, observer=None):
             store.update_job(job_id, payload=payload)
             progress(0.33, "行情准备完成，开始科学参数研究" if scientific else "行情准备完成，开始参数搜索")
             with trace.measure("research"):
-                result = optimize(config, bundle, lambda fraction, message: progress(0.33 + 0.67 * fraction, message), cancelled)
+                result = optimize(
+                    config, bundle,
+                    lambda fraction, message: progress(0.33 + 0.67 * fraction, message),
+                    cancelled, configured.performance,
+                )
             result["diagnostics"] = bundle.metadata.get("diagnostics", {})
             result["source_events"] = bundle.metadata.get("source_events", [])
             symbol = config.base.symbol
@@ -249,7 +270,7 @@ def execute_job(root: str, job_id: str, observer=None):
             else:
                 title = "历史搜索 / 样本外验证"
         elif kind == "market_import":
-            market = MarketDataService(store)
+            market = MarketDataService(store, settings=configured)
             result = market.import_file(
                 payload["symbol"], payload["timeframe"], payload["path"],
                 label_convention=payload.get("label_convention", "auto"),
@@ -261,7 +282,7 @@ def execute_job(root: str, job_id: str, observer=None):
             )
             symbol, title = payload["symbol"], f"导入 {payload['timeframe']} 行情"
         elif kind == "market_import_batch":
-            market = MarketDataService(store)
+            market = MarketDataService(store, settings=configured)
             result = market.import_folder(
                 payload["folder"], payload["timeframe"], recursive=payload.get("recursive", False),
                 label_convention=payload.get("label_convention", "auto"),
@@ -273,7 +294,7 @@ def execute_job(root: str, job_id: str, observer=None):
             )
             symbol, title = "", f"批量导入 {payload['timeframe']}"
         elif kind == "market_import_package":
-            market = MarketDataService(store)
+            market = MarketDataService(store, settings=configured)
             update_rebuild_state(store, stage="importing")
             result = import_etf_package(
                 market, payload["folder"], timeframes=payload.get("timeframes"),
@@ -288,7 +309,7 @@ def execute_job(root: str, job_id: str, observer=None):
         elif kind == "market_index_package":
             update_rebuild_state(store, stage="indexing")
             result = index_etf_package_direct(
-                MarketDataService(store), payload["folder"],
+                MarketDataService(store, settings=configured), payload["folder"],
                 timeframes=payload.get("timeframes"), symbols=payload.get("symbols"),
                 progress=progress, cancelled=cancelled,
             )
@@ -311,10 +332,10 @@ def execute_job(root: str, job_id: str, observer=None):
                         service.refresh_instruments(progress, cancelled)
                         selected = [row["symbol"] for row in store.instruments(limit=None)]
                     else:
-                        selected = MarketDataService(store).repository.symbols_for_timeframe(timeframe)
+                        selected = MarketDataService(store, settings=configured).repository.symbols_for_timeframe(timeframe)
                 elif scope == "watchlist":
                     selected = [row["symbol"] for row in store.watches()]
-                one = MarketDataSyncService(MarketDataService(store)).sync(
+                one = MarketDataSyncService(MarketDataService(store, settings=configured)).sync(
                     selected, timeframe, payload.get("mode", "incremental"),
                     start=payload.get("start_date"), end=payload.get("end_date"),
                     resume=payload.get("resume", False), retry_failed=payload.get("retry_failed", False),
@@ -340,7 +361,7 @@ def execute_job(root: str, job_id: str, observer=None):
             )
             symbol, title = "", f"数据源探测 · {payload['source']}"
         elif kind == "market_validate":
-            result = MarketDataService(store).revalidate(
+            result = MarketDataService(store, settings=configured).revalidate(
                 payload["symbol"], payload["timeframe"],
                 label_convention=payload.get("label_convention"),
                 mode=payload.get("mode", "incremental"),
@@ -348,7 +369,7 @@ def execute_job(root: str, job_id: str, observer=None):
             )
             symbol, title = payload["symbol"], f"校验 {payload['timeframe']} 行情"
         elif kind == "market_archive":
-            market = MarketDataService(store)
+            market = MarketDataService(store, settings=configured)
             values = []
             for symbol in payload.get("symbols", []):
                 values.append(market.repository.archive_dataset(
@@ -360,14 +381,14 @@ def execute_job(root: str, job_id: str, observer=None):
             }
             symbol, title = ",".join(payload.get("symbols", [])), "保护历史行情快照"
         elif kind == "market_prepare":
-            market = MarketDataService(store)
+            market = MarketDataService(store, settings=configured)
             config = BacktestConfig.model_validate(payload["config"])
             result = MarketPreparationService(market).execute(
                 config, progress=progress, cancelled=cancelled,
             )
             symbol, title = config.symbol, f"准备 {config.frequency} 行情"
         elif kind == "market_aggregate":
-            market = MarketDataService(store)
+            market = MarketDataService(store, settings=configured)
             aggregated = AggregationService(market)
             values = []
             aggregate_failures = []
@@ -410,6 +431,13 @@ def execute_job(root: str, job_id: str, observer=None):
                 title += " · 部分完成"
         if isinstance(result, dict):
             result["performance"] = trace.snapshot()
+            result["configuration_snapshot"] = frozen if isinstance(frozen, dict) else None
+            result["execution"] = {
+                "configuration_revision": (frozen or {}).get("revision") if isinstance(frozen, dict) else None,
+                "data_version": payload.get("version"),
+                "resource_settings": configured.performance.model_dump(mode="json"),
+                "cpu_units": int(cpu_units),
+            }
         result_id = store.save_result(kind, result, symbol, title)
         sync_error = None
         if failed_sync:
@@ -441,8 +469,9 @@ def execute_job(root: str, job_id: str, observer=None):
 
 
 class JobManager:
-    def __init__(self, root: str, workers=2):
+    def __init__(self, root: str, workers=2, poll_seconds: float | None = None):
         self.root, self.workers = root, workers
+        self.poll_seconds = float(poll_seconds or load_settings().market_data.scheduler_poll_seconds)
         self.stop_event = threading.Event()
         self.active: dict[str, multiprocessing.Process] = {}
         self.thread = threading.Thread(target=self._loop, daemon=True, name="grid-job-dispatcher")
@@ -459,7 +488,7 @@ class JobManager:
     def _loop(self):
         context = multiprocessing.get_context("spawn")
         store = Store(self.root)
-        while not self.stop_event.wait(0.5):
+        while not self.stop_event.wait(self.poll_seconds):
             for job_id, process in list(self.active.items()):
                 if not process.is_alive():
                     process.join()

@@ -8,6 +8,7 @@ import type { Frequency, Instrument, WatchItem } from './types'
 import Disclosure, { usePersistentFlag } from './Disclosure'
 import { useTasks } from './TaskCenter'
 import { chartValue, priceText, validPrice, validVolume } from './marketValues'
+import { useWorkbenchDefaults } from './useWorkbenchDefaults'
 
 type Bar = { timestamp: string; open: number; close: number; high: number; low: number; volume: number; [key: string]: unknown }
 type MarketFrequency = Frequency | '1week' | '1month'
@@ -15,6 +16,13 @@ type MarketData = { quote?: { close: number; preclose: number }; symbol: string;
 
 export default function MarketPanel({ onSelect, requestedReport, onReportHandled }: { onSelect?: (symbol: string) => void; requestedReport?: string | null; onReportHandled?: () => void }) {
   const tasks = useTasks()
+  const configuration = useWorkbenchDefaults()
+  const ui = (configuration.document.ui ?? {}) as Record<string, unknown>
+  const refreshIntervalMs = Math.max(1000, Number(ui.data_refresh_interval_ms) || 5000)
+  const lookupLimit = Math.max(5, Number(ui.instrument_lookup_limit) || 40)
+  const lookupDebounceMs = Math.max(50, Number(ui.instrument_lookup_debounce_ms) || 250)
+  const chartPoints = Math.max(100, Number(ui.chart_points) || 2000)
+  const configuredMa = Array.isArray(ui.default_ma) ? (ui.default_ma as unknown[]).filter(value => Number.isInteger(value) && Number(value) > 0).map(Number) : [5, 20, 60]
   const jobs = tasks.jobs.filter(task => ['instruments', 'market_sync', 'market_import', 'market_import_batch', 'market_index_package'].includes(task.kind))
   const [sidebarCollapsed, setSidebarCollapsed] = usePersistentFlag('market-sidebar-collapsed')
   const [watchlist, setWatchlist] = useState<WatchItem[]>([])
@@ -23,10 +31,10 @@ export default function MarketPanel({ onSelect, requestedReport, onReportHandled
   const [found, setFound] = useState<Instrument[]>([])
   const [active, setActive] = useState<Instrument | null>(null)
   const [frequency, setFrequency] = useState<MarketFrequency>('1d')
-  const [maDraft, setMaDraft] = useState(() => localStorage.getItem('market-ma') ?? '5,10,20,60')
+  const [maDraft, setMaDraft] = useState(() => localStorage.getItem('market-ma') ?? configuredMa.join(','))
   const [periods, setPeriods] = useState(() => {
     const values = [...new Set(maDraft.split(/[,，\s]+/).filter(Boolean).map(Number))]
-    return values.every(value => Number.isInteger(value) && value > 0 && value <= 500) ? values : [5, 10, 20, 60]
+    return values.every(value => Number.isInteger(value) && value > 0 && value <= 500) ? values : configuredMa
   })
   const [market, setMarket] = useState<MarketData | null>(null)
   const [report, setReport] = useState<{ message?: string; warnings?: string[]; symbols?: Array<{ symbol: string; last_date?: string; minute_through?: string; warnings?: string[] }>; failures?: Array<{ symbol: string; reason: string }> } | null>(null)
@@ -43,9 +51,9 @@ export default function MarketPanel({ onSelect, requestedReport, onReportHandled
   const finished = jobs.filter(job => ['completed', 'partial', 'failed', 'cancelled'].includes(job.status)).map(job => `${job.id}:${job.status}`).join(',')
   useEffect(() => {
     void refresh().catch(error => setError(String(error)))
-    const timer = window.setInterval(() => { void refresh().catch(() => undefined) }, 5000)
+    const timer = window.setInterval(() => { void refresh().catch(() => undefined) }, refreshIntervalMs)
     return () => window.clearInterval(timer)
-  }, [refresh, finished])
+  }, [refresh, finished, refreshIntervalMs])
   useEffect(() => {
     if (!requestedReport) return
     let active = true
@@ -64,17 +72,17 @@ export default function MarketPanel({ onSelect, requestedReport, onReportHandled
   useEffect(() => { if (active) onSelect?.(active.symbol) }, [active?.symbol, onSelect])
   useEffect(() => {
     let valid = true
-    const timer = setTimeout(() => { get<Instrument[]>(`/instruments?q=${encodeURIComponent(query)}${kind ? `&asset_type=${kind}` : ''}&limit=40`).then(items => { if (valid) { setFound(items); setActive(old => old ?? items[0] ?? null) } }).catch(error => { if (valid) setError(String(error)) }) }, 250)
+    const timer = setTimeout(() => { get<Instrument[]>(`/instruments?q=${encodeURIComponent(query)}${kind ? `&asset_type=${kind}` : ''}&limit=${lookupLimit}`).then(items => { if (valid) { setFound(items); setActive(old => old ?? items[0] ?? null) } }).catch(error => { if (valid) setError(String(error)) }) }, lookupDebounceMs)
     return () => { valid = false; clearTimeout(timer) }
-  }, [query, kind, finished])
+  }, [query, kind, finished, lookupLimit, lookupDebounceMs])
   useEffect(() => {
     if (!active) { setMarket(null); return }
     let valid = true
     chartRevision.current += 1
     setLoading(true); setError(''); setMarket(null)
-    get<MarketData>(`/market/bars/${encodeURIComponent(active.symbol)}?frequency=${frequency}&ma=${periods.join(',')}`).then(value => { if (valid) setMarket(value) }).catch(error => { if (valid) { setMarket(null); setError(String(error)) } }).finally(() => { if (valid) setLoading(false) })
+    get<MarketData>(`/market/bars/${encodeURIComponent(active.symbol)}?frequency=${frequency}&limit=${chartPoints}&ma=${periods.join(',')}`).then(value => { if (valid) setMarket(value) }).catch(error => { if (valid) { setMarket(null); setError(String(error)) } }).finally(() => { if (valid) setLoading(false) })
     return () => { valid = false }
-  }, [active?.symbol, frequency, periods, finished, refreshToken])
+  }, [active?.symbol, frequency, periods, finished, refreshToken, chartPoints])
   const update = async (scope: string) => {
     setBusy(true); setError('')
     try { await tasks.run(scope === 'market' ? '全市场行情更新' : scope === 'watchlist' ? '自选行情更新' : '当前标的更新', () => post('/data/sync', { scope, mode: 'incremental', frequency, resume: true, symbols: scope === 'selected' && active ? [active.symbol] : [] })); await refresh() }

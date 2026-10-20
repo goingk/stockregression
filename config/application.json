@@ -1,0 +1,333 @@
+{
+  "config_schema_version": 4,
+  "application": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "max_workers": 2
+  },
+  "paths": {
+    "data_dir": "data",
+    "package_dir": "data/dataset/etf"
+  },
+  "backtest": {
+    "grid": {
+      "grid_mode": "geometric",
+      "buy_step": 0.015,
+      "sell_step": 0.015,
+      "lower_price": null,
+      "upper_price": null
+    },
+    "position": {
+      "initial_shares": 10000,
+      "min_shares": 0,
+      "max_shares": 30000,
+      "buy_shares": 1200,
+      "sell_shares": 1000
+    },
+    "dca": {
+      "frequency": "monthly",
+      "shares": 1000,
+      "initial_shares": 0
+    },
+    "fees": {
+      "commission_rate": 0.0005,
+      "min_commission": 0.1
+    }
+  },
+  "research": {
+    "defaults": {
+      "strategy_id": "geometric_robust_j",
+      "protocol_version": 4,
+      "selection_target": "fixed",
+      "rebalance_days": 63,
+      "mode": "both",
+      "n_trials": 1000,
+      "local_search_budget": 3000,
+      "seed": 42,
+      "top_candidates": 100,
+      "max_drawdown": 0.3,
+      "min_trades": 10,
+      "min_history_days": 504,
+      "min_minute_ratio": 0.95,
+      "ranking_mode": "fixed_mean",
+      "strategy_version": 4,
+      "hypercube_edge": 3,
+      "granularity": {
+        "buy_step": 0.0001,
+        "sell_step": 0.0001,
+        "sell_shares": 100.0,
+        "buy_shares": 100.0
+      },
+      "search_method": "auto",
+      "training_budget": 30000,
+      "validation_budget": 60000,
+      "recommendation_count": 10,
+      "max_shares_mode": "unlimited",
+      "slippage_mode": "zero",
+      "neighborhood_fields": [
+        "buy_step",
+        "sell_step",
+        "buy_shares",
+        "sell_shares"
+      ],
+      "fixed_half_widths": {
+        "buy_step": 0.001,
+        "sell_step": 0.001,
+        "sell_shares": 100.0,
+        "buy_shares": 100.0,
+        "min_shares": 500.0,
+        "max_shares": 500.0
+      },
+      "ranges": {
+        "buy_step": {
+          "low": 0.005,
+          "high": 0.025,
+          "step": null
+        },
+        "sell_step": {
+          "low": 0.005,
+          "high": 0.025,
+          "step": null
+        },
+        "buy_shares": {
+          "low": 800.0,
+          "high": 1200.0,
+          "step": null
+        },
+        "sell_shares": {
+          "low": 800.0,
+          "high": 1200.0,
+          "step": null
+        }
+      },
+      "sigma": 1.0,
+      "alpha": 0.3,
+      "beta": 0.5,
+      "tau": 0.01,
+      "eta_limit": 2.0,
+      "eta_hard_cap": 3.5,
+      "gamma_max": 0.4,
+      "eta_floor": 0.0,
+      "gamma_min": 0.0,
+      "training_min_days": 250,
+      "training_max_days": 500,
+      "peak_tolerance": 1e-12,
+      "start_min": 20,
+      "start_max": 64,
+      "starts_per_candidate": 4,
+      "initial_strides": [
+        1,
+        2
+      ],
+      "stride_multiplier": 2,
+      "max_stride_fraction": 0.25,
+      "validation_reserve_fraction": 0.25,
+      "exhaustive_memory_limit_mb": 512,
+      "estimated_bytes_per_point": 512,
+      "stress_cost_multiplier": 2.0,
+      "stress_region_count": 3
+    },
+    "legacy": {
+      "source": "migration_v1",
+      "research_defaults": {
+        "protocol_version": 4,
+        "selection_target": "fixed",
+        "rebalance_days": 63,
+        "bootstrap_reps": 10000,
+        "mode": "both",
+        "n_trials": 1000,
+        "local_search_budget": 3000,
+        "seed": 42,
+        "top_candidates": 100,
+        "max_drawdown": 0.3,
+        "min_trades": 10,
+        "min_history_days": 504,
+        "min_minute_ratio": 0.95,
+        "ranking_mode": "fixed_mean",
+        "strategy_version": 1,
+        "hypercube_edge": 3,
+        "granularity": {
+          "buy_step": 0.0001,
+          "sell_step": 0.0001,
+          "sell_shares": 100.0,
+          "buy_shares": 100.0,
+          "min_shares": 500.0,
+          "max_shares": 500.0
+        },
+        "search_method": "auto",
+        "training_budget": 30000,
+        "validation_budget": 60000,
+        "recommendation_count": 10,
+        "max_shares_mode": "search",
+        "slippage_mode": "zero",
+        "neighborhood_fields": [
+          "buy_step",
+          "sell_step",
+          "buy_shares",
+          "sell_shares"
+        ],
+        "fixed_half_widths": {
+          "buy_step": 0.001,
+          "sell_step": 0.001,
+          "sell_shares": 100.0,
+          "buy_shares": 100.0,
+          "min_shares": 500.0,
+          "max_shares": 500.0
+        },
+        "ranges": {
+          "buy_step": {
+            "low": 0.005,
+            "high": 0.025,
+            "step": 0.002
+          },
+          "sell_step": {
+            "low": 0.005,
+            "high": 0.025,
+            "step": 0.002
+          },
+          "buy_shares": {
+            "low": 800.0,
+            "high": 1200.0,
+            "step": 100.0
+          },
+          "sell_shares": {
+            "low": 800.0,
+            "high": 1200.0,
+            "step": 100.0
+          },
+          "initial_shares": {
+            "low": 10000.0,
+            "high": 10000.0,
+            "step": 1000.0
+          },
+          "min_shares": {
+            "low": 0.0,
+            "high": 2000.0,
+            "step": 1000.0
+          },
+          "max_shares": {
+            "low": 20000.0,
+            "high": 22000.0,
+            "step": 2000.0
+          }
+        },
+        "sigma": 1.0,
+        "alpha": 0.3,
+        "beta": 1.2,
+        "tau": 0.01,
+        "eta_limit": 2.0,
+        "eta_hard_cap": 3.5,
+        "gamma_max": 0.4,
+        "eta_floor": 0.0,
+        "gamma_min": 0.0,
+        "training_min_days": 250,
+        "training_max_days": 500,
+        "peak_tolerance": 1e-12,
+        "start_min": 20,
+        "start_max": 64,
+        "starts_per_candidate": 4,
+        "initial_strides": [
+          1,
+          2
+        ],
+        "stride_multiplier": 2,
+        "max_stride_fraction": 0.25,
+        "validation_reserve_fraction": 0.25,
+        "exhaustive_memory_limit_mb": 512,
+        "stress_cost_multiplier": 2.0,
+        "stress_region_count": 3,
+        "strategy_id": "geometric_excess_neighborhood"
+      },
+      "backtest_defaults": {
+        "grid": {
+          "grid_mode": "geometric",
+          "buy_step": 0.015,
+          "sell_step": 0.015,
+          "lower_price": null,
+          "upper_price": null
+        },
+        "position": {
+          "initial_shares": 10000,
+          "min_shares": 0,
+          "max_shares": 30000,
+          "buy_shares": 1200,
+          "sell_shares": 1000
+        },
+        "dca": {
+          "frequency": "monthly",
+          "shares": 1000,
+          "initial_shares": 0
+        },
+        "fees": {
+          "commission_rate": 0.0005,
+          "min_commission": 0.1
+        }
+      }
+    }
+  },
+  "statistics": {
+    "bootstrap_reps": 10000,
+    "block_lengths": [
+      20,
+      10,
+      40
+    ],
+    "alpha": 0.05,
+    "outer_validation_days": 126
+  },
+  "market_data": {
+    "cache_mb": 256,
+    "recent_minute_source": "sina",
+    "etf_daily_source": "baostock",
+    "network_timeout_seconds": 15.0,
+    "request_retries": 1,
+    "failure_cooldown_hours": 24,
+    "retry_after_seconds": 60,
+    "source_lock_timeout_seconds": 30,
+    "sync_lock_timeout_seconds": 60,
+    "prepare_lock_timeout_seconds": 300,
+    "package_lock_timeout_seconds": 600,
+    "sqlite_timeout_seconds": 60,
+    "daily_batch_size": 128,
+    "service_batch_size": 128,
+    "scheduler_poll_seconds": 0.5
+  },
+  "runtime": {
+    "cpu_budget_mode": "auto",
+    "cpu_budget": null,
+    "download_workers": 4,
+    "validation_workers": 4,
+    "blas_threads": 8,
+    "workspace_mb": 8192,
+    "evaluation_chunk_size": 512,
+    "job_cancel_poll_ms": 300,
+    "progress_update_ms": 500
+  },
+  "ui": {
+    "autosave_debounce_ms": 500,
+    "polling_interval_ms": 2000,
+    "preview_debounce_ms": 300,
+    "page_size": 50,
+    "chart_points": 2000,
+    "default_ma": [
+      5,
+      20,
+      60
+    ],
+    "task_polling_interval_ms": 2500,
+    "data_refresh_interval_ms": 5000,
+    "data_health_page_size": 100,
+    "inventory_page_size": 50,
+    "instrument_lookup_limit": 40,
+    "instrument_lookup_debounce_ms": 250
+  },
+  "schedule": {
+    "enabled": false,
+    "daily_time": "18:30",
+    "weekly_day": "SAT",
+    "weekly_time": "10:00",
+    "subprocess_timeout_seconds": 45,
+    "lock_timeout_seconds": 30
+  },
+  "config_revision": "aba104d0561e1d2d0a3eeade5420c6761a34f02e40979129d0b46894ee6f2382"
+}

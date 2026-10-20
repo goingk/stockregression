@@ -7,10 +7,15 @@ from itertools import product
 import math
 from typing import Any, Iterable, Iterator
 
-from ..models import GRANULARITY_DEFAULTS, GRANULARITY_MINIMUMS, BacktestConfig, OptimizationConfig, SearchRange
+from ..models import LEGACY_GRANULARITY_DEFAULTS, GRANULARITY_MINIMUMS, BacktestConfig, OptimizationConfig, SearchRange
 
 
+ALL_FIELDS = ("buy_step", "sell_step", "buy_shares", "sell_shares", "min_shares", "max_shares")
+# Legacy v4 selectors keep their historical coordinate order for result
+# reproduction.  Robust-J explicitly constructs its space with ROBUST_FIELDS
+# below so its public coordinates follow the four-axis contract.
 FIELDS = ("buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares")
+ROBUST_FIELDS = ("buy_step", "sell_step", "buy_shares", "sell_shares")
 LABELS = {
     "buy_step": "买入间距",
     "sell_step": "卖出间距",
@@ -23,7 +28,7 @@ MIN_UNITS = GRANULARITY_MINIMUMS
 # Backwards-compatible default research granularity.  It is deliberately
 # separate from MIN_UNITS: users may sample holdings every 100 shares even
 # though older v4 studies defaulted to 500-share steps.
-DEFAULT_GRANULARITY = GRANULARITY_DEFAULTS
+DEFAULT_GRANULARITY = LEGACY_GRANULARITY_DEFAULTS
 UNITS = DEFAULT_GRANULARITY
 
 
@@ -74,16 +79,20 @@ class Dimension:
 class ParameterSpace:
     """Validated inclusive lattice; all algorithms operate on integer ticks."""
 
-    def __init__(self, config: OptimizationConfig):
+    def __init__(self, config: OptimizationConfig, *, field_order: Iterable[str] | None = None):
         self.config = config
         self.base: BacktestConfig = config.base
+        default_order = ROBUST_FIELDS if int(config.strategy.strategy_version) == 4 else FIELDS
+        self.order = tuple(default_order if field_order is None else field_order)
+        if not self.order or len(set(self.order)) != len(self.order) or not set(self.order) <= set(ALL_FIELDS):
+            raise ValueError("参数空间轴定义无效")
         if self.base.grid_mode != "geometric":
             raise ValueError("v4 参数研究只支持等比网格")
         self.initial_shares = int(self.base.initial_shares)
         self.strategy = config.strategy
         self.granularity = {
             name: float(self.strategy.granularity.get(name, DEFAULT_GRANULARITY[name]))
-            for name in FIELDS
+            for name in ALL_FIELDS
         }
         for name, unit in self.granularity.items():
             minimum = float(MIN_UNITS[name])
@@ -94,11 +103,14 @@ class ParameterSpace:
                     f"{'0.0001' if minimum == 0.0001 else int(minimum)} 的正整数倍"
                 )
         dimensions: dict[str, Dimension] = {}
-        unlimited = self.strategy.max_shares_mode == "unlimited"
-        for name in FIELDS:
+        robust_natural = int(self.strategy.strategy_version) == 4
+        unlimited = self.strategy.max_shares_mode == "unlimited" or robust_natural
+        for name in self.order:
             if name == "max_shares" and unlimited:
                 continue
             raw = config.ranges.get(name)
+            if raw is None and robust_natural and name == "min_shares":
+                raw = SearchRange(low=0, high=0, step=self.granularity[name])
             if raw is None:
                 raise ValueError(f"v4 研究缺少 {LABELS[name]} 搜索范围")
             search_range = raw if isinstance(raw, SearchRange) else SearchRange.model_validate(raw)
@@ -124,7 +136,7 @@ class ParameterSpace:
             if low > high:
                 raise ValueError(f"{LABELS[name]}与固定初始持股不相容")
             dimensions[name] = Dimension(name, low, high, unit)
-        self.dimensions = {name: dimensions[name] for name in FIELDS if name in dimensions}
+        self.dimensions = {name: dimensions[name] for name in self.order if name in dimensions}
         self.max_unlimited = unlimited
         self.fixed = {name: dim.low for name, dim in self.dimensions.items() if dim.fixed}
         self.active = tuple(name for name, dim in self.dimensions.items() if not dim.fixed)
@@ -194,7 +206,7 @@ class ParameterSpace:
     def full_coordinate(self, active_coords: Iterable[int]) -> tuple[int, ...]:
         values = dict(zip(self.active, (int(value) for value in active_coords)))
         output = []
-        for name in FIELDS:
+        for name in self.order:
             if name in values:
                 output.append(values[name])
             elif name in self.fixed and self.fixed[name] >= 0:
@@ -206,22 +218,23 @@ class ParameterSpace:
         return tuple(output)
 
     def active_coords(self, coordinate: tuple[int, ...]) -> tuple[int, ...]:
-        by_name = dict(zip(FIELDS, coordinate))
+        by_name = dict(zip(self.order, coordinate))
         return tuple(by_name[name] for name in self.active)
 
     def params(self, coordinate: tuple[int, ...]) -> dict[str, Any]:
-        by_name = dict(zip(FIELDS, coordinate))
-        params = {name: self.value(name, by_name[name]) for name in FIELDS if name in by_name and by_name[name] >= 0}
+        by_name = dict(zip(self.order, coordinate))
+        params = {name: self.value(name, by_name[name]) for name in self.order if name in by_name and by_name[name] >= 0}
         params["initial_shares"] = self.initial_shares
+        params.setdefault("min_shares", 0)
         if self.max_unlimited:
             params["max_shares"] = None
         return params
 
     def coordinate(self, params: dict[str, Any]) -> tuple[int, ...]:
-        values = {name: self.value_to_ticks(name, params[name]) for name in FIELDS if name in params and params[name] is not None}
+        values = {name: self.value_to_ticks(name, params[name]) for name in self.order if name in params and params[name] is not None}
         if self.max_unlimited:
             values["max_shares"] = -1
-        return tuple(values[name] for name in FIELDS)
+        return tuple(values[name] for name in self.order)
 
     def legal(self, active_coords: Iterable[int]) -> bool:
         vals = dict(zip(self.active, (int(value) for value in active_coords)))
@@ -295,7 +308,7 @@ class ParameterSpace:
         return self.full_coordinate(self.active_coords(coordinate))
 
     def bounds_for(self, coordinate: tuple[int, ...], radii: dict[str, int]) -> dict[str, dict[str, Any]]:
-        by_name = dict(zip(FIELDS, coordinate))
+        by_name = dict(zip(self.order, coordinate))
         bounds = {}
         for name in self.dimensions:
             radius = int(radii.get(name, 0))

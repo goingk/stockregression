@@ -163,7 +163,10 @@ class MarketPreparationService:
 
     def _refresh_auxiliary(self, symbol, start, end, cancelled) -> dict:
         calendar = fetch_market_calendar(start, end, cancelled)
-        actions, metadata = fetch_market_actions(symbol, start, end, cancelled)
+        actions, metadata = fetch_market_actions(
+            symbol, start, end, cancelled,
+            network_timeout=self.service.settings.market_data.network_timeout_seconds,
+        )
         if calendar is None or calendar.empty:
             raise MarketDataError("交易日历来源未返回数据")
         self.repository.save_auxiliary(

@@ -1,0 +1,71 @@
+{
+  "generated_at": "2026-10-20T22:31:37+0800",
+  "symbol": "159611.SZ",
+  "frequency": "1d",
+  "data_version": "mkt-2fe613b32b3cb6f36535ca00",
+  "evaluation": {
+    "start": "2026-04-17",
+    "end": "2026-10-16"
+  },
+  "strategy": {
+    "schema_version": 3,
+    "protocol_version": 4,
+    "strategy_version": 4,
+    "strategy_id": "geometric_robust_j",
+    "recommendation_count": 3,
+    "training_min_days": 250,
+    "training_max_days": 500
+  },
+  "budgets": {
+    "training": 100,
+    "validation": 2000
+  },
+  "status": "completed",
+  "fixed_status": "no_qualified",
+  "recommendation_status": "no_qualified",
+  "recommendation_count": 0,
+  "diagnostics": {
+    "geometry": "robust_j",
+    "strategy_id": "geometric_robust_j",
+    "strategy_version": 4,
+    "search_method": "exhaustive",
+    "legal_combination_count": 33,
+    "training_unique_count": 33,
+    "neighborhood_unique_count": 0,
+    "scored_center_count": 33,
+    "eligible_center_count": 0,
+    "score_complete": true,
+    "local_peak_verified": false,
+    "global_exhaustive": true,
+    "coverage_status": "global_exhaustive",
+    "training_window": {
+      "start": "2024-09-30",
+      "end": "2026-10-16",
+      "days": 493,
+      "anchor_date": "2026-10-16",
+      "anchor_price": 1.039,
+      "matched_date": "2024-09-30",
+      "matched": true,
+      "fallback": false,
+      "start_reason": "same_price_farthest",
+      "search_start": "2024-09-19",
+      "search_end": "2025-09-29",
+      "min_offset_trading_days": 250,
+      "max_offset_trading_days": 500,
+      "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+      "reason": "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 500 个交易日内距离评估日最远的一天作为训练时段起点"
+    },
+    "platforms": [],
+    "computation": {
+      "training_evaluations": 33,
+      "neighborhood_evaluations": 0,
+      "stress_evaluations": 0,
+      "cache_hits": 0
+    }
+  },
+  "regions": [],
+  "timing_seconds": {
+    "data_preparation": 1.4886578999576159,
+    "research": 1.1485106000327505
+  }
+}

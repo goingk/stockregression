@@ -191,7 +191,7 @@ def _parameter_arrays(config, prepared, parameter_schedule):
     return np.asarray(days, dtype=np.int64), np.asarray(values, dtype=np.float64).reshape((-1, 8)), normalized
 
 
-def _options(config, prepared, money, mode=0, cost_multiplier=1.0):
+def _options(config, prepared, money, mode=0, cost_multiplier=1.0, allow_odd_lot_exit=False):
     terms, fees = prepared["terms"], config.fees
     return (money["initial_equity"], money["dca_initial_equity"], money["buy_hold_initial_equity"],
         float(config.min_shares), np.inf if config.max_shares is None else float(config.max_shares),
@@ -203,7 +203,7 @@ def _options(config, prepared, money, mode=0, cost_multiplier=1.0):
         fees.share_face_value, config.initial_shares, money["reserve_cash"], config.dca.initial_shares,
         config.dca.shares, money["buy_hold_initial_shares"], money["valuation_price"],
         terms["price_tick"], terms["settlement"] == "T0", mode,
-        1 if config.schema_version == 3 else 0)
+        1 if config.schema_version == 3 else 0, bool(allow_odd_lot_exit))
 
 
 def _return_days(prepared):
@@ -253,6 +253,13 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
     for account, name in enumerate(("grid", "dca", "buy_hold")):
         metric = {key: (int(round(metrics[account, i])) if key in {"trade_count", "buy_count", "sell_count"} else float(metrics[account, i]) if math.isfinite(metrics[account, i]) else None) for i, key in enumerate(engine._METRIC_KEYS)}
         metric["initial_equity"] = initial_equities[account]
+        if account == 0:
+            metric.update(
+                actual_min_pos_ratio=float(funding_stats[0, 9]),
+                actual_max_pos_ratio=float(funding_stats[0, 10]),
+                stockout_count=int(round(funding_stats[0, 11])),
+                tplus1_block_count=int(round(funding_stats[0, 12])),
+            )
         if account != 1 and initial_equities[account] <= 0 and not (flow_aware and account == 0 and peak_invested > 0):
             metric.update({key: None for key in ("total_return", "cagr", "max_drawdown", "sharpe", "calmar", "turnover")})
         if account == 1:
@@ -311,7 +318,7 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
 
 
 def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
-                   cancelled=None, parallel=True):
+                   cancelled=None, parallel=True, allow_odd_lot_exit=False):
     """Compact day-by-candidate returns with exact intrabar fold risk.
 
     The cash budget is determined once from ``base`` and shared by every row.
@@ -347,8 +354,11 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
     returns = np.empty((len(dates), len(values)), dtype=np.float64)
     metric_values = np.empty((len(values), 11), dtype=np.float64)
     fold_values = np.empty((len(values), len(fold_ranges), 9), dtype=np.float64)
-    funding_stats = np.empty((len(values), 9), dtype=np.float64)
-    options = _options(base, prepared, money, cost_multiplier=cost_multiplier)
+    funding_stats = np.empty((len(values), 13), dtype=np.float64)
+    options = _options(
+        base, prepared, money, cost_multiplier=cost_multiplier,
+        allow_odd_lot_exit=allow_odd_lot_exit,
+    )
     empty_days, empty_values = np.zeros(0, dtype=np.int64), np.zeros((0, 7), dtype=np.float64)
     old_threads = None
     active_threads = 1
@@ -399,15 +409,27 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
             from numba import set_num_threads
             set_num_threads(old_threads)
     metrics = []
-    for row in metric_values:
+    for index, row in enumerate(metric_values):
         metric = {key: int(round(row[i])) if key in {"trade_count", "buy_count", "sell_count"} else float(row[i]) for i, key in enumerate(engine._METRIC_KEYS)}
         metric["initial_equity"] = money["initial_equity"]
+        metric.update({
+            "actual_min_pos_ratio": float(funding_stats[index, 9]),
+            "actual_max_pos_ratio": float(funding_stats[index, 10]),
+            "stockout_count": int(round(funding_stats[index, 11])),
+            "tplus1_block_count": int(round(funding_stats[index, 12])),
+        })
         metrics.append(metric)
     keys = ("max_drawdown", "trade_count", "buy_count", "sell_count", "total_fees", "turnover", "profit", "principal", "end_assets")
     fold_metrics = [[{key: int(round(row[j])) if key.endswith("count") else float(row[j]) for j, key in enumerate(keys)} for row in candidate] for candidate in fold_values]
+    position_stats = [{
+        "actual_min_pos_ratio": float(row[9]),
+        "actual_max_pos_ratio": float(row[10]),
+        "stockout_count": int(round(row[11])),
+        "tplus1_block_count": int(round(row[12])),
+    } for row in funding_stats]
     return {"dates": dates, "daily_returns": returns, "fold_drawdowns": fold_values[:, :, 0],
             "fold_metrics": fold_metrics, "metrics": metrics, "funding": money,
-            "funding_stats": funding_stats,
+            "funding_stats": funding_stats, "position_stats": position_stats,
             "backend": "numba_batch" if old_threads is not None else "serial"}
 
 

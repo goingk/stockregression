@@ -34,7 +34,7 @@ def test_fee_defaults_match_config_and_survive_partial_updates(settings_file):
         "commission_rate": 0.0008, "min_commission": 0.25,
     }
     assert restored.schedule.daily_time == "19:10"
-    assert json.loads(settings_file.read_text(encoding="utf-8"))["fee_defaults"] == restored.fee_defaults.model_dump()
+    assert json.loads(settings_file.read_text(encoding="utf-8"))["backtest"]["fees"] == restored.fee_defaults.model_dump()
 
 
 def test_zero_fees_are_remembered(settings_file):
@@ -70,13 +70,16 @@ def test_fee_preferences_settings_api(settings_file, tmp_path):
     from stockregression.api import create_app
 
     with TestClient(create_app(str(tmp_path / "data"), start_jobs=False)) as client:
-        assert client.get("/api/v1/settings").json()["fee_defaults"] == {
+        initial = client.get("/api/v1/settings").json()
+        assert initial["fee_defaults"] == {
             "commission_rate": 0.0005, "min_commission": 0.1,
         }
-        response = client.put("/api/v1/settings", json={"fee_defaults": {"commission_rate": 0}})
+        revision = initial["config_revision"]
+        response = client.put("/api/v1/settings", json={"base_revision": revision, "fee_defaults": {"commission_rate": 0}})
         assert response.status_code == 200
         assert response.json()["fee_defaults"] == {"commission_rate": 0, "min_commission": 0.1}
-        assert client.put("/api/v1/settings", json={"fee_defaults": {"min_commission": -1}}).status_code == 422
+        revision = response.json()["config_revision"]
+        assert client.put("/api/v1/settings", json={"base_revision": revision, "fee_defaults": {"min_commission": -1}}).status_code == 422
         assert client.get("/api/v1/settings").json()["fee_defaults"] == {
             "commission_rate": 0, "min_commission": 0.1,
         }

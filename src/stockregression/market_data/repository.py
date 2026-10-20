@@ -106,16 +106,29 @@ def _time_text(value: Any) -> str:
 class MarketDataRepository:
     """Immutable Parquet partitions with transactional version manifests."""
 
-    def __init__(self, root: str | Path, package_dir: str | Path | None = None):
+    def __init__(
+        self,
+        root: str | Path,
+        package_dir: str | Path | None = None,
+        *,
+        market_settings=None,
+    ):
+        from ..settings import load_settings
+
         self.root = Path(root).resolve()
         self.db_path = self.root / "catalog.sqlite"
+        self.market_settings = market_settings or load_settings().market_data
+        self.sqlite_timeout = int(self.market_settings.sqlite_timeout_seconds)
         for timeframe in TIMEFRAMES:
             (self.root / "imports" / timeframe).mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
             self._initialize(db)
         previous_package = self.meta("package_dir") or self.meta("source_package_dir")
         selected_package = package_dir or previous_package
-        self.package = PackageLayout(resolve_package_root(selected_package or self.root / "package"))
+        self.package = PackageLayout(
+            resolve_package_root(selected_package or self.root / "package"),
+            market_settings=self.market_settings,
+        )
         self.package_dir = self.package.root
         self.market_dir = self.package_dir
         self.staging_dir = self.package.staging_dir
@@ -182,11 +195,11 @@ class MarketDataRepository:
 
     @contextmanager
     def _connect(self):
-        connection = sqlite3.connect(self.db_path, timeout=60)
+        connection = sqlite3.connect(self.db_path, timeout=self.sqlite_timeout)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA synchronous=NORMAL")
-        connection.execute("PRAGMA busy_timeout=60000")
+        connection.execute(f"PRAGMA busy_timeout={self.sqlite_timeout * 1000}")
         try:
             yield connection
             connection.commit()

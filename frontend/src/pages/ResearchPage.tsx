@@ -10,22 +10,24 @@ import ConnectedRegionResults from '../ConnectedRegionResults'
 import DataDiagnosticsPanel from '../DataDiagnosticsPanel'
 import Disclosure from '../Disclosure'
 import { useTasks } from '../TaskCenter'
-import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, Field, Loading, NumField, PageHeader, SelectInput, configError, configPayload, loadConfig, percent, revealConfigError, useErrorMessage } from '../components'
+import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, Field, Loading, NumField, PageHeader, SelectInput, TextInput, configError, configPayload, loadConfig, percent, revealConfigError, useErrorMessage } from '../components'
 import { formatPValue, reviewBootstrapEvidence } from '../researchEvidence'
 import { v4ValidationLoadInfo } from '../researchV4Validation'
+import { flushConfiguration } from '../useWorkbenchDefaults'
 import type { BacktestConfig, BacktestResult, DataDiagnostics, DataPreparationRequest, DataSourceEvent, Job } from '../types'
-import { defaultSearchRanges, percentageRanges as pctRange, rangeNames, researchConfigForSubmission, researchRangesForSymbol, validResearchDefaults } from '../workbenchDefaults'
+import { defaultSearchRanges, percentageRanges as pctRange, researchConfigForSubmission, researchRangesForSymbol, validResearchDefaults } from '../workbenchDefaults'
 import type { ResearchDefaults, SearchRange as Range } from '../workbenchDefaults'
 
 type Dict = Record<string, unknown>
 type Candidate = Dict & { params?: Dict; metrics?: Record<string, number | null> }
 type SearchConfig = { base?: BacktestConfig; mode?: string; protocol_version?: number; n_trials?: number; local_search_budget?: number; seed?: number; ranges?: Dict; [key: string]: unknown }
 type TestRun = Partial<BacktestResult> & { strategies?: Record<string, { metrics?: Record<string, number | null>; equity?: Array<{ timestamp: string; equity: number }> }> }
-type RecommendationRegion = { region_id?: number; center_params?: Dict; radii?: Dict; edge_length?: number; geometry?: string; scoring_basis?: string; normalized_volume?: number; combination_count?: number; completed_count?: number; center_excess_return?: number | null; mean_excess_return?: number | null; min_excess_return?: number | null; complete?: boolean; maximum_search_complete?: boolean; global_exhaustive?: boolean; stress?: Dict }
+type RecommendationRegion = { region_id?: number; center_params?: Dict; radii?: Dict; edge_length?: number; geometry?: string; scoring_basis?: string; normalized_volume?: number; combination_count?: number; completed_count?: number; center_excess_return?: number | null; mean_excess_return?: number | null; min_excess_return?: number | null; j_score?: number | null; downside_risk_tau?: number | null; pos_penalty?: number | null; actual_min_pos_ratio?: number | null; actual_max_pos_ratio?: number | null; neighborhood_max_eta?: number | null; pos_win_rate?: number | null; safe_win_rate?: number | null; stockout_count?: number | null; tplus1_block_count?: number | null; platform_size?: number | null; score_complete?: boolean; local_peak_verified?: boolean; complete?: boolean; maximum_search_complete?: boolean; global_exhaustive?: boolean; stress?: Dict }
 type Recommendation = { params?: Dict | null; recommended_params?: Dict | null; diagnostic_params?: Dict | null; as_of?: string; score?: unknown; raw_score?: unknown; status?: string; reasons?: unknown; candidates?: Candidate[]; diagnostics?: Dict; recommendation_status?: string; recommendation_regions?: RecommendationRegion[] }
 type OptimizationResult = {
   protocol_version?: number; mode?: string; seed?: number; n_trials?: number; data_version?: string; label?: string; warnings?: string[]
   config?: SearchConfig; protocol?: Dict; is_demo?: boolean; quality?: Dict; diagnostics?: DataDiagnostics; source_events?: DataSourceEvent[]; computation?: Dict; locked_funding?: Dict
+  configuration_snapshot?: Dict; execution?: Dict; performance?: Dict
   fixed?: { status?: string; params?: Dict; as_of?: string; test_result?: TestRun; current?: Recommendation; diagnostics?: Dict; [key: string]: unknown }
   adaptive?: { status?: string; schedule?: Array<Dict & { effective_date?: string; decision_date?: string; params?: Dict }>; test_result?: TestRun; latest_params?: Dict; latest_as_of?: string; [key: string]: unknown }
   evidence?: Dict & { decisions?: Array<Dict>; final_126_day_check?: Dict }
@@ -48,6 +50,7 @@ export type Props = {
 }
 const labels: Record<string, string> = { buy_step: '买入间距', sell_step: '卖出间距', grid_step: '旧版网格间距', buy_ratio: '旧版买入比例', sell_ratio: '旧版卖出比例', initial_position: '旧版初始仓位', min_position: '旧版最小仓位', max_position: '旧版最大仓位', buy_shares: '每次买入股数', sell_shares: '每次卖出股数', initial_shares: '初始持股', min_shares: '最低持股', max_shares: '最高持股' }
 const v4ResearchFieldNames = ['buy_step', 'sell_step', 'sell_shares', 'buy_shares', 'min_shares', 'max_shares'] as const
+const robustResearchFieldNames = ['buy_step', 'sell_step', 'buy_shares', 'sell_shares'] as const
 function revealDisclosure(id: string) {
   const element = document.querySelector<HTMLDetailsElement>(`details[data-disclosure="${id}"]`)
   if (!element) return
@@ -72,7 +75,6 @@ const candidateLabels: Record<string, string> = {
   overlapping_prior_studies: '本地重叠区间研究数', exact_repeat_prior_studies: '本地同窗重复研究数',
   interpretation: '检验解释', method: '检验方法', return_basis: '收益口径', selected_index: '参照流程编号',
 }
-const knownRangeNames = [...rangeNames]
 function n(value: unknown, fallback = 0) { const parsed = Number(value); return Number.isFinite(parsed) ? parsed : fallback }
 function record(value: unknown): Dict | undefined { return value && typeof value === 'object' && !Array.isArray(value) ? value as Dict : undefined }
 function list(value: unknown): unknown[] { return Array.isArray(value) ? value : [] }
@@ -99,7 +101,7 @@ function protocolVersionOf(...values: unknown[]) {
   return 1
 }
 function jobModeLabel(value: unknown, protocolVersion = 1, strategyVersion = 1) {
-  if (protocolVersion === 4) return strategyVersion === 3 ? '等比网格 v4 · 超正方体平均超额' : strategyVersion === 2 ? '等比网格 v4 · 旧版正收益连通域' : '等比网格 v4 · 旧版矩形邻域'
+  if (protocolVersion === 4) return strategyVersion === 4 ? '等比网格 v4 · 四维稳健 J 峰值' : strategyVersion === 3 ? '等比网格 v4 · 超正方体平均超额' : strategyVersion === 2 ? '等比网格 v4 · 旧版正收益连通域' : '等比网格 v4 · 旧版矩形邻域'
   if (protocolVersion === 3) return '统计驱动研究 v3'
   if (protocolVersion === 2) return '科学研究 v2'
   return value === 'historical' ? '旧版历史最优' : value === 'robust' ? '旧版稳健验证' : value === 'both' ? '旧版历史 + 稳健' : '旧版研究'
@@ -179,6 +181,13 @@ function statusText(status: unknown) {
 }
 function firstString(item: Dict | undefined, keys: string[]) {
   for (const key of keys) if (typeof item?.[key] === 'string') return item[key] as string
+  return undefined
+}
+function resultTrainingWindow(...values: unknown[]): Dict | undefined {
+  for (const value of values) {
+    const window = record(record(value)?.training_window)
+    if (window) return window
+  }
   return undefined
 }
 
@@ -281,7 +290,7 @@ function Final126Evidence({ value }: { value?: Dict }) {
       <div><small>同时置信下界</small><strong>{review.lowerBound == null ? '—' : percent(review.lowerBound, 4)}</strong></div>
     </div>
     {procedureEntries.length > 0 && <div className='table-wrap'><table><thead><tr><th>连续样本外流程</th><th>状态</th><th>配对天数</th><th>总超额收益</th><th>日均对数超额</th></tr></thead><tbody>{procedureEntries.map(([name, raw]) => { const item = record(raw) ?? {}; return <tr key={name}><td>{name === 'fixed' ? '固定参数' : name === 'adaptive' ? '季度自适应' : name}</td><td>{statusText(item.status)}</td><td>{item.paired_days == null ? '—' : String(item.paired_days)}</td><td>{item.total_excess_return == null ? '—' : percent(n(item.total_excess_return))}</td><td>{item.mean_log_excess == null ? '—' : percent(n(item.mean_log_excess), 4)}</td></tr> })}</tbody></table></div>}
-    <div className='param-block'><strong>10 / 20 / 40 日敏感性</strong><BootstrapSensitivityTable value={bootstrap} /></div>
+    <div className='param-block'><strong>Bootstrap 区块敏感性</strong><BootstrapSensitivityTable value={bootstrap} /></div>
     <p className='inline-warning'>该检验基于固定与自适应流程真实连续 OOS 轨迹并做家族校正；p 值不是流程胜率，也不是未来盈利概率。{value.source ? ` 数据来源：${String(value.source)}。` : ''}</p>
     {reasonList(value.reasons).length > 0 && <div className='warning-list'>{reasonList(value.reasons).map((reason, index) => <div key={index}><span className='warning-dot' />{reason}</div>)}</div>}
   </>
@@ -307,7 +316,7 @@ function constraintLabel(value: boolean | undefined) {
 }
 
 export default function ResearchPage({ base, settings, onSettingsChange, onBaseChange, onLoadConfig, requestedJobId, onRequestHandled, onSelectedJobChange, onFeeDefaultsEdit, onDefaultsEdit, onRestore, onPrepareData }: Props) {
-  const { protocol_version: protocolVersion, selection_target: selectionTarget, rebalance_days: rebalanceDays, bootstrap_reps: bootstrapReps, mode, n_trials: trials, local_search_budget: localSearchBudget, seed, top_candidates: topCandidates, max_drawdown: maxDrawdown, min_trades: minTrades, min_history_days: minHistoryDays, min_minute_ratio: minMinuteRatio, strategy_version: strategyVersion, hypercube_edge: hypercubeEdge, granularity, search_method: searchMethod, training_budget: trainingBudget, validation_budget: validationBudget, recommendation_count: recommendationCount, max_shares_mode: maxSharesMode, slippage_mode: slippageMode, neighborhood_fields: neighborhoodFields, fixed_half_widths: fixedHalfWidths } = settings
+  const { protocol_version: protocolVersion, selection_target: selectionTarget, rebalance_days: rebalanceDays, bootstrap_reps: bootstrapReps, bootstrap_block_lengths: bootstrapBlockLengths, significance_alpha: significanceAlpha, outer_validation_days: outerValidationDays, mode, n_trials: trials, local_search_budget: localSearchBudget, seed, top_candidates: topCandidates, max_drawdown: maxDrawdown, min_trades: minTrades, min_history_days: minHistoryDays, min_minute_ratio: minMinuteRatio, strategy_version: strategyVersion, hypercube_edge: hypercubeEdge, granularity, search_method: searchMethod, training_budget: trainingBudget, validation_budget: validationBudget, recommendation_count: recommendationCount, max_shares_mode: maxSharesMode, slippage_mode: slippageMode, neighborhood_fields: neighborhoodFields, fixed_half_widths: fixedHalfWidths, sigma, alpha, beta: scoreBeta, tau, eta_limit: etaLimit, eta_hard_cap: etaHardCap, gamma_max: gammaMax, eta_floor: etaFloor, gamma_min: gammaMin, training_min_days: trainingMinDays, training_max_days: trainingMaxDays, peak_tolerance: peakTolerance, start_min: startMin, start_max: startMax, starts_per_candidate: startsPerCandidate, initial_strides: initialStrides, stride_multiplier: strideMultiplier, max_stride_fraction: maxStrideFraction, validation_reserve_fraction: validationReserveFraction, exhaustive_memory_limit_mb: exhaustiveMemoryLimitMb, estimated_bytes_per_point: estimatedBytesPerPoint, stress_cost_multiplier: stressCostMultiplier, stress_region_count: stressRegionCount } = settings
   const tasks = useTasks()
   const researchJobs = useMemo(() => tasks.jobs.filter(isOptimizationJob), [tasks.jobs])
   const viewableJobs = useMemo(() => researchJobs.filter(job => Boolean(job.result_id)), [researchJobs])
@@ -401,7 +410,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
       return
     }
     const submittedNeighborhoodFields = protocolVersion === 4
-      ? v4ResearchFieldNames.filter(name => !(name === 'max_shares' && maxSharesMode === 'unlimited'))
+      ? (strategyVersion === 4 ? [...robustResearchFieldNames] : v4ResearchFieldNames.filter(name => !(name === 'max_shares' && maxSharesMode === 'unlimited')))
       : neighborhoodFields.filter(name => !(name === 'max_shares' && maxSharesMode === 'unlimited'))
     if (protocolVersion === 4 && !submittedNeighborhoodFields.length) {
       setError('请至少勾选一个细搜索邻域参数。')
@@ -410,8 +419,11 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     }
     setBusy(true); setError(''); setDataIssue(null)
     try {
+      const configurationRevision = await flushConfiguration()
       const submittedRanges = Object.fromEntries(Object.entries(ranges).filter(([name]) => {
-        if (protocolVersion === 4) return v4ResearchFieldNames.includes(name as typeof v4ResearchFieldNames[number]) && !(name === 'max_shares' && maxSharesMode === 'unlimited')
+        if (protocolVersion === 4) return (strategyVersion === 4
+          ? (robustResearchFieldNames as readonly string[]).includes(name)
+          : (v4ResearchFieldNames as readonly string[]).includes(name)) && !(name === 'max_shares' && maxSharesMode === 'unlimited')
         if (protocolVersion >= 2 && name === 'initial_shares') return false
         if (protocolVersion >= 3 && base.max_shares === null && name === 'max_shares') return false
         return name !== 'grid_step'
@@ -420,16 +432,23 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
         base: configPayload(v4Base), protocol_version: protocolVersion, n_trials: trials, local_search_budget: localSearchBudget, seed, top_candidates: topCandidates,
         max_drawdown: maxDrawdown, min_trades: minTrades, min_minute_ratio: minMinuteRatio, ranges: submittedRanges,
         strategy: protocolVersion === 4 ? {
-          strategy_version: 3, search_method: searchMethod, ranking_mode: 'fixed_mean', hypercube_edge: hypercubeEdge, granularity, training_budget: trainingBudget,
+          strategy_version: strategyVersion, strategy_id: strategyVersion === 4 ? 'geometric_robust_j' : 'geometric_excess_neighborhood', search_method: searchMethod, ranking_mode: 'fixed_mean', hypercube_edge: hypercubeEdge, granularity, training_budget: trainingBudget,
           validation_budget: validationBudget, recommendation_count: recommendationCount,
           max_shares_mode: maxSharesMode, slippage_mode: slippageMode, neighborhood_fields: submittedNeighborhoodFields, fixed_half_widths: fixedHalfWidths,
+          sigma, alpha, beta: scoreBeta, tau, eta_limit: etaLimit, eta_hard_cap: etaHardCap, gamma_max: gammaMax, eta_floor: etaFloor, gamma_min: gammaMin,
+          training_min_days: trainingMinDays, training_max_days: trainingMaxDays, peak_tolerance: peakTolerance, start_min: startMin, start_max: startMax,
+          starts_per_candidate: startsPerCandidate, initial_strides: initialStrides, stride_multiplier: strideMultiplier, max_stride_fraction: maxStrideFraction,
+          validation_reserve_fraction: validationReserveFraction, exhaustive_memory_limit_mb: exhaustiveMemoryLimitMb,
+          estimated_bytes_per_point: estimatedBytesPerPoint,
+          stress_cost_multiplier: stressCostMultiplier, stress_region_count: stressRegionCount,
         } : undefined,
       }
       const request = protocolVersion >= 2
-        ? { ...common, selection_target: selectionTarget, rebalance_days: rebalanceDays, bootstrap_reps: bootstrapReps }
+        ? { ...common, selection_target: selectionTarget, rebalance_days: rebalanceDays, bootstrap_reps: bootstrapReps, bootstrap_block_lengths: bootstrapBlockLengths, significance_alpha: significanceAlpha, outer_validation_days: outerValidationDays }
         : { ...common, mode, min_history_days: minHistoryDays }
+      const versionedRequest = { ...request, configuration_revision: configurationRevision }
       if (protocolVersion >= 3) {
-        const preview = await post<Dict>('/optimizations/preview', request)
+        const preview = await post<Dict>('/optimizations/preview', versionedRequest)
         setSearchPreview(preview)
         if (preview.status === 'budget_exceeded') {
           setError(protocolVersion === 4
@@ -444,7 +463,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
           return
         }
       }
-      const response = await tasks.run('参数研究', () => post<{ job_id: string }>('/optimizations', request))
+      const response = await tasks.run('参数研究', () => post<{ job_id: string }>('/optimizations', versionedRequest))
       selectStudy(response.job_id)
     } catch (cause) {
       setError(err(cause))
@@ -542,6 +561,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const current = fixed?.current
   const actualStrategyVersion = configuredStrategyVersion || Number(current?.diagnostics?.strategy_version ?? 1)
   const isHypercubeResult = Number(actualVersion) === 4 && actualStrategyVersion === 3
+  const isRobustResult = Number(actualVersion) === 4 && actualStrategyVersion === 4
   const isConnectedResult = Number(actualVersion) === 4 && actualStrategyVersion === 2
   const regionValidation = v4ValidationLoadInfo(current?.diagnostics)
   const regionDateRange = regionValidation.kind === 'fresh' ? regionValidation.dateRange : undefined
@@ -565,7 +585,11 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const localAudit = record(result?.evidence?.local_audit)
   const statisticalProfile = record(fixed?.diagnostics?.statistical_profile) ?? record(current?.diagnostics?.statistical_profile)
   const trainingDays = record(fixed?.diagnostics)?.selection_history_days ?? record(result?.evidence?.decisions?.[0]?.diagnostics)?.selection_history_days ?? current?.diagnostics?.selection_history_days
-  const insufficientHistory = [fixed, adaptive, current].some(item => item?.status === 'insufficient_history') || finite(trainingDays) && trainingDays < (isHypercubeResult ? 250 : 504)
+  const historicalTrainingWindow = resultTrainingWindow(current?.diagnostics, fixed?.diagnostics)
+  const historicalTrainingMinDays = finite(Number(historicalTrainingWindow?.min_offset_trading_days)) ? Number(historicalTrainingWindow?.min_offset_trading_days) : trainingMinDays
+  const historicalTrainingMaxDays = finite(Number(historicalTrainingWindow?.max_offset_trading_days)) ? Number(historicalTrainingWindow?.max_offset_trading_days) : trainingMaxDays
+  const trainingMinimum = isHypercubeResult || isRobustResult ? historicalTrainingMinDays : 504
+  const insufficientHistory = [fixed, adaptive, current].some(item => item?.status === 'insufficient_history') || finite(trainingDays) && trainingDays < trainingMinimum
   const finalReview = reviewBootstrapEvidence(finalCheck)
   const finalDays = finite(finalCheck?.paired_days) ? finalCheck.paired_days : finite(finalCheck?.days) ? finalCheck.days : null
   const finalRequiredDays = finite(finalCheck?.required_days) ? finalCheck.required_days : 126
@@ -575,8 +599,8 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const adaptiveAdviceDiffers = Boolean(adaptiveRecommended && (!currentRecommended || JSON.stringify(adaptiveRecommended) !== JSON.stringify(currentRecommended) || adaptive?.latest_as_of !== current?.as_of))
   const curveRun = curveMode === 'fixed' ? fixedRun : adaptiveRun
   const rangeNamesToShow = protocolVersion === 4
-    ? v4ResearchFieldNames.filter(name => !(name === 'max_shares' && maxSharesMode === 'unlimited'))
-    : knownRangeNames.filter(name => (protocolVersion === 1 || name !== 'initial_shares') && !(protocolVersion === 3 && base.max_shares === null && name === 'max_shares'))
+    ? (strategyVersion === 4 ? [...robustResearchFieldNames] : v4ResearchFieldNames.filter(name => !(name === 'max_shares' && maxSharesMode === 'unlimited')))
+    : (['buy_step', 'sell_step', 'buy_shares', 'sell_shares', 'initial_shares', 'min_shares', 'max_shares'] as string[]).filter(name => (protocolVersion === 1 || name !== 'initial_shares') && !(protocolVersion === 3 && base.max_shares === null && name === 'max_shares'))
   const schemeLabel = selectionTarget === 'both' ? '固定 + 自适应' : selectionTarget === 'fixed' ? '固定参数' : '每季自适应'
   const landscapeDecisions = [
     { value: 'current:0', label: '当前建议决策' },
@@ -590,9 +614,9 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     <PageHeader eyebrow='PARAMETER RESEARCH' title='参数研究' description='用历史训练选择参数，在所选日期内检验固定与自适应方案。' action={<Button busy={busy} disabled={!base.symbol} onClick={() => void submit()}><FlaskConical size={15} />启动参数研究</Button>} />
     <div className='research-guide'>
       <p><strong>研究流程</strong><span>设置标的与评估期 → 选择方案并启动 → 查看样本外表现与证据 → 载入回测</span></p>
-      <Disclosure id='research-method-help' title='如何理解日期、方案与证据' summary='评估日期 · 250–500 日训练 · 当前建议'>
+      <Disclosure id='research-method-help' title='如何理解日期、方案与证据' summary={`评估日期 · ${trainingMinDays}–${trainingMaxDays} 日训练 · 当前建议`}>
         <div className='research-help-grid'>
-          <p><strong>日期与训练</strong>所选开始、结束日期定义样本外评估期。训练时段不再拆分训练与内部验证：从评估日向前 250–500 个交易日中，取距离评估日最远、且当日最低价低于评估前最后收盘价、当日最高价高于该收盘价的交易日为起点；没有这样的同价日时取 500 日。训练时段整体用于超正方体评分。</p>
+          <p><strong>日期与训练</strong>所选开始、结束日期定义样本外评估期。训练时段不再拆分训练与内部验证：从评估日向前 {trainingMinDays}–{trainingMaxDays} 个交易日中，取距离评估日最远、且当日最低价低于评估前最后收盘价、当日最高价高于该收盘价的交易日为起点；没有这样的同价日时取 {trainingMaxDays} 日。训练时段整体用于稳健 J 或历史超正方体评分。</p>
           <p><strong>固定与自适应</strong>固定方案在评估开始前锁定一组参数；自适应方案每隔设定交易日重选一次，决策只使用当时可得的历史，账户连续运行。</p>
           <p><strong>历史参数与当前建议</strong>样本外曲线使用当时已选出的参数。评估结束时算出的下一期建议属于新的选择，不能追加到历史曲线或解释为历史已实现收益。</p>
           <p><strong>三个独立判断</strong>相对最佳表示候选中得分最高；满足约束表示通过回撤、成交等条件；统计证据需要另看家族校正和置信下界。p 值不是策略胜率或未来盈利概率。</p>
@@ -621,26 +645,68 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
           </> : <div className='result-meta'><Badge tone='amber'>旧版研究 v1</Badge><span>{jobModeLabel(mode)}</span></div>}
           {protocolVersion === 4 && <>
             <div className='form-grid two'>
-              <Field label='研究策略'><div className='result-meta'><Badge tone='blue'>等比网格超正方体平均超额收益 v3</Badge><span>六维整数刻度搜索</span></div></Field>
+              <Field label='研究策略'><SelectInput value={strategyVersion} onChange={event => updateSettings({ strategy_version: Number(event.target.value) as ResearchDefaults['strategy_version'] })}><option value='4'>四维稳健 J 峰值（新版）</option><option value='3'>六维超正方体平均超额（历史）</option></SelectInput></Field>
               <NumField label='超正方体边长（研究刻度）' min={1} max={99} step='2' value={hypercubeEdge} onChange={next => next != null && updateSettings({ hypercube_edge: next })} hint='奇数边长使中心落在整数刻度；边长 3 表示每个维度取中心及两侧各一格。' />
               <Field label='搜索方法'><SelectInput value={searchMethod} onChange={event => updateSettings({ search_method: event.target.value as ResearchDefaults['search_method'] })}><option value='auto'>自动（小空间穷举）</option><option value='hierarchical'>分层搜索</option><option value='exhaustive'>完整枚举</option></SelectInput></Field>
-              <NumField label='训练预算（唯一参数点）' min={1} max={1000000} step='1' value={trainingBudget} onChange={next => next != null && updateSettings({ training_budget: next })} />
-              <NumField label='超正方体评价预算（唯一参数点）' min={1} max={2000000} step='1' value={validationBudget} onChange={next => next != null && updateSettings({ validation_budget: next })} />
+              <NumField label='训练回测预算（唯一参数点）' min={1} max={1000000} step='1' value={trainingBudget} onChange={next => next != null && updateSettings({ training_budget: next })} />
+              <NumField label='邻域与峰值核验预算（唯一参数点）' min={1} max={2000000} step='1' value={validationBudget} onChange={next => next != null && updateSettings({ validation_budget: next })} />
               <NumField label='推荐参数个数' min={1} max={100} step='1' value={recommendationCount} onChange={next => next != null && updateSettings({ recommendation_count: next })} />
-              <Field label='最高持股研究方式'><SelectInput value={maxSharesMode} onChange={event => updateSettings({ max_shares_mode: event.target.value as ResearchDefaults['max_shares_mode'] })}><option value='search'>搜索有限上限</option><option value='unlimited'>固定不限</option></SelectInput></Field>
+              {strategyVersion !== 4 && <Field label='最高持股研究方式'><SelectInput value={maxSharesMode} onChange={event => updateSettings({ max_shares_mode: event.target.value as ResearchDefaults['max_shares_mode'] })}><option value='search'>搜索有限上限</option><option value='unlimited'>固定不限</option></SelectInput></Field>}
               <Field label='滑点处理'><SelectInput value={slippageMode} onChange={event => updateSettings({ slippage_mode: event.target.value as ResearchDefaults['slippage_mode'] })}><option value='configured'>按当前配置</option><option value='zero'>不考虑滑点</option></SelectInput></Field>
             </div>
-            <p className='field-hint'>买入间距与卖出间距独立搜索，最小刻度均为 0.01 个百分点；买卖数量单位 100 股 / 份，持仓上下限单位 500 股 / 份。研究只搜索这六维，基础配置中的对应值不参与搜索。</p>
+            {strategyVersion === 4 && <p className='field-hint'>新版只搜索买入间距、卖出间距、每次买入和每次卖出四轴；最低持仓固定为零、最高持仓自然放开。买卖比例仅由股数除以初始持股派生，持仓上限作为回测后的风险资格与惩罚，不会提前截断成交。</p>}
+            {strategyVersion !== 4 && <p className='field-hint'>历史 v3 继续使用六维整数刻度搜索，用于复现既往研究。</p>}
             {strategyVersion === 1 && <div className='form-grid two'>{Object.entries(fixedHalfWidths).filter(([name]) => !(name === 'max_shares' && maxSharesMode === 'unlimited')).map(([name, value]) => { const priceStep = name === 'buy_step' || name === 'sell_step'; return <NumField key={name} label={(labels[name] ?? name) + '半宽'} min={priceStep ? .01 : legacyHalfWidthUnit(name)} step={priceStep ? '.01' : String(legacyHalfWidthUnit(name))} percentValue={priceStep} suffix={priceStep ? '%' : undefined} value={value} onChange={next => next != null && updateSettings({ fixed_half_widths: { ...fixedHalfWidths, [name]: next } })} hint={priceStep ? '按 0.01 个百分点步进' : `按 ${legacyHalfWidthUnit(name)} 股 / 份步进`} /> })}</div>}
           </>}
+          {protocolVersion === 4 && strategyVersion === 4 && <Disclosure id='research-robust-j' title='稳健 J 目标与峰区评分' summary={'α ' + percent(alpha) + ' · β ' + scoreBeta.toFixed(2) + ' · σ ' + sigma.toFixed(2) + ' · τ ' + percent(tau)}>
+            <div className='form-grid two'>
+              <NumField label='中心超额权重 α' min={0} max={100} step='1' percentValue suffix='%' value={alpha} onChange={next => next != null && updateSettings({ alpha: next })} />
+              <NumField label='下行风险系数 β' min={0} max={100} step='.1' value={scoreBeta} onChange={next => next != null && updateSettings({ beta: next })} />
+              <NumField label='安全垫阈值 τ（训练期累计）' min={-100} max={1000} step='1' percentValue suffix='%' value={tau} onChange={next => next != null && updateSettings({ tau: next })} />
+              <NumField label='高斯核宽度 σ（刻度）' min={.01} max={100} step='.1' value={sigma} onChange={next => next != null && updateSettings({ sigma: next })} />
+              <NumField label='持仓免罚上限 η limit' min={0} max={1000} step='.1' value={etaLimit} onChange={next => next != null && updateSettings({ eta_limit: next })} />
+              <NumField label='最大持仓淘汰阈值（0 表示关闭）' min={0} max={1000} step='.1' value={etaHardCap ?? 0} onChange={next => next != null && updateSettings({ eta_hard_cap: next > 0 ? next : null })} hint='仅判断中心是否合格，不提前停止回测或截断买入。' />
+              <NumField label='上界二次惩罚 γ max' min={0} max={1000} step='.05' value={gammaMax} onChange={next => next != null && updateSettings({ gamma_max: next })} hint={'例如实际最大持仓 2.5 倍、免罚上限 2、γ=0.4 时扣 0.1。'} />
+              <NumField label='底仓保护下限 η floor' min={0} max={100} step='1' percentValue suffix='%' value={etaFloor} onChange={next => next != null && updateSettings({ eta_floor: next })} />
+              <NumField label='下界二次惩罚 γ min' min={0} max={1000} step='.05' value={gammaMin} onChange={next => next != null && updateSettings({ gamma_min: next })} />
+              <NumField label='峰值比较绝对容差' min={1e-15} max={.1} step='any' value={peakTolerance} onChange={next => next != null && updateSettings({ peak_tolerance: next })} />
+            </div>
+            <p className='field-hint'>J = αR + (1−α)μΩ − βσ⁻Ω − Cpos。原始 R 只作为中心收益与诊断，候选峰值按 J 搜寻；回撤 0、收益 0 都按真实数值处理。</p>
+          </Disclosure>}
+          {protocolVersion === 4 && strategyVersion === 4 && <Disclosure id='research-robust-search' title='多起点搜索与预算控制' summary={`起点 ${startMin}–${startMax} · 每候选 ${startsPerCandidate} · 核验预留 ${percent(validationReserveFraction)}`}>
+            <div className='form-grid two'>
+              <NumField label='最少起点数' min={1} max={1000} step='1' value={startMin} onChange={next => next != null && updateSettings({ start_min: next })} />
+              <NumField label='最多起点数' min={1} max={1000} step='1' value={startMax} onChange={next => next != null && updateSettings({ start_max: next })} />
+              <NumField label='每个推荐候选对应起点数' min={1} max={100} step='1' value={startsPerCandidate} onChange={next => next != null && updateSettings({ starts_per_candidate: next })} />
+              <Field label='初始局部步长（刻度，逗号分隔）'><TextInput value={initialStrides.join(',')} onChange={event => { const values = event.target.value.split(',').map(value => Number(value.trim())).filter(value => Number.isSafeInteger(value) && value > 0); updateSettings({ initial_strides: values.length ? values : [1] }) }} /></Field>
+              <NumField label='大步长倍率' min={2} max={16} step='1' value={strideMultiplier} onChange={next => next != null && updateSettings({ stride_multiplier: next })} />
+              <NumField label='大步长最大跨度比例' min={1} max={100} step='1' percentValue suffix='%' value={maxStrideFraction} onChange={next => next != null && updateSettings({ max_stride_fraction: next })} />
+              <NumField label='峰值核验预算预留' min={0} max={100} step='1' percentValue suffix='%' value={validationReserveFraction} onChange={next => next != null && updateSettings({ validation_reserve_fraction: next })} />
+              <NumField label='穷举工作内存上限（MiB）' min={16} max={65536} step='16' value={exhaustiveMemoryLimitMb} onChange={next => next != null && updateSettings({ exhaustive_memory_limit_mb: next })} />
+              <NumField label='单点预算内存估计（字节）' min={64} max={65536} step='64' value={estimatedBytesPerPoint} onChange={next => next != null && updateSettings({ estimated_bytes_per_point: next })} hint='用于自动搜索预检和穷举工作内存估算，不改变回测结果。' />
+            </div>
+            <p className='field-hint'>自动模式只在训练预算和工作内存均允许时完整枚举；否则使用打乱 Sobol 覆盖、统计启发式种子和多起点轮转局部搜索。所有输出峰区必须完成一格联合邻域核验。</p>
+          </Disclosure>}
+          {protocolVersion === 4 && strategyVersion === 4 && <Disclosure id='research-robust-window' title='训练窗口、统计与费用压力' summary={`${trainingMinDays}–${trainingMaxDays} 日训练 · Bootstrap ${bootstrapReps.toLocaleString()} · 费用 ×${stressCostMultiplier}`}>
+            <div className='form-grid two'>
+              <NumField label='训练回看最短交易日' min={20} max={5000} step='1' value={trainingMinDays} onChange={next => next != null && updateSettings({ training_min_days: next })} />
+              <NumField label='训练回看最长交易日' min={20} max={5000} step='1' value={trainingMaxDays} onChange={next => next != null && updateSettings({ training_max_days: next })} />
+              <NumField label='Bootstrap 重抽样次数' min={100} max={100000} step='100' value={bootstrapReps} onChange={next => next != null && updateSettings({ bootstrap_reps: next })} />
+              <Field label='Bootstrap 区块长度（交易日，逗号分隔）'><TextInput value={bootstrapBlockLengths.join(',')} onChange={event => { const values = event.target.value.split(',').map(value => Number(value.trim())).filter(value => Number.isSafeInteger(value) && value > 0); updateSettings({ bootstrap_block_lengths: values.length ? values : [20] }) }} /></Field>
+              <NumField label='家族校正显著性水平' min={.001} max={.5} step='.001' value={significanceAlpha} onChange={next => next != null && updateSettings({ significance_alpha: next })} />
+              <NumField label='外层核验交易日' min={20} max={1000} step='1' value={outerValidationDays} onChange={next => next != null && updateSettings({ outer_validation_days: next })} />
+              <NumField label='费用压力倍率' min={1.01} max={20} step='.1' value={stressCostMultiplier} onChange={next => next != null && updateSettings({ stress_cost_multiplier: next })} />
+              <NumField label='费用压力推荐峰区数' min={0} max={50} step='1' value={stressRegionCount} onChange={next => next != null && updateSettings({ stress_region_count: next })} />
+            </div>
+          </Disclosure>}
           {protocolVersion === 3
             ? <NumField label='局部网格搜索预算' min={1} max={5000} step='1' value={localSearchBudget} onChange={next => next != null && updateSettings({ local_search_budget: next })} hint='统计中心各自展开中心及正负一步；超过预算时停止提交并提示调整范围。' />
             : protocolVersion !== 4 && <NumField label={protocolVersion === 2 ? '每个决策点基础试验数' : '旧版每种模式试验数'} min={1} max={5000} step='1' value={trials} onChange={next => next != null && updateSettings({ n_trials: next })} hint={protocolVersion === 2 ? '邻域压力测试会增加额外计算。' : '历史与稳健模式各自执行此次数。'} />}
-          {protocolVersion === 4 && searchPreview && <p className={['budget_exceeded', 'insufficient_history', 'insufficient_range'].includes(String(searchPreview.status)) ? 'inline-warning' : 'field-hint'}>合法组合 {String(searchPreview.legal_combination_count ?? '—')} 个 · {String(searchPreview.search_method ?? '—')} · 超正方体边长 {String(searchPreview.hypercube_edge ?? hypercubeEdge)} · 每个最多 {String(searchPreview.hypercube_volume ?? '—')} 点 · 训练时段 {String(searchPreview.training_days ?? '—')} 日{searchPreview.training_window && record(searchPreview.training_window)?.matched ? '（同价日）' : '（500 日回退）'} · 评价预算 {String(searchPreview.validation_budget ?? validationBudget)}{searchPreview.full_training_window === false ? ' · 训练时段不足' : ''}</p>}
+          {protocolVersion === 4 && searchPreview && <p className={['budget_exceeded', 'insufficient_history', 'insufficient_range'].includes(String(searchPreview.status)) ? 'inline-warning' : 'field-hint'}>合法组合 {String(searchPreview.legal_combination_count ?? '—')} 个 · {String(searchPreview.search_method ?? '—')} · 超正方体边长 {String(searchPreview.hypercube_edge ?? hypercubeEdge)} · 单中心 {String(searchPreview.hypercube_volume ?? '—')} 点 · 单峰支持最多 {String(searchPreview.estimated_peak_support_points ?? searchPreview.peak_support_volume ?? '—')} 点 · 训练时段 {String(searchPreview.training_days ?? '—')} 日{searchPreview.training_window && record(searchPreview.training_window)?.matched ? '（同价日）' : `（${trainingMaxDays} 日回退）`} · 预计内存 {String(searchPreview.estimated_sampled_memory_mb ?? searchPreview.estimated_memory_mb ?? '—')} MiB · 评价预算 {String(searchPreview.validation_budget ?? validationBudget)}{searchPreview.full_training_window === false ? ' · 训练时段不足' : ''}</p>}
           {protocolVersion === 3 && searchPreview && <p className={searchPreview.status === 'budget_exceeded' ? 'inline-warning' : 'field-hint'}>局部网格预计 {String(searchPreview.expected ?? '—')} / {String(searchPreview.budget ?? localSearchBudget)} 组，统计中心 {String(searchPreview.statistical_center_count ?? '—')} 个{searchPreview.status === 'budget_exceeded' ? '；已超过预算，研究未提交。' : '。'}</p>}
-          <div className='research-launch-action'><Button busy={busy} onClick={() => void submit()}><FlaskConical size={15} />启动参数研究</Button><small>{protocolVersion >= 2 ? schemeLabel + ' · 250–500 日训练时段' : '旧版兼容协议'} · 设置自动记忆</small></div>
+          <div className='research-launch-action'><Button busy={busy} onClick={() => void submit()}><FlaskConical size={15} />启动参数研究</Button><small>{protocolVersion >= 2 ? `${schemeLabel} · ${trainingMinDays}–${trainingMaxDays} 日训练时段` : '旧版兼容协议'} · 设置自动记忆</small></div>
           <Disclosure id='research-search-ranges' title='可调搜索范围' summary={rangesSummary}>
-            <p className='field-hint'>{protocolVersion === 4 ? '研究细粒度只决定搜索采样间隔，不等于参数变化的最小单位：间距最小单位仍为 0.01 个百分点，买卖数量与持股边界最小单位均为 100 股 / 份。超正方体按研究刻度展开。' : protocolVersion === 2 ? '固定账户初始持股与现金，分别搜索买入间距、卖出间距和交易边界。' : '股数以 100 股 / 份为单位。'}</p>
+            <p className='field-hint'>{protocolVersion === 4 ? (strategyVersion === 4 ? '四个轴各自只有一个步长来源。研究细粒度就是该轴整数刻度宽度，间距以 0.01 个百分点为最小单位，股数以 100 股 / 份为最小单位。' : '研究细粒度只决定搜索采样间隔，不等于参数变化的最小单位：间距最小单位仍为 0.01 个百分点，买卖数量与持股边界最小单位均为 100 股 / 份。超正方体按研究刻度展开。') : protocolVersion === 2 ? '固定账户初始持股与现金，分别搜索买入间距、卖出间距和交易边界。' : '股数以 100 股 / 份为单位。'}</p>
             <div className='research-range-grid'>{rangeNamesToShow.map(name => {
               const unit = researchQuantityUnit(name)
               const minimum = name === 'buy_shares' ? isStarBoard ? 200 : 100 : name === 'sell_shares' ? 100 : 0
@@ -652,7 +718,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
                   <small>{protocolVersion === 4 ? `单位 ${pctRange.has(name) ? '0.01 个百分点' : `${unit} 股 / 份`}` : pctRange.has(name) ? '百分比（%）' : '股 / 份'}</small>
                 </div>
                 <div className='research-range-inputs'>{(['low', 'high', 'step'] as const).filter(key => protocolVersion !== 4 || key !== 'step').map(key =>
-                  <NumField key={key} label={key === 'low' ? '下限' : key === 'high' ? '上限' : '步长'} value={ranges[name][key]} percentValue={pctRange.has(name)} step={protocolVersion === 4 ? pctRange.has(name) ? '.01' : String(unit) : pctRange.has(name) ? 'any' : '100'} min={pctRange.has(name) ? protocolVersion === 4 ? .01 : .000001 : key === 'step' ? 100 : minimum} onChange={next => next != null && updateRange(name, key, next)} />
+                  <NumField key={key} label={key === 'low' ? '下限' : key === 'high' ? '上限' : '步长'} value={ranges[name][key] ?? null} percentValue={pctRange.has(name)} step={protocolVersion === 4 ? pctRange.has(name) ? '.01' : String(unit) : pctRange.has(name) ? 'any' : '100'} min={pctRange.has(name) ? protocolVersion === 4 ? .01 : .000001 : key === 'step' ? 100 : minimum} onChange={next => next != null && updateRange(name, key, next)} />
                 )}</div>
                 {protocolVersion === 4 && <NumField label='研究细粒度' value={granularity[name]} percentValue={pctRange.has(name)} step={pctRange.has(name) ? '.01' : String(unit)} min={pctRange.has(name) ? .01 : unit} onChange={next => next != null && updateSettings({ granularity: { ...granularity, [name]: next } })} hint='仅控制搜索采样间隔' />}
               </div>
@@ -692,12 +758,12 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
         </div>
         {resultLoading ? <Card><Loading label='正在读取研究结果…' /></Card> : !result ? <Card><Empty title='研究结果将在这里展示' detail='在左侧启动研究，或从任务中心打开已有研究结果。' /></Card> : <>
           <Card title={originalBase?.symbol ?? '研究样本'} subtitle={(evalStart ?? '开始日期不详') + ' 至 ' + (evalEnd ?? '最新可用日期') + ' · ' + (originalBase?.frequency ?? '频率不详')}>
-            <div className='result-meta'><Badge tone={isV2Result ? 'blue' : 'amber'}>{jobModeLabel(actualMode, actualVersion, actualStrategyVersion)}</Badge>{isDemoResearch && <Badge tone='amber'>演示数据</Badge>}{selectedJob?.status === 'cancelled' && <Badge tone='amber'>已保留的部分结果</Badge>}<span>{isV2Result ? (isHypercubeResult ? '所选日期为样本外评估；训练时段为评估日前的单一区间，不再拆分内部验证。' : '所选日期为样本外评估；训练取开始日前的历史。') : '旧版历史最优或单段切分记录。'}</span></div>
+            <div className='result-meta'><Badge tone={isV2Result ? 'blue' : 'amber'}>{jobModeLabel(actualMode, actualVersion, actualStrategyVersion)}</Badge>{isDemoResearch && <Badge tone='amber'>演示数据</Badge>}{selectedJob?.status === 'cancelled' && <Badge tone='amber'>已保留的部分结果</Badge>}<span>{isV2Result ? (isHypercubeResult || isRobustResult ? '所选日期为样本外评估；训练时段为评估日前的单一区间，不再拆分内部验证。' : '所选日期为样本外评估；训练取开始日前的历史。') : '旧版历史最优或单段切分记录。'}</span></div>
             {isDemoResearch && <div className='demo-callout'>此研究使用演示行情生成，不能代表真实历史数据或投资结论。</div>}
             {isV2Result && <div className='research-summary-states'>
-              <div><small>训练时段</small><Badge tone={insufficientHistory ? 'amber' : finite(trainingDays) && trainingDays >= (isHypercubeResult ? 250 : 504) ? 'green' : 'neutral'}>{finite(trainingDays) ? trainingDays + (isHypercubeResult ? ' 个交易日（250–500 区间）' : ' / 504 个交易日') : insufficientHistory ? '历史不足' : (isHypercubeResult ? '评估日前 250–500 个交易日' : '前置 504 个交易日')}</Badge></div>
-              <div><small>当前推荐状态</small><Badge tone={currentRecommendationStatus === 'qualified' ? 'green' : 'amber'}>{currentRecommendationStatus === 'qualified' ? (Number(actualVersion) === 4 ? isHypercubeResult ? '超正方体平均超额已验证' : isConnectedResult ? (current?.diagnostics?.status === 'partial' ? '完整域已推荐 · 仍有未闭合域' : '正收益域边界已闭合') : '完整正邻域已验证' : '已通过稳健性门槛') : '暂无合格推荐'}</Badge></div>
-              <div><small>末 126 日样本外证据</small><Badge tone={finalPeriodComplete && finalReview.state === 'positive' ? 'blue' : 'amber'}>{finalEvidenceLabel}</Badge></div>
+              <div><small>训练时段</small><Badge tone={insufficientHistory ? 'amber' : finite(trainingDays) && trainingDays >= trainingMinimum ? 'green' : 'neutral'}>{finite(trainingDays) ? trainingDays + (isHypercubeResult || isRobustResult ? ' 个交易日（训练窗口）' : ' / 504 个交易日') : insufficientHistory ? '历史不足' : (isHypercubeResult || isRobustResult ? '评估日前训练窗口' : '前置 504 个交易日')}</Badge></div>
+              <div><small>当前推荐状态</small><Badge tone={currentRecommendationStatus === 'qualified' ? 'green' : 'amber'}>{currentRecommendationStatus === 'qualified' ? (Number(actualVersion) === 4 ? isRobustResult ? '稳健 J 峰区已核验' : isHypercubeResult ? '超正方体平均超额已验证' : isConnectedResult ? (current?.diagnostics?.status === 'partial' ? '完整域已推荐 · 仍有未闭合域' : '正收益域边界已闭合') : '完整正邻域已验证' : '已通过稳健性门槛') : '暂无合格推荐'}</Badge></div>
+              <div><small>{outerValidationDays} 日样本外证据</small><Badge tone={finalPeriodComplete && finalReview.state === 'positive' ? 'blue' : 'amber'}>{finalEvidenceLabel}</Badge></div>
             </div>}
             {insufficientHistory && <p className='inline-warning'>可用训练历史不足。返回参数仅代表当前候选中的相对最佳选择，样本与证据不足会分别标记。</p>}
             {isV2Result && !finalPeriodComplete && <p className='inline-warning'>末段核验样本不足{finalDays == null ? '' : '（' + finalDays + ' / ' + finalRequiredDays + ' 个交易日）'}，不能据此得出显著性结论。</p>}
@@ -705,10 +771,15 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
           </Card>
           {isConnectedResult && selectedJob?.result_id && <ConnectedRegionResults resultId={selectedJob.result_id} decisionOptions={landscapeDecisions} onLoad={loadV2} />}
           {isConnectedResult && selectedJob?.result_id && <Disclosure id='connected-training-landscape' title='训练搜索候选分布' summary='训练指标与完整参数域分别查看'><ResearchLandscape resultId={selectedJob.result_id} decisionOptions={landscapeDecisions} trainingOnly /></Disclosure>}
-          {Number(actualVersion) >= 3 && !isConnectedResult && selectedJob?.result_id && <ResearchLandscape resultId={selectedJob.result_id} defaultParams={relativeBest} decisionOptions={landscapeDecisions} qualified={Boolean(currentRecommended)} validationLabel={isHypercubeResult ? '训练时段（超正方体）' : '内部验证'} regionOptions={(current?.recommendation_regions ?? []).map(region => ({ value: String(region.region_id ?? ''), label: isHypercubeResult ? '超正方体 ' + String(region.region_id ?? '') : '区域 ' + String(region.region_id ?? '') }))} />}
+          {Number(actualVersion) >= 3 && !isConnectedResult && selectedJob?.result_id && <ResearchLandscape resultId={selectedJob.result_id} defaultParams={relativeBest} decisionOptions={landscapeDecisions} qualified={Boolean(currentRecommended)} validationLabel={isRobustResult ? '训练时段（稳健 J）' : isHypercubeResult ? '训练时段（超正方体）' : '内部验证'} regionOptions={(current?.recommendation_regions ?? []).map(region => ({ value: String(region.region_id ?? ''), label: isRobustResult ? '稳健峰区 ' + String(region.region_id ?? '') : isHypercubeResult ? '超正方体 ' + String(region.region_id ?? '') : '区域 ' + String(region.region_id ?? '') }))} />}
           {isHypercubeResult && current && <Card title='超正方体平均超额收益' subtitle='训练时段内按固定研究刻度边长展开；平均超额是超正方体全部合法组合的均值，不再要求每点为正。'>
-            <p className='field-hint'>训练时段：{firstString(record(current.diagnostics?.training_window), ['start']) ?? trainStart ?? '—'} 至 {firstString(record(current.diagnostics?.training_window), ['end']) ?? trainEnd ?? '—'}；边长 {valueText('超正方体边长', current.diagnostics?.hypercube_edge)} 个研究刻度{record(current.diagnostics?.training_window)?.fallback ? '；未找到同价日，按 500 日回退' : '；起点为同价日（最低价 < 基准价 < 最高价）'}。{regionValidation.kind === 'fresh' ? '载入按钮使用评估区间。' : ''}</p>
+            <p className='field-hint'>训练时段：{firstString(historicalTrainingWindow, ['start']) ?? trainStart ?? '—'} 至 {firstString(historicalTrainingWindow, ['end']) ?? trainEnd ?? '—'}；边长 {valueText('超正方体边长', current.diagnostics?.hypercube_edge)} 个研究刻度{historicalTrainingWindow?.fallback ? `；未找到同价日，按 ${String(historicalTrainingWindow?.max_offset_trading_days ?? historicalTrainingMaxDays)} 日回退` : '；起点为同价日（最低价 < 基准价 < 最高价）'}。{regionValidation.kind === 'fresh' ? '载入按钮使用评估区间。' : ''}</p>
             {(current.recommendation_regions ?? []).length === 0 ? <p className='inline-warning'>本次没有形成可评价的完整超正方体，正式推荐为空。</p> : <div className='table-wrap'><table><thead><tr><th>排名</th><th>中心参数</th><th>边长</th><th>组合数</th><th>平均超额</th><th>最低超额</th><th>中心超额</th><th>状态</th><th>压力诊断</th><th></th></tr></thead><tbody>{(current.recommendation_regions ?? []).map((region, index) => <tr key={region.region_id ?? index}><td>{region.region_id ?? index + 1}</td><td><ParameterBadges params={region.center_params ?? {}} compact /></td><td>{valueText('超正方体边长', region.edge_length)}</td><td>{valueText('组合数', region.completed_count)} / {valueText('组合数', region.combination_count)}</td><td>{percent(n(region.mean_excess_return), 4)}</td><td>{percent(n(region.min_excess_return), 4)}</td><td>{percent(n(region.center_excess_return), 4)}</td><td>{region.complete ? '完整超正方体' : '未完成'}{region.global_exhaustive ? ' · 全局穷尽' : ' · 训练采样'}</td><td>{String(region.stress?.status ?? '未计算')}{region.stress?.mean_excess_return != null ? ' · 均值 ' + percent(n(region.stress.mean_excess_return), 2) : ''}</td><td><Button variant='quiet' onClick={() => loadV2(region.center_params, current.as_of, regionDateRange)}>{regionDateRange ? '载入评估回测' : '载入'}</Button></td></tr>)}</tbody></table></div>}
+          </Card>}
+          {isRobustResult && current && <Card title='四维稳健 J 峰区' subtitle='J = αR + (1−α)μΩ − βσ⁻Ω − Cpos；峰值按合格中心上的完整一格联合邻域判断，原始收益峰只作诊断。'>
+            <p className='field-hint'>训练时段：{firstString(historicalTrainingWindow, ['start']) ?? trainStart ?? '—'} 至 {firstString(historicalTrainingWindow, ['end']) ?? trainEnd ?? '—'}；搜索 {String(current.diagnostics?.search_method ?? '—')}，覆盖状态 {String(current.diagnostics?.coverage_status ?? '—')}。评分完整 {String(current.diagnostics?.score_complete ?? false)}，局部峰值核验 {String(current.diagnostics?.local_peak_verified ?? false)}，全局穷尽 {String(current.diagnostics?.global_exhaustive ?? false)}。</p>
+            {(current.recommendation_regions ?? []).length === 0 ? <p className='inline-warning'>本次没有 J 为正、约束合格且完成一格平台核验的推荐峰区；诊断候选不能替代正式推荐。</p> : <div className='table-wrap scroll-table'><table><thead><tr><th>排名</th><th>中心参数</th><th>J</th><th>中心 R</th><th>邻域均值</th><th>下行风险</th><th>持仓惩罚</th><th>持仓范围 / 股数倍</th><th>邻域最差上限</th><th>正收益 / 安全垫</th><th>库存 / T+1</th><th>平台</th><th>压力诊断</th><th></th></tr></thead><tbody>{(current.recommendation_regions ?? []).map((region, index) => <tr key={region.region_id ?? index}><td>{region.region_id ?? index + 1}</td><td><ParameterBadges params={region.center_params ?? {}} compact /></td><td>{finite(region.j_score) ? percent(region.j_score, 4) : '—'}</td><td>{finite(region.center_excess_return) ? percent(region.center_excess_return, 4) : '—'}</td><td>{finite(region.mean_excess_return) ? percent(region.mean_excess_return, 4) : '—'}</td><td>{finite(region.downside_risk_tau) ? percent(region.downside_risk_tau, 4) : '—'}</td><td>{finite(region.pos_penalty) ? percent(region.pos_penalty, 4) : '—'}</td><td>{finite(region.actual_min_pos_ratio) ? n(region.actual_min_pos_ratio).toFixed(3) : '—'} – {finite(region.actual_max_pos_ratio) ? n(region.actual_max_pos_ratio).toFixed(3) : '—'}</td><td>{finite(region.neighborhood_max_eta) ? n(region.neighborhood_max_eta).toFixed(3) : '—'}</td><td>{finite(region.pos_win_rate) ? percent(region.pos_win_rate) : '—'} / {finite(region.safe_win_rate) ? percent(region.safe_win_rate) : '—'}</td><td>{region.stockout_count ?? '—'} / {region.tplus1_block_count ?? '—'}</td><td>{region.score_complete ? '评分完整' : '不完整'} · {region.local_peak_verified ? '已核验' : '未闭合'}{region.platform_size != null ? ' · ' + String(region.platform_size) + ' 点' : ''}{region.global_exhaustive ? ' · 全局穷尽' : ' · 预算搜索'}</td><td>{String(region.stress?.status ?? '未计算')}{region.stress?.mean_excess_return != null ? ' · 均值 ' + percent(n(region.stress.mean_excess_return), 2) : ''}</td><td><Button variant='quiet' onClick={() => loadV2(region.center_params, current.as_of, regionDateRange)}>{regionDateRange ? '载入评估回测' : '载入'}</Button></td></tr>)}</tbody></table></div>}
+            <p className='field-hint'>推荐中的最小／最大持仓是训练期实际观察范围，不自动成为实盘护栏；加载回测继续使用自然持仓，用户加入限制后形成新的回放配置。</p>
           </Card>}
           {Number(actualVersion) === 4 && actualStrategyVersion === 1 && current && <Card title='旧版最大正超额收益矩形邻域' subtitle='邻域内全部合法离散组合必须在原成本下超额收益为正；双倍成本只作诊断。'>
             {regionValidation.kind === 'fresh' && <p className='field-hint'>验证首日按初始配置重置账户，之后在验证窗口连续运行；收益按验证期间峰值投入本金计算。载入区域使用 {regionValidation.kind === 'fresh' ? regionValidation.dateRange.start_date : ''} 至 {regionValidation.kind === 'fresh' ? regionValidation.dateRange.end_date : ''}。平均超额是区域均值，中心超额对应中心参数。</p>}
@@ -761,9 +832,9 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
               {adaptive?.schedule?.length ? <div className='table-wrap scroll-table'><table><thead><tr><th>决策日期</th><th>生效日期</th><th>参数</th></tr></thead><tbody>{adaptive.schedule.map((item, index) => <tr key={(item.effective_date ?? '') + '-' + index}><td>{item.decision_date ?? '—'}</td><td>{item.effective_date ?? '—'}</td><td>{item.paused ? <Badge tone='amber'>暂停网格交易</Badge> : <ParameterBadges params={item.params} compact />}</td></tr>)}</tbody></table></div> : <Empty title='没有季度换参记录' detail={statusText(adaptive?.status)} />}
               {result.evidence?.decisions?.length ? <div className='table-wrap scroll-table'><table><thead><tr><th>决策日期</th><th>候选 / 实际评估</th><th>约束合格</th><th>选中参数</th><th>分窗得分</th><th>邻域得分</th></tr></thead><tbody>{result.evidence.decisions.map((raw, index) => { const item = record(raw) ?? {}; return <tr key={index}><td>{String(item.decision_date ?? item.as_of ?? '—')}</td><td>{valueText('candidate_count', item.candidate_count)} / {valueText('evaluated_count', item.evaluated_count)}</td><td>{valueText('eligible_count', item.eligible_count)}</td><td><ParameterBadges params={record(item.selected_params)} compact /></td><td>{shortSummary(item.windows ?? item.folds)}</td><td>{shortSummary(item.neighbor_scores ?? item.bootstrap)}</td></tr> })}</tbody></table></div> : <Empty title='暂无滚动决策明细' />}
             </Disclosure>
-            <Disclosure id='research-statistical-evidence' title='统计证据与敏感性' summary={'末 126 日：' + finalEvidenceLabel + ' · p 值不是胜率'}>
+            <Disclosure id='research-statistical-evidence' title='统计证据与敏感性' summary={'末 ' + outerValidationDays + ' 日：' + finalEvidenceLabel + ' · p 值不是胜率'}>
               <Card title={isConnectedResult ? '当前选参内部统计诊断' : '当前完整候选族内部验证'} subtitle='族级检验描述本次择参的不确定性；样本已经用于选择，不属于独立样本外检验。'><FamilyBootstrapPanel value={currentFamilyBootstrap} /></Card>
-              <Card title='末 126 个交易日核验' subtitle='固定与自适应的真实连续样本外轨迹，对同现金被动持有做配对比较。'><Final126Evidence value={finalCheck} /></Card>
+              <Card title={'末 ' + outerValidationDays + ' 个交易日核验'} subtitle='固定与自适应的真实连续样本外轨迹，对同现金被动持有做配对比较。'><Final126Evidence value={finalCheck} /></Card>
             </Disclosure>
             {Number(actualVersion) === 3 && <Disclosure id='research-candidate-details' title='候选评分与稳健性' summary={v2Candidates.length + ' 组候选 · 展示最多 ' + topCandidates + ' 组'}>
               <div className='research-summary-states'>{v2Candidates.slice(0, 5).map((candidate, index) => <div key={String(candidate.candidate_id ?? index)}><small>候选 {String(candidate.candidate_id ?? index + 1)} · {candidate.is_center ? '中心' : '邻点'}</small><Badge tone={candidate.recommendation_eligible ? 'green' : candidate.island_suspect ? 'red' : 'amber'}>{candidate.recommendation_eligible ? '稳健性通过' : candidate.island_suspect ? '疑似收益孤岛' : candidate.robustness_status === 'failed' ? '邻域未通过' : '未评价'}</Badge><strong>正邻点 {percent(candidate.neighbor_positive_ratio as number | undefined)} · 第25百分位 {percent(candidate.neighbor_q25_excess as number | undefined)}</strong></div>)}</div>
@@ -788,12 +859,18 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
             </Disclosure>
           </>}
           <Disclosure id='research-sample-data-quality' title='样本、数据质量与实际设置' summary={(finite(minuteCoverage) ? '准备区间分钟覆盖 ' + percent(minuteCoverage) + ' · ' : '') + '数据版本 ' + (result.data_version ?? '—')}>
-            <div className='research-period-grid'><div><small>训练时段</small><strong>{trainStart && trainEnd ? trainStart + ' 至 ' + trainEnd : isHypercubeResult ? '评估日前 250–500 个交易日' : isV2Result ? '评估开始日前的历史' : '旧版切分'}</strong></div><div><small>样本外评估</small><strong>{evalStart ?? '—'} 至 {evalEnd ?? '最新可用日期'}</strong></div></div>
+            <div className='research-period-grid'><div><small>训练时段</small><strong>{trainStart && trainEnd ? trainStart + ' 至 ' + trainEnd : isHypercubeResult || isRobustResult ? `评估日前 ${historicalTrainingMinDays}–${historicalTrainingMaxDays} 个交易日` : isV2Result ? '评估开始日前的历史' : '旧版切分'}</strong></div><div><small>样本外评估</small><strong>{evalStart ?? '—'} 至 {evalEnd ?? '最新可用日期'}</strong></div></div>
             <div className='result-meta'><span>基础试验数{isV2Result ? ' / 决策点' : ''}：{actualTrials ?? '—'}</span><span>随机种子：{actualSeed ?? '—'}</span>{isV2Result && <span>Bootstrap：{valueText('bootstrap_reps', protocol.bootstrap_reps ?? resultConfig?.bootstrap_reps ?? bootstrapReps)} 次</span>}</div>
             <DataDiagnosticsPanel diagnostics={result.diagnostics} sourceEvents={result.source_events} warnings={researchWarnings} syntheticBars={result.quality?.synthetic_bars} />
             <div className='param-block'><strong>本次实际搜索范围</strong>{savedRanges}</div>
             {isV2Result && <div className='param-block'><strong>锁定账户资金</strong><EvidenceFields value={lockedFunding} /></div>}
           </Disclosure>
+          {(result.configuration_snapshot || result.execution || result.performance) && <Disclosure id='research-task-snapshot' title='任务配置、执行与资源快照' summary={'配置版本 ' + String(record(result.configuration_snapshot)?.revision ?? result.execution?.configuration_revision ?? '—') + ' · 数据版本 ' + String(result.execution?.data_version ?? result.data_version ?? '—')}>
+            <p className='field-hint'>这里显示任务提交时冻结的配置与执行记录。之后修改当前项目配置不会改写这条历史结果；载入参数属于用户明确创建的新的回放草稿。</p>
+            {result.configuration_snapshot && <div className='param-block'><strong>提交时完整配置</strong><EvidenceFields value={result.configuration_snapshot} /></div>}
+            {result.execution && <div className='param-block'><strong>实际执行</strong><EvidenceFields value={result.execution} /></div>}
+            {result.performance && <div className='param-block'><strong>资源使用</strong><EvidenceFields value={result.performance} /></div>}
+          </Disclosure>}
           {isV2Result && <>
             <Disclosure id='research-computation-details' title='实际计算量' summary={shortSummary(result.computation)}><p className='field-hint'>记录真实评估次数和耗时，包括邻域压力测试的额外计算。</p><EvidenceFields value={result.computation} /></Disclosure>
             <Disclosure id='research-local-audit' title='重复研究记录与选择偏差' summary={localAudit ? '本地同窗重复 ' + valueText('exact_repeat_prior_studies', localAudit.exact_repeat_prior_studies) + ' 次' : '保留整次尝试记录'}>

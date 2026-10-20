@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from stockregression import source_health
 from stockregression.api import create_app
 from stockregression.jobs import execute_job
-from stockregression.settings import Settings
+from stockregression.settings import MarketDataSettings, Settings
 from stockregression.source_health import (
     SourceRouter,
     fetch_auxiliary_routed,
@@ -29,10 +29,10 @@ def _minute_frame(source="sina"):
 
 
 def test_optional_protocol_failure_falls_back_once_and_stays_suspended(tmp_path, monkeypatch):
-    store = Store(tmp_path / "data")
-    monkeypatch.setattr(source_health, "load_settings", lambda: Settings(
-        data_dir=str(store.root), recent_minute_source="tdx"
-    ))
+    store = Store(
+        tmp_path / "data",
+        settings=Settings(data_dir=str(tmp_path / "data"), recent_minute_source="tdx"),
+    )
     for market in ("stock", "etf"):
         record_success(store, "tdx", "recent_minute", market, rows=10)
     calls = {"tdx": 0, "sina": 0}
@@ -63,10 +63,10 @@ def test_optional_protocol_failure_falls_back_once_and_stays_suspended(tmp_path,
 
 
 def test_transient_optional_failure_retries_once_before_fallback(tmp_path, monkeypatch):
-    store = Store(tmp_path / "data")
-    monkeypatch.setattr(source_health, "load_settings", lambda: Settings(
-        data_dir=str(store.root), recent_minute_source="tdx"
-    ))
+    store = Store(
+        tmp_path / "data",
+        settings=Settings(data_dir=str(tmp_path / "data"), recent_minute_source="tdx"),
+    )
     record_success(store, "tdx", "recent_minute", "stock", rows=1)
     calls = []
 
@@ -82,10 +82,10 @@ def test_transient_optional_failure_retries_once_before_fallback(tmp_path, monke
 
 
 def test_one_symbol_empty_response_does_not_suspend_the_source(tmp_path, monkeypatch):
-    store = Store(tmp_path / "data")
-    monkeypatch.setattr(source_health, "load_settings", lambda: Settings(
-        data_dir=str(store.root), recent_minute_source="tdx"
-    ))
+    store = Store(
+        tmp_path / "data",
+        settings=Settings(data_dir=str(tmp_path / "data"), recent_minute_source="tdx"),
+    )
     record_success(store, "tdx", "recent_minute", "stock", rows=10)
     frame, selected, route = SourceRouter(store).call(
         "recent_minute", "stock",
@@ -101,10 +101,14 @@ def test_one_symbol_empty_response_does_not_suspend_the_source(tmp_path, monkeyp
 def test_etf_actions_use_akshare_independently_of_daily_failure(tmp_path, monkeypatch):
     from stockregression import providers
 
-    store = Store(tmp_path / "data")
-    monkeypatch.setattr(source_health, "load_settings", lambda: Settings(
-        data_dir=str(store.root), etf_daily_source="eastmoney"
-    ))
+    frozen = Settings(
+        data_dir=str(tmp_path / "data"),
+        etf_daily_source="eastmoney",
+        market_data=MarketDataSettings(
+            etf_daily_source="eastmoney", network_timeout_seconds=17,
+        ),
+    )
+    store = Store(tmp_path / "data", settings=frozen)
     record_success(store, "eastmoney", "etf_daily", "etf", rows=3)
     daily = pd.DataFrame({
         "date": [pd.Timestamp("2026-10-16")], "open": [1.0], "high": [1.1],
@@ -114,7 +118,10 @@ def test_etf_actions_use_akshare_independently_of_daily_failure(tmp_path, monkey
     calendar = pd.DataFrame({"date": [pd.Timestamp("2026-10-16")]})
     actions = providers.normalize_actions(pd.DataFrame())
 
-    def daily_source(symbol, start, end, source, cancelled):
+    timeouts = []
+
+    def daily_source(symbol, start, end, source, cancelled, network_timeout=None):
+        timeouts.append(network_timeout)
         if source == "eastmoney":
             raise ConnectionError("eastmoney unavailable")
         return daily.copy()
@@ -123,7 +130,7 @@ def test_etf_actions_use_akshare_independently_of_daily_failure(tmp_path, monkey
     monkeypatch.setattr("stockregression.providers.fetch_market_calendar", lambda *args: calendar.copy())
     monkeypatch.setattr(
         "stockregression.providers.fetch_market_actions",
-        lambda *args: (actions.copy(), {"actions_verified": True, "warnings": []}),
+        lambda *args, **kwargs: (actions.copy(), {"actions_verified": True, "warnings": []}),
     )
     result, result_actions, result_calendar, metadata = fetch_auxiliary_routed(
         store, "159611.SZ", "2026-10-16", "2026-10-16"
@@ -131,8 +138,37 @@ def test_etf_actions_use_akshare_independently_of_daily_failure(tmp_path, monkey
     assert len(result) == 1 and result_actions.empty and len(result_calendar) == 1
     assert metadata["daily_source"] == "baostock"
     assert metadata["actions_source"] == "akshare"
+    assert timeouts == [17, 17, 17]
     assert source_state(store, "eastmoney", "etf_daily", "etf")["status"] == "failed"
     assert source_state(store, "akshare", "etf_actions", "etf")["status"] == "passed"
+
+
+def test_source_router_uses_the_task_market_policy(tmp_path, monkeypatch):
+    frozen = Settings(
+        data_dir=str(tmp_path / "data"),
+        recent_minute_source="tdx",
+        market_data=MarketDataSettings(
+            recent_minute_source="tdx", request_retries=2,
+        ),
+    )
+    store = Store(tmp_path / "data", settings=frozen)
+    record_success(store, "tdx", "recent_minute", "stock", rows=1)
+    monkeypatch.setattr(
+        source_health, "load_settings",
+        lambda: Settings(recent_minute_source="sina", max_workers=1),
+    )
+    calls = []
+
+    def unavailable_tdx():
+        calls.append("tdx")
+        raise TimeoutError("request timed out")
+
+    _, selected, route = SourceRouter(store).call(
+        "recent_minute", "stock",
+        {"tdx": unavailable_tdx, "sina": lambda: _minute_frame()},
+    )
+    assert selected == "sina" and route["configured"] == "tdx"
+    assert calls == ["tdx", "tdx", "tdx"]
 
 
 def test_source_settings_require_successful_probe(tmp_path):
@@ -164,7 +200,8 @@ def test_source_api_reads_cache_and_rejects_undetected_optional_source(tmp_path,
         capabilities = {item["capability"]: item for item in response.json()["capabilities"]}
         assert capabilities["recent_minute"]["configured"] == "sina"
         assert capabilities["etf_daily"]["configured"] == "baostock"
-        rejected = client.put("/api/v1/settings", json={"recent_minute_source": "tdx"})
+        revision = client.get("/api/v1/settings").json()["config_revision"]
+        rejected = client.put("/api/v1/settings", json={"base_revision": revision, "recent_minute_source": "tdx"})
         assert rejected.status_code == 422 and "通达信" in rejected.text
         invalid = client.post("/api/v1/data/sources/probe", json={
             "source": "tdx", "capability": "etf_daily", "market": "etf",
@@ -178,7 +215,7 @@ def test_source_api_reads_cache_and_rejects_undetected_optional_source(tmp_path,
         assert client.get(f"/api/v1/jobs/{job_id}").json()["kind"] == "market_source_probe"
         monkeypatch.setattr(
             "stockregression.providers.fetch_sina",
-            lambda symbol: _minute_frame(),
+            lambda symbol, **kwargs: _minute_frame(),
         )
         # The submitted probe names TDX; exercise the job path with a temporary
         # source substitution so this API test remains offline.
@@ -208,7 +245,10 @@ def test_minute_history_sync_is_rejected_with_import_guidance(tmp_path):
 
 def test_probe_records_market_specific_health_without_market_write(tmp_path, monkeypatch):
     store = Store(tmp_path / "data")
-    monkeypatch.setattr("stockregression.providers.fetch_sina", lambda symbol: _minute_frame())
+    monkeypatch.setattr(
+        "stockregression.providers.fetch_sina",
+        lambda symbol, **kwargs: _minute_frame(),
+    )
     result = probe_source(store, "sina", "recent_minute", "all")
     assert result["status"] == "completed" and len(result["results"]) == 2
     assert all(item["state"]["status"] == "passed" for item in result["results"])

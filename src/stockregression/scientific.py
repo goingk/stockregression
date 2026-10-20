@@ -551,22 +551,15 @@ def estimate_v3_search(config: OptimizationConfig, data: DataBundle) -> dict[str
 
 
 def _compound_daily(values: np.ndarray) -> float:
-    values = np.asarray(values, dtype=np.float64)
-    growth = 1.0 + values
-    if not len(values) or np.any(growth <= 0) or not np.isfinite(growth).all():
-        return math.nan
-    return float(np.prod(growth) - 1.0)
+    from .numerics.returns import compound_daily
+
+    return compound_daily(values)
 
 
 def _buy_hold_returns(base: BacktestConfig, data: DataBundle) -> tuple[pd.DatetimeIndex, np.ndarray]:
-    from .share_engine import research_buy_hold
+    from .numerics.returns import buy_hold_returns
 
-    result = research_buy_hold(base, data)
-    dates = pd.DatetimeIndex(pd.to_datetime(result["dates"])).normalize()
-    values = np.asarray(result["daily_returns"], dtype=np.float64)
-    if len(dates) != len(values):
-        raise ValueError("buy_hold dates do not align with daily_returns")
-    return dates, values
+    return buy_hold_returns(base, data)
 
 
 def _score_training_rows(
@@ -1484,6 +1477,7 @@ def _select_at_v3(
     cancelled: Cancelled | None,
     progress_start: float = 0.0,
     progress_width: float = 0.0,
+    runtime=None,
 ) -> dict[str, Any]:
     dates = _calendar(data)
     history_dates = dates[dates <= asof] if asof is not None else pd.DatetimeIndex([])
@@ -1649,6 +1643,7 @@ def _select_at(
     cancelled: Cancelled | None,
     progress_start: float = 0.0,
     progress_width: float = 0.0,
+    runtime=None,
 ) -> dict[str, Any]:
     if int(config.protocol_version) == 4:
         from .research_v4 import select_at as select_at_v4
@@ -1663,11 +1658,13 @@ def _select_at(
             cancelled=cancelled,
             progress_start=progress_start,
             progress_width=progress_width,
+            runtime=runtime,
         )
     if int(config.protocol_version) == 3:
         return _select_at_v3(
             config, base, data, asof, seed_offset=seed_offset, progress=progress,
             cancelled=cancelled, progress_start=progress_start, progress_width=progress_width,
+            runtime=runtime,
         )
     dates = _calendar(data)
     history_dates = dates[dates <= asof] if asof is not None else pd.DatetimeIndex([])
@@ -2105,7 +2102,7 @@ def evaluate_current_family(
         passive_aligned,
         selected_index=selected_index,
         reps=int(getattr(config, "bootstrap_reps", 10_000)),
-        block_lengths=(20, 10, 40),
+        block_lengths=tuple(getattr(config, "bootstrap_block_lengths", (20, 10, 40))),
         seed=(int(config.seed) + _seed_offset_for_date(asof)) % (2**32),
         cancelled=cancelled,
         progress=lambda fraction: _emit(progress, fraction, "当前参数族内部验证bootstrap"),
@@ -2153,18 +2150,19 @@ def _evaluate_final_126(
     progress: Progress | None,
     cancelled: Cancelled | None,
 ) -> dict[str, Any]:
-    tail = eval_dates[-126:]
-    short = len(tail) < 126
+    required_days = max(1, int(getattr(config, "outer_validation_days", 126)))
+    tail = eval_dates[-required_days:]
+    short = len(tail) < required_days
     output: dict[str, Any] = {
         "status": "insufficient_history" if len(tail) == 0 else "completed",
         "start": tail[0].date().isoformat() if len(tail) else None,
         "end": tail[-1].date().isoformat() if len(tail) else None,
         "days": int(len(tail)),
-        "required_days": 126,
+        "required_days": required_days,
         "short_term_insufficient": bool(short),
         "source": "actual_continuous_fixed_and_adaptive_oos_runs",
         "procedures": [],
-        "reasons": ["外层核验不足126个交易日，区间较短"] if short and len(tail) else ([] if len(tail) else ["评估期没有交易日"]),
+        "reasons": [f"外层核验不足{required_days}个交易日，区间较短"] if short and len(tail) else ([] if len(tail) else ["评估期没有交易日"]),
     }
     if len(tail) == 0:
         return output
@@ -2245,10 +2243,11 @@ def _evaluate_final_126(
         passive_values,
         selected_index=selected_index,
         reps=int(getattr(config, "bootstrap_reps", 10_000)),
-        block_lengths=(20, 10, 40),
+        block_lengths=tuple(getattr(config, "bootstrap_block_lengths", (20, 10, 40))),
         seed=(int(config.seed) + _seed_offset_for_date(tail[-1])) % (2**32),
         cancelled=cancelled,
-        progress=lambda fraction: _emit(progress, 0.94 + 0.05 * fraction, "末126日配对bootstrap"),
+        alpha=float(getattr(config, "significance_alpha", .05)),
+        progress=lambda fraction: _emit(progress, 0.94 + 0.05 * fraction, f"末{required_days}日配对bootstrap"),
     )
     for index, name in enumerate(names):
         process_returns = matrix[:, index]
@@ -2281,6 +2280,7 @@ def optimize_scientific(
     data: DataBundle,
     progress: Progress | None = None,
     cancelled: Cancelled | None = None,
+    runtime=None,
 ) -> dict[str, Any]:
     """Run research selection using only information available at each close."""
     if config.base.schema_version not in (2, 3):
@@ -2319,6 +2319,7 @@ def optimize_scientific(
                 seed_offset=_seed_offset_for_date(asof or eval_start),
                 progress=progress, cancelled=cancelled,
                 progress_start=0.0, progress_width=0.75,
+                runtime=runtime,
             )
         else:
             selection = {
@@ -2379,7 +2380,7 @@ def optimize_scientific(
                 "current_decision": {"decision_date": selection.get("as_of"), "status": "insufficient_history", "selected_params": selected, "reasons": all_reasons},
                 "decisions": [], "candidate_archives": {"fixed": selection.get("candidate_archive", []), "current": selection.get("candidate_archive", []), "adaptive": []},
                 "trial_archives": {"fixed": selection.get("trial_archive", []), "current": selection.get("trial_archive", []), "adaptive": []},
-                "final_126_day_check": {"status": "insufficient_history", "start": None, "end": None, "days": 0, "required_days": 126, "short_term_insufficient": True, "procedures": {}, "reasons": [no_oos]},
+                "final_126_day_check": {"status": "insufficient_history", "start": None, "end": None, "days": 0, "required_days": int(getattr(config, "outer_validation_days", 126)), "short_term_insufficient": True, "procedures": {}, "reasons": [no_oos]},
                 "data_days": int(len(available_dates)), "evaluation_days": 0,
                 "evaluation_start": eval_start.date().isoformat(),
                 "evaluation_end": _date_key(config.base.end_date).date().isoformat() if config.base.end_date else None,
@@ -2399,8 +2400,9 @@ def optimize_scientific(
     base = _base_with(config.base, start=eval_dates[0], end=eval_dates[-1], reserve_cash=reserve_cash)
     protocol_v3 = int(config.protocol_version) in (3, 4)
     reasons = []
-    if len(eval_dates) < 126:
-        reasons.append(f"评估期仅{len(eval_dates)}个交易日，末126日核验不足")
+    outer_days = max(1, int(getattr(config, "outer_validation_days", 126)))
+    if len(eval_dates) < outer_days:
+        reasons.append(f"评估期仅{len(eval_dates)}个交易日，末{outer_days}日核验不足")
     minute_ratio = legacy_optimization._minute_ratio(data)
     if minute_ratio < float(config.min_minute_ratio):
         reasons.append(f"分钟覆盖率{minute_ratio:.3f}低于要求{config.min_minute_ratio:.3f}；仍提供相对排名")
@@ -2425,6 +2427,7 @@ def optimize_scientific(
             cancelled=cancelled,
             progress_start=0.02,
             progress_width=0.23,
+            runtime=runtime,
         )
         fixed_selection = selected
         candidate_archives["fixed"] = selected["candidate_archive"]
@@ -2493,6 +2496,7 @@ def optimize_scientific(
                 cancelled=cancelled,
                 progress_start=0.28 + 0.5 * step_number / max(1, len(step_indices)),
                 progress_width=0.5 / max(1, len(step_indices)),
+                runtime=runtime,
             )
             candidate_archives["adaptive"].append({
                 "effective_date": effective_date.date().isoformat(),
@@ -2591,6 +2595,7 @@ def optimize_scientific(
         cancelled=cancelled,
         progress_start=0.83,
         progress_width=0.05,
+        runtime=runtime,
     )
     candidate_archives["current"] = current["candidate_archive"]
     trial_archives["current"] = current["trial_archive"]

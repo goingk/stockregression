@@ -4,9 +4,10 @@ import {
   ArrowRight, Database, Download, FileSearch, FileUp, FolderOpen, FolderUp,
   Archive, Merge, PackageCheck, RefreshCw, ShieldCheck, Upload, X,
 } from 'lucide-react'
-import { get, post, postForm, put } from '../api'
+import { get, post, postForm } from '../api'
 import { Badge, Button, Card, Empty, ErrorBox, Field, Loading, PageHeader, SelectInput, Stat, TextInput, compact, dateText, useErrorMessage } from '../components'
 import { useTasks } from '../TaskCenter'
+import { useWorkspaces } from '../WorkbenchState'
 import { DataTaskReport } from '../DataTaskReport'
 import type {
   Coverage, DataInventoryItem, DataInventoryResponse, DataPackageInfo,
@@ -119,6 +120,8 @@ export default function DataManagementPage({
   onReturn?: () => void
 }) {
   const tasks = useTasks()
+  const workspace = useWorkspaces()
+  const ui = (workspace.configuration.ui ?? {}) as Record<string, unknown>
   const errorText = useErrorMessage()
   const [inventory, setInventory] = useState<DataInventoryResponse | null>(null)
   const [packageInfo, setPackageInfo] = useState<DataPackageInfo | null>(null)
@@ -129,7 +132,7 @@ export default function DataManagementPage({
   const [timeframe, setTimeframe] = useState<DataTimeframe | ''>('')
   const [status, setStatus] = useState('')
   const [page, setPage] = useState(0)
-  const pageSize = 50
+  const pageSize = Math.max(10, Number(ui.inventory_page_size) || 50)
   const [selectedSymbol, setSelectedSymbol] = useState('')
   const [selectedTimeframe, setSelectedTimeframe] = useState<DataTimeframe>('1day')
   const [coverage, setCoverage] = useState<PeriodCoverage | null>(null)
@@ -290,7 +293,7 @@ export default function DataManagementPage({
     setBusy('切换来源'); setError(''); setNotice('')
     try {
       const field = capability === 'recent_minute' ? 'recent_minute_source' : 'etf_daily_source'
-      await put('/settings', { [field]: source })
+      await workspace.saveConfiguration({ market_data: { [field]: source } })
       setNotice(`数据源已切换为 ${source}。`)
       await loadInventory()
     } catch (cause) { setError(errorText(cause)) } finally { setBusy('') }

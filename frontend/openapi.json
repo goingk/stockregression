@@ -1,0 +1,5919 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "A 股及 ETF 行情与网格研究台",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/health": {
+      "get": {
+        "summary": "Health",
+        "operationId": "health_api_v1_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/system/restart": {
+      "post": {
+        "summary": "Restart Project",
+        "operationId": "restart_project_api_v1_system_restart_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestartRequest",
+                "default": {
+                  "force": false
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/instruments": {
+      "get": {
+        "summary": "Instruments",
+        "operationId": "instruments_api_v1_instruments_get",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Q"
+            }
+          },
+          {
+            "name": "asset_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "stock",
+                    "etf"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Asset Type"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/workbench/recent-symbols": {
+      "get": {
+        "summary": "Recent Workbench Symbols",
+        "operationId": "recent_workbench_symbols_api_v1_workbench_recent_symbols_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/instruments/refresh": {
+      "post": {
+        "summary": "Refresh Instruments",
+        "operationId": "refresh_instruments_api_v1_instruments_refresh_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/watchlist": {
+      "get": {
+        "summary": "Watches",
+        "operationId": "watches_api_v1_watchlist_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Add Watch",
+        "operationId": "add_watch_api_v1_watchlist_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/watchlist/{symbol}": {
+      "delete": {
+        "summary": "Delete Watch",
+        "operationId": "delete_watch_api_v1_watchlist__symbol__delete",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/frequencies": {
+      "get": {
+        "summary": "Data Frequencies",
+        "operationId": "data_frequencies_api_v1_data_frequencies_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/package": {
+      "get": {
+        "summary": "Data Package",
+        "operationId": "data_package_api_v1_data_package_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/inventory": {
+      "get": {
+        "summary": "Data Inventory",
+        "operationId": "data_inventory_api_v1_data_inventory_get",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Q"
+            }
+          },
+          {
+            "name": "asset_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "stock",
+                    "etf"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Asset Type"
+            }
+          },
+          {
+            "name": "timeframe",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Timeframe"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/import-package/scan": {
+      "post": {
+        "summary": "Import Package Scan",
+        "operationId": "import_package_scan_api_v1_data_import_package_scan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketPackageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/import-package": {
+      "post": {
+        "summary": "Import Package",
+        "operationId": "import_package_api_v1_data_import_package_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketPackageRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/datasets": {
+      "get": {
+        "summary": "Data Datasets",
+        "operationId": "data_datasets_api_v1_data_datasets_get",
+        "parameters": [
+          {
+            "name": "timeframe",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Timeframe"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "",
+              "title": "Q"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 200,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/coverage/{symbol}": {
+      "get": {
+        "summary": "Coverage",
+        "operationId": "coverage_api_v1_data_coverage__symbol__get",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "timeframe",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Timeframe"
+            }
+          },
+          {
+            "name": "frequency",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Frequency"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/sync": {
+      "post": {
+        "summary": "Sync Data",
+        "operationId": "sync_data_api_v1_data_sync_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketSyncRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/sources": {
+      "get": {
+        "summary": "Data Sources",
+        "operationId": "data_sources_api_v1_data_sources_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/sources/probe": {
+      "post": {
+        "summary": "Probe Data Source",
+        "operationId": "probe_data_source_api_v1_data_sources_probe_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketSourceProbeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/sync-status": {
+      "get": {
+        "summary": "Sync Status",
+        "operationId": "sync_status_api_v1_data_sync_status_get",
+        "parameters": [
+          {
+            "name": "run_key",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Run Key"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/import": {
+      "post": {
+        "summary": "Import Data",
+        "operationId": "import_data_api_v1_data_import_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketImportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/upload": {
+      "post": {
+        "summary": "Upload Import Data",
+        "operationId": "upload_import_data_api_v1_data_upload_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_import_data_api_v1_data_upload_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/upload-batch": {
+      "post": {
+        "summary": "Upload Import Batch",
+        "operationId": "upload_import_batch_api_v1_data_upload_batch_post",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_import_batch_api_v1_data_upload_batch_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/import-batch/scan": {
+      "post": {
+        "summary": "Import Batch Scan",
+        "operationId": "import_batch_scan_api_v1_data_import_batch_scan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketBatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/import-batch": {
+      "post": {
+        "summary": "Import Batch",
+        "operationId": "import_batch_api_v1_data_import_batch_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketBatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/validate": {
+      "post": {
+        "summary": "Validate Data",
+        "operationId": "validate_data_api_v1_data_validate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketValidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/archive": {
+      "post": {
+        "summary": "Archive Data",
+        "operationId": "archive_data_api_v1_data_archive_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketArchiveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/compliance/{symbol}": {
+      "get": {
+        "summary": "Data Compliance",
+        "operationId": "data_compliance_api_v1_data_compliance__symbol__get",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/aggregate": {
+      "post": {
+        "summary": "Aggregate Data",
+        "operationId": "aggregate_data_api_v1_data_aggregate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketAggregateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/readiness": {
+      "post": {
+        "summary": "Data Readiness",
+        "operationId": "data_readiness_api_v1_data_readiness_post",
+        "parameters": [
+          {
+            "name": "version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BacktestConfig"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/preparation/plan": {
+      "post": {
+        "summary": "Preparation Plan",
+        "operationId": "preparation_plan_api_v1_data_preparation_plan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketPreparationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/preparation": {
+      "post": {
+        "summary": "Preparation Submit",
+        "operationId": "preparation_submit_api_v1_data_preparation_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MarketPreparationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/bars/{symbol}": {
+      "get": {
+        "summary": "Bars",
+        "operationId": "bars_api_v1_data_bars__symbol__get",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start Date"
+            }
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End Date"
+            }
+          },
+          {
+            "name": "frequency",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "1m",
+              "title": "Frequency"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 10000,
+              "minimum": 1,
+              "default": 1500,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backtests": {
+      "post": {
+        "summary": "Backtest",
+        "operationId": "backtest_api_v1_backtests_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BacktestConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/data/reference-price/{symbol}": {
+      "get": {
+        "summary": "Reference Price",
+        "operationId": "reference_price_api_v1_data_reference_price__symbol__get",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Start Date"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/market/bars/{symbol}": {
+      "get": {
+        "summary": "Market Bars",
+        "operationId": "market_bars_api_v1_market_bars__symbol__get",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "frequency",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "1d",
+              "title": "Frequency"
+            }
+          },
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start Date"
+            }
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End Date"
+            }
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 5000,
+              "minimum": 1,
+              "default": 600,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "ma",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "5,10,20,60",
+              "title": "Ma"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backtests/preview": {
+      "post": {
+        "summary": "Preview",
+        "operationId": "preview_api_v1_backtests_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backtests/preview/{session_id}": {
+      "get": {
+        "summary": "Preview Status",
+        "operationId": "preview_status_api_v1_backtests_preview__session_id__get",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Cancel Preview",
+        "operationId": "cancel_preview_api_v1_backtests_preview__session_id__delete",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/configs/convert": {
+      "post": {
+        "summary": "Convert Config",
+        "operationId": "convert_config_api_v1_configs_convert_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BacktestConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/backtests/batch": {
+      "post": {
+        "summary": "Batch",
+        "operationId": "batch_api_v1_backtests_batch_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/optimizations": {
+      "post": {
+        "summary": "Optimization",
+        "operationId": "optimization_api_v1_optimizations_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/OptimizationConfig"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ResearchRequestV4"
+                  }
+                ],
+                "title": "Config"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/optimizations/preview": {
+      "post": {
+        "summary": "Optimization Preview",
+        "operationId": "optimization_preview_api_v1_optimizations_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/OptimizationConfig"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ResearchRequestV4"
+                  }
+                ],
+                "title": "Config"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/research/strategies": {
+      "get": {
+        "summary": "Research Strategies",
+        "operationId": "research_strategies_api_v1_research_strategies_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs": {
+      "get": {
+        "summary": "Jobs",
+        "operationId": "jobs_api_v1_jobs_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}": {
+      "get": {
+        "summary": "Get Job",
+        "operationId": "get_job_api_v1_jobs__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}/cancel": {
+      "post": {
+        "summary": "Cancel Job",
+        "operationId": "cancel_job_api_v1_jobs__job_id__cancel_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}/events": {
+      "get": {
+        "summary": "Job Events",
+        "operationId": "job_events_api_v1_jobs__job_id__events_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}/result": {
+      "get": {
+        "summary": "Job Result",
+        "operationId": "job_result_api_v1_jobs__job_id__result_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/jobs/{job_id}/items": {
+      "get": {
+        "summary": "Job Items",
+        "operationId": "job_items_api_v1_jobs__job_id__items_get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "section",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "all",
+              "title": "Section"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/results": {
+      "get": {
+        "summary": "Results",
+        "operationId": "results_api_v1_results_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/results/{result_id}": {
+      "get": {
+        "summary": "Get Result",
+        "operationId": "get_result_api_v1_results__result_id__get",
+        "parameters": [
+          {
+            "name": "result_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Result Id"
+            }
+          },
+          {
+            "name": "full",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Full"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/results/{result_id}/landscape": {
+      "get": {
+        "summary": "Result Landscape",
+        "operationId": "result_landscape_api_v1_results__result_id__landscape_get",
+        "parameters": [
+          {
+            "name": "result_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Result Id"
+            }
+          },
+          {
+            "name": "decision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(current|fixed|adaptive)$",
+              "default": "current",
+              "title": "Decision"
+            }
+          },
+          {
+            "name": "decision_index",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Decision Index"
+            }
+          },
+          {
+            "name": "sample",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(training|validation)$",
+              "default": "validation",
+              "title": "Sample"
+            }
+          },
+          {
+            "name": "cost",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(original|stress)$",
+              "default": "original",
+              "title": "Cost"
+            }
+          },
+          {
+            "name": "fold",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Fold"
+            }
+          },
+          {
+            "name": "region_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Region Id"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 10000,
+              "minimum": 1,
+              "default": 1000,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "view",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(sample|members|slice|projection)$",
+              "default": "sample",
+              "title": "View"
+            }
+          },
+          {
+            "name": "x",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X"
+            }
+          },
+          {
+            "name": "y",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Y"
+            }
+          },
+          {
+            "name": "anchor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(stable|peak)$",
+              "default": "stable",
+              "title": "Anchor"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/results/{result_id}/regions/{region_id}/export": {
+      "get": {
+        "summary": "Export Region",
+        "operationId": "export_region_api_v1_results__result_id__regions__region_id__export_get",
+        "parameters": [
+          {
+            "name": "result_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Result Id"
+            }
+          },
+          {
+            "name": "region_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Region Id"
+            }
+          },
+          {
+            "name": "decision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(current|fixed|adaptive)$",
+              "default": "current",
+              "title": "Decision"
+            }
+          },
+          {
+            "name": "decision_index",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Decision Index"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^(csv|json)$",
+              "default": "csv",
+              "title": "Format"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/results/{result_id}/export": {
+      "get": {
+        "summary": "Export",
+        "operationId": "export_api_v1_results__result_id__export_get",
+        "parameters": [
+          {
+            "name": "result_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Result Id"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "json",
+              "title": "Kind"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/configs": {
+      "get": {
+        "summary": "Configs",
+        "operationId": "configs_api_v1_configs_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Save Config",
+        "operationId": "save_config_api_v1_configs_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/configs/{config_id}": {
+      "delete": {
+        "summary": "Delete Config",
+        "operationId": "delete_config_api_v1_configs__config_id__delete",
+        "parameters": [
+          {
+            "name": "config_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Config Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/settings": {
+      "get": {
+        "summary": "Settings",
+        "operationId": "settings_api_v1_settings_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Update Settings",
+        "operationId": "update_settings_api_v1_settings_put",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": true,
+                "type": "object",
+                "title": "Payload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/configuration": {
+      "get": {
+        "summary": "Get Configuration",
+        "operationId": "get_configuration_api_v1_configuration_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigurationEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Update Configuration",
+        "operationId": "update_configuration_api_v1_configuration_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigurationPatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigurationEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/configuration/schema": {
+      "get": {
+        "summary": "Get Configuration Schema",
+        "operationId": "get_configuration_schema_api_v1_configuration_schema_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/configuration/validate": {
+      "post": {
+        "summary": "Validate Configuration",
+        "operationId": "validate_configuration_api_v1_configuration_validate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigurationValidationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigurationValidationEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/performance": {
+      "get": {
+        "summary": "Performance Status",
+        "operationId": "performance_status_api_v1_performance_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/schedule/install": {
+      "post": {
+        "summary": "Install Schedule",
+        "operationId": "install_schedule_api_v1_schedule_install_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/schedule/remove": {
+      "post": {
+        "summary": "Remove Schedule",
+        "operationId": "remove_schedule_api_v1_schedule_remove_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApplicationSection": {
+        "properties": {
+          "host": {
+            "type": "string",
+            "title": "Host",
+            "default": "127.0.0.1"
+          },
+          "port": {
+            "type": "integer",
+            "maximum": 65535.0,
+            "minimum": 1.0,
+            "title": "Port",
+            "default": 8000
+          },
+          "max_workers": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": 1.0,
+            "title": "Max Workers",
+            "default": 2
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ApplicationSection"
+      },
+      "BacktestConfig": {
+        "properties": {
+          "schema_version": {
+            "type": "integer",
+            "enum": [
+              1,
+              2,
+              3
+            ],
+            "title": "Schema Version",
+            "default": 1
+          },
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "start_date": {
+            "type": "string",
+            "format": "date",
+            "title": "Start Date"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Date"
+          },
+          "frequency": {
+            "type": "string",
+            "enum": [
+              "1m",
+              "5m",
+              "15m",
+              "30m",
+              "60m",
+              "1d"
+            ],
+            "title": "Frequency",
+            "default": "1m"
+          },
+          "initial_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 0.0,
+            "title": "Initial Shares",
+            "default": 1000
+          },
+          "min_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 0.0,
+            "title": "Min Shares",
+            "default": 0
+          },
+          "max_shares": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "multipleOf": 100.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Shares",
+            "default": 2000
+          },
+          "buy_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 100.0,
+            "title": "Buy Shares",
+            "default": 100
+          },
+          "sell_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 100.0,
+            "title": "Sell Shares",
+            "default": 100
+          },
+          "dca": {
+            "$ref": "#/components/schemas/DcaConfig"
+          },
+          "reference_price_mode": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "manual"
+            ],
+            "title": "Reference Price Mode",
+            "default": "auto"
+          },
+          "initial_cash": {
+            "type": "number",
+            "exclusiveMinimum": 0.0,
+            "title": "Initial Cash",
+            "default": 100000
+          },
+          "reserve_cash": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reserve Cash"
+          },
+          "selection_asof": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selection Asof"
+          },
+          "initial_position": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Initial Position",
+            "default": 0.5
+          },
+          "min_position": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Min Position",
+            "default": 0
+          },
+          "max_position": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Max Position",
+            "default": 1
+          },
+          "grid_mode": {
+            "type": "string",
+            "enum": [
+              "trailing",
+              "arithmetic",
+              "geometric"
+            ],
+            "title": "Grid Mode",
+            "default": "trailing"
+          },
+          "buy_step": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Buy Step",
+            "default": 0.03
+          },
+          "sell_step": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Sell Step",
+            "default": 0.03
+          },
+          "grid_step": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Grid Step",
+            "default": 0.03
+          },
+          "reference_price": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Price"
+          },
+          "lower_price": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lower Price"
+          },
+          "upper_price": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upper Price"
+          },
+          "buy_quantity": {
+            "$ref": "#/components/schemas/QuantityConfig"
+          },
+          "sell_quantity": {
+            "$ref": "#/components/schemas/QuantityConfig"
+          },
+          "fees": {
+            "$ref": "#/components/schemas/FeeConfig"
+          },
+          "dca_frequency": {
+            "type": "string",
+            "enum": [
+              "daily",
+              "weekly",
+              "monthly"
+            ],
+            "title": "Dca Frequency",
+            "default": "monthly"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "symbol",
+          "start_date"
+        ],
+        "title": "BacktestConfig"
+      },
+      "BacktestSection": {
+        "properties": {
+          "grid": {
+            "$ref": "#/components/schemas/GridDefaults"
+          },
+          "position": {
+            "$ref": "#/components/schemas/PositionDefaults"
+          },
+          "dca": {
+            "$ref": "#/components/schemas/DcaDefaults"
+          },
+          "fees": {
+            "$ref": "#/components/schemas/FeeDefaults"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "BacktestSection"
+      },
+      "BatchRequest": {
+        "properties": {
+          "configs": {
+            "items": {
+              "$ref": "#/components/schemas/BacktestConfig"
+            },
+            "type": "array",
+            "maxItems": 100,
+            "minItems": 1,
+            "title": "Configs"
+          }
+        },
+        "type": "object",
+        "required": [
+          "configs"
+        ],
+        "title": "BatchRequest"
+      },
+      "Body_upload_import_batch_api_v1_data_upload_batch_post": {
+        "properties": {
+          "files": {
+            "items": {
+              "type": "string",
+              "contentMediaType": "application/octet-stream"
+            },
+            "type": "array",
+            "title": "Files"
+          },
+          "timeframe": {
+            "type": "string",
+            "title": "Timeframe"
+          },
+          "label_convention": {
+            "type": "string",
+            "title": "Label Convention",
+            "default": "auto"
+          },
+          "etf_category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Etf Category"
+          },
+          "calendar_file": {
+            "anyOf": [
+              {
+                "type": "string",
+                "contentMediaType": "application/octet-stream"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Calendar File"
+          },
+          "skip_invalid_rows": {
+            "type": "boolean",
+            "title": "Skip Invalid Rows",
+            "default": false
+          },
+          "import_mode": {
+            "type": "string",
+            "title": "Import Mode",
+            "default": "merge"
+          }
+        },
+        "type": "object",
+        "required": [
+          "files",
+          "timeframe"
+        ],
+        "title": "Body_upload_import_batch_api_v1_data_upload_batch_post"
+      },
+      "Body_upload_import_data_api_v1_data_upload_post": {
+        "properties": {
+          "market_file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "Market File"
+          },
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "timeframe": {
+            "type": "string",
+            "title": "Timeframe"
+          },
+          "label_convention": {
+            "type": "string",
+            "title": "Label Convention",
+            "default": "auto"
+          },
+          "etf_category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Etf Category"
+          },
+          "calendar_file": {
+            "anyOf": [
+              {
+                "type": "string",
+                "contentMediaType": "application/octet-stream"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Calendar File"
+          },
+          "actions_file": {
+            "anyOf": [
+              {
+                "type": "string",
+                "contentMediaType": "application/octet-stream"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actions File"
+          },
+          "skip_invalid_rows": {
+            "type": "boolean",
+            "title": "Skip Invalid Rows",
+            "default": false
+          },
+          "import_mode": {
+            "type": "string",
+            "title": "Import Mode",
+            "default": "merge"
+          }
+        },
+        "type": "object",
+        "required": [
+          "market_file",
+          "symbol",
+          "timeframe"
+        ],
+        "title": "Body_upload_import_data_api_v1_data_upload_post"
+      },
+      "ConfigurationDocument": {
+        "properties": {
+          "config_schema_version": {
+            "type": "integer",
+            "enum": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "title": "Config Schema Version",
+            "default": 4
+          },
+          "config_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Config Revision"
+          },
+          "application": {
+            "$ref": "#/components/schemas/ApplicationSection"
+          },
+          "paths": {
+            "$ref": "#/components/schemas/PathsSection"
+          },
+          "backtest": {
+            "$ref": "#/components/schemas/BacktestSection"
+          },
+          "research": {
+            "$ref": "#/components/schemas/ResearchSection"
+          },
+          "statistics": {
+            "$ref": "#/components/schemas/StatisticsSettings"
+          },
+          "market_data": {
+            "$ref": "#/components/schemas/MarketDataSettings"
+          },
+          "runtime": {
+            "$ref": "#/components/schemas/PerformanceSettings"
+          },
+          "ui": {
+            "$ref": "#/components/schemas/UiSettings"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/ScheduleSettings"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ConfigurationDocument",
+        "description": "The complete validated project configuration file."
+      },
+      "ConfigurationEnvelope": {
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/ConfigurationDocument"
+          },
+          "revision": {
+            "type": "string",
+            "title": "Revision"
+          },
+          "pending_restart": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Pending Restart"
+          },
+          "active_data_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Data Dir"
+          },
+          "active_package_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active Package Dir"
+          }
+        },
+        "type": "object",
+        "required": [
+          "config",
+          "revision"
+        ],
+        "title": "ConfigurationEnvelope"
+      },
+      "ConfigurationPatchRequest": {
+        "properties": {
+          "base_revision": {
+            "type": "string",
+            "title": "Base Revision"
+          },
+          "patch": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Patch"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "base_revision",
+          "patch"
+        ],
+        "title": "ConfigurationPatchRequest"
+      },
+      "ConfigurationValidationEnvelope": {
+        "properties": {
+          "valid": {
+            "type": "boolean",
+            "const": true,
+            "title": "Valid",
+            "default": true
+          },
+          "config": {
+            "$ref": "#/components/schemas/ConfigurationDocument"
+          },
+          "revision": {
+            "type": "string",
+            "title": "Revision"
+          }
+        },
+        "type": "object",
+        "required": [
+          "config",
+          "revision"
+        ],
+        "title": "ConfigurationValidationEnvelope"
+      },
+      "ConfigurationValidationRequest": {
+        "properties": {
+          "patch": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Patch"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "patch"
+        ],
+        "title": "ConfigurationValidationRequest"
+      },
+      "DcaConfig": {
+        "properties": {
+          "frequency": {
+            "type": "string",
+            "enum": [
+              "daily",
+              "weekly",
+              "monthly"
+            ],
+            "title": "Frequency",
+            "default": "monthly"
+          },
+          "shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 100.0,
+            "title": "Shares",
+            "default": 100
+          },
+          "initial_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 0.0,
+            "title": "Initial Shares",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "DcaConfig"
+      },
+      "DcaDefaults": {
+        "properties": {
+          "frequency": {
+            "type": "string",
+            "enum": [
+              "daily",
+              "weekly",
+              "monthly"
+            ],
+            "title": "Frequency",
+            "default": "monthly"
+          },
+          "shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 100.0,
+            "title": "Shares",
+            "default": 100
+          },
+          "initial_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 0.0,
+            "title": "Initial Shares",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "DcaDefaults"
+      },
+      "FeeConfig": {
+        "properties": {
+          "commission_rate": {
+            "type": "number",
+            "maximum": 0.05,
+            "minimum": 0.0,
+            "title": "Commission Rate",
+            "default": 0.0005
+          },
+          "min_commission": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Min Commission",
+            "default": 0.1
+          },
+          "slippage_bps": {
+            "type": "number",
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Slippage Bps",
+            "default": 5
+          },
+          "share_face_value": {
+            "type": "number",
+            "exclusiveMinimum": 0.0,
+            "title": "Share Face Value",
+            "default": 1
+          },
+          "legacy_sh_transfer_rate": {
+            "type": "number",
+            "maximum": 0.05,
+            "minimum": 0.0,
+            "title": "Legacy Sh Transfer Rate",
+            "default": 0.001
+          },
+          "legacy_sh_min_transfer": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Legacy Sh Min Transfer",
+            "default": 1
+          },
+          "legacy_sz_transfer_rate": {
+            "type": "number",
+            "maximum": 0.05,
+            "minimum": 0.0,
+            "title": "Legacy Sz Transfer Rate",
+            "default": 2.55e-05
+          }
+        },
+        "type": "object",
+        "title": "FeeConfig"
+      },
+      "FeeDefaults": {
+        "properties": {
+          "commission_rate": {
+            "type": "number",
+            "maximum": 0.05,
+            "minimum": 0.0,
+            "title": "Commission Rate",
+            "default": 0.0005
+          },
+          "min_commission": {
+            "type": "number",
+            "minimum": 0.0,
+            "title": "Min Commission",
+            "default": 0.1
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "FeeDefaults"
+      },
+      "GridDefaults": {
+        "properties": {
+          "grid_mode": {
+            "type": "string",
+            "enum": [
+              "trailing",
+              "arithmetic",
+              "geometric"
+            ],
+            "title": "Grid Mode",
+            "default": "trailing"
+          },
+          "buy_step": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Buy Step",
+            "default": 0.03
+          },
+          "sell_step": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Sell Step",
+            "default": 0.03
+          },
+          "lower_price": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lower Price"
+          },
+          "upper_price": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upper Price"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "GridDefaults"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "MarketAggregateRequest": {
+        "properties": {
+          "symbols": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Symbols"
+          },
+          "source_timeframe": {
+            "type": "string",
+            "title": "Source Timeframe"
+          },
+          "target_timeframe": {
+            "type": "string",
+            "title": "Target Timeframe"
+          },
+          "start_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Date"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Date"
+          }
+        },
+        "type": "object",
+        "required": [
+          "symbols",
+          "source_timeframe",
+          "target_timeframe"
+        ],
+        "title": "MarketAggregateRequest"
+      },
+      "MarketArchiveRequest": {
+        "properties": {
+          "symbols": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Symbols"
+          },
+          "timeframe": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeframe"
+          },
+          "frequency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frequency"
+          }
+        },
+        "type": "object",
+        "title": "MarketArchiveRequest"
+      },
+      "MarketBatchRequest": {
+        "properties": {
+          "folder": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Folder"
+          },
+          "timeframe": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeframe"
+          },
+          "frequency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frequency"
+          },
+          "recursive": {
+            "type": "boolean",
+            "title": "Recursive",
+            "default": false
+          },
+          "label_convention": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "start",
+              "end"
+            ],
+            "title": "Label Convention",
+            "default": "auto"
+          },
+          "adjustment": {
+            "type": "string",
+            "title": "Adjustment",
+            "default": "none"
+          },
+          "etf_category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Etf Category"
+          },
+          "resume": {
+            "type": "boolean",
+            "title": "Resume",
+            "default": true
+          },
+          "calendar_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Calendar Path"
+          },
+          "workers": {
+            "type": "integer",
+            "maximum": 4.0,
+            "minimum": 1.0,
+            "title": "Workers",
+            "default": 4
+          },
+          "skip_invalid_rows": {
+            "type": "boolean",
+            "title": "Skip Invalid Rows",
+            "default": false
+          },
+          "import_mode": {
+            "type": "string",
+            "enum": [
+              "merge",
+              "snapshot"
+            ],
+            "title": "Import Mode",
+            "default": "merge"
+          }
+        },
+        "type": "object",
+        "title": "MarketBatchRequest"
+      },
+      "MarketDataSettings": {
+        "properties": {
+          "cache_mb": {
+            "type": "integer",
+            "maximum": 16384.0,
+            "minimum": 0.0,
+            "title": "Cache Mb",
+            "default": 256
+          },
+          "recent_minute_source": {
+            "type": "string",
+            "enum": [
+              "sina",
+              "tdx"
+            ],
+            "title": "Recent Minute Source",
+            "default": "sina"
+          },
+          "etf_daily_source": {
+            "type": "string",
+            "enum": [
+              "baostock",
+              "eastmoney"
+            ],
+            "title": "Etf Daily Source",
+            "default": "baostock"
+          },
+          "network_timeout_seconds": {
+            "type": "number",
+            "maximum": 300.0,
+            "minimum": 1.0,
+            "title": "Network Timeout Seconds",
+            "default": 15
+          },
+          "request_retries": {
+            "type": "integer",
+            "maximum": 5.0,
+            "minimum": 0.0,
+            "title": "Request Retries",
+            "default": 1
+          },
+          "failure_cooldown_hours": {
+            "type": "integer",
+            "maximum": 720.0,
+            "minimum": 0.0,
+            "title": "Failure Cooldown Hours",
+            "default": 24
+          },
+          "retry_after_seconds": {
+            "type": "integer",
+            "maximum": 86400.0,
+            "minimum": 1.0,
+            "title": "Retry After Seconds",
+            "default": 60
+          },
+          "source_lock_timeout_seconds": {
+            "type": "integer",
+            "maximum": 600.0,
+            "minimum": 1.0,
+            "title": "Source Lock Timeout Seconds",
+            "default": 30
+          },
+          "sync_lock_timeout_seconds": {
+            "type": "integer",
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Sync Lock Timeout Seconds",
+            "default": 60
+          },
+          "prepare_lock_timeout_seconds": {
+            "type": "integer",
+            "maximum": 86400.0,
+            "minimum": 1.0,
+            "title": "Prepare Lock Timeout Seconds",
+            "default": 300
+          },
+          "package_lock_timeout_seconds": {
+            "type": "integer",
+            "maximum": 86400.0,
+            "minimum": 1.0,
+            "title": "Package Lock Timeout Seconds",
+            "default": 600
+          },
+          "sqlite_timeout_seconds": {
+            "type": "integer",
+            "maximum": 600.0,
+            "minimum": 1.0,
+            "title": "Sqlite Timeout Seconds",
+            "default": 60
+          },
+          "daily_batch_size": {
+            "type": "integer",
+            "maximum": 2048.0,
+            "minimum": 1.0,
+            "title": "Daily Batch Size",
+            "default": 128
+          },
+          "service_batch_size": {
+            "type": "integer",
+            "maximum": 2048.0,
+            "minimum": 1.0,
+            "title": "Service Batch Size",
+            "default": 128
+          },
+          "scheduler_poll_seconds": {
+            "type": "number",
+            "maximum": 60.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Scheduler Poll Seconds",
+            "default": 0.5
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "MarketDataSettings"
+      },
+      "MarketImportRequest": {
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "timeframe": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeframe"
+          },
+          "frequency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frequency"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          },
+          "label_convention": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "start",
+              "end"
+            ],
+            "title": "Label Convention",
+            "default": "auto"
+          },
+          "adjustment": {
+            "type": "string",
+            "title": "Adjustment",
+            "default": "none"
+          },
+          "etf_category": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Etf Category"
+          },
+          "calendar_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Calendar Path"
+          },
+          "actions_path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actions Path"
+          },
+          "skip_invalid_rows": {
+            "type": "boolean",
+            "title": "Skip Invalid Rows",
+            "default": false
+          },
+          "import_mode": {
+            "type": "string",
+            "enum": [
+              "merge",
+              "snapshot"
+            ],
+            "title": "Import Mode",
+            "default": "merge"
+          }
+        },
+        "type": "object",
+        "required": [
+          "symbol"
+        ],
+        "title": "MarketImportRequest"
+      },
+      "MarketPackageRequest": {
+        "properties": {
+          "folder": {
+            "type": "string",
+            "title": "Folder"
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "etf",
+              "stock",
+              "package"
+            ],
+            "title": "Format",
+            "default": "package"
+          },
+          "timeframes": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeframes"
+          },
+          "symbols": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Symbols"
+          },
+          "label_convention": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "start",
+              "end"
+            ],
+            "title": "Label Convention",
+            "default": "auto"
+          },
+          "resume": {
+            "type": "boolean",
+            "title": "Resume",
+            "default": true
+          },
+          "workers": {
+            "type": "integer",
+            "maximum": 4.0,
+            "minimum": 1.0,
+            "title": "Workers",
+            "default": 4
+          },
+          "skip_invalid_rows": {
+            "type": "boolean",
+            "title": "Skip Invalid Rows",
+            "default": false
+          }
+        },
+        "type": "object",
+        "required": [
+          "folder"
+        ],
+        "title": "MarketPackageRequest"
+      },
+      "MarketPreparationRequest": {
+        "properties": {
+          "config": {
+            "$ref": "#/components/schemas/BacktestConfig"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "type": "object",
+        "required": [
+          "config"
+        ],
+        "title": "MarketPreparationRequest"
+      },
+      "MarketSourceProbeRequest": {
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "sina",
+              "tdx",
+              "baostock",
+              "eastmoney"
+            ],
+            "title": "Source"
+          },
+          "capability": {
+            "type": "string",
+            "enum": [
+              "recent_minute",
+              "etf_daily"
+            ],
+            "title": "Capability"
+          },
+          "market": {
+            "type": "string",
+            "enum": [
+              "all",
+              "stock",
+              "etf"
+            ],
+            "title": "Market",
+            "default": "all"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source",
+          "capability"
+        ],
+        "title": "MarketSourceProbeRequest"
+      },
+      "MarketSyncRequest": {
+        "properties": {
+          "symbols": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Symbols"
+          },
+          "timeframe": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeframe"
+          },
+          "frequency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frequency"
+          },
+          "timeframes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Timeframes"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "history",
+              "incremental",
+              "daily",
+              "repair"
+            ],
+            "title": "Mode",
+            "default": "incremental"
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "market",
+                  "watchlist",
+                  "selected"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scope"
+          },
+          "start_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Date"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Date"
+          },
+          "resume": {
+            "type": "boolean",
+            "title": "Resume",
+            "default": false
+          },
+          "retry_failed": {
+            "type": "boolean",
+            "title": "Retry Failed",
+            "default": false
+          },
+          "initialize": {
+            "type": "boolean",
+            "title": "Initialize",
+            "default": false
+          },
+          "workers": {
+            "type": "integer",
+            "maximum": 4.0,
+            "minimum": 1.0,
+            "title": "Workers",
+            "default": 4
+          },
+          "configuration_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configuration Revision"
+          }
+        },
+        "type": "object",
+        "title": "MarketSyncRequest"
+      },
+      "MarketValidateRequest": {
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "timeframe": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timeframe"
+          },
+          "frequency": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Frequency"
+          },
+          "label_convention": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "start",
+                  "end"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label Convention"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "incremental",
+              "full"
+            ],
+            "title": "Mode",
+            "default": "incremental"
+          },
+          "start_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Date"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Date"
+          }
+        },
+        "type": "object",
+        "required": [
+          "symbol"
+        ],
+        "title": "MarketValidateRequest"
+      },
+      "OptimizationConfig": {
+        "properties": {
+          "base": {
+            "$ref": "#/components/schemas/BacktestConfig"
+          },
+          "protocol_version": {
+            "type": "integer",
+            "enum": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "title": "Protocol Version",
+            "default": 1
+          },
+          "selection_target": {
+            "type": "string",
+            "enum": [
+              "fixed",
+              "adaptive",
+              "both"
+            ],
+            "title": "Selection Target",
+            "default": "both"
+          },
+          "rebalance_days": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Rebalance Days",
+            "default": 63
+          },
+          "bootstrap_reps": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Bootstrap Reps",
+            "default": 10000
+          },
+          "bootstrap_block_lengths": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Bootstrap Block Lengths"
+          },
+          "significance_alpha": {
+            "type": "number",
+            "exclusiveMaximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Significance Alpha",
+            "default": 0.05
+          },
+          "outer_validation_days": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 20.0,
+            "title": "Outer Validation Days",
+            "default": 126
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "historical",
+              "robust",
+              "both"
+            ],
+            "title": "Mode",
+            "default": "both"
+          },
+          "n_trials": {
+            "type": "integer",
+            "maximum": 5000.0,
+            "minimum": 1.0,
+            "title": "N Trials",
+            "default": 200
+          },
+          "local_search_budget": {
+            "type": "integer",
+            "maximum": 5000.0,
+            "minimum": 1.0,
+            "title": "Local Search Budget",
+            "default": 3000
+          },
+          "seed": {
+            "type": "integer",
+            "title": "Seed",
+            "default": 42
+          },
+          "top_candidates": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Top Candidates",
+            "default": 20
+          },
+          "max_drawdown": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Max Drawdown",
+            "default": 0.2
+          },
+          "min_trades": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Min Trades",
+            "default": 10
+          },
+          "min_history_days": {
+            "type": "integer",
+            "minimum": 20.0,
+            "title": "Min History Days",
+            "default": 504
+          },
+          "min_minute_ratio": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Min Minute Ratio",
+            "default": 0.95
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/ResearchStrategySpec"
+          },
+          "research_context": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResearchContext"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ranges": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/SearchRange"
+            },
+            "type": "object",
+            "title": "Ranges"
+          },
+          "configuration_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configuration Revision"
+          }
+        },
+        "type": "object",
+        "required": [
+          "base"
+        ],
+        "title": "OptimizationConfig"
+      },
+      "PathsSection": {
+        "properties": {
+          "data_dir": {
+            "type": "string",
+            "title": "Data Dir"
+          },
+          "package_dir": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Package Dir"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "data_dir"
+        ],
+        "title": "PathsSection"
+      },
+      "PerformanceSettings": {
+        "properties": {
+          "cpu_budget_mode": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "custom"
+            ],
+            "title": "Cpu Budget Mode",
+            "default": "auto"
+          },
+          "cpu_budget": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 128.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cpu Budget"
+          },
+          "download_workers": {
+            "type": "integer",
+            "maximum": 8.0,
+            "minimum": 1.0,
+            "title": "Download Workers",
+            "default": 4
+          },
+          "validation_workers": {
+            "type": "integer",
+            "maximum": 4.0,
+            "minimum": 1.0,
+            "title": "Validation Workers",
+            "default": 4
+          },
+          "blas_threads": {
+            "type": "integer",
+            "maximum": 16.0,
+            "minimum": 1.0,
+            "title": "Blas Threads",
+            "default": 8
+          },
+          "workspace_mb": {
+            "type": "integer",
+            "maximum": 65536.0,
+            "minimum": 256.0,
+            "title": "Workspace Mb",
+            "default": 8192
+          },
+          "evaluation_chunk_size": {
+            "type": "integer",
+            "maximum": 8192.0,
+            "minimum": 16.0,
+            "title": "Evaluation Chunk Size",
+            "default": 512
+          },
+          "job_cancel_poll_ms": {
+            "type": "integer",
+            "maximum": 10000.0,
+            "minimum": 100.0,
+            "title": "Job Cancel Poll Ms",
+            "default": 300
+          },
+          "progress_update_ms": {
+            "type": "integer",
+            "maximum": 60000.0,
+            "minimum": 100.0,
+            "title": "Progress Update Ms",
+            "default": 500
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "PerformanceSettings"
+      },
+      "PositionDefaults": {
+        "properties": {
+          "initial_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 0.0,
+            "title": "Initial Shares",
+            "default": 1000
+          },
+          "min_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 0.0,
+            "title": "Min Shares",
+            "default": 0
+          },
+          "max_shares": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "multipleOf": 100.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Shares",
+            "default": 2000
+          },
+          "buy_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 100.0,
+            "title": "Buy Shares",
+            "default": 100
+          },
+          "sell_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 100.0,
+            "title": "Sell Shares",
+            "default": 100
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "PositionDefaults"
+      },
+      "PreviewRequest": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_-]+$",
+            "title": "Session Id"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          },
+          "config": {
+            "$ref": "#/components/schemas/BacktestConfig"
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id",
+          "revision",
+          "config"
+        ],
+        "title": "PreviewRequest"
+      },
+      "QuantityConfig": {
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "shares",
+              "cash",
+              "equity_ratio"
+            ],
+            "title": "Mode",
+            "default": "equity_ratio"
+          },
+          "value": {
+            "type": "number",
+            "exclusiveMinimum": 0.0,
+            "title": "Value",
+            "default": 0.1
+          }
+        },
+        "type": "object",
+        "title": "QuantityConfig"
+      },
+      "ResearchContext": {
+        "properties": {
+          "symbol": {
+            "type": "string",
+            "title": "Symbol"
+          },
+          "start_date": {
+            "type": "string",
+            "format": "date",
+            "title": "Start Date"
+          },
+          "end_date": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Date"
+          },
+          "frequency": {
+            "type": "string",
+            "enum": [
+              "1m",
+              "5m",
+              "15m",
+              "30m",
+              "60m",
+              "1d"
+            ],
+            "title": "Frequency",
+            "default": "1m"
+          },
+          "initial_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 0.0,
+            "title": "Initial Shares",
+            "default": 1000
+          },
+          "grid_mode": {
+            "type": "string",
+            "const": "geometric",
+            "title": "Grid Mode",
+            "default": "geometric"
+          },
+          "fees": {
+            "$ref": "#/components/schemas/FeeConfig"
+          },
+          "reference_price_mode": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "manual"
+            ],
+            "title": "Reference Price Mode",
+            "default": "auto"
+          },
+          "reference_price": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Price"
+          },
+          "lower_price": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lower Price"
+          },
+          "upper_price": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Upper Price"
+          },
+          "dca": {
+            "$ref": "#/components/schemas/DcaConfig"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "symbol",
+          "start_date"
+        ],
+        "title": "ResearchContext",
+        "description": "Public v4 research input independent of backtest search values."
+      },
+      "ResearchDefaults": {
+        "properties": {
+          "strategy_id": {
+            "type": "string",
+            "enum": [
+              "geometric_excess_neighborhood",
+              "geometric_robust_j"
+            ],
+            "title": "Strategy Id",
+            "default": "geometric_robust_j"
+          },
+          "protocol_version": {
+            "type": "integer",
+            "enum": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "title": "Protocol Version",
+            "default": 4
+          },
+          "selection_target": {
+            "type": "string",
+            "enum": [
+              "fixed",
+              "adaptive",
+              "both"
+            ],
+            "title": "Selection Target",
+            "default": "both"
+          },
+          "rebalance_days": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Rebalance Days",
+            "default": 63
+          },
+          "bootstrap_reps": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Bootstrap Reps",
+            "default": 10000
+          },
+          "bootstrap_block_lengths": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Bootstrap Block Lengths"
+          },
+          "significance_alpha": {
+            "type": "number",
+            "exclusiveMaximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Significance Alpha",
+            "default": 0.05
+          },
+          "outer_validation_days": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 20.0,
+            "title": "Outer Validation Days",
+            "default": 126
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "historical",
+              "robust",
+              "both"
+            ],
+            "title": "Mode",
+            "default": "both"
+          },
+          "n_trials": {
+            "type": "integer",
+            "maximum": 5000.0,
+            "minimum": 1.0,
+            "title": "N Trials",
+            "default": 1000
+          },
+          "local_search_budget": {
+            "type": "integer",
+            "maximum": 5000.0,
+            "minimum": 1.0,
+            "title": "Local Search Budget",
+            "default": 3000
+          },
+          "seed": {
+            "type": "integer",
+            "title": "Seed",
+            "default": 42
+          },
+          "top_candidates": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Top Candidates",
+            "default": 20
+          },
+          "max_drawdown": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Max Drawdown",
+            "default": 0.2
+          },
+          "min_trades": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Min Trades",
+            "default": 10
+          },
+          "min_history_days": {
+            "type": "integer",
+            "minimum": 20.0,
+            "title": "Min History Days",
+            "default": 250
+          },
+          "min_minute_ratio": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Min Minute Ratio",
+            "default": 0.95
+          },
+          "ranking_mode": {
+            "type": "string",
+            "enum": [
+              "max_volume",
+              "fixed_mean"
+            ],
+            "title": "Ranking Mode",
+            "default": "fixed_mean"
+          },
+          "strategy_version": {
+            "type": "integer",
+            "enum": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "title": "Strategy Version",
+            "default": 4
+          },
+          "hypercube_edge": {
+            "type": "integer",
+            "maximum": 99.0,
+            "minimum": 1.0,
+            "title": "Hypercube Edge",
+            "default": 3
+          },
+          "granularity": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Granularity"
+          },
+          "search_method": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "hierarchical",
+              "exhaustive"
+            ],
+            "title": "Search Method",
+            "default": "auto"
+          },
+          "training_budget": {
+            "type": "integer",
+            "maximum": 1000000.0,
+            "minimum": 1.0,
+            "title": "Training Budget",
+            "default": 20000
+          },
+          "validation_budget": {
+            "type": "integer",
+            "maximum": 2000000.0,
+            "minimum": 1.0,
+            "title": "Validation Budget",
+            "default": 100000
+          },
+          "recommendation_count": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Recommendation Count",
+            "default": 10
+          },
+          "max_shares_mode": {
+            "type": "string",
+            "enum": [
+              "search",
+              "unlimited"
+            ],
+            "title": "Max Shares Mode",
+            "default": "search"
+          },
+          "slippage_mode": {
+            "type": "string",
+            "enum": [
+              "configured",
+              "zero"
+            ],
+            "title": "Slippage Mode",
+            "default": "configured"
+          },
+          "neighborhood_fields": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "buy_step",
+                "sell_step",
+                "sell_shares",
+                "buy_shares",
+                "min_shares",
+                "max_shares"
+              ]
+            },
+            "type": "array",
+            "title": "Neighborhood Fields"
+          },
+          "fixed_half_widths": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Fixed Half Widths"
+          },
+          "ranges": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ResearchRangeDefaults"
+            },
+            "type": "object",
+            "title": "Ranges"
+          },
+          "sigma": {
+            "type": "number",
+            "maximum": 100.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Sigma",
+            "default": 1.0
+          },
+          "alpha": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Alpha",
+            "default": 0.3
+          },
+          "beta": {
+            "type": "number",
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Beta",
+            "default": 1.2
+          },
+          "tau": {
+            "type": "number",
+            "maximum": 10.0,
+            "minimum": -1.0,
+            "title": "Tau",
+            "default": 0.01
+          },
+          "eta_limit": {
+            "type": "number",
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Eta Limit",
+            "default": 2.0
+          },
+          "eta_hard_cap": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1000.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eta Hard Cap",
+            "default": 3.5
+          },
+          "gamma_max": {
+            "type": "number",
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Gamma Max",
+            "default": 0.4
+          },
+          "eta_floor": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Eta Floor",
+            "default": 0.0
+          },
+          "gamma_min": {
+            "type": "number",
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Gamma Min",
+            "default": 0.0
+          },
+          "training_min_days": {
+            "type": "integer",
+            "maximum": 5000.0,
+            "minimum": 20.0,
+            "title": "Training Min Days",
+            "default": 250
+          },
+          "training_max_days": {
+            "type": "integer",
+            "maximum": 5000.0,
+            "minimum": 20.0,
+            "title": "Training Max Days",
+            "default": 500
+          },
+          "peak_tolerance": {
+            "type": "number",
+            "maximum": 0.1,
+            "exclusiveMinimum": 0.0,
+            "title": "Peak Tolerance",
+            "default": 1e-12
+          },
+          "start_min": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Start Min",
+            "default": 20
+          },
+          "start_max": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Start Max",
+            "default": 64
+          },
+          "starts_per_candidate": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Starts Per Candidate",
+            "default": 4
+          },
+          "initial_strides": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Initial Strides"
+          },
+          "stride_multiplier": {
+            "type": "integer",
+            "maximum": 16.0,
+            "minimum": 2.0,
+            "title": "Stride Multiplier",
+            "default": 2
+          },
+          "max_stride_fraction": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Max Stride Fraction",
+            "default": 0.25
+          },
+          "validation_reserve_fraction": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Validation Reserve Fraction",
+            "default": 0.25
+          },
+          "exhaustive_memory_limit_mb": {
+            "type": "integer",
+            "maximum": 65536.0,
+            "minimum": 16.0,
+            "title": "Exhaustive Memory Limit Mb",
+            "default": 512
+          },
+          "estimated_bytes_per_point": {
+            "type": "integer",
+            "maximum": 65536.0,
+            "minimum": 64.0,
+            "title": "Estimated Bytes Per Point",
+            "default": 512
+          },
+          "stress_cost_multiplier": {
+            "type": "number",
+            "maximum": 20.0,
+            "exclusiveMinimum": 1.0,
+            "title": "Stress Cost Multiplier",
+            "default": 2.0
+          },
+          "stress_region_count": {
+            "type": "integer",
+            "maximum": 50.0,
+            "minimum": 0.0,
+            "title": "Stress Region Count",
+            "default": 3
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ResearchDefaults"
+      },
+      "ResearchRangeDefaults": {
+        "properties": {
+          "low": {
+            "type": "number",
+            "title": "Low"
+          },
+          "high": {
+            "type": "number",
+            "title": "High"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "low",
+          "high"
+        ],
+        "title": "ResearchRangeDefaults"
+      },
+      "ResearchRequestV4": {
+        "properties": {
+          "research_context": {
+            "$ref": "#/components/schemas/ResearchContext"
+          },
+          "ranges": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/SearchRange"
+            },
+            "type": "object",
+            "title": "Ranges"
+          },
+          "strategy": {
+            "$ref": "#/components/schemas/ResearchStrategySpec"
+          },
+          "selection_target": {
+            "type": "string",
+            "enum": [
+              "fixed",
+              "adaptive",
+              "both"
+            ],
+            "title": "Selection Target",
+            "default": "both"
+          },
+          "rebalance_days": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Rebalance Days",
+            "default": 63
+          },
+          "bootstrap_reps": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Bootstrap Reps",
+            "default": 10000
+          },
+          "bootstrap_block_lengths": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Bootstrap Block Lengths"
+          },
+          "significance_alpha": {
+            "type": "number",
+            "exclusiveMaximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Significance Alpha",
+            "default": 0.05
+          },
+          "outer_validation_days": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 20.0,
+            "title": "Outer Validation Days",
+            "default": 126
+          },
+          "seed": {
+            "type": "integer",
+            "title": "Seed",
+            "default": 42
+          },
+          "top_candidates": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Top Candidates",
+            "default": 20
+          },
+          "max_drawdown": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Max Drawdown",
+            "default": 0.2
+          },
+          "min_trades": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Min Trades",
+            "default": 10
+          },
+          "min_history_days": {
+            "type": "integer",
+            "minimum": 20.0,
+            "title": "Min History Days",
+            "default": 250
+          },
+          "min_minute_ratio": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Min Minute Ratio",
+            "default": 0.95
+          },
+          "configuration_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configuration Revision"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "research_context",
+          "ranges"
+        ],
+        "title": "ResearchRequestV4",
+        "description": "Standalone public request that does not carry backtest search defaults."
+      },
+      "ResearchSection": {
+        "properties": {
+          "defaults": {
+            "$ref": "#/components/schemas/ResearchDefaults"
+          },
+          "legacy": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Legacy"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ResearchSection"
+      },
+      "ResearchStrategySpec": {
+        "properties": {
+          "strategy_id": {
+            "type": "string",
+            "enum": [
+              "geometric_excess_neighborhood",
+              "geometric_robust_j"
+            ],
+            "title": "Strategy Id",
+            "default": "geometric_robust_j"
+          },
+          "strategy_version": {
+            "type": "integer",
+            "enum": [
+              1,
+              2,
+              3,
+              4
+            ],
+            "title": "Strategy Version",
+            "default": 4
+          },
+          "search_method": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "hierarchical",
+              "exhaustive"
+            ],
+            "title": "Search Method",
+            "default": "auto"
+          },
+          "ranking_mode": {
+            "type": "string",
+            "enum": [
+              "max_volume",
+              "fixed_mean"
+            ],
+            "title": "Ranking Mode",
+            "default": "fixed_mean"
+          },
+          "hypercube_edge": {
+            "type": "integer",
+            "maximum": 99.0,
+            "minimum": 1.0,
+            "title": "Hypercube Edge",
+            "default": 3
+          },
+          "granularity": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Granularity"
+          },
+          "training_budget": {
+            "type": "integer",
+            "maximum": 1000000.0,
+            "minimum": 1.0,
+            "title": "Training Budget",
+            "default": 20000
+          },
+          "validation_budget": {
+            "type": "integer",
+            "maximum": 2000000.0,
+            "minimum": 1.0,
+            "title": "Validation Budget",
+            "default": 100000
+          },
+          "recommendation_count": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Recommendation Count",
+            "default": 10
+          },
+          "max_shares_mode": {
+            "type": "string",
+            "enum": [
+              "search",
+              "unlimited"
+            ],
+            "title": "Max Shares Mode",
+            "default": "search"
+          },
+          "slippage_mode": {
+            "type": "string",
+            "enum": [
+              "configured",
+              "zero"
+            ],
+            "title": "Slippage Mode",
+            "default": "configured"
+          },
+          "neighborhood_fields": {
+            "items": {
+              "type": "string",
+              "enum": [
+                "buy_step",
+                "sell_step",
+                "sell_shares",
+                "buy_shares",
+                "min_shares",
+                "max_shares"
+              ]
+            },
+            "type": "array",
+            "title": "Neighborhood Fields"
+          },
+          "fixed_half_widths": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Fixed Half Widths"
+          },
+          "sigma": {
+            "type": "number",
+            "maximum": 100.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Sigma",
+            "default": 1.0
+          },
+          "alpha": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Alpha",
+            "default": 0.3
+          },
+          "beta": {
+            "type": "number",
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Beta",
+            "default": 1.2
+          },
+          "tau": {
+            "type": "number",
+            "maximum": 10.0,
+            "minimum": -1.0,
+            "title": "Tau",
+            "default": 0.01
+          },
+          "eta_limit": {
+            "type": "number",
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Eta Limit",
+            "default": 2.0
+          },
+          "eta_hard_cap": {
+            "anyOf": [
+              {
+                "type": "number",
+                "maximum": 1000.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eta Hard Cap",
+            "default": 3.5
+          },
+          "gamma_max": {
+            "type": "number",
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Gamma Max",
+            "default": 0.4
+          },
+          "eta_floor": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Eta Floor",
+            "default": 0.0
+          },
+          "gamma_min": {
+            "type": "number",
+            "maximum": 1000.0,
+            "minimum": 0.0,
+            "title": "Gamma Min",
+            "default": 0.0
+          },
+          "training_min_days": {
+            "type": "integer",
+            "maximum": 5000.0,
+            "minimum": 20.0,
+            "title": "Training Min Days",
+            "default": 250
+          },
+          "training_max_days": {
+            "type": "integer",
+            "maximum": 5000.0,
+            "minimum": 20.0,
+            "title": "Training Max Days",
+            "default": 500
+          },
+          "peak_tolerance": {
+            "type": "number",
+            "maximum": 0.1,
+            "exclusiveMinimum": 0.0,
+            "title": "Peak Tolerance",
+            "default": 1e-12
+          },
+          "start_min": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Start Min",
+            "default": 20
+          },
+          "start_max": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Start Max",
+            "default": 64
+          },
+          "starts_per_candidate": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Starts Per Candidate",
+            "default": 4
+          },
+          "initial_strides": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Initial Strides"
+          },
+          "stride_multiplier": {
+            "type": "integer",
+            "maximum": 16.0,
+            "minimum": 2.0,
+            "title": "Stride Multiplier",
+            "default": 2
+          },
+          "max_stride_fraction": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Max Stride Fraction",
+            "default": 0.25
+          },
+          "validation_reserve_fraction": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Validation Reserve Fraction",
+            "default": 0.25
+          },
+          "exhaustive_memory_limit_mb": {
+            "type": "integer",
+            "maximum": 65536.0,
+            "minimum": 16.0,
+            "title": "Exhaustive Memory Limit Mb",
+            "default": 512
+          },
+          "estimated_bytes_per_point": {
+            "type": "integer",
+            "maximum": 65536.0,
+            "minimum": 64.0,
+            "title": "Estimated Bytes Per Point",
+            "default": 512
+          },
+          "stress_cost_multiplier": {
+            "type": "number",
+            "maximum": 20.0,
+            "exclusiveMinimum": 1.0,
+            "title": "Stress Cost Multiplier",
+            "default": 2.0
+          },
+          "stress_region_count": {
+            "type": "integer",
+            "maximum": 50.0,
+            "minimum": 0.0,
+            "title": "Stress Region Count",
+            "default": 3
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ResearchStrategySpec",
+        "description": "Versioned research algorithm configuration."
+      },
+      "RestartRequest": {
+        "properties": {
+          "force": {
+            "type": "boolean",
+            "title": "Force",
+            "default": false
+          }
+        },
+        "type": "object",
+        "title": "RestartRequest"
+      },
+      "ScheduleSettings": {
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled",
+            "default": false
+          },
+          "daily_time": {
+            "type": "string",
+            "title": "Daily Time",
+            "default": "18:30"
+          },
+          "weekly_day": {
+            "type": "string",
+            "title": "Weekly Day",
+            "default": "SAT"
+          },
+          "weekly_time": {
+            "type": "string",
+            "title": "Weekly Time",
+            "default": "10:00"
+          },
+          "subprocess_timeout_seconds": {
+            "type": "integer",
+            "maximum": 900.0,
+            "minimum": 5.0,
+            "title": "Subprocess Timeout Seconds",
+            "default": 45
+          },
+          "lock_timeout_seconds": {
+            "type": "integer",
+            "maximum": 300.0,
+            "minimum": 1.0,
+            "title": "Lock Timeout Seconds",
+            "default": 30
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ScheduleSettings"
+      },
+      "SearchRange": {
+        "properties": {
+          "low": {
+            "type": "number",
+            "title": "Low"
+          },
+          "high": {
+            "type": "number",
+            "title": "High"
+          },
+          "step": {
+            "anyOf": [
+              {
+                "type": "number",
+                "exclusiveMinimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Step"
+          }
+        },
+        "type": "object",
+        "required": [
+          "low",
+          "high"
+        ],
+        "title": "SearchRange"
+      },
+      "StatisticsSettings": {
+        "properties": {
+          "bootstrap_reps": {
+            "type": "integer",
+            "maximum": 1000000.0,
+            "minimum": 100.0,
+            "title": "Bootstrap Reps",
+            "default": 10000
+          },
+          "block_lengths": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Block Lengths"
+          },
+          "alpha": {
+            "type": "number",
+            "exclusiveMaximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Alpha",
+            "default": 0.05
+          },
+          "outer_validation_days": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 20.0,
+            "title": "Outer Validation Days",
+            "default": 126
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "StatisticsSettings"
+      },
+      "UiSettings": {
+        "properties": {
+          "autosave_debounce_ms": {
+            "type": "integer",
+            "maximum": 10000.0,
+            "minimum": 100.0,
+            "title": "Autosave Debounce Ms",
+            "default": 500
+          },
+          "polling_interval_ms": {
+            "type": "integer",
+            "maximum": 60000.0,
+            "minimum": 500.0,
+            "title": "Polling Interval Ms",
+            "default": 2000
+          },
+          "preview_debounce_ms": {
+            "type": "integer",
+            "maximum": 10000.0,
+            "minimum": 50.0,
+            "title": "Preview Debounce Ms",
+            "default": 300
+          },
+          "page_size": {
+            "type": "integer",
+            "maximum": 500.0,
+            "minimum": 10.0,
+            "title": "Page Size",
+            "default": 50
+          },
+          "chart_points": {
+            "type": "integer",
+            "maximum": 5000.0,
+            "minimum": 100.0,
+            "title": "Chart Points",
+            "default": 2000
+          },
+          "default_ma": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "title": "Default Ma"
+          },
+          "task_polling_interval_ms": {
+            "type": "integer",
+            "maximum": 60000.0,
+            "minimum": 500.0,
+            "title": "Task Polling Interval Ms",
+            "default": 2500
+          },
+          "data_refresh_interval_ms": {
+            "type": "integer",
+            "maximum": 300000.0,
+            "minimum": 1000.0,
+            "title": "Data Refresh Interval Ms",
+            "default": 5000
+          },
+          "data_health_page_size": {
+            "type": "integer",
+            "maximum": 500.0,
+            "minimum": 10.0,
+            "title": "Data Health Page Size",
+            "default": 100
+          },
+          "inventory_page_size": {
+            "type": "integer",
+            "maximum": 500.0,
+            "minimum": 10.0,
+            "title": "Inventory Page Size",
+            "default": 50
+          },
+          "instrument_lookup_limit": {
+            "type": "integer",
+            "maximum": 200.0,
+            "minimum": 5.0,
+            "title": "Instrument Lookup Limit",
+            "default": 40
+          },
+          "instrument_lookup_debounce_ms": {
+            "type": "integer",
+            "maximum": 5000.0,
+            "minimum": 50.0,
+            "title": "Instrument Lookup Debounce Ms",
+            "default": 250
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "UiSettings"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

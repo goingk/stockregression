@@ -17,7 +17,7 @@ from ..providers import (
     _baostock_reset, _baostock_session, fetch_sina, fetch_tdx,
     latest_closed_date, serialized_baostock,
 )
-from ..settings import load_settings
+from ..settings import Settings
 from ..source_health import SourceRouter, fetch_auxiliary_routed, market_for_symbol
 from ..storage import Store
 from ..rules import instrument_terms
@@ -33,9 +33,18 @@ SOURCE_VERSION = "market-sync-v2-package"
 DAILY_BATCH_SIZE = 128
 
 
-def _prepare_daily_worker(root: str, package_dir: str | None, symbol: str, mode: str, start, end):
-    store = Store(root)
-    service = MarketDataService(store, package_dir=package_dir)
+def _prepare_daily_worker(
+    root: str,
+    package_dir: str | None,
+    symbol: str,
+    mode: str,
+    start,
+    end,
+    settings_json: str | None = None,
+):
+    configured = Settings.model_validate_json(settings_json) if settings_json else None
+    store = Store(root, settings=configured)
+    service = MarketDataService(store, package_dir=package_dir, settings=configured)
     return MarketDataSyncService(service)._prepare_daily(
         symbol, mode, start, end, lambda: False
     )
@@ -56,7 +65,11 @@ class MarketDataSyncService:
         self.service = service
         self.store = service.store
         self.repository = service.repository
-        configured = load_settings().performance
+        settings = service.settings
+        configured = settings.performance
+        self.market_settings = settings.market_data
+        self.daily_batch_size = int(self.market_settings.daily_batch_size)
+        self.scheduler_poll_seconds = float(self.market_settings.scheduler_poll_seconds)
         self.download_capacity = min(
             int(configured.download_workers),
             effective_cpu_budget(configured),
@@ -175,10 +188,10 @@ class MarketDataSyncService:
         total = len(symbols)
         completed = 0
         worker_count = self._worker_count(workers)
-        for batch_start in range(0, total, DAILY_BATCH_SIZE):
+        for batch_start in range(0, total, self.daily_batch_size):
             if cancelled():
                 raise InterruptedError("任务已取消")
-            batch = symbols[batch_start:batch_start + DAILY_BATCH_SIZE]
+            batch = symbols[batch_start:batch_start + self.daily_batch_size]
             active = []
             for symbol in batch:
                 state = self.store.sync_item(run_key, symbol)
@@ -205,7 +218,7 @@ class MarketDataSyncService:
                     executor.submit(
                         _prepare_daily_worker,
                         str(self.store.root), str(self.repository.package_dir),
-                        symbol, mode, start, end,
+                        symbol, mode, start, end, self.service.settings.model_dump_json(),
                     ): symbol for symbol in active
                 }
             else:
@@ -221,7 +234,7 @@ class MarketDataSyncService:
                     if cancelled():
                         raise InterruptedError("任务已取消")
                     done, pending = wait(
-                        pending, timeout=0.5, return_when=FIRST_COMPLETED
+                        pending, timeout=self.scheduler_poll_seconds, return_when=FIRST_COMPLETED
                     )
                     for future in done:
                         symbol = futures[future]
@@ -286,14 +299,14 @@ class MarketDataSyncService:
             completed += len(batch)
             progress(
                 completed / max(1, total),
-                f"{completed}/{total} · 日线批次 {batch_start // DAILY_BATCH_SIZE + 1}",
+                f"{completed}/{total} · 日线批次 {batch_start // self.daily_batch_size + 1}",
             )
         status = "completed" if not failures else "partial" if results else "failed"
         return {
             "status": status, "mode": mode, "timeframe": "1day",
             "symbols": results, "failures": failures, "skipped": skipped,
-            "batches": (total + DAILY_BATCH_SIZE - 1) // DAILY_BATCH_SIZE,
-            "batch_size": DAILY_BATCH_SIZE,
+            "batches": (total + self.daily_batch_size - 1) // self.daily_batch_size,
+            "batch_size": self.daily_batch_size,
             "message": f"完成 {len(results)} 个，跳过 {len(skipped)} 个，失败 {len(failures)} 个",
         }
 
@@ -572,11 +585,19 @@ class MarketDataSyncService:
             with SharedSlots(
                 self.store.root, "recent-minute-source", self.download_capacity
             ).acquire(cancelled):
-                frame, source, route = SourceRouter(self.store).call(
+                frame, source, route = SourceRouter(
+                    self.store, settings=self.service.settings,
+                ).call(
                     "recent_minute", market_for_symbol(symbol),
                     {
-                        "sina": lambda: fetch_sina(symbol),
-                        "tdx": lambda: fetch_tdx(symbol, earliest=start, cancelled=cancelled),
+                        "sina": lambda: fetch_sina(
+                            symbol,
+                            network_timeout=self.market_settings.network_timeout_seconds,
+                        ),
+                        "tdx": lambda: fetch_tdx(
+                            symbol, earliest=start, cancelled=cancelled,
+                            network_timeout=self.market_settings.network_timeout_seconds,
+                        ),
                     },
                 )
             metadata["label_convention"] = "end"
@@ -590,7 +611,7 @@ class MarketDataSyncService:
         return frame, "baostock", metadata
 
     def _worker_count(self, workers) -> int:
-        configured = load_settings().performance
+        configured = self.service.settings.performance
         requested = max(1, int(workers or 1))
         return max(1, min(
             requested, int(configured.download_workers),

@@ -18,7 +18,7 @@ from ..performance import (
     blas_thread_limit, effective_cpu_budget, effective_setting, record_count,
     record_seconds,
 )
-from ..settings import load_settings
+from ..settings import Settings, load_settings
 from ..quality import QUALITY_RULES_VERSION
 from ..price_validation import (
     PRICE_VALIDATION_VERSION, anomalies_in_range, anomaly_records, anomaly_summary,
@@ -100,9 +100,19 @@ def _validate_month_worker(
 
 
 class MarketDataService:
-    def __init__(self, store_or_root: Store | str | Path, package_dir: str | Path | None = None):
+    def __init__(
+        self,
+        store_or_root: Store | str | Path,
+        package_dir: str | Path | None = None,
+        *,
+        settings: Settings | None = None,
+    ):
+        self.settings = settings or load_settings()
         self.store = store_or_root if isinstance(store_or_root, Store) else Store(store_or_root)
-        self.repository = MarketDataRepository(self.store.root, package_dir=package_dir)
+        self.repository = MarketDataRepository(
+            self.store.root, package_dir=package_dir,
+            market_settings=self.settings.market_data,
+        )
 
     def frequency_catalog(self) -> list[dict]:
         sources = {
@@ -897,7 +907,8 @@ class MarketDataService:
         resume, calendar_path, skip_invalid_rows, progress, cancelled,
     ) -> dict:
         results, skipped = [], []
-        batch_size = 128
+        market_settings = self.settings.market_data
+        batch_size = int(market_settings.service_batch_size)
         for batch_start in range(0, len(symbols), batch_size):
             if cancelled():
                 raise InterruptedError("任务已取消")
@@ -1217,7 +1228,7 @@ class MarketDataService:
             month_end = (cursor + pd.offsets.MonthBegin(1)).normalize() - pd.Timedelta(days=1)
             months.append((max(first, cursor), min(last, month_end)))
             cursor += pd.offsets.MonthBegin(1)
-        configured = load_settings().performance
+        configured = self.settings.performance
         workers = min(
             effective_setting(configured, "validation_workers", 4, 4),
             effective_cpu_budget(configured), max(1, len(months)),
@@ -1243,13 +1254,14 @@ class MarketDataService:
         }
         checked = skipped = failed = 0
         completed = 0
+        scheduler_poll = float(self.settings.market_data.scheduler_poll_seconds)
         try:
             pending = set(futures)
             while pending:
                 if cancelled():
                     raise InterruptedError("任务已取消")
                 done, pending = wait(
-                    pending, timeout=0.5, return_when=FIRST_COMPLETED
+                    pending, timeout=scheduler_poll, return_when=FIRST_COMPLETED
                 )
                 for future in done:
                     result = future.result()

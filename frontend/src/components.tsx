@@ -129,7 +129,7 @@ export function clearPendingFeeDefaults() {
   try { localStorage.removeItem(FEE_DEFAULTS_PENDING_KEY) } catch { /* local preferences are optional */ }
 }
 
-export function defaultConfig(feeDefaults: FeeDefaults = readFeeDefaults()): BacktestConfig {
+export function defaultConfig(feeDefaults: FeeDefaults = baseFeeDefaults): BacktestConfig {
   const current = today()
   const year = Number(current.slice(0, 4)) - 1
   const month = Number(current.slice(5, 7))

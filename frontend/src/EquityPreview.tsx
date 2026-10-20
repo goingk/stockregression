@@ -5,10 +5,15 @@ import DataDiagnosticsPanel from './DataDiagnosticsPanel'
 import Disclosure from './Disclosure'
 import { Badge, Card, Empty, configError, configPayload, money, percent } from './components'
 import type { BacktestConfig, BacktestResult } from './types'
+import { useWorkbenchDefaults } from './useWorkbenchDefaults'
 
 type Preview = { revision: number; status: string; progress?: number; message?: string; error?: string; result?: BacktestResult }
 
 export default function EquityPreview({ config, onFunding }: { config: BacktestConfig; onFunding?: (funding: NonNullable<BacktestResult['funding']>, context: { symbol: string; start_date: string }) => void }) {
+  const configuration = useWorkbenchDefaults()
+  const ui = (configuration.document.ui ?? {}) as Record<string, unknown>
+  const previewDebounceMs = Math.max(50, Number(ui.preview_debounce_ms) || 300)
+  const pollingMs = Math.max(500, Number(ui.polling_interval_ms) || 2000)
   const session = useRef(`preview_${Math.random().toString(36).slice(2)}`)
   const revision = useRef(0)
   const [result, setResult] = useState<BacktestResult | null>(null)
@@ -41,15 +46,15 @@ export default function EquityPreview({ config, onFunding }: { config: BacktestC
       }
       if (value.status === 'failed') { setError(value.error ?? '预览计算失败'); setStatus('计算失败'); setMessage(value.message ?? ''); return }
       setStatus(value.status === 'queued' ? '排队中' : '计算中'); setMessage(value.message ?? '')
-      poll = window.setTimeout(() => { get<Preview>(`/backtests/preview/${session.current}`).then(accept).catch(fail) }, 400)
+      poll = window.setTimeout(() => { get<Preview>(`/backtests/preview/${session.current}`).then(accept).catch(fail) }, pollingMs)
     }
     const fail = (value: unknown) => { if (active) { setStatus('无法预览'); setError(value instanceof Error ? value.message : String(value)) } }
     const timer = validation ? undefined : window.setTimeout(() => {
       setStatus('计算中')
       post<Preview>('/backtests/preview', { session_id: session.current, revision: current, config: JSON.parse(payload) }).then(accept).catch(fail)
-    }, 600)
+    }, previewDebounceMs)
     return () => { active = false; clearTimeout(timer); clearTimeout(poll) }
-  }, [payload, onFunding])
+  }, [payload, onFunding, pollingMs, previewDebounceMs])
   useEffect(() => () => { void del(`/backtests/preview/${session.current}`).catch(() => undefined) }, [])
   return <Card title="收益率预览" subtitle="资产 ÷ 累计投入 − 1 · 修改参数后自动重算" className="preview-card" action={<span title={message}><Badge tone={status === '已更新' ? 'green' : 'amber'}>{status}</Badge></span>}>
     {result && <div className="preview-summary-strip"><span>{result.config.frequency === '1d' ? '日线模式' : `分钟覆盖 ${Number.isFinite(minuteRatio) ? `${(minuteRatio * 100).toFixed(1)}%` : '—'}`} · 日线降级 {result.config.frequency === '1d' ? 0 : Number.isFinite(fallbackDays) ? Math.max(0, fallbackDays) : '—'} 天</span>{result.funding && <span>{result.schema_version === 3 ? <>峰值净投入 <strong>{money(result.funding.peak_invested ?? result.funding.initial_equity)}</strong> 元 · 补款 <strong>{money(result.funding.topups)}</strong> 元</> : <>预留现金 <strong>{money(result.funding.reserve_cash)}</strong> 元</>} · 起始资产 <strong>{money(result.funding.initial_equity)}</strong> 元</span>}</div>}

@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { CalendarClock, Database, Download, FileUp, RefreshCw, Search, Settings2, Trash2 } from 'lucide-react'
-import { del, get, post, put } from '../api'
+import { del, get, post } from '../api'
 import { Badge, Button, Card, Empty, ErrorBox, Field, Loading, PageHeader, SelectInput, Stat, TextInput, compact, dateText, percent, useConfirm, useErrorMessage } from '../components'
 import DataDiagnosticsPanel from '../DataDiagnosticsPanel'
 import { actualRepairMinutes, coverageDayHasIssue, uniqueCurrentWarnings } from '../dataDiagnostics'
 import MarketPanel from '../MarketPanel'
 import Disclosure from '../Disclosure'
 import { useTasks } from '../TaskCenter'
+import { useWorkspaces } from '../WorkbenchState'
 import type { Coverage, DataDiagnostics, Instrument, WatchItem } from '../types'
 
 type PerformanceSettings = { cpu_budget_mode: 'auto' | 'custom'; cpu_budget?: number | null; download_workers: number; validation_workers: number; blas_threads: number; workspace_mb: number }
@@ -40,6 +41,9 @@ function CoverageQualityStats({ coverage, diagnostics }: { coverage: Coverage; d
 
 export default function DataCenterPage({ requestedReport, onReportHandled }: { requestedReport?: string | null; onReportHandled?: () => void }) {
   const tasks = useTasks()
+  const workspace = useWorkspaces()
+  const ui = (workspace.configuration.ui ?? {}) as Record<string, unknown>
+  const refreshIntervalMs = Math.max(1000, Number(ui.data_refresh_interval_ms) || 5000)
   const jobs = tasks.jobs
   const [query, setQuery] = useState('')
   const [instruments, setInstruments] = useState<Instrument[]>([])
@@ -81,9 +85,9 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
   const completedDataJobs = jobs.filter(job => ['instruments', 'market_sync', 'market_import', 'market_import_batch', 'market_index_package', 'market_validate', 'market_aggregate'].includes(job.kind) && JOB_TERMINAL.has(job.status)).map(job => `${job.id}:${job.status}`).join(',')
   useEffect(() => { void refresh() }, [refresh, completedDataJobs])
   useEffect(() => {
-    const timer = window.setInterval(() => { void refresh() }, 5000)
+    const timer = window.setInterval(() => { void refresh() }, refreshIntervalMs)
     return () => window.clearInterval(timer)
-  }, [refresh])
+  }, [refresh, refreshIntervalMs])
   useEffect(() => {
     if (!activeSymbol) { setCoverage(null); return }
     let cancelled = false
@@ -150,14 +154,14 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
   const setScheduleValue = (key: keyof ScheduleDraft, value: string) => setScheduleDraft((draft) => ({ ...draft, [key]: value }))
   const installSchedule = (install: boolean) => void runAction('schedule', async () => {
     if (install) {
-      await put('/settings', { schedule: scheduleToSave() })
+      await workspace.saveConfiguration({ schedule: scheduleToSave() })
       setScheduleDraft({})
     }
     return post<{ message?: string }>(install ? '/schedule/install' : '/schedule/remove')
   }, (result) => (result as { message?: string }).message ?? (install ? '已请求安装本机定时任务。' : '已请求移除本机定时任务。'))
   const saveSchedule = () => void runAction('schedule', async () => {
     const savedSchedule = scheduleToSave()
-    await put('/settings', { schedule: savedSchedule })
+    await workspace.saveConfiguration({ schedule: savedSchedule })
     setScheduleDraft({})
     return savedSchedule.enabled ? post<{ message?: string }>('/schedule/install') : { message: '更新计划配置已保存。' }
   }, (result) => (result as { message?: string }).message ?? '更新计划配置已保存。')
@@ -165,7 +169,9 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
     const path = (dataDirDraft ?? settings.data_dir ?? '').trim()
     if (!path) { setError('请填写下次启动的数据目录。'); return }
     void runAction('data-dir', async () => {
-      const saved = await put<SettingsResponse>('/settings', { data_dir: path })
+      await workspace.saveConfiguration({ paths: { data_dir: path } })
+      const saved = await get<SettingsResponse>('/settings')
+      setSettings(saved)
       dataDirDraftEdited.current = false
       setDataDirDraft(saved.data_dir ?? path)
       return saved
@@ -173,11 +179,17 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
   }
   const saveCacheBudget = () => {
     const value = Math.max(0, Math.round(Number(cacheMbDraft ?? settings.market_cache_mb ?? 256)))
-    void runAction('cache', () => put<SettingsResponse>('/settings', { market_cache_mb: value }), () => `行情与预览缓存上限已设为 ${value} MiB。`)
+    void runAction('cache', async () => {
+      await workspace.saveConfiguration({ market_data: { cache_mb: value } })
+      const saved = await get<SettingsResponse>('/settings'); setSettings(saved); return saved
+    }, () => `行情与预览缓存上限已设为 ${value} MiB。`)
   }
   const savePerformance = () => {
     const value = performanceDraft ?? { cpu_budget_mode: 'auto' as const, cpu_budget: null, download_workers: 4, validation_workers: 4, blas_threads: 8, workspace_mb: 8192 }
-    void runAction('performance', () => put<SettingsResponse>('/settings', { performance: value }), () => '计算资源设置已保存，将在后续任务中生效。')
+    void runAction('performance', async () => {
+      await workspace.saveConfiguration({ runtime: value })
+      const saved = await get<SettingsResponse>('/settings'); setSettings(saved); return saved
+    }, () => '计算资源设置已保存，将在后续任务中生效。')
   }
   const setPerformanceValue = (key: keyof PerformanceSettings, value: string | number | null) => {
     setPerformanceDraft(current => ({ ...(current ?? { cpu_budget_mode: 'auto', cpu_budget: null, download_workers: 4, validation_workers: 4, blas_threads: 8, workspace_mb: 8192 }), [key]: value }))
@@ -195,7 +207,7 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
       : days
     return filtered.slice().reverse()
   }, [coverage?.days, qualityFilter])
-  const pageSize = 100
+  const pageSize = Math.max(10, Number(ui.data_health_page_size) || 100)
   const pageCount = Math.max(1, Math.ceil(filteredDays.length / pageSize))
   const currentQualityPage = Math.min(qualityPage, pageCount)
   const visibleDays = filteredDays.slice((currentQualityPage - 1) * pageSize, currentQualityPage * pageSize)

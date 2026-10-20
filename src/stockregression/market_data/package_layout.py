@@ -100,8 +100,12 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 class PackageLayout:
     """Stable on-disk identity and publication metadata for one data package."""
 
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, *, market_settings=None):
         self.root = Path(root).expanduser().resolve()
+        from ..settings import load_settings
+
+        self.market_settings = market_settings or load_settings().market_data
+        self.lock_timeout = int(self.market_settings.package_lock_timeout_seconds)
         self._root_text = os.path.normcase(os.path.normpath(str(self.root)))
         self.control = self.root / ".stockregression"
         self.versions_dir = self.control / "versions"
@@ -141,7 +145,7 @@ class PackageLayout:
         return {}
 
     def _manifest_guard(self):
-        lock = FileLock(str(self.control / "manifest.lock"), timeout=600)
+        lock = FileLock(str(self.control / "manifest.lock"), timeout=self.lock_timeout)
 
         class Guard:
             def __enter__(inner):
@@ -291,7 +295,7 @@ class PackageLayout:
 
     def lock_for(self, name: str) -> FileLock:
         digest = hashlib.sha256(name.encode()).hexdigest()[:24]
-        return FileLock(str(self.locks_dir / f"{digest}.lock"), timeout=600)
+        return FileLock(str(self.locks_dir / f"{digest}.lock"), timeout=self.lock_timeout)
 
     def set_file_metadata(self, relative_path: str, metadata: dict[str, Any]) -> None:
         relative_path = str(relative_path).replace("\\", "/")

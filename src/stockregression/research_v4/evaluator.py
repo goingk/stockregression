@@ -9,8 +9,8 @@ import numpy as np
 import pandas as pd
 
 from ..models import BacktestConfig, DataBundle, OptimizationConfig
+from ..numerics.returns import buy_hold_returns, compound_daily
 from ..share_engine import research_batch
-from ..scientific import _buy_hold_returns, _compound_daily
 from .space import ParameterSpace
 
 
@@ -41,6 +41,8 @@ class BatchEvaluator:
         validation_folds: list[tuple[pd.Timestamp, pd.Timestamp]] | None = None,
         cancelled: Cancelled | None = None,
         progress: Progress | None = None,
+        allow_odd_lot_exit: bool = False,
+        chunk_size: int | None = None,
     ):
         self.config = config
         self.base = base.model_copy(update={"grid_mode": "geometric"})
@@ -50,7 +52,8 @@ class BatchEvaluator:
         self.validation_dates = pd.DatetimeIndex(validation_dates)
         self.cancelled = cancelled
         self.progress = progress
-        self.chunk_size = 512
+        self.allow_odd_lot_exit = bool(allow_odd_lot_exit)
+        self.chunk_size = int(chunk_size or 512)
         self.retain_daily_returns = not (
             config.strategy.strategy_version == 2 and config.strategy.search_method == "hierarchical"
         )
@@ -73,9 +76,9 @@ class BatchEvaluator:
         self._validation_folds = list(validation_folds) if validation_folds else self._fold_ranges()
 
     def _baseline(self, base: BacktestConfig, dates: pd.DatetimeIndex) -> float:
-        baseline_dates, values = _buy_hold_returns(base, self.data)
+        baseline_dates, values = buy_hold_returns(base, self.data)
         mask = (baseline_dates >= dates[0]) & (baseline_dates <= dates[-1])
-        return _compound_daily(values[mask])
+        return compound_daily(values[mask])
 
     def _fold_ranges(self) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
         dates = self.validation_dates
@@ -100,9 +103,13 @@ class BatchEvaluator:
             if self.cancelled and self.cancelled():
                 raise InterruptedError("研究已取消")
             params = [self.space.params(item) for item in chunk]
-            result = research_batch(self.train_base, self.train_data, params, fold, cancelled=self.cancelled)
+            result = research_batch(
+                self.train_base, self.train_data, params, fold, cancelled=self.cancelled,
+                allow_odd_lot_exit=self.allow_odd_lot_exit,
+            )
             for index, coordinate in enumerate(chunk):
                 evidence = result["fold_metrics"][index][0]
+                positions = result.get("position_stats", [{}] * len(chunk))[index]
                 grid_return = float(result["metrics"][index]["total_return"])
                 excess = grid_return - self._train_baseline if math.isfinite(grid_return) else math.nan
                 output.append({
@@ -115,21 +122,22 @@ class BatchEvaluator:
                     "training_baseline_return": self._train_baseline,
                     "training_excess_return": excess,
                     "training_score": excess,
-                    "training_drawdown": float(evidence.get("max_drawdown", math.inf) or math.inf),
+                    "training_drawdown": float(evidence.get("max_drawdown", math.inf)),
                     "training_trade_count": int(evidence.get("trade_count", 0) or 0),
                     "training_buy_count": int(evidence.get("buy_count", 0) or 0),
                     "training_sell_count": int(evidence.get("sell_count", 0) or 0),
-                    "max_drawdown": float(evidence.get("max_drawdown", math.inf) or math.inf),
+                    "max_drawdown": float(evidence.get("max_drawdown", math.inf)),
                     "trade_count": int(evidence.get("trade_count", 0) or 0),
                     "buy_count": int(evidence.get("buy_count", 0) or 0),
                     "sell_count": int(evidence.get("sell_count", 0) or 0),
+                    **positions,
                     "training_folds": [evidence],
                 })
             if self.progress:
                 self.progress((chunk_index + 1) * self.chunk_size / max(1, len(coordinates)), "评估训练参数")
         return output
 
-    def evaluate_training_stress(self, coordinates: list[tuple[int, ...]]) -> dict[tuple[int, ...], dict[str, Any]]:
+    def evaluate_training_stress(self, coordinates: list[tuple[int, ...]], cost_multiplier: float = 2.0) -> dict[tuple[int, ...], dict[str, Any]]:
         """Double-cost diagnostic over the single training block."""
         output: dict[tuple[int, ...], dict[str, Any]] = {}
         if not len(self.train_dates):
@@ -141,17 +149,20 @@ class BatchEvaluator:
             params = [self.space.params(item) for item in chunk]
             result = research_batch(
                 self.train_base, self.train_data, params, fold,
-                cost_multiplier=2.0, cancelled=self.cancelled,
+                cost_multiplier=float(cost_multiplier), cancelled=self.cancelled,
+                allow_odd_lot_exit=self.allow_odd_lot_exit,
             )
             for index, coordinate in enumerate(chunk):
                 evidence = result["fold_metrics"][index][0]
+                positions = result.get("position_stats", [{}] * len(chunk))[index]
                 grid_return = float(result["metrics"][index]["total_return"])
                 excess = grid_return - self._train_baseline if math.isfinite(grid_return) else math.nan
                 output[coordinate] = {
                     "training_return_stress": grid_return,
                     "training_excess_stress": excess,
-                    "max_drawdown": float(evidence.get("max_drawdown", math.inf) or math.inf),
+                    "max_drawdown": float(evidence.get("max_drawdown", math.inf)),
                     "trade_count": int(evidence.get("trade_count", 0) or 0),
+                    **positions,
                 }
         return output
 
@@ -163,6 +174,7 @@ class BatchEvaluator:
         metrics: dict[str, Any],
         daily_dates: pd.DatetimeIndex | None = None,
         daily_values: np.ndarray | None = None,
+        position_stats: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         # Folds only diagnose risk; the whole validation interval is one fresh
         # account, using the same peak-invested ROI as the production backtest.
@@ -189,6 +201,7 @@ class BatchEvaluator:
             "sell_count": sell_count,
             "constraint_reasons": [],
             "complete": True,
+            **(position_stats or {}),
         }
         if cost_key == "stress":
             row["validation_return_stress"] = grid_return
@@ -212,7 +225,11 @@ class BatchEvaluator:
             if self.cancelled and self.cancelled():
                 raise InterruptedError("研究已取消")
             params = [self.space.params(item) for item in chunk]
-            result = research_batch(self.validation_base, self.validation_data, params, fold_ranges, cancelled=self.cancelled)
+            result = research_batch(
+                self.validation_base, self.validation_data, params, fold_ranges,
+                cancelled=self.cancelled,
+                allow_odd_lot_exit=self.allow_odd_lot_exit,
+            )
             dates = pd.DatetimeIndex(result["dates"])
             mask = (dates >= self.validation_dates[0]) & (dates <= self.validation_dates[-1])
             for index, coordinate in enumerate(chunk):
@@ -223,6 +240,7 @@ class BatchEvaluator:
                     result["metrics"][index],
                     dates[mask] if self.retain_daily_returns else None,
                     np.asarray(result["daily_returns"][mask, index], dtype=np.float64) if self.retain_daily_returns else None,
+                    result.get("position_stats", [{}] * len(chunk))[index],
                 )
                 output.append(row)
             if self.progress:
@@ -245,10 +263,12 @@ class BatchEvaluator:
                 fold_ranges,
                 cost_multiplier=2.0,
                 cancelled=self.cancelled,
+                allow_odd_lot_exit=self.allow_odd_lot_exit,
             )
             for index, coordinate in enumerate(chunk):
                 output[coordinate] = self._aggregate_validation(
                     coordinate, result["fold_metrics"][index], "stress", result["metrics"][index],
+                    position_stats=result.get("position_stats", [{}] * len(chunk))[index],
                 )
             if self.progress:
                 self.progress((chunk_index + 1) * self.chunk_size / max(1, len(coordinates)), "评估双倍成本压力")

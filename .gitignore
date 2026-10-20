@@ -16,4 +16,8 @@ data/
 .coverage
 htmlcov/
 .local/
+config/backups/
+config/*.lock
+config/*.writing
+.pytest-debug-temp/
 *.log

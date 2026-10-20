@@ -1,10 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { get, put } from './api'
-import { clearPendingFeeDefaults, defaultConfig, markFeeDefaultsPending, readFeeDefaults, readPendingFeeDefaults, validFeeDefaults, writeFeeDefaults } from './components'
+import { defaultConfig, validFeeDefaults } from './components'
 import type { FeeDefaults } from './components'
-import { rememberWorkbenchGroup, useWorkbenchDefaults } from './useWorkbenchDefaults'
-import { strategyDefaults, workbenchConfig } from './workbenchDefaults'
+import { flushConfiguration, rememberConfigurationPatch, rememberLegacyResearch, rememberWorkbenchGroup, saveConfigurationPatch, useWorkbenchDefaults } from './useWorkbenchDefaults'
+import { normalizeRememberedResearchDefaults, strategyDefaults, workbenchConfig } from './workbenchDefaults'
 import type { ResearchDefaults, StrategyDefaultsGroup } from './workbenchDefaults'
 import type { BacktestConfig } from './types'
 
@@ -14,6 +13,9 @@ type Workspace = {
   updateBacktest: (next: ConfigUpdate) => void; updateResearch: (next: ConfigUpdate) => void
   updateResearchSettings: (next: ResearchDefaults) => void
   rememberFees: (next: FeeDefaults) => void; rememberStrategy: (group: StrategyDefaultsGroup, next: BacktestConfig) => void
+  configuration: Record<string, unknown>; pendingRestart: string[]; flushConfiguration: () => Promise<string>
+  rememberConfiguration: (patch: Record<string, unknown>) => void
+  saveConfiguration: (patch: Record<string, unknown>) => Promise<string>
   restore: (page: 'backtest' | 'research') => void
   transfer: (page: 'backtest' | 'research', config: BacktestConfig) => void
 }
@@ -29,58 +31,52 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
   const [backtest, setBacktest] = useState<BacktestConfig | null>(null)
   const [research, setResearch] = useState<BacktestConfig | null>(null)
   const [researchSettings, setResearchSettings] = useState<ResearchDefaults | null>(null)
-  const [feesLoaded, setFeesLoaded] = useState(false)
   const [error, setError] = useState('')
-  const feeDefaults = useRef(readFeeDefaults())
-  const feeRevision = useRef(0)
-  const feeDirty = useRef(false)
-  const saveChain = useRef<Promise<void>>(Promise.resolve())
+  const feeDefaults = useRef<FeeDefaults>({ commission_rate: .0005, min_commission: .1 })
 
   const saveFees = useCallback((next: FeeDefaults) => {
     if (!validFeeDefaults(next)) return
-    const revision = ++feeRevision.current
-    feeDefaults.current = { ...next }; feeDirty.current = true
-    writeFeeDefaults(next); markFeeDefaultsPending()
-    saveChain.current = saveChain.current.catch(() => undefined).then(async () => {
-      if (revision !== feeRevision.current) return
-      await put('/settings', { fee_defaults: next })
-      if (revision === feeRevision.current) { feeDirty.current = false; clearPendingFeeDefaults(); setError('') }
-    }).catch(cause => { if (revision === feeRevision.current) setError('默认佣金未能保存，将在下次启动时重试：' + String(cause)) })
+    feeDefaults.current = { ...next }
+    rememberConfigurationPatch({ backtest: { fees: next } })
+    setError('')
   }, [])
   useEffect(() => {
-    let active = true
-    get<{ fee_defaults?: unknown }>('/settings').then(settings => {
-      if (!active) return
-      const pending = readPendingFeeDefaults()
-      feeDefaults.current = pending ?? (validFeeDefaults(settings.fee_defaults) ? settings.fee_defaults : readFeeDefaults())
-      writeFeeDefaults(feeDefaults.current)
-      if (pending) saveFees(pending)
-    }).catch(() => {
-      if (!active) return
-      const pending = readPendingFeeDefaults()
-      if (pending) saveFees(pending)
-    }).finally(() => { if (active) setFeesLoaded(true) })
-    return () => { active = false }
-  }, [saveFees])
-  useEffect(() => {
-    if (!feesLoaded || preferences.loading) return
+    if (preferences.loading) return
+    const fees = (preferences.document.backtest as Record<string, unknown> | undefined)?.fees
+    if (validFeeDefaults(fees)) feeDefaults.current = fees
     // Initialize both copies together, so editing either page cannot initialize the other with its draft.
     const initial = workbenchConfig(defaultConfig(feeDefaults.current), preferences.value)
     setBacktest(current => current ?? structuredClone(initial))
     setResearch(current => current ?? structuredClone(initial))
     setResearchSettings(current => current ?? structuredClone(preferences.value.research))
-  }, [feesLoaded, preferences.loading, preferences.value])
-  useEffect(() => {
-    const flush = () => {
-      if (!feeDirty.current) return
-      void fetch('/api/v1/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fee_defaults: feeDefaults.current }), keepalive: true }).catch(() => undefined)
-    }
-    window.addEventListener('pagehide', flush)
-    return () => { window.removeEventListener('pagehide', flush); flush() }
-  }, [])
+  }, [preferences.loading, preferences.document, preferences.value])
   const updateBacktest = useCallback((next: ConfigUpdate) => setBacktest(current => current ? typeof next === 'function' ? next(current) : next : current), [])
   const updateResearch = useCallback((next: ConfigUpdate) => setResearch(current => current ? typeof next === 'function' ? next(current) : next : current), [])
-  const updateResearchSettings = useCallback((next: ResearchDefaults) => { setResearchSettings(next); rememberWorkbenchGroup('research', next) }, [])
+  const updateResearchSettings = useCallback((next: ResearchDefaults) => {
+    const current = researchSettings
+    if (next.strategy_version === 4) {
+      const active = preferences.value.research
+      const restored = current && current.strategy_version !== 4 && next.strategy_version === 4
+        ? normalizeRememberedResearchDefaults(active)
+        : next
+      setResearchSettings(restored)
+      rememberWorkbenchGroup('research', restored)
+      return
+    }
+    let value = next
+    if (current?.strategy_version === 4) {
+      const research = (preferences.document.research ?? {}) as Record<string, unknown>
+      const legacy = (research.legacy ?? {}) as Record<string, unknown>
+      const archived = legacy.research_defaults ?? legacy.defaults
+      if (archived && typeof archived === 'object') value = normalizeRememberedResearchDefaults({
+        ...next, ...(archived as Record<string, unknown>),
+        strategy_version: next.strategy_version,
+        strategy_id: 'geometric_excess_neighborhood',
+      })
+    }
+    setResearchSettings(value)
+    rememberLegacyResearch(value)
+  }, [preferences.document, preferences.value.research, researchSettings])
   const rememberStrategy = useCallback((group: StrategyDefaultsGroup, next: BacktestConfig) => { rememberWorkbenchGroup(group, strategyDefaults(next)[group]) }, [])
   const restore = (page: 'backtest' | 'research') => {
     const initial = workbenchConfig(defaultConfig(feeDefaults.current), preferences.value)
@@ -91,5 +87,11 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
     if (page === 'backtest') setBacktest(structuredClone(config))
     else setResearch(structuredClone(config))
   }
-  return <WorkspaceContext.Provider value={{ backtest, research, researchSettings, error: error || preferences.error, updateBacktest, updateResearch, updateResearchSettings, rememberFees: saveFees, rememberStrategy, restore, transfer }}>{children}</WorkspaceContext.Provider>
+  return <WorkspaceContext.Provider value={{
+    backtest, research, researchSettings, error: error || preferences.error,
+    updateBacktest, updateResearch, updateResearchSettings, rememberFees: saveFees, rememberStrategy, restore, transfer,
+    configuration: preferences.document, pendingRestart: preferences.pendingRestart,
+    flushConfiguration, rememberConfiguration: rememberConfigurationPatch,
+    saveConfiguration: saveConfigurationPatch,
+  }}>{children}</WorkspaceContext.Provider>
 }

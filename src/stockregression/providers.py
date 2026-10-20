@@ -18,6 +18,7 @@ import pandas as pd
 
 from .models import normalize_symbol
 from .quality import canonical_frame
+from .settings import load_settings
 
 _BAOSTOCK_LOCK = threading.RLock()
 _AKSHARE_HTTP_LOCK = threading.RLock()
@@ -56,11 +57,18 @@ def _baostock_reset() -> None:
 TDX_SERVERS = [("180.153.18.170", 7709), ("180.153.18.172", 80), ("202.108.253.139", 80), ("60.191.117.167", 7709)]
 
 
+def _network_timeout(timeout: float | None = None) -> float:
+    if timeout is not None:
+        return float(timeout)
+    return float(load_settings().market_data.network_timeout_seconds)
+
+
 @contextlib.contextmanager
-def bounded_akshare_http(timeout: float = 15):
+def bounded_akshare_http(timeout: float | None = None):
     """Give AKShare's network calls a bounded timeout without global process settings."""
     import requests
 
+    timeout = _network_timeout() if timeout is None else float(timeout)
     original = requests.sessions.Session.request
     with _AKSHARE_HTTP_LOCK:
         def request_with_timeout(session, *args, **kwargs):
@@ -105,13 +113,17 @@ def fetch_latest_trading_date(as_of: str):
         raise
 
 
-def fetch_instruments(_legacy_revision: str | None = None) -> list[dict]:
+def fetch_instruments(
+    _legacy_revision: str | None = None,
+    *,
+    network_timeout: float | None = None,
+) -> list[dict]:
     """Refresh names from AKShare; history comes exclusively from the local package."""
     from .rules import instrument_terms
     records, failures = {}, []
     try:
         import akshare as ak
-        with bounded_akshare_http():
+        with bounded_akshare_http(network_timeout):
             names = ak.stock_info_a_code_name()
         for item in names.to_dict("records"):
             try:
@@ -123,7 +135,7 @@ def fetch_instruments(_legacy_revision: str | None = None) -> list[dict]:
         failures.append(f"最新股票清单: {exc}")
     try:
         import akshare as ak
-        with bounded_akshare_http():
+        with bounded_akshare_http(network_timeout):
             etf_frame = ak.fund_etf_category_sina(symbol="ETF基金")
         for item in etf_frame.to_dict("records"):
             symbol = normalize_symbol(str(item["代码"]))
@@ -135,7 +147,12 @@ def fetch_instruments(_legacy_revision: str | None = None) -> list[dict]:
     return [instrument_terms(symbol, {**item, "catalog_warnings": failures}) for symbol, item in sorted(records.items())]
 
 
-def fetch_tdx(symbol: str, earliest=None, cancelled=lambda: False) -> pd.DataFrame:
+def fetch_tdx(
+    symbol: str,
+    earliest=None,
+    cancelled=lambda: False,
+    network_timeout: float | None = None,
+) -> pd.DataFrame:
     from pytdx.hq import TdxHq_API
     code, exchange = normalize_symbol(symbol).split(".")
     market = 1 if exchange == "SH" else 0
@@ -145,7 +162,7 @@ def fetch_tdx(symbol: str, earliest=None, cancelled=lambda: False) -> pd.DataFra
             raise InterruptedError("任务已取消")
         api = TdxHq_API(heartbeat=False, auto_retry=False, raise_exception=True)
         try:
-            if not api.connect(host, port, time_out=4):
+            if not api.connect(host, port, time_out=int(max(1, round(_network_timeout(network_timeout))))):
                 failures.append(f"{host}:{port}连接失败")
                 continue
             bars = []
@@ -176,11 +193,16 @@ def fetch_tdx(symbol: str, earliest=None, cancelled=lambda: False) -> pd.DataFra
     raise RuntimeError("通达信节点不可用：" + "；".join(failures))
 
 
-def fetch_sina(symbol: str) -> pd.DataFrame:
+def fetch_sina(symbol: str, network_timeout: float | None = None) -> pd.DataFrame:
     code, exchange = normalize_symbol(symbol).split(".")
     # AKShare's unadjusted helper performs extra adjusted-daily requests. Use
     # the documented Sina payload directly so one security costs one request.
-    frame = _fetch_sina_minute(exchange.lower() + code)
+    if network_timeout is None:
+        frame = _fetch_sina_minute(exchange.lower() + code)
+    else:
+        frame = _fetch_sina_minute(
+            exchange.lower() + code, network_timeout=network_timeout,
+        )
     if frame is None or frame.empty:
         raise RuntimeError("新浪未返回近期分钟行情")
     frame = canonical_frame(frame, source="sina")
@@ -213,11 +235,11 @@ def _decode_sina_payload(text: str) -> list[dict]:
     return payload
 
 
-def _fetch_sina_minute(sina_symbol: str) -> pd.DataFrame:
+def _fetch_sina_minute(sina_symbol: str, network_timeout: float | None = None) -> pd.DataFrame:
     response = _sina_session().get(
         _SINA_MINUTE_URL,
         params={"symbol": sina_symbol, "scale": "1", "ma": "no", "datalen": "1970"},
-        timeout=15,
+        timeout=_network_timeout(network_timeout),
     )
     response.raise_for_status()
     payload = _decode_sina_payload(response.text)
@@ -291,11 +313,18 @@ def fetch_stock_daily(symbol: str, start, end, cancelled=lambda: False):
 
 
 @serialized_baostock
-def fetch_etf_daily(symbol: str, start, end, source: str = "baostock", cancelled=lambda: False) -> pd.DataFrame:
+def fetch_etf_daily(
+    symbol: str,
+    start,
+    end,
+    source: str = "baostock",
+    cancelled=lambda: False,
+    network_timeout: float | None = None,
+) -> pd.DataFrame:
     code, exchange = normalize_symbol(symbol).split(".")
     if source == "eastmoney":
         import akshare as ak
-        with bounded_akshare_http():
+        with bounded_akshare_http(network_timeout):
             frame = ak.fund_etf_hist_em(
                 symbol=code, period="daily",
                 start_date=pd.Timestamp(start).strftime("%Y%m%d"),
@@ -333,37 +362,63 @@ def fetch_etf_daily(symbol: str, start, end, source: str = "baostock", cancelled
     return canonical_frame(pd.DataFrame(rows, columns=result.fields), daily=True)
 
 
-def fetch_auxiliary(symbol: str, start, end, cancelled=lambda: False):
+def fetch_auxiliary(
+    symbol: str,
+    start,
+    end,
+    cancelled=lambda: False,
+    network_timeout: float | None = None,
+):
     """Compatibility adapter for callers that need all auxiliary files at once."""
     if symbol.startswith(("1", "5")):
-        daily = fetch_etf_daily(symbol, start, end, "baostock", cancelled)
+        daily = fetch_etf_daily(
+            symbol, start, end, "baostock", cancelled,
+            network_timeout=network_timeout,
+        )
         calendar = fetch_market_calendar(start, end, cancelled)
-        actions, metadata = fetch_market_actions(symbol, start, end, cancelled)
+        actions, metadata = fetch_market_actions(
+            symbol, start, end, cancelled, network_timeout=network_timeout,
+        )
         return daily, actions, calendar, metadata
     daily, metadata = fetch_stock_daily(symbol, start, end, cancelled)
     calendar = fetch_market_calendar(start, end, cancelled)
-    actions, action_metadata = fetch_market_actions(symbol, start, end, cancelled)
+    actions, action_metadata = fetch_market_actions(
+        symbol, start, end, cancelled, network_timeout=network_timeout,
+    )
     metadata = {**metadata, **action_metadata}
     metadata["actions_verified"] = bool(action_metadata.get("actions_verified")) and not action_metadata.get("actions_unverified_years")
     return daily, actions, calendar, metadata
 
 
 @lru_cache(maxsize=48)
-def _fund_actions(year: int, as_of: str):
+def _fund_actions(year: int, as_of: str, network_timeout: float | None = None):
     import akshare as ak
-    with bounded_akshare_http():
+    with bounded_akshare_http(network_timeout):
         return ak.fund_fh_em(year=str(year)), ak.fund_cf_em(year=str(year))
 
 
-def fetch_etf_auxiliary(symbol, start, end, cancelled=lambda: False, daily_source="baostock"):
+def fetch_etf_auxiliary(
+    symbol,
+    start,
+    end,
+    cancelled=lambda: False,
+    daily_source="baostock",
+    network_timeout: float | None = None,
+):
     code, exchange = normalize_symbol(symbol).split(".")
     daily_notes = []
     try:
-        daily = fetch_etf_daily(symbol, start, end, daily_source, cancelled)
+        daily = fetch_etf_daily(
+            symbol, start, end, daily_source, cancelled,
+            network_timeout=network_timeout,
+        )
     except Exception as exc:
         if daily_source == "baostock":
             raise
-        daily = fetch_etf_daily(symbol, start, end, "baostock", cancelled)
+        daily = fetch_etf_daily(
+            symbol, start, end, "baostock", cancelled,
+            network_timeout=network_timeout,
+        )
         daily_notes.append("东方财富 ETF 日线不可用，已改用 BaoStock：" + str(exc))
     calendar = fetch_market_calendar(start, end, cancelled)
     records, warnings, unverified = [], [], []
@@ -371,7 +426,9 @@ def fetch_etf_auxiliary(symbol, start, end, cancelled=lambda: False, daily_sourc
         if cancelled():
             raise InterruptedError("任务已取消")
         try:
-            dividends, splits = _fund_actions(year, str(pd.Timestamp(end).date()))
+            dividends, splits = _fund_actions(
+                year, str(pd.Timestamp(end).date()), network_timeout,
+            )
             for row in dividends.loc[dividends["基金代码"].astype(str).str.zfill(6) == code].to_dict("records"):
                 records.append({"record_date": row["权益登记日"], "ex_date": row["除息日期"], "pay_date": row["分红发放日"], "cash_per_share": row["分红"], "bonus_ratio": 0})
             for row in splits.loc[splits["基金代码"].astype(str).str.zfill(6) == code].to_dict("records"):
@@ -428,7 +485,13 @@ def fetch_market_calendar(start, end, cancelled=lambda: False) -> pd.DataFrame:
 
 
 @serialized_baostock
-def fetch_market_actions(symbol, start, end, cancelled=lambda: False) -> tuple[pd.DataFrame, dict]:
+def fetch_market_actions(
+    symbol,
+    start,
+    end,
+    cancelled=lambda: False,
+    network_timeout: float | None = None,
+) -> tuple[pd.DataFrame, dict]:
     """Fetch only corporate/fund actions for an already selected date range."""
     symbol = normalize_symbol(symbol)
     code, exchange = symbol.split(".")
@@ -440,7 +503,9 @@ def fetch_market_actions(symbol, start, end, cancelled=lambda: False) -> tuple[p
             if cancelled():
                 raise InterruptedError("任务已取消")
             try:
-                dividends, splits = _fund_actions(year, str(pd.Timestamp(end).date()))
+                dividends, splits = _fund_actions(
+                    year, str(pd.Timestamp(end).date()), network_timeout,
+                )
                 for row in dividends.loc[
                     dividends["基金代码"].astype(str).str.zfill(6) == code
                 ].to_dict("records"):

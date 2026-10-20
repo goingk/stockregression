@@ -8,7 +8,7 @@ from typing import Callable, Iterable
 import pandas as pd
 from filelock import FileLock
 
-from .settings import load_settings
+from .settings import Settings, load_settings
 from .storage import Store, now_iso
 
 
@@ -135,10 +135,12 @@ def _record(
     coverage_start=None,
     coverage_end=None,
     duration_seconds: float | None = None,
+    market_settings=None,
 ) -> dict:
+    market_policy = market_settings or store.market_settings
     lock_path = store.root / ".source-health.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with FileLock(str(lock_path), timeout=30):
+    with FileLock(str(lock_path), timeout=market_policy.source_lock_timeout_seconds):
         previous = store.state(_health_key(source, capability, market)) or {}
         checked = now_iso()
         if error is None:
@@ -156,7 +158,7 @@ def _record(
             category = classify_source_error(error)
             cooldown = None
             if category != "cancelled":
-                cooldown = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=SOURCE_COOLDOWN_HOURS)).isoformat()
+                cooldown = (pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=market_policy.failure_cooldown_hours)).isoformat()
             value = {
                 **previous, "status": "cancelled" if category == "cancelled" else "failed",
                 "source": source, "capability": capability, "market": market,
@@ -207,16 +209,17 @@ def decode_coverage(frame: pd.DataFrame):
 class SourceRouter:
     """Resolve configured sources and keep health shared across jobs and processes."""
 
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, *, settings: Settings | None = None):
         self.store = store
+        self.settings = settings or store.settings
+        self.market_settings = self.settings.market_data
 
     def route(self, capability: str, market: str) -> dict:
         spec = SOURCE_CAPABILITIES[capability]
         default = spec["default"]
         optional = spec["optional"]
-        settings = load_settings()
         field = "recent_minute_source" if capability == "recent_minute" else "etf_daily_source"
-        configured = getattr(settings, field)
+        configured = getattr(self.settings, field)
         if configured == default:
             return {"configured": default, "effective": default, "fallback": False, "reason": None}
         state = source_state(self.store, optional, capability, market)
@@ -257,40 +260,55 @@ class SourceRouter:
         def invoke(source: str):
             started = time.monotonic()
             category = "provider"
+            retries = int(self.market_settings.request_retries)
             try:
                 value = calls[source]()
                 if record:
                     rows = len(value) if isinstance(value, (pd.DataFrame, list, tuple)) else None
                     start, end = decode_coverage(value) if isinstance(value, pd.DataFrame) else (None, None)
-                    record_success(self.store, source, capability, market, rows=rows,
-                                   coverage_start=start, coverage_end=end,
-                                   duration_seconds=round(time.monotonic() - started, 3))
+                    record_success(
+                        self.store, source, capability, market, rows=rows,
+                        coverage_start=start, coverage_end=end,
+                        duration_seconds=round(time.monotonic() - started, 3),
+                        market_settings=self.market_settings,
+                    )
                 return value, source
             except InterruptedError:
                 raise
             except Exception as exc:
                 category = classify_source_error(exc)
                 if record and category not in {"empty", "unsupported", "data_quality"}:
-                    record_failure(self.store, source, capability, market, exc,
-                                   duration_seconds=round(time.monotonic() - started, 3))
-                if is_transient(category):
+                    record_failure(
+                        self.store, source, capability, market, exc,
+                        duration_seconds=round(time.monotonic() - started, 3),
+                        market_settings=self.market_settings,
+                    )
+                for _attempt in range(retries if is_transient(category) else 0):
                     try:
                         value = calls[source]()
                         if record:
                             rows = len(value) if isinstance(value, (pd.DataFrame, list, tuple)) else None
                             start, end = decode_coverage(value) if isinstance(value, pd.DataFrame) else (None, None)
-                            record_success(self.store, source, capability, market, rows=rows,
-                                           coverage_start=start, coverage_end=end,
-                                           duration_seconds=round(time.monotonic() - started, 3))
+                            record_success(
+                                self.store, source, capability, market, rows=rows,
+                                coverage_start=start, coverage_end=end,
+                                duration_seconds=round(time.monotonic() - started, 3),
+                                market_settings=self.market_settings,
+                            )
                         return value, source
                     except InterruptedError:
                         raise
                     except Exception as retry_error:
                         if record and classify_source_error(retry_error) not in {"empty", "unsupported", "data_quality"}:
-                            record_failure(self.store, source, capability, market, retry_error,
-                                           duration_seconds=round(time.monotonic() - started, 3))
+                            record_failure(
+                                self.store, source, capability, market, retry_error,
+                                duration_seconds=round(time.monotonic() - started, 3),
+                                market_settings=self.market_settings,
+                            )
                         exc = retry_error
                         category = classify_source_error(exc)
+                        if not is_transient(category):
+                            break
                 raise SourceFailure(source, capability, category, str(exc)) from exc
 
         if primary not in calls:
@@ -315,13 +333,13 @@ def probe_guard(store: Store, source: str, capability: str, market: str):
     lock = store.root / f".source-probe-{capability}-{source}-{market}.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
     with _PROBE_LOCK:
-        with FileLock(str(lock), timeout=60):
+        with FileLock(str(lock), timeout=store.market_settings.source_lock_timeout_seconds):
             yield
 
 
 def configured_sources(store: Store) -> dict:
     settings = load_settings()
-    router = SourceRouter(store)
+    router = SourceRouter(store, settings=settings)
     capabilities = []
     for name, spec in SOURCE_CAPABILITIES.items():
         field = "recent_minute_source" if name == "recent_minute" else "etf_daily_source"
@@ -347,7 +365,12 @@ def configured_sources(store: Store) -> dict:
             "routes": [{"market": market, **router.route(name, market)} for market in spec["markets"]],
             "sources": sources,
         })
-    return {"policy_version": SOURCE_POLICY_VERSION, "cooldown_hours": SOURCE_COOLDOWN_HOURS, "capabilities": capabilities}
+    return {
+        "policy_version": SOURCE_POLICY_VERSION,
+        "cooldown_hours": settings.market_data.failure_cooldown_hours,
+        "request_retries": settings.market_data.request_retries,
+        "capabilities": capabilities,
+    }
 
 
 def validate_source_settings(store: Store, values: dict) -> None:
@@ -365,28 +388,27 @@ def _component_call(
     callback: Callable[[], object],
 ):
     started = time.monotonic()
-    try:
-        value = callback()
-    except InterruptedError:
-        raise
-    except Exception as first_error:
-        category = classify_source_error(first_error)
-        if not is_transient(category):
-            if category not in {"empty", "unsupported", "data_quality"}:
-                record_failure(store, source, capability, market, first_error,
-                               duration_seconds=round(time.monotonic() - started, 3))
-            raise
+    retries = int(store.market_settings.request_retries)
+    for attempt in range(retries + 1):
         try:
             value = callback()
         except InterruptedError:
             raise
-        except Exception as retry_error:
-            if classify_source_error(retry_error) not in {"empty", "unsupported", "data_quality"}:
-                record_failure(store, source, capability, market, retry_error,
-                               duration_seconds=round(time.monotonic() - started, 3))
-            raise
-    record_success(store, source, capability, market, duration_seconds=round(time.monotonic() - started, 3))
-    return value
+        except Exception as exc:
+            category = classify_source_error(exc)
+            if category not in {"empty", "unsupported", "data_quality", "cancelled"}:
+                record_failure(
+                    store, source, capability, market, exc,
+                    duration_seconds=round(time.monotonic() - started, 3),
+                )
+            if not is_transient(category) or attempt >= retries:
+                raise
+            continue
+        record_success(
+            store, source, capability, market,
+            duration_seconds=round(time.monotonic() - started, 3),
+        )
+        return value
 
 
 def fetch_auxiliary_routed(
@@ -406,14 +428,21 @@ def fetch_auxiliary_routed(
 
     market = market_for_symbol(symbol)
     router = SourceRouter(store)
+    network_timeout = router.market_settings.network_timeout_seconds
     metadata: dict = {}
     events: list[dict] = []
     if market == "etf":
         daily, daily_source, route = router.call(
             "etf_daily", market,
             {
-                "baostock": lambda: fetch_etf_daily(symbol, start, end, "baostock", cancelled),
-                "eastmoney": lambda: fetch_etf_daily(symbol, start, end, "eastmoney", cancelled),
+                "baostock": lambda: fetch_etf_daily(
+                    symbol, start, end, "baostock", cancelled,
+                    network_timeout=network_timeout,
+                ),
+                "eastmoney": lambda: fetch_etf_daily(
+                    symbol, start, end, "eastmoney", cancelled,
+                    network_timeout=network_timeout,
+                ),
             },
         )
         metadata.update({"daily_source": daily_source, "etf_daily_route": route})
@@ -439,7 +468,9 @@ def fetch_auxiliary_routed(
     actions, action_metadata = _component_call(
         store, "akshare" if market == "etf" else "baostock",
         "etf_actions" if market == "etf" else "stock_actions", market,
-        lambda: fetch_market_actions(symbol, start, end, cancelled),
+        lambda: fetch_market_actions(
+            symbol, start, end, cancelled, network_timeout=network_timeout,
+        ),
     )
     metadata.update(action_metadata)
     metadata.update({
@@ -470,6 +501,7 @@ def probe_source(
     if capability == "etf_daily" and source not in {"baostock", "eastmoney"}:
         raise ValueError("ETF 日线探测来源应为 baostock 或 eastmoney")
     markets = _market_list(capability, market)
+    network_timeout = store.market_settings.network_timeout_seconds
     end = pd.Timestamp(latest_closed_date()).normalize()
     start = end - pd.Timedelta(days=35)
     results = []
@@ -481,9 +513,19 @@ def probe_source(
         try:
             with probe_guard(store, source, capability, item):
                 if capability == "recent_minute":
-                    frame = fetch_tdx(symbol, earliest=start, cancelled=cancelled) if source == "tdx" else fetch_sina(symbol)
+                    frame = (
+                        fetch_tdx(
+                            symbol, earliest=start, cancelled=cancelled,
+                            network_timeout=network_timeout,
+                        ) if source == "tdx" else fetch_sina(
+                            symbol, network_timeout=network_timeout,
+                        )
+                    )
                 else:
-                    frame = fetch_etf_daily(symbol, start, end, source, cancelled)
+                    frame = fetch_etf_daily(
+                        symbol, start, end, source, cancelled,
+                        network_timeout=network_timeout,
+                    )
             if frame is None or frame.empty:
                 raise RuntimeError(f"{source} 探测未返回数据")
             coverage_start, coverage_end = decode_coverage(frame)

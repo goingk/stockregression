@@ -28,6 +28,32 @@ def fixture(symbol="600000.SH", days=8, **metadata):
     return config, bundle
 
 
+def test_grid_position_audit_records_stockout_once_for_a_repeated_sell_signal():
+    config, bundle = fixture()
+    prices = np.array([8.0, 9.5, 9.7, 9.9, 10.1, 10.3, 10.5, 10.7, 10.9])
+    for name, values in (
+        ("open", prices), ("close", prices), ("high", prices + .01),
+        ("low", prices - .01), ("preclose", np.r_[prices[0], prices[:-1]]),
+        ("turnover", prices * 100000),
+    ):
+        bundle.daily[name] = values
+    bundle.bars = bundle.daily.iloc[1:].copy()
+    bundle.bars["timestamp"] = bundle.bars.date + pd.Timedelta(hours=15)
+    bundle.bars["frequency"], bundle.bars["tradable"], bundle.bars["is_synthetic"] = "1d", True, False
+    config = config.model_copy(update={
+        "schema_version": 3, "initial_shares": 200, "min_shares": 100,
+        "max_shares": None, "buy_shares": 100, "sell_shares": 300,
+        "grid_mode": "geometric", "buy_step": .01, "sell_step": .01,
+        "reference_price_mode": "manual", "reference_price": 8.5,
+        "fees": FeeConfig(commission_rate=0, min_commission=0, slippage_bps=0),
+    })
+    grid = engine.run_backtest(config, bundle)["strategies"]["grid"]
+    assert grid["metrics"]["stockout_count"] == 1
+    assert grid["metrics"]["tplus1_block_count"] == 0
+    assert grid["metrics"]["actual_min_pos_ratio"] == pytest.approx(.5)
+    assert grid["metrics"]["actual_max_pos_ratio"] == pytest.approx(1.0)
+
+
 def test_existing_shares_sell_first_day_and_orders_use_hundreds(monkeypatch):
     config, bundle = fixture()
     config = config.model_copy(update={"reference_price_mode": "manual", "reference_price": 8.5})
@@ -464,7 +490,7 @@ def test_market_dry_run_reports_universe_without_creating_data_job(tmp_path, mon
     from stockregression import cli
     from stockregression.settings import Settings
     monkeypatch.setattr(cli, "load_settings", lambda: Settings(data_dir=str(tmp_path)))
-    monkeypatch.setattr("stockregression.providers.fetch_instruments", lambda *args: [{"symbol": "600000.SH"}, {"symbol": "510300.SH"}])
+    monkeypatch.setattr("stockregression.providers.fetch_instruments", lambda *args, **kwargs: [{"symbol": "600000.SH"}, {"symbol": "510300.SH"}])
     result = CliRunner().invoke(cli.app, ["sync", "--scope", "market", "--mode", "history", "--dry-run"])
     assert result.exit_code == 0, result.output
     assert "ETF 1" in result.output

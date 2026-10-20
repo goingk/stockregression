@@ -6,6 +6,8 @@ import re
 import subprocess
 import sys
 
+from filelock import FileLock
+
 from .settings import PROJECT_ROOT, load_settings, save_settings
 
 TASK_NAMES = ["StockRegression-Daily", "StockRegression-Weekly"]
@@ -47,7 +49,15 @@ def configure_schedule(install: bool) -> dict:
         for name in TASK_NAMES:
             commands.append("if (Get-ScheduledTask -TaskName " + _powershell_literal(name) + " -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName " + _powershell_literal(name) + " -Confirm:$false }")
     encoded = base64.b64encode("\n".join(commands).encode("utf-16le")).decode("ascii")
-    completed = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=45, creationflags=subprocess.CREATE_NO_WINDOW)
+    lock_dir = PROJECT_ROOT / ".local"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(lock_dir / "schedule.lock"), timeout=settings.schedule.lock_timeout_seconds):
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=settings.schedule.subprocess_timeout_seconds,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
     if completed.returncode:
         raise RuntimeError("计划任务注册失败：" + (completed.stderr or completed.stdout).strip())
     save_settings({"schedule": {"enabled": install}})

@@ -18,9 +18,18 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
-from typing import Literal
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Any, Literal
 from .preview import PreviewManager
+from .configuration import (
+    ConfigurationConflict,
+    configuration_schema as public_configuration_schema,
+    current_configuration,
+    patch_configuration,
+    pending_restart_fields,
+    task_configuration_snapshot,
+    validate_configuration_patch,
+)
 
 from .data import DataService
 from .data_diagnostics import derive_source_spans, project_data_diagnostics
@@ -39,7 +48,7 @@ from .performance import effective_cpu_budget, logical_cpu_count
 from .rules import instrument_terms
 from .research_preparation import preparation_config
 from .schedule import configure_schedule
-from .settings import PROJECT_ROOT, load_settings, resolve_project_path, save_settings
+from .settings import ConfigurationDocument, PROJECT_ROOT, Settings, load_settings, resolve_project_path, save_settings
 from .source_health import configured_sources, validate_source_settings
 from .storage import Store, dumps, json_safe, now_iso
 from .watchlist_sync import import_watchlist_snapshot
@@ -52,6 +61,7 @@ class SyncRequest(BaseModel):
     resume: bool = False
     retry_failed: bool = False
     workers: int = Field(default=4, ge=1, le=4)
+    configuration_revision: str | None = None
 
 
 class MarketSyncRequest(BaseModel):
@@ -67,6 +77,32 @@ class MarketSyncRequest(BaseModel):
     retry_failed: bool = False
     initialize: bool = False
     workers: int = Field(default=4, ge=1, le=4)
+    configuration_revision: str | None = None
+
+
+class ConfigurationPatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    base_revision: str
+    patch: dict[str, Any]
+
+
+class ConfigurationValidationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    patch: dict[str, Any]
+
+
+class ConfigurationEnvelope(BaseModel):
+    config: ConfigurationDocument
+    revision: str
+    pending_restart: list[str] = Field(default_factory=list)
+    active_data_dir: str | None = None
+    active_package_dir: str | None = None
+
+
+class ConfigurationValidationEnvelope(BaseModel):
+    valid: Literal[True] = True
+    config: ConfigurationDocument
+    revision: str
 
 
 class MarketImportRequest(BaseModel):
@@ -598,11 +634,11 @@ def _with_data_availability(store: Store, result: dict) -> dict:
     }
 
 
-def create_app(data_dir: str | None = None, start_jobs: bool = True):
-    configured = load_settings()
+def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_only: bool = False):
+    configured = load_settings() if not openapi_only else Settings()
     root = str(Path(data_dir or configured.data_dir).resolve())
     configure_cache(configured.market_cache_mb)
-    store = Store(root)
+    store = None if openapi_only else Store(root)
     watchlist_snapshot = PROJECT_ROOT / "config" / "watchlist.json" if data_dir is None else None
 
     def refresh_watchlist_snapshot():
@@ -617,9 +653,12 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         str(resolve_project_path(configured.package_dir))
         if data_dir is None and configured.package_dir else None
     )
-    initial_market = MarketDataService(store, package_dir=initial_package)
-    package_dir = str(initial_market.repository.package_dir)
-    manager = JobManager(root, configured.max_workers)
+    if openapi_only:
+        package_dir = str(resolve_project_path(configured.package_dir)) if configured.package_dir else root
+    else:
+        initial_market = MarketDataService(store, package_dir=initial_package)
+        package_dir = str(initial_market.repository.package_dir)
+    manager = JobManager(root, configured.max_workers, configured.market_data.scheduler_poll_seconds)
     previews = PreviewManager(store)
     instance_id = uuid.uuid4().hex
 
@@ -641,7 +680,22 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
 
     def submit(kind, payload):
-        return {"job_id": store.new_job(kind, payload)}
+        frozen = dict(payload)
+        snapshot = task_configuration_snapshot(
+            active_data_dir=root,
+            active_package_dir=package_dir,
+            active_host=configured.host,
+            active_port=configured.port,
+        )
+        requested_revision = str(frozen.get("configuration_revision") or "")
+        if requested_revision and requested_revision != snapshot.get("revision"):
+            raise HTTPException(409, detail={
+                "code": "CONFIG_REVISION_CONFLICT",
+                "message": "研究提交所使用的配置版本已过期，请等待配置保存后重试",
+            })
+        frozen.setdefault("configuration_revision", snapshot.get("revision"))
+        frozen.setdefault("configuration_snapshot", snapshot)
+        return {"job_id": store.new_job(kind, frozen)}
 
     def snapshot_version(config):
         # Preserve a submission-time immutable input when the active snapshot
@@ -1224,7 +1278,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             config = config.to_optimization()
         prepared = preparation_config(
             store, config.base,
-            lookback_days=500 if config.protocol_version == 4 else 504,
+            lookback_days=(config.strategy.training_max_days if config.protocol_version == 4 and config.strategy.strategy_version == 4 else 500) if config.protocol_version == 4 else 504,
         )
         version = require_ready(prepared)
         bundle = DataService(store).load_bundle(prepared, version)
@@ -1252,7 +1306,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
                 "message": reason or f"完整枚举需要 {preview.get('legal_combination_count')} 个验证点，超过预算 {preview.get('validation_budget')}",
                 **preview,
             })
-        submitted = submit("optimization", {"config": config.model_dump(mode="json"), "version": version})
+        submitted = submit("optimization", {
+            "config": config.model_dump(mode="json"), "version": version,
+            "configuration_revision": config.configuration_revision,
+        })
         return {**submitted, "search_preview": preview}
 
     @app.post("/api/v1/optimizations/preview")
@@ -1261,7 +1318,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             config = config.to_optimization()
         prepared = preparation_config(
             store, config.base,
-            lookback_days=500 if config.protocol_version == 4 else 504,
+            lookback_days=(config.strategy.training_max_days if config.protocol_version == 4 and config.strategy.strategy_version == 4 else 500) if config.protocol_version == 4 else 504,
         )
         version = require_ready(prepared)
         bundle = DataService(store).load_bundle(prepared, version)
@@ -1580,15 +1637,64 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     @app.get("/api/v1/settings")
     def settings():
         current = load_settings()
+        document = current_configuration()
         return {
             **current.model_dump(), "active_data_dir": root,
             "active_package_dir": package_dir,
             "package_dir": current.package_dir or package_dir,
+            "config_revision": document.get("config_revision"),
+            "configuration_document": document,
             "restart_required": current.data_dir != root or bool(
                 current.package_dir and resolve_package_root(current.package_dir) != Path(package_dir).resolve()
             ),
             "market_cache": cache_settings(),
         }
+
+    @app.get("/api/v1/configuration", response_model=ConfigurationEnvelope)
+    def get_configuration():
+        document = current_configuration()
+        return {
+            "config": document,
+            "revision": document.get("config_revision"),
+            "pending_restart": pending_restart_fields(
+                document, active_data_dir=root, active_package_dir=package_dir,
+                active_host=configured.host, active_port=configured.port,
+            ),
+            "active_data_dir": root,
+            "active_package_dir": package_dir,
+        }
+
+    @app.get("/api/v1/configuration/schema")
+    def get_configuration_schema():
+        return public_configuration_schema()
+
+    @app.post("/api/v1/configuration/validate", response_model=ConfigurationValidationEnvelope)
+    def validate_configuration(payload: ConfigurationValidationRequest):
+        try:
+            document = validate_configuration_patch(payload.patch)
+            return {"valid": True, "config": document, "revision": document.get("config_revision")}
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.patch("/api/v1/configuration", response_model=ConfigurationEnvelope)
+    def update_configuration(payload: ConfigurationPatchRequest):
+        base_revision = payload.base_revision
+        patch = payload.patch
+        try:
+            document = patch_configuration(patch, base_revision=base_revision)
+            configure_cache(int(document["market_data"]["cache_mb"]))
+            return {
+                "config": document,
+                "revision": document.get("config_revision"),
+                "pending_restart": pending_restart_fields(
+                    document, active_data_dir=root, active_package_dir=package_dir,
+                    active_host=configured.host, active_port=configured.port,
+                ),
+            }
+        except ConfigurationConflict as exc:
+            raise HTTPException(409, {"code": "CONFIG_REVISION_CONFLICT", "message": str(exc)}) from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, str(exc)) from exc
 
     @app.get("/api/v1/performance")
     def performance_status():
@@ -1607,13 +1713,20 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
 
     @app.put("/api/v1/settings")
     def update_settings(payload: dict):
+        payload = dict(payload)
+        base_revision = str(payload.pop("base_revision", "") or "")
+        if not base_revision:
+            raise HTTPException(428, detail={
+                "code": "CONFIG_REVISION_REQUIRED",
+                "message": "旧式设置写入必须携带 base_revision；请改用 PATCH /api/v1/configuration",
+            })
         try:
             if payload.get("package_dir"):
                 requested = resolve_package_root(str(payload["package_dir"]))
                 if requested != Path(package_dir).resolve():
                     raise ValueError("固定数据包目录不能通过设置切换到其他目录")
             validate_source_settings(store, payload)
-            values = save_settings(payload)
+            values = save_settings(payload, base_revision=base_revision)
             configure_cache(values.market_cache_mb)
             return {
                 **values.model_dump(), "active_data_dir": root,
@@ -1622,7 +1735,12 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
                     values.package_dir and resolve_package_root(values.package_dir) != Path(package_dir).resolve()
                 ),
                 "market_cache": cache_settings(),
+                "config_revision": current_configuration().get("config_revision"),
             }
+        except RuntimeError as exc:
+            if str(exc) == "CONFIG_REVISION_CONFLICT":
+                raise HTTPException(409, detail={"code": "CONFIG_REVISION_CONFLICT", "message": "配置已被其他页面或手工编辑修改"}) from exc
+            raise
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 

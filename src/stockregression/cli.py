@@ -22,20 +22,29 @@ from .market_data.cleanup import apply_legacy_cleanup, legacy_cleanup_plan
 app = typer.Typer(help="本地 A 股及 ETF 行情与网格研究台", no_args_is_help=True)
 schedule_app = typer.Typer(help="安装、移除或查看 Windows 补数计划")
 data_app = typer.Typer(help="按周期管理本地行情数据库")
+config_app = typer.Typer(help="查看、校验及迁移项目主配置")
 app.add_typer(schedule_app, name="schedule")
 app.add_typer(data_app, name="data")
+app.add_typer(config_app, name="config")
 
 
 @app.command()
-def serve(port: int = 8000, open_browser: bool = False):
+def serve(
+    port: int | None = typer.Option(None, help="覆盖配置中的监听端口"),
+    host: str | None = typer.Option(None, help="覆盖配置中的监听地址"),
+    open_browser: bool = False,
+):
     """启动本地网页和独立计算进程。"""
     import uvicorn
     from .api import create_app
     import threading
 
+    settings = load_settings()
+    host = host or settings.host
+    port = int(port or settings.port)
     application = create_app()
     server = uvicorn.Server(uvicorn.Config(
-        application, host="127.0.0.1", port=port, log_level="info",
+        application, host=host, port=port, log_level="info",
     ))
 
     def restart_callback(_active_jobs: int):
@@ -58,7 +67,7 @@ def serve(port: int = 8000, open_browser: bool = False):
 
     application.state.restart_callback = restart_callback
     if open_browser:
-        timer = threading.Timer(1.5, lambda: webbrowser.open(f"http://127.0.0.1:{port}"))
+        timer = threading.Timer(1.5, lambda: webbrowser.open(f"http://{host}:{port}"))
         timer.daemon = True
         timer.start()
     server.run()
@@ -85,7 +94,9 @@ def sync(mode: str = "daily", symbol: list[str] = typer.Option(None), scope: str
         from .models import normalize_symbol
         if scope == "market":
             try:
-                records = fetch_instruments()
+                records = fetch_instruments(
+                    network_timeout=settings.market_data.network_timeout_seconds,
+                )
                 symbols = sorted({item["symbol"] for item in records})
                 typer.echo(f"目录目标：{len(symbols)} 个（股票 {sum(not code.startswith(('1', '5')) for code in symbols)}，ETF {sum(code.startswith(('1', '5')) for code in symbols)}）；不自动加入自选")
                 for warning in sorted({warning for item in records for warning in item.get("catalog_warnings", [])}):
@@ -382,6 +393,44 @@ def set_data_dir(path: Path):
     """修改数据目录，下次启动生效；原目录内容保留。"""
     settings = save_settings({"data_dir": str(path.resolve())})
     typer.echo(settings.data_dir)
+
+
+@config_app.command("show")
+def config_show():
+    """输出当前主配置文件及其内容哈希。"""
+    from .configuration import current_configuration
+
+    typer.echo(json.dumps(current_configuration(), ensure_ascii=False, indent=2))
+
+
+@config_app.command("validate")
+def config_validate(path: Path | None = typer.Option(None, exists=True, dir_okay=False)):
+    """校验主文件或指定 JSON 草稿，不写入任何配置。"""
+    from .settings import read_configuration_document
+
+    _, revision = read_configuration_document(path)
+    typer.echo(f"配置有效；revision={revision}")
+
+
+@config_app.command("migrate-legacy")
+def config_migrate_legacy(
+    source: Path | None = typer.Option(None, exists=True, dir_okay=False, help="旧版 settings.json"),
+    replace: bool = typer.Option(False, "--replace", help="主文件已存在时明确允许替换"),
+):
+    """显式导入旧设置；主文件存在时必须加 --replace。"""
+    from . import settings as settings_module
+    from .settings import migrate_configuration_document, save_configuration_document
+
+    old_path = source or settings_module.LEGACY_SETTINGS_FILE
+    if not old_path.exists():
+        raise typer.BadParameter(f"旧配置不存在：{old_path}")
+    if settings_module.SETTINGS_FILE.exists() and not replace:
+        raise typer.BadParameter("主配置已存在；如确认导入旧配置，请重新执行并加 --replace")
+    raw = json.loads(old_path.read_text(encoding="utf-8"))
+    document = migrate_configuration_document(raw)
+    written, _ = save_configuration_document(document, base_revision=None)
+    typer.echo(f"已迁移到 {settings_module.SETTINGS_FILE}")
+    typer.echo(f"revision={written['config_revision']}")
 
 
 def _run(kind: str, payload: dict):

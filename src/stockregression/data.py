@@ -19,6 +19,7 @@ from .quality import QUALITY_RULES_VERSION, DataQualityError, _closing_auction_p
 from .data_diagnostics import add_source_events, derive_source_spans, project_data_diagnostics
 from .storage import Store
 from .rules import instrument_terms
+from .settings import Settings, load_settings
 
 
 def merge_frames(old: pd.DataFrame, new: pd.DataFrame, key: str) -> pd.DataFrame:
@@ -84,8 +85,10 @@ def _verified_flag(value) -> bool:
 
 
 class DataService:
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, settings: Settings | None = None):
         self.store = store
+        self.settings = settings or load_settings()
+        self.market_settings = self.settings.market_data
         self._sync_context = threading.local()
 
     def _sync_stage(self, symbol, **values):
@@ -95,7 +98,9 @@ class DataService:
 
     def refresh_instruments(self, progress=lambda *_: None, cancelled=lambda: False):
         progress(0.1, "刷新 AKShare 股票与新浪 ETF 证券目录")
-        records = fetch_instruments()
+        records = fetch_instruments(
+            network_timeout=self.market_settings.network_timeout_seconds,
+        )
         for record in records:
             if cancelled():
                 raise InterruptedError("任务已取消")
@@ -113,7 +118,7 @@ class DataService:
         if scope == "market":
             if symbols:
                 raise ValueError("全市场范围不能同时指定代码")
-            symbols = MarketDataService(self.store).repository.symbols_for_timeframe("1day")
+            symbols = MarketDataService(self.store, settings=self.settings).repository.symbols_for_timeframe("1day")
         elif not symbols:
             symbols = [row["symbol"] for row in self.store.watches()]
         if not symbols:
@@ -123,7 +128,7 @@ class DataService:
         selected = sorted(set(normalize_symbol(value) for value in symbols))
         runs = []
         for offset, value in enumerate((["1day"] if mode == "history" else ["1day", "1min"])):
-            runs.append(MarketDataSyncService(MarketDataService(self.store)).sync(
+            runs.append(MarketDataSyncService(MarketDataService(self.store, settings=self.settings)).sync(
                 selected, value, "incremental" if mode == "daily" else mode,
                 resume=resume, retry_failed=retry_failed, workers=workers,
                 progress=lambda fraction, message, offset=offset: progress(
@@ -190,7 +195,7 @@ class DataService:
                 def report(fraction, message):
                     with report_lock:
                         progress((completed + fraction) / max(1, len(targets)), f"{completed}/{len(targets)} · {symbol}：{message}")
-                with FileLock(str(self.store.root / f"sync-{symbol}.lock"), timeout=60):
+                with FileLock(str(self.store.root / f"sync-{symbol}.lock"), timeout=self.market_settings.sync_lock_timeout_seconds):
                     result = self._sync_one(symbol, mode, report, cancelled)
                 self.store.sync_item(run_key, symbol, status="completed", daily_status="completed", minute_status=result.get("minute_status", "available" if result.get("minute_through") else "unavailable"), daily_through=result.get("last_date"), minute_through=result.get("minute_through"), error=None)
                 self.store.state(f"sync:{symbol}", {"mode": mode, "result": result, "error": None})
@@ -230,7 +235,7 @@ class DataService:
             return None
         if manifest.get("market_data"):
             from .market_data import MarketDataService
-            readiness = MarketDataService(self.store).readiness(config)
+            readiness = MarketDataService(self.store, settings=self.settings).readiness(config)
             return manifest["version"] if readiness.get("ready") else None
         request, context_key = self._preparation_request(config, check_minutes=True)
         cache_key = "ready:" + context_key
@@ -266,7 +271,7 @@ class DataService:
             raise DataQualityError("DATA_VERSION_NOT_FOUND: 当前没有该行情数据版本；旧格式快照已停止兼容")
         if manifest and manifest.get("market_data"):
             from .market_data import MarketDataService
-            market = MarketDataService(self.store)
+            market = MarketDataService(self.store, settings=self.settings)
             readiness = market.readiness(config, manifest["version"])
             if not readiness.get("ready"):
                 details = "；".join(item.get("message", "") for item in readiness.get("gaps", []))
@@ -316,7 +321,7 @@ class DataService:
         # This lock is deliberately distinct from sync-{symbol}.lock. sync() owns
         # that lock around _sync_one; nesting the same lock here would deadlock.
         prepare_lock = FileLock(str(self.store.root / f"prepare-{config.symbol}.lock"))
-        self._acquire_prepare_lock(prepare_lock, cancelled, timeout=300)
+        self._acquire_prepare_lock(prepare_lock, cancelled, timeout=self.market_settings.prepare_lock_timeout_seconds)
         try:
             if cancelled():
                 raise InterruptedError("任务已取消")
@@ -410,7 +415,7 @@ class DataService:
                 "gap_signature": gap_signature,
                 "remaining_gaps": remaining,
                 "attempted_at": time.time(),
-                "retry_after": time.time() + 60 if sync_error or bundle is None else None,
+                "retry_after": time.time() + self.market_settings.retry_after_seconds if sync_error or bundle is None else None,
                 "error": sync_error or load_error,
             }
             self.store.state(key, state)
@@ -641,11 +646,17 @@ class DataService:
         raw_cache = []
         earliest = end - pd.Timedelta(days=14) if mode == "daily" and previous else None
         try:
-            recent_raw, recent_source, route = SourceRouter(self.store).call(
+            recent_raw, recent_source, route = SourceRouter(self.store, settings=self.settings).call(
                 "recent_minute", market_for_symbol(symbol),
                 {
-                    "sina": lambda: fetch_sina(symbol),
-                    "tdx": lambda: fetch_tdx(symbol, earliest, cancelled),
+                    "sina": lambda: fetch_sina(
+                        symbol,
+                        network_timeout=self.market_settings.network_timeout_seconds,
+                    ),
+                    "tdx": lambda: fetch_tdx(
+                        symbol, earliest, cancelled,
+                        network_timeout=self.market_settings.network_timeout_seconds,
+                    ),
                 },
             )
             if recent_source == "sina":
@@ -763,7 +774,7 @@ class DataService:
             raise DataQualityError("DATA_VERSION_NOT_FOUND: 该数据版本不存在或已清理")
         if manifest.get("market_data"):
             from .market_data import MarketDataService
-            return MarketDataService(self.store).load_backtest_bundle(config, version or manifest["version"])
+            return MarketDataService(self.store, settings=self.settings).load_backtest_bundle(config, version or manifest["version"])
         raise DataQualityError("旧 Parquet 快照已取消兼容，请从当前 ETF 数据包读取行情")
         files, metadata = manifest["files"], manifest["metadata"]
         daily_all = self.store.read_files(files["daily"])
@@ -863,7 +874,7 @@ class DataService:
     def market_bars(self, symbol, frequency="1d", start_date=None, end_date=None, before=None, limit=600, ma_periods=(5, 10, 20, 60)):
         from .market_data import MarketDataService
         from .market_data.timeframes import normalize_timeframe
-        return MarketDataService(self.store).market_bars(
+        return MarketDataService(self.store, settings=self.settings).market_bars(
             symbol, normalize_timeframe(frequency), start=start_date, end=end_date,
             before=before, limit=limit, ma_periods=ma_periods,
         )
@@ -974,7 +985,7 @@ class DataService:
 
     def coverage(self, symbol: str):
         from .market_data import MarketDataService
-        return MarketDataService(self.store).compatibility_coverage(symbol)
+        return MarketDataService(self.store, settings=self.settings).compatibility_coverage(symbol)
         symbol = normalize_symbol(symbol)
         manifest = self.store.snapshot(symbol)
         if not manifest:
@@ -982,7 +993,7 @@ class DataService:
             return {"symbol": symbol, "version": None, "rows": 0, "days": [], "profiles": {}, "warnings": ["尚未下载本地数据"], "diagnostics": projection["diagnostics"], "source_events": [], "bytes": 0}
         if manifest.get("market_data"):
             from .market_data import MarketDataService
-            return MarketDataService(self.store).compatibility_coverage(symbol)
+            return MarketDataService(self.store, settings=self.settings).compatibility_coverage(symbol)
         cache_key = f"coverage:{manifest['version']}:q{QUALITY_RULES_VERSION}"
         cache = self.store.state(cache_key)
         if cache and cache.get("quality_rules_version") == QUALITY_RULES_VERSION and (cache.get("diagnostics") or {}).get("schema_version") == 1 and "source_events" in cache:
@@ -1014,7 +1025,7 @@ class DataService:
         """Keep the historical import entry point while routing every file to the managed package."""
         from .market_data import MarketDataService
 
-        market = MarketDataService(self.store)
+        market = MarketDataService(self.store, settings=self.settings)
         symbol = normalize_symbol(payload["symbol"])
         results = []
         for timeframe, key, convention in (
@@ -1052,7 +1063,7 @@ class DataService:
                     if codes and codes != {symbol}:
                         raise DataQualityError(f"填写的证券代码 {symbol} 与文件 {path.name} 中的证券代码 {', '.join(sorted(codes))} 不一致，请修改证券代码后重新提交导入")
             return frame
-        with FileLock(str(self.store.root / f"sync-{symbol}.lock"), timeout=60), self.store.lock:
+        with FileLock(str(self.store.root / f"sync-{symbol}.lock"), timeout=self.market_settings.sync_lock_timeout_seconds), self.store.lock:
             previous = self.store.snapshot(symbol)
             if previous and previous["metadata"].get("is_demo"):
                 previous = None
@@ -1253,7 +1264,7 @@ class DataService:
         metadata = {"name": "演示 · " + symbol, "listing_date": str(calendar_days[0].date()), "board": "star" if symbol.startswith("688") else "chinext" if symbol.startswith("3") else "main", "actions_verified": True, "is_demo": True}
         profiles = {"demo": {"verified": True, "convention": "end", "volume_multiplier": 1, "reason": "确定性生成的模拟数据；不是历史行情"}}
         progress(0.6, "保存已标记的演示分钟与日线数据")
-        with FileLock(str(self.store.root / f"sync-{symbol}.lock"), timeout=60), self.store.lock:
+        with FileLock(str(self.store.root / f"sync-{symbol}.lock"), timeout=self.market_settings.sync_lock_timeout_seconds), self.store.lock:
             if self.store.snapshot(symbol) and not self.store.snapshot(symbol)["metadata"].get("is_demo"):
                 raise ValueError("该标的已有真实数据，不能用演示数据覆盖")
             manifest = self.store.publish(symbol, minute, daily, actions, calendar, metadata, profiles)

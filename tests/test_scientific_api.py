@@ -200,11 +200,21 @@ def test_old_research_preferences_fill_new_defaults_and_keep_custom_ranges():
     assert old.protocol_version == 4
     assert old.n_trials == 321
     assert old.mode == "robust"
-    assert len(old.ranges) == 7
+    assert len(old.ranges) == 4
     assert {"buy_step", "sell_step"} <= set(old.ranges)
     assert old.selection_target == "both"
     assert old.rebalance_days == 63
     assert old.bootstrap_reps == 10_000
+
+    legacy = ResearchDefaults.model_validate({
+        "strategy_version": 3,
+        "ranges": {
+            **ResearchDefaults.model_validate({"strategy_version": 3}).model_dump()["ranges"],
+            "max_shares": {"low": 2000, "high": 2200, "step": 100},
+        },
+    })
+    assert len(legacy.ranges) == 7
+    assert legacy.ranges["max_shares"].high == 2200
 
 
 @pytest.mark.skip(reason="Legacy snapshot research seed was removed")
@@ -258,6 +268,12 @@ def test_scientific_result_daily_clipping_preserves_fields_and_exports_both_sele
         job = client.get(f"/api/v1/jobs/{job_id}").json()
         assert job["status"] == "completed", job.get("error")
         result = client.get(f"/api/v1/jobs/{job_id}/result").json()
+        frozen = job["payload"]["configuration_snapshot"]
+        assert result["configuration_snapshot"] == frozen
+        assert result["execution"]["configuration_revision"] == frozen["revision"]
+        assert result["execution"]["data_version"] == job["payload"]["version"]
+        assert result["execution"]["cpu_units"] >= 1
+        assert result["execution"]["resource_settings"]["workspace_mb"] >= 256
         assert result["fixed"]["params"]["buy_shares"] == 100
         assert result["adaptive"]["latest_params"]["buy_shares"] == 200
         assert result["evidence"]["notes"] == ["audit remains visible"]

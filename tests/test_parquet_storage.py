@@ -210,8 +210,8 @@ def test_settings_store_project_paths_relative(tmp_path, monkeypatch):
     assert saved.data_dir == str((tmp_path / "data").resolve())
     assert saved.package_dir == str((tmp_path / "data" / "dataset").resolve())
     stored = json.loads((tmp_path / ".local" / "settings.json").read_text(encoding="utf-8"))
-    assert stored["data_dir"] == "data"
-    assert stored["package_dir"] == "data/dataset"
+    assert stored["paths"]["data_dir"] == "data"
+    assert stored["paths"]["package_dir"] == "data/dataset"
 
 
 def test_etf_package_normalizes_units_and_opening_auction(tmp_path):

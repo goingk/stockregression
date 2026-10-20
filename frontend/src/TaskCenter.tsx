@@ -5,6 +5,7 @@ import { get, post } from './api'
 import { Badge, Button, Empty, JobProgress } from './components'
 import { isActiveJob, mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds, taskLabel, taskStatusLabel } from './taskState'
 import type { Job } from './types'
+import { useWorkbenchDefaults } from './useWorkbenchDefaults'
 
 type Notice = { id: string; label: string; job?: Job; error?: string; submitting?: boolean; expiresAt?: number }
 type Tasks = {
@@ -19,6 +20,8 @@ export function useTasks() {
 }
 
 export function TaskProvider({ children, onOpenResult }: { children: ReactNode; onOpenResult: (job: Job) => void }) {
+  const configuration = useWorkbenchDefaults()
+  const pollingMs = Number((configuration.document.ui as Record<string, unknown> | undefined)?.task_polling_interval_ms ?? 2500)
   const [jobs, setJobs] = useState<Job[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -77,9 +80,9 @@ export function TaskProvider({ children, onOpenResult }: { children: ReactNode; 
   useEffect(() => {
     mounted.current = true
     void refresh()
-    const timer = window.setInterval(() => { void refresh() }, 2500)
+    const timer = window.setInterval(() => { void refresh() }, Math.max(500, pollingMs))
     return () => { mounted.current = false; window.clearInterval(timer) }
-  }, [refresh])
+  }, [refresh, pollingMs])
   useEffect(() => {
     if (!notices.some(notice => notice.expiresAt)) return
     const timer = window.setInterval(() => setNotices(current => current.filter(notice => !notice.expiresAt || notice.expiresAt > Date.now())), 500)

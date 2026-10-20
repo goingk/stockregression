@@ -82,6 +82,30 @@ def test_new_shares_obey_t_plus_one():
     assert any(row["reason"] == "t_plus_1" for row in grid["rejections"])
 
 
+def test_share_metrics_separate_t_plus_one_from_stockout():
+    days = ["2024-01-02"]
+    bars = [
+        _bar("2024-01-02 09:31", 10.0, 9.5),
+        _bar("2024-01-02 09:32", 9.5, 11.0),
+        _bar("2024-01-02 09:33", 11.0, 11.0),
+    ]
+    daily = [
+        _daily("2024-01-01", 10.0, 10.0, preclose=10.0),
+        _daily("2024-01-02", 10.0, 11.0, preclose=10.0),
+    ]
+    config = _config(
+        days[0], schema_version=3, grid_mode="geometric", initial_shares=100,
+        min_shares=0, max_shares=None, buy_shares=100, sell_shares=200,
+        buy_step=.03, sell_step=.03, reference_price_mode="manual",
+        reference_price=10.0,
+    )
+    grid = run_backtest(config, _bundle(bars, days, daily=daily))["strategies"]["grid"]
+    assert grid["metrics"]["stockout_count"] == 0
+    assert grid["metrics"]["tplus1_block_count"] == 1
+    assert grid["metrics"]["actual_min_pos_ratio"] == pytest.approx(1.0)
+    assert grid["metrics"]["actual_max_pos_ratio"] == pytest.approx(2.0)
+
+
 def test_fixed_grid_uses_independent_buy_and_sell_spacing():
     config = _config(
         "2024-01-02", schema_version=3, grid_mode="geometric",
@@ -501,6 +525,31 @@ def test_position_ratio_counts_bonus_receivable_but_excludes_cash_receivable(mon
     assert ex_date_grid["position_ratio"] < (
         ex_date_grid["position"] * prices[1] + cash_receivable
     ) / ex_date_grid["equity"]
+
+
+def test_reported_position_peak_includes_ex_rights_share_receivable():
+    days = ["2024-01-02", "2024-01-03"]
+    bars = [_bar("2024-01-03 09:31", 6.67, 6.67)]
+    daily = [
+        _daily("2024-01-02", 10.0, 10.0, preclose=10.0),
+        _daily("2024-01-03", 6.67, 6.67, preclose=6.67),
+    ]
+    actions = [{
+        "record_date": pd.Timestamp("2024-01-02"), "ex_date": pd.Timestamp("2024-01-03"),
+        "pay_date": pd.Timestamp("2024-01-04"), "stock_date": pd.Timestamp("2024-01-05"),
+        "cash_per_share": 0.0, "bonus_ratio": 0.5,
+        "implemented": True, "unsupported_reason": "",
+    }]
+    config = _config(
+        days[1], schema_version=3, grid_mode="geometric", initial_shares=1000,
+        min_shares=0, max_shares=None, buy_shares=100, sell_shares=100,
+        buy_step=.5, sell_step=.5, reference_price_mode="manual", reference_price=10.0,
+    )
+    grid = run_backtest(
+        config, _bundle(bars, days, daily=daily, actions=actions),
+    )["strategies"]["grid"]
+    assert grid["metrics"]["actual_min_pos_ratio"] == pytest.approx(1.0)
+    assert grid["metrics"]["actual_max_pos_ratio"] == pytest.approx(1.5)
 
 
 def test_future_ohlc_perturbation_cannot_change_pre_break_trades_in_either_engine(monkeypatch):

@@ -1,0 +1,256 @@
+{
+  "generated_at": "2026-10-20T22:31:43+0800",
+  "space": {
+    "axes": [
+      "buy_step",
+      "sell_step",
+      "buy_shares",
+      "sell_shares"
+    ],
+    "shape": [
+      7,
+      7,
+      3,
+      3
+    ],
+    "legal_points": 441,
+    "hypercube_edge": 3,
+    "sigma": 1.0,
+    "top_k": 3
+  },
+  "budgets": {
+    "hierarchical_training": 72,
+    "hierarchical_neighborhood": 360,
+    "exhaustive_reference": 441,
+    "cost_model": "one unique synthetic point equals one raw backtest"
+  },
+  "scenarios": [
+    {
+      "name": "narrow_peak",
+      "reference_peak_count": 1,
+      "reference_top_k": [
+        [
+          4,
+          4,
+          2,
+          2
+        ]
+      ],
+      "sparse_top_k": [],
+      "top_k_recall": 0.0,
+      "best_j_regret": null,
+      "reference_scored_points": 441,
+      "sparse": {
+        "peaks": [],
+        "best_j": null,
+        "training_points": 72,
+        "neighborhood_points": 260,
+        "unique_backtests": 332,
+        "cache_hits": 179,
+        "start_count": 20,
+        "incomplete_verifications": 0,
+        "seconds": 0.9724746000138111
+      },
+      "reference_seconds": 0.013263900007586926
+    },
+    {
+      "name": "wide_peak",
+      "reference_peak_count": 1,
+      "reference_top_k": [
+        [
+          3,
+          4,
+          2,
+          2
+        ]
+      ],
+      "sparse_top_k": [
+        [
+          3,
+          4,
+          2,
+          2
+        ]
+      ],
+      "top_k_recall": 1.0,
+      "best_j_regret": 2.0816681711721685e-17,
+      "reference_scored_points": 441,
+      "sparse": {
+        "peaks": [
+          [
+            3,
+            4,
+            2,
+            2
+          ]
+        ],
+        "best_j": 0.03837233238263989,
+        "training_points": 72,
+        "neighborhood_points": 338,
+        "unique_backtests": 410,
+        "cache_hits": 221,
+        "start_count": 20,
+        "incomplete_verifications": 4,
+        "seconds": 0.1713774999952875
+      },
+      "reference_seconds": 0.04152739996789023
+    },
+    {
+      "name": "boundary_peak",
+      "reference_peak_count": 1,
+      "reference_top_k": [
+        [
+          1,
+          7,
+          1,
+          3
+        ]
+      ],
+      "sparse_top_k": [
+        [
+          1,
+          7,
+          1,
+          3
+        ]
+      ],
+      "top_k_recall": 1.0,
+      "best_j_regret": 0.0,
+      "reference_scored_points": 441,
+      "sparse": {
+        "peaks": [
+          [
+            1,
+            7,
+            1,
+            3
+          ]
+        ],
+        "best_j": 0.0304417777193805,
+        "training_points": 72,
+        "neighborhood_points": 279,
+        "unique_backtests": 351,
+        "cache_hits": 58,
+        "start_count": 20,
+        "incomplete_verifications": 1,
+        "seconds": 0.06360930000664666
+      },
+      "reference_seconds": 0.014794799964874983
+    },
+    {
+      "name": "multi_peak",
+      "reference_peak_count": 3,
+      "reference_top_k": [
+        [
+          6,
+          6,
+          3,
+          1
+        ],
+        [
+          2,
+          2,
+          1,
+          3
+        ],
+        [
+          1,
+          7,
+          3,
+          3
+        ]
+      ],
+      "sparse_top_k": [
+        [
+          6,
+          6,
+          3,
+          1
+        ],
+        [
+          2,
+          2,
+          1,
+          3
+        ]
+      ],
+      "top_k_recall": 0.6666666666666666,
+      "best_j_regret": 6.938893903907228e-18,
+      "reference_scored_points": 441,
+      "sparse": {
+        "peaks": [
+          [
+            6,
+            6,
+            3,
+            1
+          ],
+          [
+            2,
+            2,
+            1,
+            3
+          ]
+        ],
+        "best_j": 0.027615103776725144,
+        "training_points": 72,
+        "neighborhood_points": 346,
+        "unique_backtests": 418,
+        "cache_hits": 146,
+        "start_count": 20,
+        "incomplete_verifications": 4,
+        "seconds": 0.08640100003685802
+      },
+      "reference_seconds": 0.0182801999617368
+    },
+    {
+      "name": "constraint_split",
+      "reference_peak_count": 0,
+      "reference_top_k": [],
+      "sparse_top_k": [],
+      "top_k_recall": 1.0,
+      "best_j_regret": null,
+      "reference_scored_points": 441,
+      "sparse": {
+        "peaks": [],
+        "best_j": null,
+        "training_points": 72,
+        "neighborhood_points": 260,
+        "unique_backtests": 332,
+        "cache_hits": 115,
+        "start_count": 20,
+        "incomplete_verifications": 0,
+        "seconds": 0.05947660002857447
+      },
+      "reference_seconds": 0.0137253999710083
+    },
+    {
+      "name": "flat",
+      "reference_peak_count": 1,
+      "reference_top_k": [
+        [
+          1,
+          1,
+          1,
+          1
+        ]
+      ],
+      "sparse_top_k": [],
+      "top_k_recall": 0.0,
+      "best_j_regret": null,
+      "reference_scored_points": 441,
+      "sparse": {
+        "peaks": [],
+        "best_j": null,
+        "training_points": 72,
+        "neighborhood_points": 360,
+        "unique_backtests": 432,
+        "cache_hits": 75,
+        "start_count": 20,
+        "incomplete_verifications": 1,
+        "seconds": 0.13303329999325797
+      },
+      "reference_seconds": 0.09072350000496954
+    }
+  ]
+}

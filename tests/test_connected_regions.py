@@ -180,7 +180,7 @@ def test_refinement_allocates_to_multiple_centers_and_starts_locally():
 
 
 def test_strategy_version_defaults_and_legacy_fixed_mode():
-    assert ResearchStrategySpec().strategy_version == 3
+    assert ResearchStrategySpec().strategy_version == 4
     assert ResearchStrategySpec().hypercube_edge == 3
     assert ResearchStrategySpec(ranking_mode="fixed_mean").strategy_version == 1
     assert ResearchStrategySpec(ranking_mode="max_volume").strategy_version == 2

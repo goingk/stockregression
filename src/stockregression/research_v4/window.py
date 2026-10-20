@@ -35,6 +35,8 @@ class TrainingWindow:
     search_end: pd.Timestamp | None
     match_rule: str
     reason: str
+    min_offset: int = MIN_TRAINING_OFFSET
+    max_offset: int = MAX_TRAINING_OFFSET
 
     @property
     def days(self) -> int:
@@ -57,8 +59,8 @@ class TrainingWindow:
             "start_reason": self.start_reason,
             "search_start": self.search_start.date().isoformat() if self.search_start is not None else None,
             "search_end": self.search_end.date().isoformat() if self.search_end is not None else None,
-            "min_offset_trading_days": MIN_TRAINING_OFFSET,
-            "max_offset_trading_days": MAX_TRAINING_OFFSET,
+            "min_offset_trading_days": self.min_offset,
+            "max_offset_trading_days": self.max_offset,
             "match_rule": self.match_rule,
             "reason": self.reason,
         }
@@ -135,8 +137,16 @@ def _daily_prices(data: DataBundle) -> pd.DataFrame:
     return frame[["close", "high", "low"]].sort_index()
 
 
-def training_window(data: DataBundle, asof: pd.Timestamp | None) -> TrainingWindow:
+def training_window(
+    data: DataBundle,
+    asof: pd.Timestamp | None,
+    *,
+    min_offset: int = MIN_TRAINING_OFFSET,
+    max_offset: int = MAX_TRAINING_OFFSET,
+) -> TrainingWindow:
     """Return the new single-block training window ending at ``asof``."""
+    min_offset = max(1, int(min_offset))
+    max_offset = max(min_offset, int(max_offset))
     empty = TrainingWindow(
         pd.DatetimeIndex([]), None, None, None, None, None, False, True,
         None, None, "daily_low_lt_anchor_close_lt_daily_high", "没有可用的决策日收盘价",
@@ -163,8 +173,8 @@ def training_window(data: DataBundle, asof: pd.Timestamp | None) -> TrainingWind
         return empty
     anchor_index = int(positions[0])
     evaluation_index = anchor_index + 1
-    earliest_index = max(0, evaluation_index - MAX_TRAINING_OFFSET)
-    latest_index = max(earliest_index, evaluation_index - MIN_TRAINING_OFFSET)
+    earliest_index = max(0, evaluation_index - max_offset)
+    latest_index = max(earliest_index, evaluation_index - min_offset)
     latest_index = min(latest_index, anchor_index)
     search_start = pd.Timestamp(calendar[earliest_index]).normalize()
     search_end = pd.Timestamp(calendar[latest_index]).normalize()
@@ -191,13 +201,13 @@ def training_window(data: DataBundle, asof: pd.Timestamp | None) -> TrainingWind
         matched = True
         fallback = False
         matched_date = pd.Timestamp(calendar[start_index]).normalize()
-        reason = "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 500 个交易日内距离评估日最远的一天作为训练时段起点"
+        reason = f"找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 {min_offset} 至 {max_offset} 个交易日内距离评估日最远的一天作为训练时段起点"
     else:
-        start_index = max(0, evaluation_index - MAX_TRAINING_OFFSET)
+        start_index = max(0, evaluation_index - max_offset)
         matched = False
         fallback = True
         matched_date = None
-        reason = "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段"
+        reason = f"{min_offset} 至 {max_offset} 个交易日内没有同价日，按评估日前 {max_offset} 个交易日取训练时段"
 
     dates = pd.DatetimeIndex(calendar[start_index:anchor_index + 1])
     return TrainingWindow(
@@ -213,4 +223,28 @@ def training_window(data: DataBundle, asof: pd.Timestamp | None) -> TrainingWind
         search_end=search_end,
         match_rule="daily_low_lt_anchor_close_lt_daily_high",
         reason=reason,
+        min_offset=min_offset,
+        max_offset=max_offset,
     )
+
+
+@dataclass(frozen=True)
+class TrainingWindowPolicy:
+    """Validated lookback policy shared by preflight and production selection."""
+
+    min_offset: int = MIN_TRAINING_OFFSET
+    max_offset: int = MAX_TRAINING_OFFSET
+
+    def __post_init__(self) -> None:
+        if int(self.min_offset) < 1:
+            raise ValueError("训练窗口最短回看日数必须为正整数")
+        if int(self.max_offset) < int(self.min_offset):
+            raise ValueError("训练窗口最长回看日数不能小于最短回看日数")
+
+    def window(self, data: DataBundle, asof: pd.Timestamp | None) -> TrainingWindow:
+        return training_window(
+            data, asof, min_offset=int(self.min_offset), max_offset=int(self.max_offset),
+        )
+
+    def diagnostic(self) -> dict[str, int]:
+        return {"min_offset_trading_days": int(self.min_offset), "max_offset_trading_days": int(self.max_offset)}

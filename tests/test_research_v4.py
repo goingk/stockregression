@@ -62,10 +62,10 @@ def test_v4_fixed_units_reject_off_lattice_values():
 
 
 def test_v4_neighborhood_fields_must_be_a_nonempty_unique_subset():
-    assert ResearchStrategySpec().neighborhood_fields == ["buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares"]
-    with pytest.raises(ValueError, match="至少需要一个"):
+    assert ResearchStrategySpec().neighborhood_fields == ["buy_step", "sell_step", "buy_shares", "sell_shares"]
+    with pytest.raises(ValueError, match="搜索轴"):
         ResearchStrategySpec(neighborhood_fields=[])
-    with pytest.raises(ValueError, match="不能重复"):
+    with pytest.raises(ValueError, match="搜索轴"):
         ResearchStrategySpec(neighborhood_fields=["buy_step", "buy_step"])
     with pytest.raises(ValueError):
         ResearchStrategySpec(neighborhood_fields=["not_a_field"])

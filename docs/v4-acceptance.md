@@ -1,5 +1,7 @@
 # 参数研究 v4 验收记录
 
+> 本文件记录旧版 v4（策略 v1/v2/v3）的历史验收，不包含四维稳健 J。当前策略 v4 的固定真实数据验收见 [robust-j-acceptance.md](robust-j-acceptance.md)，数学与搜索说明见 [parameter-research-v4.md](parameter-research-v4.md)。
+
 验收日期：2026-10-19（北京时间）  
 标的：`159611.SZ`  
 数据版本：`mkt-db1f049ec31807d71aa41ecd`  

@@ -105,11 +105,19 @@ def _hydrate_v4_archives(root: Path, result: dict) -> dict:
 
 
 class Store:
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, *, settings=None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.db_path = self.root / "catalog.sqlite"
-        self.lock = FileLock(str(self.root / "sync.lock"), timeout=5)
+        from .settings import load_settings
+
+        configured = settings or load_settings()
+        self.settings = configured
+        self.market_settings = configured.market_data
+        self.lock = FileLock(
+            str(self.root / "sync.lock"),
+            timeout=self.market_settings.source_lock_timeout_seconds,
+        )
         with self.db() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS instruments(symbol TEXT PRIMARY KEY,name TEXT,exchange TEXT,board TEXT,listing_date TEXT,delisting_date TEXT);
@@ -166,10 +174,11 @@ class Store:
 
     @contextmanager
     def db(self):
-        connection = sqlite3.connect(self.db_path, timeout=30)
+        sqlite_timeout = int(self.market_settings.sqlite_timeout_seconds)
+        connection = sqlite3.connect(self.db_path, timeout=sqlite_timeout)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute(f"PRAGMA busy_timeout={sqlite_timeout * 1000}")
         try:
             yield connection
             connection.commit()

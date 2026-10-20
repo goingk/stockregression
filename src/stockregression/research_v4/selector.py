@@ -7,7 +7,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from ..models import BacktestConfig, DataBundle, OptimizationConfig
+from ..models import GRANULARITY_DEFAULTS, BacktestConfig, DataBundle, OptimizationConfig
 from .. import scientific
 from .evaluator import BatchEvaluator, center_constraints
 from .neighborhoods import find_regions, region_sort_key
@@ -123,7 +123,15 @@ def select_at(
     cancelled: Cancelled | None = None,
     progress_start: float = 0.0,
     progress_width: float = 1.0,
+    runtime=None,
 ) -> dict[str, Any]:
+    if config.strategy.strategy_version == 4:
+        from ..research.robust import select_robust_at
+        return select_robust_at(
+            config, base, data, asof, seed_offset=seed_offset, progress=progress,
+            cancelled=cancelled, progress_start=progress_start, progress_width=progress_width,
+            runtime=runtime,
+        )
     if config.strategy.strategy_version == 3:
         from .hypercube_selector import select_hypercube_at
         return select_hypercube_at(
@@ -396,6 +404,9 @@ def estimate_search(config: OptimizationConfig, data: DataBundle) -> dict[str, A
         raise ValueError("v4 preflight requires protocol_version=4")
     if config.base.grid_mode != "geometric":
         raise ValueError("v4 参数研究只支持等比网格")
+    if config.strategy.strategy_version == 4:
+        from ..research.robust import estimate_robust_search
+        return estimate_robust_search(config, data)
     space = ParameterSpace(config)
     movable = _movable_fields(space, config)
     dates = pd.DatetimeIndex(data.calendar)
@@ -533,6 +544,25 @@ def estimate_search(config: OptimizationConfig, data: DataBundle) -> dict[str, A
 def strategy_descriptions() -> dict[str, Any]:
     return {
         "strategies": [{
+            "strategy_id": "geometric_robust_j",
+            "strategy_version": 4,
+            "label": "等比网格四维稳健 J 峰值研究",
+            "grid_mode": "geometric",
+            "fields": ["buy_step", "sell_step", "buy_shares", "sell_shares"],
+            "granularity": {**GRANULARITY_DEFAULTS},
+            "max_shares_mode": "unlimited",
+            "neighborhood_fields": ["buy_step", "sell_step", "buy_shares", "sell_shares"],
+            "search_methods": ["auto", "hierarchical", "exhaustive"],
+            "ranking_modes": ["robust_j"],
+            "default_ranking_mode": "robust_j",
+            "defaults": {
+                "training_budget": 20_000, "validation_budget": 100_000,
+                "recommendation_count": 10, "hypercube_edge": 3,
+                "sigma": 1.0, "alpha": .30, "beta": 1.20, "tau": .01,
+                "eta_limit": 2.0, "eta_hard_cap": 3.5, "gamma_max": .40,
+                "eta_floor": 0.0, "gamma_min": 0.0,
+            },
+        }, {
             "strategy_id": "geometric_excess_neighborhood",
             "strategy_version": 3,
             "label": "等比网格超正方体平均超额收益",

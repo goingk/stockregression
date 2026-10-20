@@ -813,6 +813,7 @@ def optimize(
     data: DataBundle,
     progress: Progress | None = None,
     cancelled: Cancelled | None = None,
+    runtime=None,
 ) -> dict[str, Any]:
     """Search grid parameters and optionally validate them out of sample.
 
@@ -825,7 +826,7 @@ def optimize(
     if config.protocol_version in (2, 3, 4):
         from .scientific import optimize_scientific
 
-        return optimize_scientific(config, data, progress, cancelled)
+        return optimize_scientific(config, data, progress, cancelled, runtime)
     result = _base_result(config, data)
     if progress:
         _emit(progress, 0.0, "准备参数搜索")

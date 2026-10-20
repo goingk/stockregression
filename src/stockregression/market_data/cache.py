@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import os
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -127,7 +126,7 @@ class ByteLRU:
             self.evictions += 1
 
 
-_cache = ByteLRU(int(os.environ.get("STOCKREGRESSION_MARKET_CACHE_MB", DEFAULT_CACHE_MB)))
+_cache = ByteLRU(DEFAULT_CACHE_MB)
 
 
 def configure_cache(budget_mb: int) -> None:
