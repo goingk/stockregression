@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import shutil
 import uuid
@@ -39,6 +40,7 @@ from .schedule import configure_schedule
 from .settings import PROJECT_ROOT, load_settings, resolve_project_path, save_settings
 from .source_health import configured_sources, validate_source_settings
 from .storage import Store, dumps, json_safe, now_iso
+from .watchlist_sync import import_watchlist_snapshot
 
 
 class SyncRequest(BaseModel):
@@ -593,6 +595,16 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     root = str(Path(data_dir or configured.data_dir).resolve())
     configure_cache(configured.market_cache_mb)
     store = Store(root)
+    watchlist_snapshot = PROJECT_ROOT / "config" / "watchlist.json" if data_dir is None else None
+
+    def refresh_watchlist_snapshot():
+        if watchlist_snapshot is not None:
+            try:
+                import_watchlist_snapshot(store, watchlist_snapshot)
+            except (OSError, ValueError) as exc:
+                logging.getLogger(__name__).warning("自选快照导入失败，保留本地列表：%s", exc)
+
+    refresh_watchlist_snapshot()
     initial_package = (
         str(resolve_project_path(configured.package_dir))
         if data_dir is None and configured.package_dir else None
@@ -716,6 +728,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
 
     @app.get("/api/v1/watchlist")
     def watches():
+        refresh_watchlist_snapshot()
         return store.watches()
 
     @app.post("/api/v1/watchlist")
