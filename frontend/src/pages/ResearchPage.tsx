@@ -4,7 +4,6 @@ import type { EChartsOption } from 'echarts'
 import { FlaskConical, RefreshCw, RotateCcw } from 'lucide-react'
 import { ApiError, get, post } from '../api'
 import ChartView from '../ChartView'
-import EquityCurve from '../EquityCurve'
 import ResearchLandscape from '../ResearchLandscape'
 import ConnectedRegionResults from '../ConnectedRegionResults'
 import DataDiagnosticsPanel from '../DataDiagnosticsPanel'
@@ -209,21 +208,6 @@ function EvidenceFields({ value }: { value?: unknown }) {
   return rows.length ? <div className='research-evidence-grid'>{rows.map(({ key, value: raw }) => <div key={key}><small>{displayKey(key)}</small><strong>{valueText(key.split('.').at(-1) ?? key, raw)}</strong></div>)}</div> : <Empty title='暂无可展示的统计字段' />
 }
 
-function Assessment({ recommendation, familyEvidence }: { recommendation?: Recommendation; familyEvidence?: Dict }) {
-  if (!recommendation) return null
-  const diagnostics = record(recommendation.diagnostics)
-  const eligible = eligibleOf(diagnostics, recommendation)
-  const bootstrapReview = reviewBootstrapEvidence(familyEvidence)
-  const trainingOnly = diagnostics?.training_only === true
-  const statBadge = trainingOnly ? '不适用（单一训练时段）' : bootstrapReview.state === 'positive' ? '校正下界为正' : bootstrapReview.state === 'not_positive' ? '尚无校正后正向证据' : '统计证据不足'
-  return <div className='research-assessment'>
-    <div><small>约束</small><Badge tone={eligible === true ? 'green' : eligible === false ? 'amber' : 'neutral'}>{eligible === true ? '满足' : eligible === false ? '未满足' : '未提供'}</Badge></div>
-    <div><small>统计证据</small><Badge tone={trainingOnly ? 'neutral' : bootstrapReview.state === 'positive' ? 'blue' : 'amber'}>{statBadge}</Badge></div>
-    {recommendation.score != null && <div><small>选择得分</small><strong>{valueText('score', recommendation.score)}</strong></div>}
-    <div className='research-assessment-reasons'><small>说明</small>{reasonList(recommendation.reasons ?? diagnostics?.constraints).length ? <ul>{reasonList(recommendation.reasons ?? diagnostics?.constraints).map((reason, index) => <li key={index}>{reason}</li>)}</ul> : <span>系统会返回当前候选中相对得分最高的参数，并单独标注约束与证据状态。</span>}</div>
-  </div>
-}
-
 function sensitivityRows(value: unknown): Array<{ block: string; result: Dict }> {
   const root = record(value) ?? {}
   const bootstrap = record(root.bootstrap) ?? root
@@ -302,95 +286,6 @@ function ParameterBadges({ params, compact = false }: { params?: Dict; compact?:
   return <div className={'research-parameter-badges' + (compact ? ' compact' : '')}>{entries.map(([key, value]) => <span className='research-parameter-badge' key={key}><small>{labelOf(key)}</small><strong>{pctRange.has(key) ? rangeValue(key, value) : record(value) ? shortSummary(value) : valueText(key, value)}</strong></span>)}</div>
 }
 
-const peakParamNames = ['buy_step', 'sell_step', 'buy_shares', 'sell_shares'] as const
-
-function peakParamSubset(params?: Dict): Dict {
-  const source = params ?? {}
-  const subset = Object.fromEntries(
-    peakParamNames.filter(name => source[name] != null).map(name => [name, source[name]]),
-  )
-  return Object.keys(subset).length ? subset : source
-}
-
-function stressLabel(stress?: Dict): string {
-  const value = record(stress) ?? {}
-  const status = String(value.status ?? '')
-  const label = status === 'completed' ? '已完成' : status === 'partial' ? '部分完成' : status === 'failed' ? '失败' : '未计算'
-  return finite(value.mean_excess_return) ? label + ' · 均值 ' + percent(n(value.mean_excess_return), 2) : label
-}
-
-function RobustPeakRegions({ current, dateRange, onLoad }: {
-  current: Recommendation
-  dateRange?: { start_date: string; end_date: string }
-  onLoad: (params: Dict | undefined, selectionAsOf: string | undefined, dateRange?: { start_date: string; end_date: string }) => void
-}) {
-  const regions = current.recommendation_regions ?? []
-  if (!regions.length) return <p className='inline-warning'>本次没有 J 为正、约束合格且完成一格平台核验的推荐峰区；诊断候选不能替代正式推荐。</p>
-  const diagnostics = current.diagnostics ?? {}
-  const coverage = String(diagnostics.coverage_status ?? '')
-  const coverageLabel = coverage === 'global_exhaustive' ? '全局穷尽' : coverage === 'budgeted_local_peaks' ? '预算搜索' : coverage || '覆盖状态未知'
-  return <div className='research-peak-regions'>
-    <div className='research-peak-regions-head'>
-      <span>共 {regions.length} 个合格峰区 · 按 J 从高到低</span>
-      <span className='research-peak-regions-badges'>
-        <Badge tone={diagnostics.score_complete === true ? 'green' : 'amber'}>{diagnostics.score_complete === true ? '评分完整' : '评分不完整'}</Badge>
-        <Badge tone={diagnostics.local_peak_verified === true ? 'green' : 'amber'}>{diagnostics.local_peak_verified === true ? '峰值已核验' : '峰值未闭合'}</Badge>
-        <Badge tone={coverage === 'global_exhaustive' ? 'blue' : 'neutral'}>{coverageLabel}</Badge>
-      </span>
-    </div>
-    {regions.map((region, index) => {
-      const params = peakParamSubset(region.center_params)
-      const minPosition = finite(region.actual_min_pos_ratio) ? n(region.actual_min_pos_ratio).toFixed(3) : '—'
-      const maxPosition = finite(region.actual_max_pos_ratio) ? n(region.actual_max_pos_ratio).toFixed(3) : '—'
-      return <article className='research-peak-region' key={region.region_id ?? index}>
-        <div className='research-peak-region-main'>
-          <span className='research-peak-rank'>#{region.region_id ?? index + 1}</span>
-          <div className='research-peak-params'><ParameterBadges params={params} compact /></div>
-          <div className='research-peak-score'><small>稳健 J</small><strong>{percent(region.j_score, 4)}</strong></div>
-          <Button variant='quiet' onClick={() => onLoad(region.center_params, current.as_of, dateRange)}>{dateRange ? '载入评估回测' : '载入'}</Button>
-        </div>
-        <div className='research-peak-metrics'>
-          <span><small>中心 R</small><strong>{percent(region.center_excess_return, 4)}</strong></span>
-          <span><small>邻域均值</small><strong>{percent(region.mean_excess_return, 4)}</strong></span>
-          <span><small>下行风险</small><strong>{percent(region.downside_risk_tau, 4)}</strong></span>
-          <span><small>持仓惩罚</small><strong>{percent(region.pos_penalty, 4)}</strong></span>
-        </div>
-        <div className='research-peak-status'>
-          <Badge tone={region.score_complete === true ? 'green' : 'amber'}>{region.score_complete === true ? '评分完整' : '评分不完整'}</Badge>
-          <Badge tone={region.local_peak_verified === true ? 'green' : 'amber'}>{region.local_peak_verified === true ? '峰值已核验' : '峰值未闭合'}</Badge>
-          <Badge tone={region.global_exhaustive === true ? 'blue' : 'neutral'}>{region.global_exhaustive === true ? '全局穷尽' : '预算搜索'}</Badge>
-          <span>平台 {region.platform_size ?? '—'} 点</span>
-          <span>压力 {stressLabel(region.stress)}</span>
-        </div>
-        <details className='research-peak-details'>
-          <summary>持仓、成交与平台诊断</summary>
-          <div className='research-peak-detail-grid'>
-            <span><small>超正方体边长</small><strong>{valueText('超正方体边长', region.edge_length)}</strong></span>
-            <span><small>组合数</small><strong>{valueText('组合数', region.completed_count)} / {valueText('组合数', region.combination_count)}</strong></span>
-            <span><small>最低超额</small><strong>{percent(region.min_excess_return, 4)}</strong></span>
-            <span><small>持仓范围</small><strong>{minPosition} – {maxPosition}</strong></span>
-            <span><small>邻域最差上限</small><strong>{finite(region.neighborhood_max_eta) ? n(region.neighborhood_max_eta).toFixed(3) : '—'}</strong></span>
-            <span><small>正收益 / 安全垫</small><strong>{percent(region.pos_win_rate)} / {percent(region.safe_win_rate)}</strong></span>
-            <span><small>库存 / T+1</small><strong>{region.stockout_count ?? '—'} / {region.tplus1_block_count ?? '—'}</strong></span>
-            <span><small>最低持股</small><strong>{valueText('min_shares', region.center_params?.min_shares)}</strong></span>
-            <span><small>初始持股</small><strong>{valueText('initial_shares', region.center_params?.initial_shares)}</strong></span>
-            <span><small>最高持股</small><strong>{valueText('max_shares', region.center_params?.max_shares)}</strong></span>
-          </div>
-        </details>
-      </article>
-    })}
-  </div>
-}
-
-function ResultCurve({ run }: { run?: TestRun }) {
-  if (!run) return <Empty title='暂无样本外结果' detail='当前方案没有可绘制的连续样本外回测。' />
-  const curveReady = Array.isArray(run.strategies?.grid?.equity) && run.strategies.grid.equity.length > 0
-  return <>
-    {curveReady ? <EquityCurve result={run as BacktestResult} height={350} /> : <Empty title='样本外曲线暂不可用' detail='本次结果未包含标准回测权益序列。' />}
-    <StrategyComparison run={run} />
-  </>
-}
-
 function constraintLabel(value: boolean | undefined) {
   return value === true ? '满足约束' : value === false ? '未满足约束' : '未提供约束状态'
 }
@@ -410,7 +305,6 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const [searchPreview, setSearchPreview] = useState<Dict | null>(null)
   const [error, setError] = useState('')
   const [dataIssue, setDataIssue] = useState<DataPreparationRequest | null>(null)
-  const [curveMode, setCurveMode] = useState<'fixed' | 'adaptive'>('fixed')
   const jobRequests = useRef(new Map<string, Promise<Job>>())
   const resultRequests = useRef(new Map<string, Promise<OptimizationResult>>())
   const err = useErrorMessage()
@@ -469,10 +363,6 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
       .finally(() => { if (active) setResultLoading(false) })
     return () => { active = false }
   }, [selectedResultKey, selectedJobId, err])
-
-  useEffect(() => {
-    if (result) setCurveMode(runOf(result.fixed?.test_result) ? 'fixed' : 'adaptive')
-  }, [result])
 
   const updateRange = (name: string, key: keyof Range, shown: number) => {
     updateSettings({ ranges: { ...settings.ranges, [name]: { ...settings.ranges[name], [key]: shown } } })
@@ -650,7 +540,6 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     ? current?.recommended_params ?? (explicitlyUnqualified ? undefined : current?.params ?? undefined)
     : current?.params
   const relativeBest = current?.diagnostic_params ?? (currentRecommended ? undefined : current?.params ?? undefined)
-  const adaptiveRecommended = adaptive?.latest_params
   const fixedRun = runOf(fixed?.test_result)
   const adaptiveRun = runOf(adaptive?.test_result)
   const protocolTrain = record(protocol.training) ?? record(protocol.train) ?? {}
@@ -676,8 +565,6 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const finalPeriodComplete = Boolean(finalCheck && finalCheck.short_term_insufficient !== true && (finalDays == null || finalDays >= finalRequiredDays))
   const finalEvidenceLabel = !finalPeriodComplete ? '样本不足' : finalReview.state === 'positive' ? '校正下界为正' : finalReview.state === 'not_positive' ? '尚无校正后正向证据' : '统计证据不足'
   const currentRecommendationStatus = String(current?.recommendation_status ?? (currentRecommended ? 'qualified' : 'no_qualified'))
-  const adaptiveAdviceDiffers = Boolean(adaptiveRecommended && (!currentRecommended || JSON.stringify(adaptiveRecommended) !== JSON.stringify(currentRecommended) || adaptive?.latest_as_of !== current?.as_of))
-  const curveRun = curveMode === 'fixed' ? fixedRun : adaptiveRun
   const rangeNamesToShow = protocolVersion === 4
     ? (strategyVersion === 4 ? [...robustResearchFieldNames] : v4ResearchFieldNames.filter(name => !(name === 'max_shares' && maxSharesMode === 'unlimited')))
     : (['buy_step', 'sell_step', 'buy_shares', 'sell_shares', 'initial_shares', 'min_shares', 'max_shares'] as string[]).filter(name => (protocolVersion === 1 || name !== 'initial_shares') && !(protocolVersion === 3 && base.max_shares === null && name === 'max_shares'))
@@ -813,11 +700,11 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
             </div>
             <p className='field-hint'>候选的相对排名与约束是否满足会分别展示。</p>
           </Disclosure>
-          <Disclosure id='research-reproducibility' title='换参、统计与复现设置' summary={(protocolVersion >= 2 ? rebalanceDays + ' 日换参 · Bootstrap ' + bootstrapReps.toLocaleString() + ' · ' : '') + '种子 ' + seed + ' · 展示 ' + topCandidates + ' 组'}>
+          <Disclosure id='research-reproducibility' title='换参、统计与复现设置' summary={(protocolVersion >= 2 ? rebalanceDays + ' 日换参 · Bootstrap ' + bootstrapReps.toLocaleString() + ' · ' : '') + '种子 ' + seed + (strategyVersion === 4 ? ' · 推荐 ' + recommendationCount : ' · 展示 ' + topCandidates) + ' 组'}>
             <div className='form-grid two'>
               {protocolVersion >= 2 && <><NumField label='自适应换参周期（交易日）' min={1} max={504} step='1' value={rebalanceDays} onChange={next => next != null && updateSettings({ rebalance_days: next })} /><NumField label='Bootstrap 重抽样次数' min={100} max={100000} step='100' value={bootstrapReps} onChange={next => next != null && updateSettings({ bootstrap_reps: next })} /></>}
               <NumField label='随机种子' step='1' value={seed} onChange={next => next != null && updateSettings({ seed: next })} />
-              <NumField label='结果候选展示上限' min={1} max={100} step='1' value={topCandidates} onChange={next => next != null && updateSettings({ top_candidates: next })} hint='只限制页面展示数量，不截断研究验证。' />
+              {strategyVersion !== 4 && <NumField label='结果候选展示上限' min={1} max={100} step='1' value={topCandidates} onChange={next => next != null && updateSettings({ top_candidates: next })} hint='只限制页面展示数量，不截断研究验证。' />}
             </div>
           </Disclosure>
           <Disclosure id='research-legacy-protocol' title='研究协议与旧版兼容' summary={protocolVersion === 4 ? '等比网格 v4 · 超正方体平均超额' : protocolVersion === 3 ? '统计驱动研究 v3' : protocolVersion === 2 ? '科学研究 v2' : '旧版 v1 · ' + jobModeLabel(mode)}>
@@ -842,7 +729,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
             {isDemoResearch && <div className='demo-callout'>此研究使用演示行情生成，不能代表真实历史数据或投资结论。</div>}
             {isV2Result && <div className='research-summary-states'>
               <div><small>训练时段</small><Badge tone={insufficientHistory ? 'amber' : finite(trainingDays) && trainingDays >= trainingMinimum ? 'green' : 'neutral'}>{finite(trainingDays) ? trainingDays + (isHypercubeResult || isRobustResult ? ' 个交易日（训练窗口）' : ' / 504 个交易日') : insufficientHistory ? '历史不足' : (isHypercubeResult || isRobustResult ? '评估日前训练窗口' : '前置 504 个交易日')}</Badge></div>
-              <div><small>当前推荐状态</small><Badge tone={currentRecommendationStatus === 'qualified' ? 'green' : 'amber'}>{currentRecommendationStatus === 'qualified' ? (Number(actualVersion) === 4 ? isRobustResult ? '稳健 J 峰区已核验' : isHypercubeResult ? '超正方体平均超额已验证' : isConnectedResult ? (current?.diagnostics?.status === 'partial' ? '完整域已推荐 · 仍有未闭合域' : '正收益域边界已闭合') : '完整正邻域已验证' : '已通过稳健性门槛') : '暂无合格推荐'}</Badge></div>
+              <div><small>当前推荐状态</small><Badge tone={currentRecommendationStatus === 'qualified' ? 'green' : 'amber'}>{isRobustResult ? '按 J 排名推荐参数' : currentRecommendationStatus === 'qualified' ? (Number(actualVersion) === 4 ? isHypercubeResult ? '超正方体平均超额已验证' : isConnectedResult ? (current?.diagnostics?.status === 'partial' ? '完整域已推荐 · 仍有未闭合域' : '正收益域边界已闭合') : '完整正邻域已验证' : '已通过稳健性门槛') : '暂无合格推荐'}</Badge></div>
               <div><small>{outerValidationDays} 日样本外证据</small><Badge tone={finalPeriodComplete && finalReview.state === 'positive' ? 'blue' : 'amber'}>{finalEvidenceLabel}</Badge></div>
             </div>}
             {insufficientHistory && <p className='inline-warning'>可用训练历史不足。返回参数仅代表当前候选中的相对最佳选择，样本与证据不足会分别标记。</p>}
@@ -851,15 +738,10 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
           </Card>
           {isConnectedResult && selectedJob?.result_id && <ConnectedRegionResults resultId={selectedJob.result_id} decisionOptions={landscapeDecisions} onLoad={loadV2} />}
           {isConnectedResult && selectedJob?.result_id && <Disclosure id='connected-training-landscape' title='训练搜索候选分布' summary='训练指标与完整参数域分别查看'><ResearchLandscape key={`connected-${selectedJob.result_id}`} resultId={selectedJob.result_id} decisionOptions={landscapeDecisions} trainingOnly /></Disclosure>}
-          {Number(actualVersion) >= 3 && !isConnectedResult && selectedJob?.result_id && <ResearchLandscape key={selectedJob.result_id} resultId={selectedJob.result_id} defaultParams={relativeBest} decisionOptions={landscapeDecisions} qualified={Boolean(currentRecommended)} validationLabel={isRobustResult ? '训练时段（稳健 J）' : isHypercubeResult ? '训练时段（超正方体）' : '内部验证'} defaultSample={isRobustResult || isHypercubeResult ? 'training' : 'validation'} allowValidation={!isRobustResult && !isHypercubeResult} scoreKind={isRobustResult ? 'robust_j' : isHypercubeResult ? 'hypercube' : 'legacy'} regionOptions={(current?.recommendation_regions ?? []).map(region => ({ value: String(region.region_id ?? ''), label: isRobustResult ? '稳健峰区 ' + String(region.region_id ?? '') : isHypercubeResult ? '超正方体 ' + String(region.region_id ?? '') : '区域 ' + String(region.region_id ?? '') }))} />}
+          {Number(actualVersion) >= 3 && !isConnectedResult && selectedJob?.result_id && <ResearchLandscape key={selectedJob.result_id} resultId={selectedJob.result_id} defaultParams={relativeBest} onLoad={(params, asOf) => loadV2(params, asOf ?? current?.as_of, Number(actualVersion) === 4 ? regionDateRange : undefined)} decisionOptions={landscapeDecisions} qualified={Boolean(currentRecommended)} validationLabel={isRobustResult ? '训练时段（稳健 J）' : isHypercubeResult ? '训练时段（超正方体）' : '内部验证'} defaultSample={isRobustResult || isHypercubeResult ? 'training' : 'validation'} allowValidation={!isRobustResult && !isHypercubeResult} scoreKind={isRobustResult ? 'robust_j' : isHypercubeResult ? 'hypercube' : 'legacy'} regionOptions={(current?.recommendation_regions ?? []).map(region => ({ value: String(region.region_id ?? ''), label: isRobustResult ? '稳健峰区 ' + String(region.region_id ?? '') : isHypercubeResult ? '超正方体 ' + String(region.region_id ?? '') : '区域 ' + String(region.region_id ?? '') }))} />}
           {isHypercubeResult && current && <Card title='超正方体平均超额收益' subtitle='训练时段内按固定研究刻度边长展开；平均超额是超正方体全部合法组合的均值，不再要求每点为正。'>
             <p className='field-hint'>训练时段：{firstString(historicalTrainingWindow, ['start']) ?? trainStart ?? '—'} 至 {firstString(historicalTrainingWindow, ['end']) ?? trainEnd ?? '—'}；边长 {valueText('超正方体边长', current.diagnostics?.hypercube_edge)} 个研究刻度{historicalTrainingWindow?.fallback ? `；未找到同价日，按 ${String(historicalTrainingWindow?.max_offset_trading_days ?? historicalTrainingMaxDays)} 日回退` : '；起点为同价日（最低价 < 基准价 < 最高价）'}。{regionValidation.kind === 'fresh' ? '载入按钮使用评估区间。' : ''}</p>
             {(current.recommendation_regions ?? []).length === 0 ? <p className='inline-warning'>本次没有形成可评价的完整超正方体，正式推荐为空。</p> : <div className='table-wrap'><table><thead><tr><th>排名</th><th>中心参数</th><th>边长</th><th>组合数</th><th>平均超额</th><th>最低超额</th><th>中心超额</th><th>状态</th><th>压力诊断</th><th></th></tr></thead><tbody>{(current.recommendation_regions ?? []).map((region, index) => <tr key={region.region_id ?? index}><td>{region.region_id ?? index + 1}</td><td><ParameterBadges params={region.center_params ?? {}} compact /></td><td>{valueText('超正方体边长', region.edge_length)}</td><td>{valueText('组合数', region.completed_count)} / {valueText('组合数', region.combination_count)}</td><td>{percent(n(region.mean_excess_return), 4)}</td><td>{percent(n(region.min_excess_return), 4)}</td><td>{percent(n(region.center_excess_return), 4)}</td><td>{region.complete ? '完整超正方体' : '未完成'}{region.global_exhaustive ? ' · 全局穷尽' : ' · 训练采样'}</td><td>{String(region.stress?.status ?? '未计算')}{region.stress?.mean_excess_return != null ? ' · 均值 ' + percent(n(region.stress.mean_excess_return), 2) : ''}</td><td><Button variant='quiet' onClick={() => loadV2(region.center_params, current.as_of, regionDateRange)}>{regionDateRange ? '载入评估回测' : '载入'}</Button></td></tr>)}</tbody></table></div>}
-          </Card>}
-          {isRobustResult && current && <Card title='四维稳健 J 峰区' subtitle='J = αR + (1−α)μΩ − βσ⁻Ω − Cpos；峰值按合格中心上的完整一格联合邻域判断，原始收益峰只作诊断。'>
-            <p className='field-hint'>训练时段：{firstString(historicalTrainingWindow, ['start']) ?? trainStart ?? '—'} 至 {firstString(historicalTrainingWindow, ['end']) ?? trainEnd ?? '—'}；搜索 {String(current.diagnostics?.search_method ?? '—')}。峰区按 J 排序，中心 R、邻域均值与下行风险均为训练期指标。</p>
-            <RobustPeakRegions current={current} dateRange={regionDateRange} onLoad={loadV2} />
-            <p className='field-hint'>推荐中的最小／最大持仓是训练期实际观察范围，不自动成为实盘护栏；加载回测继续使用自然持仓，用户加入限制后形成新的回放配置。</p>
           </Card>}
           {Number(actualVersion) === 4 && actualStrategyVersion === 1 && current && <Card title='旧版最大正超额收益矩形邻域' subtitle='邻域内全部合法离散组合必须在原成本下超额收益为正；双倍成本只作诊断。'>
             {regionValidation.kind === 'fresh' && <p className='field-hint'>验证首日按初始配置重置账户，之后在验证窗口连续运行；收益按验证期间峰值投入本金计算。载入区域使用 {regionValidation.kind === 'fresh' ? regionValidation.dateRange.start_date : ''} 至 {regionValidation.kind === 'fresh' ? regionValidation.dateRange.end_date : ''}。平均超额是区域均值，中心超额对应中心参数。</p>}
@@ -883,29 +765,6 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
                 {adaptive && <tr><td><strong>自适应参数</strong><small>每 {valueText('rebalance_days', protocol.rebalance_days ?? resultConfig?.rebalance_days ?? rebalanceDays)} 个交易日重选</small></td><td>账户连续运行，{adaptive.schedule?.length ?? 0} 次参数生效<small>各期参数见下方换参记录</small></td><td>{adaptiveRun?.strategies?.grid?.metrics?.total_return == null ? '—' : percent(n(adaptiveRun.strategies.grid.metrics.total_return))}</td><td>{adaptiveRun?.strategies?.grid?.metrics?.max_drawdown == null ? '—' : percent(n(adaptiveRun.strategies.grid.metrics.max_drawdown))}</td><td><Badge tone={adaptive.status === 'insufficient_history' ? 'amber' : 'neutral'}>{statusText(adaptive.status)}</Badge><small>约束按决策点分别判断</small></td></tr>}
               </tbody></table></div>
               <div className='research-locked-funding'>{Number(actualVersion) >= 3 ? <><span>初始持股 <strong>{valueText('initial_shares', lockedFunding.initial_shares ?? originalBase?.initial_shares)}</strong></span><span>资金模式 <strong>成功买入时补足差额</strong></span></> : <><span>固定初始持股 <strong>{valueText('initial_shares', lockedFunding.initial_shares ?? originalBase?.initial_shares)}</strong></span><span>固定现金 <strong>{valueText('reserve_cash', lockedFunding.reserve_cash ?? originalBase?.reserve_cash)}</strong></span></>}</div>
-            </Card>
-            {!isConnectedResult && (current || adaptiveRecommended) && <Card title='下一期参考参数' className='research-recommendations' subtitle={isHypercubeResult ? '参数只使用当时或之前可用的训练时段；平均超额为正且中心满足约束才列为合格推荐，相对最佳仅作研究对照。' : '参数只使用当时或之前可用的数据；通过邻域稳健性检查才列为合格推荐，相对最佳仅作研究对照。'}>
-              {current && <section className='research-next-period'>
-                <div className='research-recommendation-head'><div><strong>{currentRecommended ? '当前合格推荐' : relativeBest ? '相对最佳参数 · 仅诊断' : '暂无合格推荐'}</strong><small>决策日期 {current.as_of ?? '—'} · {statusText(current.status)}</small></div><Button variant='secondary' onClick={() => loadV2(currentRecommended ?? relativeBest, current.as_of, Number(actualVersion) === 4 ? regionDateRange : undefined)} disabled={!(currentRecommended ?? relativeBest) || !originalBase}>{currentRecommended ? Number(actualVersion) === 4 && regionDateRange ? '载入验证回测' : '载入当前参数' : '载入相对最佳'}</Button></div>
-                {currentRecommended ? <ParameterBadges params={currentRecommended} /> : relativeBest ? <>
-                  <ParameterBadges params={relativeBest} />
-                  <div className='research-relative-best-note'><Badge tone='amber'>未通过资格验证</Badge><span>当前筛选下验证超额收益 {current.score == null ? '—' : percent(n(current.score))}</span></div>
-                  <p className='inline-warning'>{Number(actualVersion) === 4 ? (isHypercubeResult ? '全量候选中存在收益更高的单点，但超正方体平均超额未为正或中心未满足约束。上方为相对最佳单点，不能替代合格推荐。' : '全量候选中存在收益更高的单点，但没有形成 J 为正、约束合格且完成峰值核验的局部峰区。上方为相对最佳单点，不能替代合格推荐。') : '没有参数同时通过双成本、80% 正超额邻点和邻域第 25 百分位门槛。上方为相对最佳单点，仅作研究对照。'}</p>
-                </> : <p className='inline-warning'>{Number(actualVersion) === 4 ? (isHypercubeResult ? '训练时段内没有形成平均超额为正且中心满足约束的完整超正方体。' : '冻结参数域内没有发现 J 为正、约束合格且完成峰值核验的局部峰区，本次也没有可用的相对最佳单点。') : '没有参数同时通过双成本、80% 正超额邻点和邻域第 25 百分位门槛。'}</p>}
-                <Assessment recommendation={current} familyEvidence={currentFamilyBootstrap} />
-              </section>}
-              {adaptiveAdviceDiffers && <section className='research-next-period'>
-                <div className='research-recommendation-head'><div><strong>自适应参数最新建议</strong><small>决策日期 {adaptive?.latest_as_of ?? current?.as_of ?? '—'}</small></div><Button variant='secondary' onClick={() => loadV2(adaptiveRecommended ?? undefined, adaptive?.latest_as_of ?? current?.as_of ?? adaptive?.schedule?.at(-1)?.decision_date)} disabled={!adaptiveRecommended || !originalBase}>载入最新建议</Button></div>
-                {adaptiveRecommended ? <ParameterBadges params={adaptiveRecommended} /> : <p className='inline-warning'>本期没有合格推荐，自适应网格保持暂停。</p>}
-              </section>}
-              {adaptiveRecommended && !adaptiveAdviceDiffers && <p className='field-hint'>自适应参数最新建议与当前参数相同。</p>}
-            </Card>}
-            <Card title='真实样本外曲线' subtitle='只绘制本次评估区间的连续回测；期末最新建议不并入曲线。'>
-              <div className='research-curve-tabs' role='tablist' aria-label='样本外曲线方案'>
-                <button type='button' role='tab' aria-selected={curveMode === 'fixed'} className={curveMode === 'fixed' ? 'active' : ''} disabled={!fixedRun} onClick={() => setCurveMode('fixed')}>固定参数</button>
-                <button type='button' role='tab' aria-selected={curveMode === 'adaptive'} className={curveMode === 'adaptive' ? 'active' : ''} disabled={!adaptiveRun} onClick={() => setCurveMode('adaptive')}>自适应参数</button>
-              </div>
-              <div role='tabpanel' aria-label={curveMode === 'fixed' ? '固定参数样本外曲线' : '自适应参数样本外曲线'}><ResultCurve run={curveRun} /></div>
             </Card>
             <Disclosure id='research-rebalance-records' title='换参记录与滚动决策' summary={(adaptive?.schedule?.length ?? 0) + ' 次生效 · ' + (result.evidence?.decisions?.length ?? 0) + ' 个决策点'}>
               <p className='field-hint'>决策日表示何时重选参数；生效日表示参数开始作用的日期。各决策只使用当时已知历史。</p>

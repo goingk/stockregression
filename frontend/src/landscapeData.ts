@@ -29,6 +29,16 @@ export type LandscapePoint = {
   safe_win_rate?: number | null
   score_complete?: boolean | null
   score_missing_count?: number | null
+  constraint_eligible?: boolean | null
+  constraint_reasons?: string[]
+  actual_min_pos_ratio?: number | null
+  actual_max_pos_ratio?: number | null
+  neighborhood_max_eta?: number | null
+  stockout_count?: number | null
+  tplus1_block_count?: number | null
+  local_peak_verified?: boolean
+  platform_size?: number | null
+  stress?: { status?: string; mean_excess_return?: number | null }
   island_suspect: boolean
   folds: LandscapeParams[]
 }
@@ -45,6 +55,15 @@ export type LandscapeResponse = {
   sampled: boolean
   sample_strategy: string
   center_count: number
+  j_focus?: LandscapePoint | null
+  j_ranking?: LandscapePoint[]
+  j_candidate_count?: number
+  recommendation_count?: number
+  decision_as_of?: string | null
+  training_start?: string | null
+  training_end?: string | null
+  coverage_status?: string | null
+  focus_completion_error?: string | null
 }
 
 export type LandscapeNeighborhood = {

@@ -3,6 +3,7 @@ import type { EChartsOption } from 'echarts'
 import { get } from './api'
 import ChartView from './ChartView'
 import { Badge, Card, Empty, Field, Loading, SelectInput } from './components'
+import { RobustJRanking, RobustPointSummary } from './RobustJResults'
 import {
   chooseLandscapeAxes,
   formatLandscapeAxis,
@@ -42,7 +43,7 @@ function pointFromEvent(raw: unknown): LandscapePoint | undefined {
   return ((raw as { data?: { item?: LandscapePoint } }).data ?? {}).item
 }
 
-export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, regionOptions = [], qualified = false, trainingOnly = false, defaultSample = trainingOnly ? 'training' : 'validation', allowValidation = !trainingOnly, scoreKind = 'legacy', validationLabel = '内部验证' }: {
+export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, regionOptions = [], qualified = false, trainingOnly = false, defaultSample = trainingOnly ? 'training' : 'validation', allowValidation = !trainingOnly, scoreKind = 'legacy', validationLabel = '内部验证', onLoad }: {
   resultId: string
   defaultParams?: Dict
   decisionOptions: Array<{ value: string; label: string }>
@@ -53,6 +54,7 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
   allowValidation?: boolean
   scoreKind?: 'legacy' | 'hypercube' | 'robust_j'
   validationLabel?: string
+  onLoad?: (params: Dict, asOf?: string) => void
 }) {
   const [decision, setDecision] = useState(decisionOptions[0]?.value ?? 'current')
   const [sample, setSample] = useState<'training' | 'validation'>(allowValidation ? defaultSample : 'training')
@@ -67,6 +69,8 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const activeSample = allowValidation ? sample : 'training'
+  const activeCost = activeSample === 'training' ? 'original' : cost
+  const activeFold = activeSample === 'training' ? 'total' : fold
 
   useEffect(() => {
     setSample(allowValidation ? defaultSample : 'training')
@@ -77,8 +81,8 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
   useEffect(() => {
     let active = true
     setLoading(true); setError('')
-    const query = new URLSearchParams({ decision: decisionKind, decision_index: String(decisionIndex), sample: activeSample, cost, limit: '1000' })
-    if (fold !== 'total') query.set('fold', fold)
+    const query = new URLSearchParams({ decision: decisionKind, decision_index: String(decisionIndex), sample: activeSample, cost: activeCost, limit: '1000' })
+    if (activeFold !== 'total') query.set('fold', activeFold)
     if (region !== 'all') query.set('region_id', region)
     void get<LandscapeResponse>(`/results/${encodeURIComponent(resultId)}/landscape?${query}`)
       .then(value => {
@@ -89,7 +93,7 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
       .catch(cause => { if (active) setError(cause instanceof Error ? cause.message : String(cause)) })
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
-  }, [resultId, decisionKind, decisionIndex, activeSample, cost, fold, region])
+  }, [resultId, decisionKind, decisionIndex, activeSample, activeCost, activeFold, region])
 
   const parameters = data?.parameters ?? []
   const axisSignature = parameters.join('|')
@@ -189,21 +193,27 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
   if (error) return <Empty title='参数收益分布不可用' detail={error} />
   if (!data || !data.points.length) return <Empty title='暂无参数收益分布' detail='本次研究没有可展示的训练或验证候选。' />
 
-  const ranking = (data.top_candidates.length ? data.top_candidates : data.focus ? [data.focus] : []).slice(0, 3)
   const focusValue = data.focus?.excess_return ?? null
   const neighborhood = data.focus_neighborhood
+  const foldCount = Math.max(0, ...data.points.map(point => point.folds.length))
+  const loadPoint = onLoad && !loading ? (params: Dict) => onLoad(params, data.decision_as_of ?? undefined) : undefined
   return <Card
     title={trainingOnly ? '训练候选收益分布' : '参数收益分布'}
     subtitle={trainingOnly
       ? '训练搜索候选仅用于发现入口；正式参数域与两个代表点以内部验证结果为准。'
       : scoreKind === 'robust_j'
-        ? '当前显示训练样本；稳健 J 的资格看 J、中心约束和峰值核验，正式推荐见峰区表。'
+        ? '同时比较超额收益最高点与 J 最高点；按完整 J 评分推荐参数，约束状态单独展示。'
         : scoreKind === 'hypercube'
           ? '当前显示训练样本；超正方体按邻域平均超额评分，不要求每个邻点为正。'
           : '先看相对最佳参数，再用二维切片判断它周围是否稳定。横纵轴以外的参数固定为相对最佳单点。'}
     action={<Badge tone='blue'>{loading ? '读取中…' : `${data.total.toLocaleString()} 个候选 · 当前切片 ${slice.length.toLocaleString()}`}</Badge>}
   >
-    {data.focus && !trainingOnly && <div className={`research-landscape-focus ${qualified ? 'verified' : 'diagnostic'}`}>
+    {scoreKind === 'robust_j' && <div className='research-representatives'>
+      <RobustPointSummary point={data.focus} kind='excess' onLoad={loadPoint} />
+      <RobustPointSummary point={data.j_focus ?? null} kind='j' onLoad={loadPoint} />
+    </div>}
+    {scoreKind === 'robust_j' && data.focus_completion_error && <p className='inline-warning'>{data.focus_completion_error}</p>}
+    {scoreKind !== 'robust_j' && data.focus && !trainingOnly && <div className={`research-landscape-focus ${qualified ? 'verified' : 'diagnostic'}`}>
       <div className='research-landscape-focus-copy'>
         <small>{scoreKind === 'legacy' ? (qualified ? '全量候选中的相对最佳单点' : '相对最佳单点 · 仅作研究对照') : '当前样本中的相对最佳单点'}</small>
         <strong>相对全仓超额 {ratio(focusValue)}</strong>
@@ -234,19 +244,6 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
       </div>
     )}
 
-    {scoreKind === 'robust_j' && data.focus && <div className='research-neighborhood-check passed'>
-      <div><strong>稳健 J 邻域（训练样本）</strong><span>四维一格联合邻域；邻点不需要全部为正。</span></div>
-      <div className='research-neighborhood-stats'>
-        <span><small>J</small><strong>{ratio(data.focus.j_score)}</strong></span>
-        <span><small>中心超额</small><strong>{ratio(data.focus.excess_return)}</strong></span>
-        <span><small>邻域均值</small><strong>{ratio(data.focus.neighborhood_mean)}</strong></span>
-        <span><small>正收益占比</small><strong>{ratio(data.focus.pos_win_rate ?? data.focus.neighbor_positive_ratio)}</strong></span>
-        <span><small>邻域点数</small><strong>{data.focus.neighborhood_size ?? '—'}</strong></span>
-        <span><small>评分完整</small><strong>{data.focus.score_complete === true ? '是' : data.focus.score_complete === false ? '否' : '—'}</strong></span>
-      </div>
-      <p>推荐资格由 J&gt;0、回撤/成交/持仓约束和局部峰值核验共同决定；邻点负收益会降低 J，不会直接取消资格。</p>
-    </div>}
-
     {scoreKind === 'hypercube' && data.focus && <div className='research-neighborhood-check passed'>
       <div><strong>超正方体平均超额</strong><span>训练样本内按固定边长计算邻域均值。</span></div>
       <div className='research-neighborhood-stats'>
@@ -264,12 +261,12 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
     </div>
 
     <div className='form-grid four research-landscape-controls'>
-      <Field label='研究决策'><SelectInput value={decision} onChange={event => setDecision(event.target.value)}>{decisionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>
-      <Field label='样本用途'><SelectInput value={activeSample} disabled={!allowValidation} onChange={event => setSample(event.target.value as 'training' | 'validation')}>{allowValidation && <option value='validation'>{validationLabel}</option>}<option value='training'>训练搜索</option></SelectInput></Field>
-      <Field label='成本情景'><SelectInput value={cost} onChange={event => setCost(event.target.value as 'original' | 'stress')}><option value='original'>原始成本</option><option value='stress'>双倍压力</option></SelectInput></Field>
-      <Field label='验证窗口'><SelectInput value={fold} onChange={event => setFold(event.target.value)} disabled={activeSample === 'training'}><option value='total'>整个验证段</option>{[0, 1, 2, 3].map(index => <option key={index} value={index}>窗口 {index + 1}</option>)}</SelectInput></Field>
+      {decisionOptions.length > 1 && <Field label='研究决策'><SelectInput value={decision} onChange={event => setDecision(event.target.value)}>{decisionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>}
+      {allowValidation && <Field label='样本用途'><SelectInput value={activeSample} onChange={event => setSample(event.target.value as 'training' | 'validation')}><option value='validation'>{validationLabel}</option><option value='training'>训练搜索</option></SelectInput></Field>}
+      {activeSample === 'validation' && <Field label='成本情景'><SelectInput value={cost} onChange={event => setCost(event.target.value as 'original' | 'stress')}><option value='original'>原始成本</option><option value='stress'>双倍压力</option></SelectInput></Field>}
+      {activeSample === 'validation' && foldCount > 1 && <Field label='验证窗口'><SelectInput value={fold} onChange={event => setFold(event.target.value)}><option value='total'>整个验证段</option>{Array.from({ length: foldCount }, (_, index) => <option key={index} value={index}>窗口 {index + 1}</option>)}</SelectInput></Field>}
       <Field label='着色指标'><SelectInput value={metric} onChange={event => setMetric(event.target.value as 'excess' | 'grid')}><option value='excess'>相对全仓超额</option><option value='grid'>网格收益</option></SelectInput></Field>
-      {regionOptions.length > 1 && <Field label='推荐区域'><SelectInput value={region} onChange={event => setRegion(event.target.value)}><option value='all'>全部候选</option>{regionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>}
+      {scoreKind === 'legacy' && regionOptions.length > 1 && <Field label='推荐区域'><SelectInput value={region} onChange={event => setRegion(event.target.value)}><option value='all'>全部候选</option>{regionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>}
       <Field label='横轴参数'><SelectInput value={xName} onChange={event => {
         const next = event.target.value
         if (next === yName) setYName(xName)
@@ -293,21 +290,7 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
 
     <p className='field-hint'>当前切片固定于 {fixedNames.filter(name => center[name] != null).map(name => `${landscapeLabels[name] ?? name}=${formatLandscapeParameter(name, center[name])}`).join('，') || '相对最佳单点的其余参数'}。</p>
 
-    <section className='research-candidate-ranking'>
-      <div className='research-candidate-ranking-head'>
-        <div><strong>全量候选排名</strong><small>按当前筛选的相对全仓超额排序，只显示前 {ranking.length} 名</small></div>
-        <span>相对最佳 #{data.focus?.candidate_id ?? '—'}</span>
-      </div>
-      {ranking.length ? <div className='table-wrap'><table><thead><tr><th>排名</th><th>收益</th><th>参数</th><th>状态</th></tr></thead><tbody>{ranking.map(candidate => {
-        const candidateValue = candidate.excess_return
-        return <tr key={candidate.candidate_id} className={candidate.is_focus ? 'focus-row' : ''}>
-          <td>{candidate.rank ?? (candidate.is_focus ? 1 : '—')}</td>
-          <td><strong>{ratio(candidateValue)}</strong></td>
-          <td><div className='research-inline-params'>{Object.entries(candidate.params).filter(([name, value]) => name !== 'initial_shares' && value != null).map(([name, value]) => <span key={name}>{landscapeLabels[name] ?? name} {formatLandscapeParameter(name, value)}</span>)}</div></td>
-          <td><button type='button' className='text-link' onClick={() => setSelected(candidate)}>{candidate.is_focus ? '相对最佳 · 查看' : candidate.is_center ? '推荐中心 · 查看' : '查看'}</button></td>
-        </tr>
-      })}</tbody></table></div> : <Empty title='没有可排名的候选' />}
-    </section>
+    {scoreKind === 'robust_j' && <RobustJRanking points={data.j_ranking ?? []} total={data.j_candidate_count ?? 0} count={data.recommendation_count ?? 10} coverage={data.coverage_status} onLoad={loadPoint} />}
 
     {selected && <section className='research-selected-candidate'>
       <div className='research-selected-head'>

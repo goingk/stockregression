@@ -159,7 +159,7 @@ class EvaluationSession:
         self.attempts = 0
         self.requested = 0
         self.failures = 0
-        self.spent = {"training": 0, "validation": 0}
+        self.spent = {"training": 0, "validation": 0, "reporting": 0}
         self.scores: dict[tuple[int, ...], RobustScore | None] = {}
 
     def ensure(self, coordinates: Iterable[tuple[int, ...]], phase: str, cap: int) -> int:
@@ -212,6 +212,81 @@ def _score_sort(score: RobustScore, coordinate: tuple[int, ...]) -> tuple:
         float(score.downside_risk), float(score.position_penalty),
         -float(score.center_return), coordinate,
     )
+
+
+def _complete_return_leader(session: EvaluationSession) -> set[tuple[int, ...]]:
+    attempted: set[tuple[int, ...]] = set()
+    while True:
+        available = (coordinate for coordinate, row in session.rows.items() if completed(row))
+        leader = min(available, key=lambda coordinate: (-float(session.rows[coordinate]["training_excess_return"]), coordinate), default=None)
+        if leader is None or leader in attempted:
+            return attempted
+        session.score(leader, phase="reporting", cap=session.space.size())
+        attempted.add(leader)
+
+
+def _complete_reporting_scores(session: EvaluationSession) -> None:
+    """Complete the final return leader and enough centres for the J ranking.
+
+    Reporting support is charged separately from search/peak verification. A
+    newly evaluated neighbour can become the return leader, so repeat until
+    the leader's real support is present. Failed evaluations remain missing.
+    """
+    target = int(session.config.strategy.recommendation_count)
+    cap = session.space.size()
+    attempted = _complete_return_leader(session)
+    while True:
+        available = sorted(
+            (coordinate for coordinate, row in session.rows.items() if completed(row)),
+            key=lambda coordinate: (-float(session.rows[coordinate]["training_excess_return"]), coordinate),
+        )
+        if not available:
+            break
+        leader = available[0]
+        if leader not in attempted:
+            session.score(leader, phase="reporting", cap=cap)
+            attempted.add(leader)
+            continue
+        for coordinate in session.rows:
+            score = session.scores.get(coordinate)
+            if score is None or not score.complete:
+                session.scores[coordinate] = robust_score(coordinate, session.rows, session.space, session.config.strategy)
+        count = sum(score is not None and score.complete for score in session.scores.values())
+        if count >= min(target, len(available)):
+            break
+        next_center = next((coordinate for coordinate in available if coordinate not in attempted
+                            and not session.scores[coordinate].complete), None)
+        if next_center is None:
+            break
+        session.score(next_center, phase="reporting", cap=cap)
+        attempted.add(next_center)
+
+
+def complete_archived_focus(config: OptimizationConfig, data: DataBundle, archive: list[dict], dates: pd.DatetimeIndex) -> list[dict]:
+    """Return a small overlay for older immutable results missing focus support."""
+    base = _base_natural(config, config.base)
+    config = config.model_copy(update={"base": base})
+    space = ParameterSpace(config, field_order=ROBUST_FIELDS)
+    evaluator = BatchEvaluator(config, base, data, space, dates, dates, validation_folds=[], allow_odd_lot_exit=True)
+    evaluator.retain_daily_returns = False
+    session = EvaluationSession(evaluator, space, config, None)
+    session.rows = {space.coordinate(row["params"]): row for row in archive}
+    original = set(session.rows)
+    complete_count = sum(row.get("score_complete") is True and row.get("j_score") is not None for row in archive)
+    if complete_count >= int(config.strategy.recommendation_count):
+        scored = _complete_return_leader(session)
+    else:
+        _complete_reporting_scores(session)
+        scored = set(session.scores)
+    next_id = max((int(row.get("candidate_id") or 0) for row in archive), default=0)
+    overlay = []
+    for coordinate in sorted((set(session.rows) - original) | scored):
+        row = _public_row(session.rows[coordinate], session.scores.get(coordinate))
+        if coordinate not in original:
+            next_id += 1
+            row["candidate_id"] = next_id
+        overlay.append(row)
+    return overlay
 
 
 def _normalized_distance(space: ParameterSpace, left: tuple[int, ...], right: tuple[int, ...]) -> float:
@@ -601,6 +676,8 @@ def select_robust_at(
             region = _region(space, representative, row, score, analysis, session, region_id)
             region["global_exhaustive"] = method == "exhaustive" and len(session.rows) == total
             regions.append(region)
+        _emit(progress, progress_start + .78 * progress_width, "补齐最高超额收益点邻域与 J 排名")
+        _complete_reporting_scores(session)
         if int(strategy.stress_region_count) > 0 and regions and not (cancelled and cancelled()):
             stress_regions = regions[:int(strategy.stress_region_count)]
             stress_points = sorted({tuple(point) for region in stress_regions for point in region["region_points"]})
@@ -649,7 +726,11 @@ def select_robust_at(
             "neighborhood_volume": minimum_box, "peak_support_volume": min(total, int(math.prod(min(space.dimensions[name].count, edge + 2) for name in space.active)) if space.active else 1),
             "training_budget": int(strategy.training_budget), "neighborhood_budget": int(strategy.validation_budget),
             "training_unique_count": session.spent["training"], "neighborhood_unique_count": session.spent["validation"],
+            "reporting_unique_count": session.spent["reporting"],
             "training_attempt_count": session.attempts, "failed_count": session.failures,
+            "candidate_count": len(session.rows),
+            "generation_evaluation_count": session.spent["training"],
+            "validation_evaluation_count": session.spent["validation"] + session.spent["reporting"],
             "scored_center_count": sum(1 for score in session.scores.values() if score is not None and score.complete),
             "eligible_center_count": len(candidates), "recommendation_count": len(regions),
             "recommendation_status": "qualified" if regions else "no_qualified",
@@ -671,6 +752,7 @@ def select_robust_at(
             } for index, analysis in enumerate(analyses, 1)],
             "computation": {
                 "training_evaluations": session.spent["training"], "neighborhood_evaluations": session.spent["validation"],
+                "reporting_evaluations": session.spent["reporting"],
                 "stress_evaluations": sum(int(region.get("combination_count", 0)) for region in regions[:int(strategy.stress_region_count)]),
                 "cache_hits": max(0, session.requested - session.attempts),
             },
@@ -681,6 +763,7 @@ def select_robust_at(
         record_seconds("robust_j_selection", time.perf_counter() - started_seconds)
         record_count("robust_j_training_points", session.spent["training"])
         record_count("robust_j_neighborhood_points", session.spent["validation"])
+        record_count("robust_j_reporting_points", session.spent["reporting"])
         return {
             "status": "completed", "recommendation_status": "qualified" if regions else "no_qualified",
             "params": selected,

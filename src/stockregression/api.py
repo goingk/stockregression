@@ -8,9 +8,11 @@ import logging
 import math
 import shutil
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from itertools import combinations, product
 from pathlib import Path, PurePosixPath
+from threading import Lock
 
 import pandas as pd
 import numpy as np
@@ -270,7 +272,7 @@ def _landscape_metric(row: dict, sample: str, cost: str, fold: int | None) -> fl
 def _landscape_point(row: dict, sample: str, cost: str, fold: int | None, fallback_id: int | None = None) -> dict:
     folds = row.get("stress_folds" if cost == "stress" else "folds", []) if sample == "validation" else []
     folds = folds if isinstance(folds, list) else []
-    status = row.get("evaluation_status") if sample == "validation" else row.get("status")
+    status = row.get("evaluation_status") if sample == "validation" else row.get("status", row.get("evaluation_status"))
     if sample == "training":
         grid_value, baseline_value = row.get("training_return"), row.get("training_baseline_return")
     elif fold is not None and fold < len(folds) and isinstance(folds[fold], dict):
@@ -287,7 +289,7 @@ def _landscape_point(row: dict, sample: str, cost: str, fold: int | None, fallba
         "excess_return": _landscape_metric(row, sample, cost, fold),
         "grid_return": grid_value, "baseline_return": baseline_value,
         "drawdown": row.get("max_drawdown") if sample == "validation" else row.get("training_drawdown"),
-        "trade_count": row.get("trade_count") if sample == "validation" else row.get("training_trade_count"),
+        "trade_count": row.get("trade_count") if sample == "validation" else row.get("training_trade_count", row.get("trade_count")),
         "peak_invested": row.get("peak_invested"), "folds": folds,
         "neighbor_candidate_ids": row.get("neighbor_candidate_ids", []),
         "neighbor_of_candidate_ids": row.get("neighbor_of_candidate_ids", []),
@@ -312,6 +314,73 @@ def _landscape_point(row: dict, sample: str, cost: str, fold: int | None, fallba
         "stability_margin": row.get("stability_margin"),
         "constraint_eligible": row.get("constraint_eligible"),
         "constraint_reasons": row.get("constraint_reasons", []),
+        **{name: row.get(name) for name in (
+            "actual_min_pos_ratio", "actual_max_pos_ratio", "neighborhood_max_eta",
+            "stockout_count", "tplus1_block_count", "buy_count", "sell_count",
+        )},
+    }
+
+
+def _robust_return_key(row: dict) -> tuple:
+    value = _landscape_metric(row, "training", "original", None)
+    return (-(value if value is not None else -math.inf),
+            _landscape_param_key(row["params"], ["buy_step", "sell_step", "buy_shares", "sell_shares"]))
+
+
+def _robust_landscape_ranking(archive: list[dict], config: dict, selection: dict) -> dict:
+    """Rank complete J scores independently of execution/peak eligibility."""
+    strategy = config.get("strategy", {})
+    count = max(1, min(100, int(strategy.get("recommendation_count", 10))))
+    fields = ["buy_step", "sell_step", "buy_shares", "sell_shares"]
+    regions = {
+        _landscape_param_key(region.get("center_params", {}), fields): region
+        for region in selection.get("recommendation_regions", [])
+    }
+
+    def finite(row, name, fallback=0.0):
+        value = row.get(name)
+        return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else fallback
+
+    ranked = sorted(
+        (row for row in archive if row.get("score_complete") is not False
+         and finite(row, "j_score", None) is not None),
+        key=lambda row: (
+            -finite(row, "j_score"), -finite(row, "neighborhood_mean"),
+            finite(row, "downside_risk_tau"), finite(row, "pos_penalty"),
+            -finite(row, "training_excess_return"),
+            _landscape_param_key(row["params"], fields),
+        ),
+    )
+    points = []
+    for rank, row in enumerate(ranked[:count], 1):
+        point = _landscape_point(row, "training", "original", None)
+        reasons = []
+        if finite(row, "j_score") <= 0:
+            reasons.append("J 未大于 0")
+        if finite(row, "training_drawdown", math.inf) > config.get("max_drawdown", .3):
+            reasons.append("回撤超过约束")
+        if finite(row, "trade_count") < config.get("min_trades", 10):
+            reasons.append("成交笔数不足")
+        if finite(row, "buy_count") <= 0 or finite(row, "sell_count") <= 0:
+            reasons.append("未同时发生买入和卖出")
+        hard_cap = strategy.get("eta_hard_cap", 3.5)
+        if hard_cap is not None and finite(row, "actual_max_pos_ratio", math.inf) > hard_cap:
+            reasons.append("实际持仓超过约束")
+        region = regions.get(_landscape_param_key(row["params"], fields), {})
+        point.update({
+            "rank": rank, "constraint_eligible": not reasons, "constraint_reasons": reasons,
+            "local_peak_verified": region.get("local_peak_verified", False),
+            "platform_size": region.get("platform_size"), "stress": region.get("stress", {}),
+        })
+        points.append(point)
+    diagnostics = selection.get("diagnostics", {})
+    return {
+        "j_focus": points[0] if points else None, "j_ranking": points,
+        "j_candidate_count": len(ranked), "recommendation_count": count,
+        "decision_as_of": selection.get("as_of", selection.get("decision_date")),
+        "training_start": diagnostics.get("training_start"),
+        "training_end": diagnostics.get("training_end"),
+        "coverage_status": diagnostics.get("coverage_status"),
     }
 
 
@@ -676,6 +745,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         package_dir = str(initial_market.repository.package_dir)
     manager = JobManager(root, configured.max_workers, configured.market_data.scheduler_poll_seconds)
     previews = PreviewManager(store)
+    landscape_focus_cache: OrderedDict[tuple, list[dict]] = OrderedDict()
+    landscape_focus_lock = Lock()
     instance_id = uuid.uuid4().hex
 
     @asynccontextmanager
@@ -1480,6 +1551,45 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
                     raise HTTPException(404, "研究决策不存在")
                 archive = archive[decision_index].get("candidate_archive", [])
         archive = [row for row in archive if isinstance(row, dict) and isinstance(row.get("params"), dict)]
+        config = result.get("config", {})
+        robust_j = config.get("strategy", {}).get("strategy_version") == 4 and sample == "training"
+        selection = {}
+        focus_completion_error = None
+        if robust_j and archive:
+            from .research_v4.region_api import decision_context
+            selection = decision_context(result, decision, decision_index)
+            leader = min(archive, key=_robust_return_key)
+            if leader.get("score_complete") is not True and result.get("data_version"):
+                cache_key = (result_id, result["data_version"], decision, decision_index)
+                try:
+                    with landscape_focus_lock:
+                        overlay = landscape_focus_cache.get(cache_key)
+                        if overlay is None:
+                            from .research.robust import complete_archived_focus
+                            parsed = OptimizationConfig.model_validate(config)
+                            diagnostics = selection.get("diagnostics", {})
+                            start = diagnostics.get("training_start")
+                            end = diagnostics.get("training_end")
+                            if not start or not end:
+                                raise ValueError("历史结果缺少原训练时段，无法补算邻域")
+                            prepared = preparation_config(store, parsed.base, result["data_version"], parsed.strategy.training_max_days)
+                            bundle = DataService(store).load_bundle(prepared, result["data_version"])
+                            dates = pd.DatetimeIndex(bundle.calendar)
+                            dates = dates[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))]
+                            if not len(dates):
+                                raise ValueError("原数据版本缺少训练时段行情")
+                            overlay = json_safe(complete_archived_focus(parsed, bundle, archive, dates))
+                            landscape_focus_cache[cache_key] = overlay
+                            if len(landscape_focus_cache) > 8:
+                                landscape_focus_cache.popitem(last=False)
+                        landscape_focus_cache.move_to_end(cache_key)
+                    fields = ["buy_step", "sell_step", "buy_shares", "sell_shares"]
+                    merged = {_landscape_param_key(row["params"], fields): row for row in archive}
+                    merged.update({_landscape_param_key(row["params"], fields): row for row in overlay})
+                    archive = list(merged.values())
+                except Exception as exc:
+                    focus_completion_error = f"最高超额收益点邻域补算失败：{exc}"
+                    logging.getLogger(__name__).warning("%s (%s)", focus_completion_error, result_id)
         if region_id is not None:
             archive = [row for row in archive if region_id in (row.get("region_ids") or [])]
         total_points = len(archive)
@@ -1489,7 +1599,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
                     "limit": limit, "total": total_points, "points": [], "bounds": None,
                     "focus": None, "focus_neighborhood": None, "top_candidates": [], "slices": {},
                     "sampled": False, "center_count": 0}
-        focus_index = max(
+        focus_index = min(range(total_points), key=lambda index: _robust_return_key(archive[index])) if robust_j else max(
             range(total_points),
             key=lambda index: _landscape_rank_key(archive[index], sample, cost, fold, index),
         )
@@ -1499,7 +1609,6 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         else:
             selected_indices = _landscape_sample_indices(total_points, limit, focus_index)
             sampled = len(selected_indices) < total_points
-        config = result.get("config", {})
         ordered_names = [
             "buy_step", "sell_step", "sell_shares", "buy_shares",
             "min_shares", "max_shares", "grid_step",
@@ -1507,6 +1616,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         names = [
             name for name in ordered_names
             if any(row.get("params", {}).get(name) is not None for row in archive)
+            and (not robust_j or name in {"buy_step", "sell_step", "buy_shares", "sell_shares"})
         ]
         points = []
         for index in selected_indices:
@@ -1547,6 +1657,9 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             archive, archive[focus_index].get("params", {}), names, sample, cost, fold,
             fields=neighborhood_fields,
         )
+        ranking = {}
+        if robust_j:
+            ranking = _robust_landscape_ranking(archive, config, selection)
         finite = [float(point["excess_return"]) for point in points if isinstance(point.get("excess_return"), (int, float)) and np.isfinite(float(point["excess_return"]))]
         return {
             "result_id": result_id, "decision": decision, "decision_index": decision_index,
@@ -1559,6 +1672,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             "top_candidates": top_candidates,
             "slices": slices,
             "sampled": sampled, "sample_strategy": "even" if sampled else "page",
+            **ranking,
+            "focus_completion_error": focus_completion_error,
         }
 
     @app.get("/api/v1/results/{result_id}/regions/{region_id}/export")

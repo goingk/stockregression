@@ -75,7 +75,7 @@
 | `research.defaults.search_method` | 枚举 | `auto` | auto/hierarchical/exhaustive；穷举须过预检 | CandidateSearcher | 搜索方法 | 下次研究 | 是 |
 | `research.defaults.training_budget` | 唯一回测点 | `20000` | 1–1,000,000 | EvaluationSession | 训练预算 | 下次研究 | 是 |
 | `research.defaults.validation_budget` | 唯一回测点 | `100000` | 1–2,000,000 | 邻域和峰值核验 | 邻域预算 | 下次研究 | 是 |
-| `research.defaults.recommendation_count` | 整数 / 峰区 | `10` | 1–100 | Top-K 峰区 | 推荐参数个数 | 下次研究 | 是 |
+| `research.defaults.recommendation_count` | 整数 / 组 | `10` | 1–100 | J 排名推荐数量；旧策略为 Top-K 峰区 | 推荐参数个数 | 下次研究 | 是 |
 | `research.defaults.max_shares_mode` | 枚举 | `unlimited` | search/unlimited | 历史适配 | 历史最高持股 | 下次研究 | 历史版本是 |
 | `research.defaults.slippage_mode` | 枚举 | `configured` | configured/zero | 费用与成交 | 滑点处理 | 下次研究 | 是 |
 | `research.defaults.neighborhood_fields` | 轴名数组 | 四轴顺序 | v4 必须恰好四轴 | 契约校验 | 固定轴说明 | 下次研究 | 是 |

@@ -17,6 +17,7 @@ from stockregression.numerics.robust import (
 from stockregression.research import robust as robust_research
 from stockregression.research.robust import (
     EvaluationSession,
+    _complete_reporting_scores,
     _strides,
     estimate_robust_search,
     select_robust_at,
@@ -253,6 +254,46 @@ def test_neighborhood_budget_exhaustion_returns_incomplete_score():
     score = session.score(center, cap=2)
     assert not score.complete
     assert score.missing_count > 0
+
+
+def test_reporting_completes_the_final_return_leader_after_search_budget_is_spent():
+    config = make_config(buy_high=.011, share_high=100, strategy={"recommendation_count": 4})
+    space = ParameterSpace(config)
+
+    class RisingEvaluator(FakeEvaluator):
+        def evaluate_training(self, coordinates):
+            return [row(space, coordinate, coordinate[0] / 100, trades=0, max_pos=4.0) for coordinate in coordinates]
+
+    session = EvaluationSession(RisingEvaluator(space), space, config, None)
+    start = space.full_coordinate((3,))
+    session.ensure([start], "training", 1)
+    # Leave a stale partial score, as can happen before peak verification adds
+    # more raw observations to the shared session.
+    session.score(start, cap=1)
+    spent_before = dict(session.spent)
+    _complete_reporting_scores(session)
+    leader = max(session.rows, key=lambda coordinate: session.rows[coordinate]["training_excess_return"])
+    assert leader[0] == space.dimensions["buy_step"].high
+    score = session.scores[leader]
+    assert score.complete and score.missing_count == 0
+    assert score.neighborhood_mean == pytest.approx(robust_score(leader, session.rows, space, config.strategy).neighborhood_mean)
+    assert sum(score.complete for score in session.scores.values()) >= 4
+    assert session.spent["training"] == spent_before["training"]
+    assert session.spent["validation"] == spent_before["validation"]
+    assert session.spent["reporting"] > 0
+    assert not eligible(session.rows[leader], score, max_drawdown=config.max_drawdown, min_trades=config.min_trades, strategy=config.strategy)
+
+
+def test_reporting_preserves_failed_neighbours_and_does_not_retry_them_forever():
+    config = make_config(buy_high=.003, share_high=100)
+    space = ParameterSpace(config)
+    session = EvaluationSession(FakeEvaluator(space, fail=True), space, config, None)
+    center = space.full_coordinate((2,))
+    session.rows[center] = row(space, center, .1)
+    _complete_reporting_scores(session)
+    assert not session.scores[center].complete
+    assert session.scores[center].missing_count == 2
+    assert session.spent["reporting"] == 2
 
 
 def _long_history_data() -> tuple[DataBundle, pd.Timestamp]:
