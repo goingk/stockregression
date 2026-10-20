@@ -26,8 +26,9 @@ def main() -> None:
     parser.add_argument("--end", default="2026-10-16")
     parser.add_argument("--frequency", choices=("1d", "1m"), default="1d")
     parser.add_argument("--method", choices=("auto", "hierarchical", "exhaustive"), default="exhaustive")
-    parser.add_argument("--ranking", choices=("max_volume", "fixed_mean"), default="max_volume")
-    parser.add_argument("--strategy-version", choices=(1, 2), type=int, default=2)
+    parser.add_argument("--ranking", choices=("max_volume", "fixed_mean"), default="fixed_mean")
+    parser.add_argument("--strategy-version", choices=(1, 2, 3), type=int, default=3)
+    parser.add_argument("--edge", type=int, default=3)
     parser.add_argument("--training-budget", type=int, default=100)
     parser.add_argument("--validation-budget", type=int, default=100)
     parser.add_argument("--bootstrap-reps", type=int, default=100)
@@ -53,13 +54,16 @@ def main() -> None:
         "min_shares": {"low": 0, "high": 0},
         "max_shares": {"low": 2000, "high": 2000},
     }
+    strategy_version = 1 if args.strategy_version == 2 and args.ranking == "fixed_mean" else args.strategy_version
     config = OptimizationConfig.model_validate({
         "base": base.model_dump(mode="python"), "protocol_version": 4,
         "selection_target": "fixed", "ranges": ranges, "bootstrap_reps": args.bootstrap_reps,
         "min_trades": 0, "max_drawdown": .95, "min_minute_ratio": 0,
         "strategy": {
-            "strategy_version": 1 if args.ranking == "fixed_mean" else args.strategy_version,
-            "search_method": args.method, "ranking_mode": args.ranking,
+            "strategy_version": strategy_version,
+            "search_method": args.method,
+            "ranking_mode": "fixed_mean" if strategy_version in (1, 3) else "max_volume",
+            "hypercube_edge": args.edge,
             "training_budget": args.training_budget, "validation_budget": args.validation_budget,
         },
     })
@@ -98,6 +102,7 @@ def main() -> None:
             "regions": [
                 {
                     "region_id": item.get("region_id"), "geometry": item.get("geometry"),
+                    "edge_length": item.get("edge_length"),
                     "share": item.get("normalized_volume"), "points": item.get("combination_count"),
                     "stable_margin": (item.get("stable_point") or {}).get("stability_margin"),
                     "peak_excess_return": (item.get("peak_point") or {}).get("excess_return"),

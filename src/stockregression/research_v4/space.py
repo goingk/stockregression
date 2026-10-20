@@ -7,7 +7,7 @@ from itertools import product
 import math
 from typing import Any, Iterable, Iterator
 
-from ..models import BacktestConfig, OptimizationConfig, SearchRange
+from ..models import GRANULARITY_DEFAULTS, GRANULARITY_MINIMUMS, BacktestConfig, OptimizationConfig, SearchRange
 
 
 FIELDS = ("buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares")
@@ -19,7 +19,12 @@ LABELS = {
     "min_shares": "最低持股",
     "max_shares": "最高持股",
 }
-UNITS = {"buy_step": 0.0001, "sell_step": 0.0001, "sell_shares": 100.0, "buy_shares": 100.0, "min_shares": 500.0, "max_shares": 500.0}
+MIN_UNITS = GRANULARITY_MINIMUMS
+# Backwards-compatible default research granularity.  It is deliberately
+# separate from MIN_UNITS: users may sample holdings every 100 shares even
+# though older v4 studies defaulted to 500-share steps.
+DEFAULT_GRANULARITY = GRANULARITY_DEFAULTS
+UNITS = DEFAULT_GRANULARITY
 
 
 def _strict_tick(value: float, unit: float, name: str) -> int:
@@ -36,6 +41,10 @@ def _strict_tick(value: float, unit: float, name: str) -> int:
 
 def value_to_ticks(name: str, value: float) -> int:
     return _strict_tick(float(value), UNITS[name], name)
+
+
+def minimum_ticks(name: str, value: float) -> int:
+    return _strict_tick(float(value), MIN_UNITS[name], name)
 
 
 def ticks_to_value(name: str, value: int) -> float | int:
@@ -72,6 +81,18 @@ class ParameterSpace:
             raise ValueError("v4 参数研究只支持等比网格")
         self.initial_shares = int(self.base.initial_shares)
         self.strategy = config.strategy
+        self.granularity = {
+            name: float(self.strategy.granularity.get(name, DEFAULT_GRANULARITY[name]))
+            for name in FIELDS
+        }
+        for name, unit in self.granularity.items():
+            minimum = float(MIN_UNITS[name])
+            steps = unit / minimum
+            if unit <= 0 or abs(steps - round(steps)) > 1e-7:
+                raise ValueError(
+                    f"{LABELS[name]}研究细粒度必须是参数最小单位 "
+                    f"{'0.0001' if minimum == 0.0001 else int(minimum)} 的正整数倍"
+                )
         dimensions: dict[str, Dimension] = {}
         unlimited = self.strategy.max_shares_mode == "unlimited"
         for name in FIELDS:
@@ -81,7 +102,12 @@ class ParameterSpace:
             if raw is None:
                 raise ValueError(f"v4 研究缺少 {LABELS[name]} 搜索范围")
             search_range = raw if isinstance(raw, SearchRange) else SearchRange.model_validate(raw)
-            low, high = value_to_ticks(name, search_range.low), value_to_ticks(name, search_range.high)
+            unit = self.granularity[name]
+            low_value, high_value = float(search_range.low), float(search_range.high)
+            self._check_minimum_alignment(name, low_value)
+            self._check_minimum_alignment(name, high_value)
+            low = math.ceil(low_value / unit - 1e-9)
+            high = math.floor(high_value / unit + 1e-9)
             if name in {"buy_step", "sell_step"}:
                 minimum, maximum = 1, 10000
             elif name in ("sell_shares", "buy_shares"):
@@ -92,12 +118,12 @@ class ParameterSpace:
             if low > high:
                 raise ValueError(f"{LABELS[name]}搜索范围无合法值")
             if name == "min_shares":
-                high = min(high, self.initial_shares // int(UNITS[name]))
+                high = min(high, self.initial_shares // int(unit))
             elif name == "max_shares":
-                low = max(low, math.ceil(self.initial_shares / UNITS[name]))
+                low = max(low, math.ceil(self.initial_shares / unit))
             if low > high:
                 raise ValueError(f"{LABELS[name]}与固定初始持股不相容")
-            dimensions[name] = Dimension(name, low, high, UNITS[name])
+            dimensions[name] = Dimension(name, low, high, unit)
         self.dimensions = {name: dimensions[name] for name in FIELDS if name in dimensions}
         self.max_unlimited = unlimited
         self.fixed = {name: dim.low for name, dim in self.dimensions.items() if dim.fixed}
@@ -105,7 +131,10 @@ class ParameterSpace:
         self.fields = tuple(self.dimensions)
         if self.max_unlimited:
             self.fixed["max_shares"] = -1
-        special_buy_min = 2 if self.base.symbol.startswith(("688", "689")) else 1
+        special_buy_min = (
+            math.ceil(200 / self.granularity["buy_shares"])
+            if self.base.symbol.startswith(("688", "689")) else 1
+        )
         if "buy_shares" in self.dimensions:
             dim = self.dimensions["buy_shares"]
             if dim.low < special_buy_min:
@@ -127,7 +156,7 @@ class ParameterSpace:
         for name, tick in self.fixed.items():
             if name == "max_shares" and tick == -1:
                 continue
-            value = ticks_to_value(name, tick)
+            value = self.value(name, tick)
             if name == "min_shares" and int(value) > self.initial_shares:
                 raise ValueError("最低持股高于固定初始持股")
             if name == "max_shares" and int(value) < self.initial_shares:
@@ -137,6 +166,26 @@ class ParameterSpace:
         if "min_shares" in self.dimensions and "max_shares" in self.dimensions:
             if self.dimensions["min_shares"].low > self.dimensions["max_shares"].high:
                 raise ValueError("最低持股范围与最高持股范围没有合法组合")
+
+    def _check_minimum_alignment(self, name: str, value: float) -> None:
+        minimum = float(MIN_UNITS[name])
+        scaled = float(value) / minimum
+        if abs(scaled - round(scaled)) > 1e-7:
+            raise ValueError(
+                f"{LABELS[name]}搜索范围必须以参数最小单位 "
+                f"{'0.0001' if minimum == 0.0001 else int(minimum)} 对齐"
+            )
+
+    def value_to_ticks(self, name: str, value: float) -> int:
+        self._check_minimum_alignment(name, float(value))
+        return _strict_tick(float(value), self.granularity[name], name)
+
+    def value(self, name: str, tick: int) -> float | int:
+        unit = self.granularity[name]
+        return float(tick) * unit if name in {"buy_step", "sell_step"} else int(round(tick * unit))
+
+    def ticks_to_value(self, name: str, tick: int) -> float | int:
+        return self.value(name, tick)
 
     def coords(self, name: str) -> tuple[int, ...]:
         dim = self.dimensions[name]
@@ -162,14 +211,14 @@ class ParameterSpace:
 
     def params(self, coordinate: tuple[int, ...]) -> dict[str, Any]:
         by_name = dict(zip(FIELDS, coordinate))
-        params = {name: ticks_to_value(name, by_name[name]) for name in FIELDS if name in by_name and by_name[name] >= 0}
+        params = {name: self.value(name, by_name[name]) for name in FIELDS if name in by_name and by_name[name] >= 0}
         params["initial_shares"] = self.initial_shares
         if self.max_unlimited:
             params["max_shares"] = None
         return params
 
     def coordinate(self, params: dict[str, Any]) -> tuple[int, ...]:
-        values = {name: value_to_ticks(name, params[name]) for name in FIELDS if name in params and params[name] is not None}
+        values = {name: self.value_to_ticks(name, params[name]) for name in FIELDS if name in params and params[name] is not None}
         if self.max_unlimited:
             values["max_shares"] = -1
         return tuple(values[name] for name in FIELDS)
@@ -181,7 +230,7 @@ class ParameterSpace:
                 return False
         if "min_shares" in vals and "max_shares" in vals and vals["min_shares"] > vals["max_shares"]:
             return False
-        if "min_shares" not in vals and "max_shares" in vals and vals["max_shares"] * UNITS["max_shares"] < self.initial_shares:
+        if "min_shares" not in vals and "max_shares" in vals and int(self.value("max_shares", vals["max_shares"])) < self.initial_shares:
             return False
         return True
 
@@ -253,8 +302,8 @@ class ParameterSpace:
             dim = self.dimensions[name]
             low, high = by_name[name] - radius, by_name[name] + radius
             bounds[name] = {
-                "low": ticks_to_value(name, low) if low >= 0 else None,
-                "high": ticks_to_value(name, high) if high >= 0 else None,
+                "low": self.value(name, low) if low >= 0 else None,
+                "high": self.value(name, high) if high >= 0 else None,
                 "low_ticks": low,
                 "high_ticks": high,
             }
@@ -271,7 +320,7 @@ class ParameterSpace:
             radius = int(radii.get(name, 0))
             if radius <= 0:
                 continue
-            volume *= min(1.0, 2.0 * radius * dim.unit / (dim.width * dim.unit))
+            volume *= min(1.0, 2.0 * radius / max(1, dim.width))
         return float(volume)
 
     def neighbor_offsets(self, diagonal: bool = True, fields: Iterable[str] | None = None) -> Iterator[tuple[int, ...]]:

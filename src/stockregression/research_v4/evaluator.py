@@ -117,10 +117,42 @@ class BatchEvaluator:
                     "training_score": excess,
                     "training_drawdown": float(evidence.get("max_drawdown", math.inf) or math.inf),
                     "training_trade_count": int(evidence.get("trade_count", 0) or 0),
+                    "training_buy_count": int(evidence.get("buy_count", 0) or 0),
+                    "training_sell_count": int(evidence.get("sell_count", 0) or 0),
+                    "max_drawdown": float(evidence.get("max_drawdown", math.inf) or math.inf),
+                    "trade_count": int(evidence.get("trade_count", 0) or 0),
+                    "buy_count": int(evidence.get("buy_count", 0) or 0),
+                    "sell_count": int(evidence.get("sell_count", 0) or 0),
                     "training_folds": [evidence],
                 })
             if self.progress:
                 self.progress((chunk_index + 1) * self.chunk_size / max(1, len(coordinates)), "评估训练参数")
+        return output
+
+    def evaluate_training_stress(self, coordinates: list[tuple[int, ...]]) -> dict[tuple[int, ...], dict[str, Any]]:
+        """Double-cost diagnostic over the single training block."""
+        output: dict[tuple[int, ...], dict[str, Any]] = {}
+        if not len(self.train_dates):
+            return output
+        fold = [(self.train_dates[0].date().isoformat(), self.train_dates[-1].date().isoformat())]
+        for chunk in _chunks(coordinates, self.chunk_size):
+            if self.cancelled and self.cancelled():
+                raise InterruptedError("研究已取消")
+            params = [self.space.params(item) for item in chunk]
+            result = research_batch(
+                self.train_base, self.train_data, params, fold,
+                cost_multiplier=2.0, cancelled=self.cancelled,
+            )
+            for index, coordinate in enumerate(chunk):
+                evidence = result["fold_metrics"][index][0]
+                grid_return = float(result["metrics"][index]["total_return"])
+                excess = grid_return - self._train_baseline if math.isfinite(grid_return) else math.nan
+                output[coordinate] = {
+                    "training_return_stress": grid_return,
+                    "training_excess_stress": excess,
+                    "max_drawdown": float(evidence.get("max_drawdown", math.inf) or math.inf),
+                    "trade_count": int(evidence.get("trade_count", 0) or 0),
+                }
         return output
 
     def _aggregate_validation(

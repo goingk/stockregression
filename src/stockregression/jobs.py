@@ -44,6 +44,11 @@ def _cleanup_uploaded_input(store: Store, job_id: str):
 
 def _research_protocol_hash(config: OptimizationConfig) -> str:
     payload = config.model_dump(mode="json")
+    if config.protocol_version == 4 and config.strategy.strategy_version in (1, 2):
+        legacy_strategy = dict(payload.get("strategy", {}))
+        legacy_strategy.pop("hypercube_edge", None)
+        legacy_strategy.pop("granularity", None)
+        payload["strategy"] = legacy_strategy
     if config.protocol_version == 3:
         payload["protocol_thresholds"] = {
             "positive_neighbor_ratio": 0.8,
@@ -54,8 +59,9 @@ def _research_protocol_hash(config: OptimizationConfig) -> str:
         }
     elif config.protocol_version == 4:
         from .research_v4.space import UNITS
+        strategy_payload = dict(payload.get("strategy", {}))
         payload["protocol_thresholds"] = {
-            "strategy": config.strategy.model_dump(mode="json"),
+            "strategy": strategy_payload,
             "grid_mode": "geometric",
             "spacing_unit": UNITS["buy_step"],
             "units": UNITS,
@@ -71,6 +77,14 @@ def _research_protocol_hash(config: OptimizationConfig) -> str:
                 geometry="connected_lattice", connectivity="axis_one_tick",
                 stability_metric="normalized_euclidean_to_inner_boundary",
                 closure="expand_discovered_components_until_closed", constraints_role="diagnostic_only",
+            )
+        elif config.strategy.strategy_version == 3:
+            payload["protocol_thresholds"].update(
+                geometry="hypercube_mean", connectivity="fixed_edge_cube",
+                hypercube_edge=int(config.strategy.hypercube_edge),
+                granularity=dict(config.strategy.granularity),
+                training_window="farthest_same_price_day_250_500_or_500_fallback",
+                training_only=True, constraints_role="diagnostic_only",
             )
     base = dict(payload.get("base", {}))
     for key in ("symbol", "start_date", "end_date"):
@@ -194,7 +208,7 @@ def execute_job(root: str, job_id: str, observer=None):
             from .optimization import optimize
             config = OptimizationConfig.model_validate(payload["config"])
             scientific = config.protocol_version in (2, 3, 4)
-            progress(0.01, "检查本地行情并准备研究数据" if not scientific else "准备评估区间及前置 504 个交易日")
+            progress(0.01, "检查本地行情并准备研究数据" if not scientific else "准备评估区间及前置训练时段")
             with trace.measure("data_preparation"):
                 if scientific:
                     bundle = prepare_research_bundle(
@@ -203,6 +217,7 @@ def execute_job(root: str, job_id: str, observer=None):
                         payload.get("version"),
                         lambda fraction, message: progress(0.02 + 0.30 * fraction, message),
                         cancelled,
+                        lookback_days=500 if config.protocol_version == 4 else 504,
                     )
                 else:
                     bundle = service.ensure_bundle(config.base, payload.get("version"), lambda fraction, message: progress(0.02 + 0.30 * fraction, message), cancelled)

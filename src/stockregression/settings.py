@@ -9,6 +9,8 @@ from typing import Literal
 from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from .models import GRANULARITY_DEFAULTS, GRANULARITY_MINIMUMS
+
 PROJECT_ROOT = Path(os.environ.get("STOCKREGRESSION_HOME", Path(__file__).resolve().parents[2])).resolve()
 SETTINGS_FILE = PROJECT_ROOT / ".local" / "settings.json"
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
@@ -137,10 +139,12 @@ class ResearchDefaults(_WorkbenchPreference):
     top_candidates: int = Field(default=20, ge=1, le=100)
     max_drawdown: float = Field(default=0.2, gt=0, le=1)
     min_trades: int = Field(default=10, ge=0)
-    min_history_days: int = Field(default=504, ge=20)
+    min_history_days: int = Field(default=250, ge=20)
     min_minute_ratio: float = Field(default=0.95, ge=0, le=1)
-    ranking_mode: Literal["max_volume", "fixed_mean"] = "max_volume"
-    strategy_version: Literal[1, 2] = 2
+    ranking_mode: Literal["max_volume", "fixed_mean"] = "fixed_mean"
+    strategy_version: Literal[1, 2, 3] = 3
+    hypercube_edge: int = Field(default=3, ge=1, le=99)
+    granularity: dict[str, float] = Field(default_factory=lambda: dict(GRANULARITY_DEFAULTS))
     search_method: Literal["auto", "hierarchical", "exhaustive"] = "auto"
     training_budget: int = Field(default=20_000, ge=1, le=1_000_000)
     validation_budget: int = Field(default=100_000, ge=1, le=2_000_000)
@@ -165,7 +169,30 @@ class ResearchDefaults(_WorkbenchPreference):
     def migrate_protocol(cls, values):
         if isinstance(values, dict):
             values = dict(values)
-            values["strategy_version"] = 1 if values.get("ranking_mode") == "fixed_mean" else 2
+            if "strategy_version" not in values:
+                values["strategy_version"] = 1 if values.get("ranking_mode") == "fixed_mean" else 3
+            elif int(values.get("strategy_version")) == 2 and values.get("ranking_mode") == "max_volume":
+                # The connected-component selector is no longer offered for new
+                # studies.  Remembered v4 settings move to the hypercube mode.
+                values["strategy_version"] = 3
+            if int(values.get("strategy_version", 3)) == 3:
+                values["ranking_mode"] = "fixed_mean"
+            elif int(values.get("strategy_version")) == 2:
+                values["ranking_mode"] = "max_volume"
+            if not isinstance(values.get("granularity"), dict):
+                values["granularity"] = dict(GRANULARITY_DEFAULTS)
+            else:
+                saved_granularity = values["granularity"]
+                granularity = {
+                    name: saved_granularity.get(name, default)
+                    for name, default in GRANULARITY_DEFAULTS.items()
+                }
+                for name, value in list(granularity.items()):
+                    minimum = float(GRANULARITY_MINIMUMS[name])
+                    steps = float(value) / minimum
+                    if float(value) <= 0 or abs(steps - round(steps)) > 1e-7:
+                        granularity[name] = GRANULARITY_DEFAULTS[name]
+                values["granularity"] = granularity
             if isinstance(values.get("ranges"), dict):
                 ranges = dict(values["ranges"])
                 legacy = ranges.pop("grid_step", None)
@@ -237,6 +264,19 @@ class ResearchDefaults(_WorkbenchPreference):
             raise ValueError("细搜索邻域至少需要一个可移动参数")
         if len(set(self.neighborhood_fields)) != len(self.neighborhood_fields):
             raise ValueError("细搜索邻域参数不能重复")
+        return self
+
+    @model_validator(mode="after")
+    def valid_hypercube(self):
+        if self.hypercube_edge < 1 or self.hypercube_edge % 2 != 1:
+            raise ValueError("超正方体边长必须为正奇数")
+        if set(self.granularity) != set(GRANULARITY_DEFAULTS):
+            raise ValueError("研究细粒度必须包含全部六个研究参数")
+        for name, value in self.granularity.items():
+            minimum = float(GRANULARITY_MINIMUMS[name])
+            steps = float(value) / minimum
+            if float(value) <= 0 or abs(steps - round(steps)) > 1e-7:
+                raise ValueError("研究细粒度必须是参数最小单位的正整数倍")
         return self
 
 
@@ -313,6 +353,11 @@ def save_settings(values: dict) -> Settings:
                             else:
                                 merged_ranges[name] = range_patch
                         merged_group["ranges"] = merged_ranges
+                    if group == "research" and isinstance(patch.get("granularity"), dict):
+                        merged_group["granularity"] = {
+                            **merged_defaults[group].get("granularity", GRANULARITY_DEFAULTS),
+                            **patch["granularity"],
+                        }
                     merged_defaults[group] = merged_group
                 else:
                     merged_defaults[group] = patch

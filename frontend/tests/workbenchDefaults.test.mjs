@@ -2,12 +2,12 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { defaultWorkbenchDefaults, normalizeRememberedResearchDefaults, normalizeWorkbenchDefaults, researchConfigForSubmission, researchRangesForSymbol, strategyDefaults, validResearchDefaults, validWorkbenchGroup, workbenchConfig } from '../src/workbenchDefaults.ts'
 
-test('v4 holding bounds use 500 shares while order quantities keep 100 shares', () => {
+test('v4 holding bounds use 100-share minimum units while default granularity stays 500', () => {
   const value = defaultWorkbenchDefaults().research
   value.ranges.min_shares.high = 1500
   value.ranges.buy_shares.low = 200
   assert.equal(validResearchDefaults(value), true)
-  value.ranges.min_shares.high = 1200
+  value.ranges.min_shares.high = 1250
   assert.equal(validResearchDefaults(value), false)
   const old = defaultWorkbenchDefaults().research
   old.fixed_half_widths.min_shares = 100
@@ -42,8 +42,13 @@ test('an empty maximum holding is a valid remembered draft', () => {
 test('new workspaces use the v4 geometric neighborhood defaults', () => {
   const research = defaultWorkbenchDefaults().research
   assert.equal(research.protocol_version, 4)
-  assert.equal(research.ranking_mode, 'max_volume')
-  assert.equal(research.strategy_version, 2)
+  assert.equal(research.ranking_mode, 'fixed_mean')
+  assert.equal(research.strategy_version, 3)
+  assert.equal(research.hypercube_edge, 3)
+  assert.deepEqual(research.granularity, {
+    buy_step: .0001, sell_step: .0001, sell_shares: 100, buy_shares: 100,
+    min_shares: 500, max_shares: 500,
+  })
   assert.equal(research.training_budget, 20000)
   assert.equal(research.validation_budget, 100000)
   assert.equal(research.selection_target, 'both')
@@ -57,7 +62,7 @@ test('new workspaces use the v4 geometric neighborhood defaults', () => {
 test('legacy fixed-radius ranking normalizes to strategy version one', () => {
   const saved = defaultWorkbenchDefaults().research
   saved.ranking_mode = 'fixed_mean'
-  saved.strategy_version = 2
+  saved.strategy_version = 1
   const normalized = normalizeRememberedResearchDefaults(saved)
   assert.equal(normalized.ranking_mode, 'fixed_mean')
   assert.equal(normalized.strategy_version, 1)
@@ -89,8 +94,8 @@ test('legacy saved research settings fill v4 fields while preserving every remem
   for (const key of ['protocol_version', 'selection_target', 'rebalance_days', 'bootstrap_reps', 'local_search_budget']) delete saved[key]
   const migrated = normalizeWorkbenchDefaults({ research: saved }).research
   assert.equal(migrated.protocol_version, 4)
-  assert.equal(migrated.ranking_mode, 'max_volume')
-  assert.equal(migrated.strategy_version, 2)
+  assert.equal(migrated.ranking_mode, 'fixed_mean')
+  assert.equal(migrated.strategy_version, 3)
   assert.equal(migrated.selection_target, 'both')
   assert.equal(migrated.rebalance_days, 63)
   assert.equal(migrated.bootstrap_reps, 10000)

@@ -274,16 +274,17 @@ def test_v4_landscape_exposes_independent_buy_and_sell_spacing_slices(tmp_path):
     assert payload["focus_neighborhood"]["dimensions"] == ["buy_step", "sell_step"]
 
 
-def test_v4_strategy_catalog_defaults_to_max_volume_geometric_research(tmp_path):
+def test_v4_strategy_catalog_defaults_to_hypercube_geometric_research(tmp_path):
     with TestClient(create_app(str(tmp_path), start_jobs=False)) as client:
         response = client.get("/api/v1/research/strategies")
         assert response.status_code == 200
         strategy = response.json()["strategies"][0]
         assert strategy["grid_mode"] == "geometric"
-        assert strategy["default_ranking_mode"] == "max_volume"
-        assert strategy["units"] == {
+        assert strategy["default_ranking_mode"] == "fixed_mean"
+        assert strategy["strategy_version"] == 3
+        assert strategy["granularity"] == {
             "buy_step": .0001, "sell_step": .0001, "sell_shares": 100.0, "buy_shares": 100.0,
-            "min_shares": 500.0, "max_shares": 500.0, "shares": 100,
+            "min_shares": 500.0, "max_shares": 500.0,
         }
 
 

@@ -7,11 +7,13 @@ from .models import BacktestConfig, DataBundle
 from .storage import Store
 
 
-_RESEARCH_LOOKBACK_TRADING_DAYS = 504
+_LEGACY_LOOKBACK_TRADING_DAYS = 504
+_RESEARCH_LOOKBACK_TRADING_DAYS = _LEGACY_LOOKBACK_TRADING_DAYS
 _CALENDAR_DAYS_PER_TRADING_DAY = 1.6
 
 
-def preparation_config(store: Store, base: BacktestConfig, version: str | None = None) -> BacktestConfig:
+def preparation_config(store: Store, base: BacktestConfig, version: str | None = None,
+                       lookback_days: int = _LEGACY_LOOKBACK_TRADING_DAYS) -> BacktestConfig:
     """Return a copy whose start includes the selection lookback.
 
     The user-selected start/end stay on ``base`` for the out-of-sample period.
@@ -30,10 +32,11 @@ def preparation_config(store: Store, base: BacktestConfig, version: str | None =
         if not calendar.empty and "date" in calendar:
             dates = pd.DatetimeIndex(pd.to_datetime(calendar["date"], errors="coerce").dropna().dt.normalize().unique()).sort_values()
     first_selection_day = int(dates.searchsorted(anchor, side="left")) if len(dates) else 0
-    if first_selection_day >= _RESEARCH_LOOKBACK_TRADING_DAYS + 1:
-        start = dates[first_selection_day - _RESEARCH_LOOKBACK_TRADING_DAYS - 1]
+    lookback_days = max(20, int(lookback_days))
+    if first_selection_day >= lookback_days + 1:
+        start = dates[first_selection_day - lookback_days - 1]
     else:
-        calendar_days = int(_RESEARCH_LOOKBACK_TRADING_DAYS * _CALENDAR_DAYS_PER_TRADING_DAY)
+        calendar_days = int(lookback_days * _CALENDAR_DAYS_PER_TRADING_DAY)
         start = anchor - pd.Timedelta(days=calendar_days)
     return base.model_copy(update={"start_date": start.date()})
 
@@ -44,10 +47,11 @@ def prepare_research_bundle(
     version: str | None,
     progress=lambda *_: None,
     cancelled=lambda: False,
+    lookback_days: int = _LEGACY_LOOKBACK_TRADING_DAYS,
 ) -> DataBundle:
     """Prepare selection lookback and evaluation data from one immutable snapshot."""
     store = service.store
-    request = preparation_config(store, base, version)
+    request = preparation_config(store, base, version, lookback_days)
     if cancelled():
         raise InterruptedError("任务已取消")
     try:
@@ -64,7 +68,7 @@ def prepare_research_bundle(
         if manifest.get("market_data"):
             fallback = base.model_copy(update={"start_date": request.start_date, "end_date": base.end_date})
             bundle = service.load_bundle(fallback, manifest["version"])
-            message = "自动 504 日准备未完成；已使用锁定快照中可用历史，证据强度可能较弱。"
+            message = f"自动 {int(lookback_days)} 日训练时段准备未完成；已使用锁定快照中可用历史，证据强度可能较弱。"
             bundle.warnings = list(dict.fromkeys([*(bundle.warnings or []), message]))
             bundle.metadata = {
                 **bundle.metadata,
@@ -92,7 +96,7 @@ def prepare_research_bundle(
                 start = available_start.date()
             fallback = base.model_copy(update={"start_date": start, "end_date": end})
             bundle = service.load_bundle(fallback, manifest["version"])
-            message = "自动补齐 504 个前置交易日未完成；已使用锁定快照中可用历史，证据强度可能较弱。"
+            message = f"自动补齐 {int(lookback_days)} 个前置交易日未完成；已使用锁定快照中可用历史，证据强度可能较弱。"
             bundle.warnings = list(dict.fromkeys([*(bundle.warnings or []), message]))
             bundle.metadata = {
                 **bundle.metadata,
@@ -116,7 +120,7 @@ def prepare_research_bundle(
             if lower <= pd.Timestamp(day).normalize() <= upper
         }
     bundle.metadata["research_preparation"] = {
-        "requested_lookback_trading_days": _RESEARCH_LOOKBACK_TRADING_DAYS,
+        "requested_lookback_trading_days": int(lookback_days),
         "evaluation_start": str(base.start_date),
         "evaluation_end": str(base.end_date) if base.end_date else None,
         "prepared_start": str(lower.date()),

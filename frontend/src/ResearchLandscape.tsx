@@ -42,13 +42,14 @@ function pointFromEvent(raw: unknown): LandscapePoint | undefined {
   return ((raw as { data?: { item?: LandscapePoint } }).data ?? {}).item
 }
 
-export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, regionOptions = [], qualified = false, trainingOnly = false }: {
+export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, regionOptions = [], qualified = false, trainingOnly = false, validationLabel = '内部验证' }: {
   resultId: string
   defaultParams?: Dict
   decisionOptions: Array<{ value: string; label: string }>
   regionOptions?: Array<{ value: string; label: string }>
   qualified?: boolean
   trainingOnly?: boolean
+  validationLabel?: string
 }) {
   const [decision, setDecision] = useState(decisionOptions[0]?.value ?? 'current')
   const [sample, setSample] = useState<'training' | 'validation'>(trainingOnly ? 'training' : 'validation')
@@ -214,7 +215,7 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
 
     <div className='form-grid four research-landscape-controls'>
       <Field label='研究决策'><SelectInput value={decision} onChange={event => setDecision(event.target.value)}>{decisionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>
-      <Field label='样本用途'><SelectInput value={sample} disabled={trainingOnly} onChange={event => setSample(event.target.value as 'training' | 'validation')}>{!trainingOnly && <option value='validation'>内部验证</option>}<option value='training'>训练搜索</option></SelectInput></Field>
+      <Field label='样本用途'><SelectInput value={sample} disabled={trainingOnly} onChange={event => setSample(event.target.value as 'training' | 'validation')}>{!trainingOnly && <option value='validation'>{validationLabel}</option>}<option value='training'>训练搜索</option></SelectInput></Field>
       <Field label='成本情景'><SelectInput value={cost} onChange={event => setCost(event.target.value as 'original' | 'stress')}><option value='original'>原始成本</option><option value='stress'>双倍压力</option></SelectInput></Field>
       <Field label='验证窗口'><SelectInput value={fold} onChange={event => setFold(event.target.value)} disabled={sample === 'training'}><option value='total'>整个验证段</option>{[0, 1, 2, 3].map(index => <option key={index} value={index}>窗口 {index + 1}</option>)}</SelectInput></Field>
       <Field label='着色指标'><SelectInput value={metric} onChange={event => setMetric(event.target.value as 'excess' | 'grid')}><option value='excess'>相对全仓超额</option><option value='grid'>网格收益</option></SelectInput></Field>

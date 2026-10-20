@@ -1222,7 +1222,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     def optimization(config: OptimizationConfig | ResearchRequestV4):
         if isinstance(config, ResearchRequestV4):
             config = config.to_optimization()
-        prepared = preparation_config(store, config.base)
+        prepared = preparation_config(
+            store, config.base,
+            lookback_days=500 if config.protocol_version == 4 else 504,
+        )
         version = require_ready(prepared)
         bundle = DataService(store).load_bundle(prepared, version)
         if config.protocol_version == 4:
@@ -1243,9 +1246,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         else:
             raise HTTPException(422, "新研究请先通过配置转换并使用 protocol_version=3 或 4")
         if config.protocol_version == 4 and preview.get("status") == "budget_exceeded":
+            reason = next((value for value in preview.get("reasons", []) if "超正方体" in str(value) or "预算" in str(value)), None)
             raise HTTPException(422, {
                 "code": "SEARCH_BUDGET_EXCEEDED",
-                "message": f"完整枚举需要 {preview.get('legal_combination_count')} 个验证点，超过预算 {preview.get('validation_budget')}",
+                "message": reason or f"完整枚举需要 {preview.get('legal_combination_count')} 个验证点，超过预算 {preview.get('validation_budget')}",
                 **preview,
             })
         submitted = submit("optimization", {"config": config.model_dump(mode="json"), "version": version})
@@ -1255,7 +1259,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     def optimization_preview(config: OptimizationConfig | ResearchRequestV4):
         if isinstance(config, ResearchRequestV4):
             config = config.to_optimization()
-        prepared = preparation_config(store, config.base)
+        prepared = preparation_config(
+            store, config.base,
+            lookback_days=500 if config.protocol_version == 4 else 504,
+        )
         version = require_ready(prepared)
         bundle = DataService(store).load_bundle(prepared, version)
         if config.protocol_version == 4:
@@ -1493,8 +1500,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         try:
             context = decision_context(result, decision, decision_index)
             region = next((r for r in context.get("recommendation_regions", []) if r.get("region_id") == region_id), None)
-            if not region or region.get("geometry") != "connected_lattice":
-                raise LookupError("连通参数域不存在")
+            if not region or region.get("geometry") not in {"connected_lattice", "hypercube_mean"}:
+                raise LookupError("推荐参数域不存在")
             rows = [r for r in decision_archive(result, decision, decision_index) if region_id in r.get("region_ids", [])]
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc

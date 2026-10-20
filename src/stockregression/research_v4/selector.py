@@ -76,9 +76,12 @@ def _empty_result(
             "status": "insufficient_history",
             "protocol_version": 4,
             "strategy_version": config.strategy.strategy_version,
-            "geometry": "connected_lattice" if config.strategy.strategy_version == 2 else "symmetric_box",
-            "budget_role": "seed_discovery" if config.strategy.strategy_version == 2 else "evaluation_cap",
+            "geometry": ("connected_lattice" if config.strategy.strategy_version == 2
+                         else "hypercube_mean" if config.strategy.strategy_version == 3 else "symmetric_box"),
+            "budget_role": ("seed_discovery" if config.strategy.strategy_version == 2
+                            else "training_sample_and_box_cap" if config.strategy.strategy_version == 3 else "evaluation_cap"),
             "expand_until_closed": config.strategy.strategy_version == 2,
+            "training_only": config.strategy.strategy_version == 3,
             "selection_history_days": int(len(history_dates)),
             "candidate_count": 0,
             "eligible_count": 0,
@@ -121,6 +124,12 @@ def select_at(
     progress_start: float = 0.0,
     progress_width: float = 1.0,
 ) -> dict[str, Any]:
+    if config.strategy.strategy_version == 3:
+        from .hypercube_selector import select_hypercube_at
+        return select_hypercube_at(
+            config, base, data, asof, seed_offset=seed_offset, progress=progress,
+            cancelled=cancelled, progress_start=progress_start, progress_width=progress_width,
+        )
     if config.strategy.strategy_version == 2:
         from .connected_selector import select_connected_at
         return select_connected_at(
@@ -392,6 +401,62 @@ def estimate_search(config: OptimizationConfig, data: DataBundle) -> dict[str, A
     dates = pd.DatetimeIndex(data.calendar)
     eval_start = pd.Timestamp(config.base.start_date).normalize()
     asof = scientific._known_preceding_close(data, eval_start)
+    reasons: list[str] = []
+    if config.strategy.strategy_version == 3:
+        from .window import MIN_TRAINING_OFFSET, training_window
+        window = training_window(data, asof)
+        total = space.size()
+        method = _method(config, total)
+        edge = int(config.strategy.hypercube_edge)
+        box_volume = edge ** len(space.active) if space.active else 1
+        impossible = [name for name in space.active if space.dimensions[name].count < edge]
+        if len(window.dates) < MIN_TRAINING_OFFSET:
+            status = "insufficient_history"
+            reasons = [*reasons, f"训练时段只有 {len(window.dates)} 个交易日，少于最低 {MIN_TRAINING_OFFSET} 日"]
+        elif impossible:
+            status = "insufficient_range"
+            reasons = [*reasons, "超正方体边长超出这些参数的有效范围：" + "、".join(impossible)]
+        elif box_volume > int(config.strategy.validation_budget):
+            status = "budget_exceeded"
+            reasons = [*reasons, f"一个超正方体需要 {box_volume} 个评价点，超过验证预算 {config.strategy.validation_budget}"]
+        elif method == "exhaustive" and total > int(config.strategy.training_budget):
+            status = "budget_exceeded"
+            reasons = [*reasons, f"完整枚举需要 {total} 个训练点，超过训练预算 {config.strategy.training_budget}"]
+        else:
+            status = "ready"
+        evaluation_days = int(len(dates[dates >= eval_start]))
+        fixed_count = 1 if config.selection_target in ("fixed", "both") else 0
+        adaptive_count = math.ceil(evaluation_days / max(1, int(config.rebalance_days))) if config.selection_target in ("adaptive", "both") else 0
+        return {
+            "status": status, "protocol_version": 4, "strategy_id": config.strategy.strategy_id,
+            "strategy_version": 3, "geometry": "hypercube_mean", "connectivity": "fixed_edge_cube",
+            "budget_role": "training_sample_and_box_cap", "expand_until_closed": False,
+            "grid_mode": "geometric", "ranking_mode": "fixed_mean", "hypercube_edge": edge,
+            "hypercube_volume": int(box_volume), "active_dimensions": list(space.active),
+            "granularity": dict(space.granularity), "neighborhood_fields": list(space.active),
+            "fields": list(space.fields), "active_fields": list(space.active),
+            "units": {**space.granularity},
+            "effective_bounds": {
+                name: {
+                    "low_ticks": dim.low, "high_ticks": dim.high,
+                    "low": space.value(name, dim.low), "high": space.value(name, dim.high),
+                    "fixed": dim.fixed,
+                }
+                for name, dim in space.dimensions.items()
+            },
+            "legal_combination_count": int(total), "search_method": method,
+            "training_budget": int(config.strategy.training_budget),
+            "validation_budget": int(config.strategy.validation_budget),
+            "minimum_neighborhood_size": int(box_volume),
+            "minimum_neighborhood_possible": not impossible,
+            "decision_count_estimate": int(fixed_count + adaptive_count + 1),
+            "history_days": int(window.days), "training_days": int(window.days),
+            "validation_days": 0, "full_504_day_history": bool(window.days >= MIN_TRAINING_OFFSET),
+            "full_training_window": bool(window.days >= MIN_TRAINING_OFFSET),
+            "training_window": window.diagnostic(),
+            "slippage_mode": config.strategy.slippage_mode,
+            "reasons": list(dict.fromkeys(reasons)),
+        }
     history = _history(data, asof)
     generation, folds, split, reasons = scientific._folds_for_history(history)
     total = space.size()
@@ -469,21 +534,23 @@ def strategy_descriptions() -> dict[str, Any]:
     return {
         "strategies": [{
             "strategy_id": "geometric_excess_neighborhood",
-            "strategy_version": 2,
-            "label": "等比网格正收益连通域",
+            "strategy_version": 3,
+            "label": "等比网格超正方体平均超额收益",
             "grid_mode": "geometric",
             "fields": list(FIELDS),
-            "units": {**UNITS, "shares": 100},
+            "granularity": {**UNITS},
             "search_methods": ["auto", "hierarchical", "exhaustive"],
-            "ranking_modes": ["max_volume", "fixed_mean"],
-            "default_ranking_mode": "max_volume",
+            "ranking_modes": ["fixed_mean"],
+            "default_ranking_mode": "fixed_mean",
             "defaults": {
                 "training_budget": 20_000,
                 "validation_budget": 100_000,
                 "recommendation_count": 10,
+                "hypercube_edge": 3,
                 "max_shares_mode": "search",
                 "slippage_mode": "configured",
                 "neighborhood_fields": ["buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares"],
+                "granularity": {**UNITS},
                 "fixed_half_widths": {
                     "buy_step": 0.001, "sell_step": 0.001, "sell_shares": 100, "buy_shares": 100,
                     "min_shares": 500, "max_shares": 500,

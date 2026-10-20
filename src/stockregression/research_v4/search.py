@@ -115,7 +115,7 @@ def statistical_coordinates(space: ParameterSpace, profile: dict[str, Any]) -> l
             dim = space.dimensions[name]
             if name in {"buy_step", "sell_step"}:
                 try:
-                    tick = value_to_ticks(name, float(raw))
+                    tick = space.value_to_ticks(name, float(raw))
                 except (TypeError, ValueError):
                     tick = dim.low
                 values.append(min(dim.high, max(dim.low, tick)))
@@ -252,7 +252,7 @@ def box_coordinates(
             continue
         radius = int(radii.get(name, 0))
         low, high = center[index] - radius, center[index] + radius
-        if radius < 1 or low < dim.low or high > dim.high:
+        if radius < 0 or low < dim.low or high > dim.high:
             return None
         axes.append(tuple(range(low, high + 1)))
     if not axes:

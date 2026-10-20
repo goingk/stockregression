@@ -39,7 +39,14 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
     assert defaults["research"]["mode"] == "both"
     assert defaults["research"]["n_trials"] == 1000
     assert defaults["research"]["protocol_version"] == 4
-    assert defaults["research"]["ranking_mode"] == "max_volume"
+    assert defaults["research"]["strategy_version"] == 3
+    assert defaults["research"]["ranking_mode"] == "fixed_mean"
+    assert defaults["research"]["hypercube_edge"] == 3
+    assert defaults["research"]["granularity"] == {
+        "buy_step": 0.0001, "sell_step": 0.0001,
+        "sell_shares": 100.0, "buy_shares": 100.0,
+        "min_shares": 500.0, "max_shares": 500.0,
+    }
     assert defaults["research"]["local_search_budget"] == 3000
     assert defaults["research"]["selection_target"] == "both"
     assert defaults["research"]["rebalance_days"] == 63

@@ -165,15 +165,38 @@ class SearchRange(BaseModel):
 
 NeighborhoodField = Literal["buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares"]
 
+# The true exchange/config minimum for each research dimension.  Granularity
+# controls how densely the research samples this space; it never changes the
+# minimum unit a parameter may take.
+GRANULARITY_MINIMUMS = {
+    "buy_step": 0.0001,
+    "sell_step": 0.0001,
+    "sell_shares": 100.0,
+    "buy_shares": 100.0,
+    "min_shares": 100.0,
+    "max_shares": 100.0,
+}
+
+GRANULARITY_DEFAULTS = {
+    "buy_step": 0.0001,
+    "sell_step": 0.0001,
+    "sell_shares": 100.0,
+    "buy_shares": 100.0,
+    "min_shares": 500.0,
+    "max_shares": 500.0,
+}
+
 
 class ResearchStrategySpec(BaseModel):
     """Versioned research algorithm configuration."""
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     strategy_id: Literal["geometric_excess_neighborhood"] = "geometric_excess_neighborhood"
-    strategy_version: Literal[1, 2] = 2
+    strategy_version: Literal[1, 2, 3] = 3
     search_method: Literal["auto", "hierarchical", "exhaustive"] = "auto"
-    ranking_mode: Literal["max_volume", "fixed_mean"] = "max_volume"
+    ranking_mode: Literal["max_volume", "fixed_mean"] = "fixed_mean"
+    hypercube_edge: int = Field(default=3, ge=1, le=99)
+    granularity: dict[str, float] = Field(default_factory=lambda: dict(GRANULARITY_DEFAULTS))
     training_budget: int = Field(default=20_000, ge=1, le=1_000_000)
     validation_budget: int = Field(default=100_000, ge=1, le=2_000_000)
     recommendation_count: int = Field(default=10, ge=1, le=100)
@@ -197,8 +220,19 @@ class ResearchStrategySpec(BaseModel):
         if not isinstance(value, dict):
             return value
         value = dict(value)
-        if "strategy_version" not in value and value.get("ranking_mode") == "fixed_mean":
-            value["strategy_version"] = 1
+        if "strategy_version" not in value:
+            # Explicit legacy ranking modes keep their historical semantics.
+            # A request that omits both fields is a new study and gets v3.
+            if "ranking_mode" in value:
+                value["strategy_version"] = 1 if value.get("ranking_mode") == "fixed_mean" else 2
+            else:
+                value["strategy_version"] = 3
+        if "ranking_mode" not in value:
+            value["ranking_mode"] = "fixed_mean" if int(value.get("strategy_version", 3)) in (1, 3) else "max_volume"
+        if not isinstance(value.get("granularity"), dict):
+            value["granularity"] = dict(GRANULARITY_DEFAULTS)
+        else:
+            value["granularity"] = {**GRANULARITY_DEFAULTS, **value["granularity"]}
         fields = value.get("neighborhood_fields")
         if isinstance(fields, list) and "grid_step" in fields:
             migrated: list[str] = []
@@ -222,6 +256,19 @@ class ResearchStrategySpec(BaseModel):
     def valid_half_widths(self):
         if self.strategy_version == 2 and self.ranking_mode != "max_volume":
             raise ValueError("连通域策略 v2 仅支持最大正收益连通域；固定邻域请使用策略 v1")
+        if self.strategy_version == 3 and self.ranking_mode != "fixed_mean":
+            raise ValueError("超正方体平均超额收益策略 v3 只使用 fixed_mean 评分")
+        if self.hypercube_edge < 1 or self.hypercube_edge % 2 != 1:
+            raise ValueError("超正方体边长必须为正奇数，使中心落在整数研究刻度上")
+        allowed_granularity = set(GRANULARITY_DEFAULTS)
+        if set(self.granularity) != allowed_granularity:
+            raise ValueError("研究细粒度必须包含全部六个研究参数")
+        for name, value in self.granularity.items():
+            minimum = float(GRANULARITY_MINIMUMS[name])
+            sampled = float(value) / minimum
+            if float(value) <= 0 or abs(sampled - round(sampled)) > 1e-7:
+                unit = "0.0001" if minimum == 0.0001 else str(int(minimum))
+                raise ValueError(f"{name} 研究细粒度必须是参数最小单位 {unit} 的正整数倍")
         if not self.neighborhood_fields:
             raise ValueError("细搜索邻域至少需要一个可移动参数")
         if len(set(self.neighborhood_fields)) != len(self.neighborhood_fields):
@@ -312,7 +359,7 @@ class ResearchRequestV4(BaseModel):
     top_candidates: int = Field(default=20, ge=1, le=100)
     max_drawdown: float = Field(default=0.2, gt=0, le=1)
     min_trades: int = Field(default=10, ge=0)
-    min_history_days: int = Field(default=504, ge=20)
+    min_history_days: int = Field(default=250, ge=20)
     min_minute_ratio: float = Field(default=0.95, ge=0, le=1)
 
     def to_optimization(self) -> OptimizationConfig:
