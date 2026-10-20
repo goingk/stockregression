@@ -545,7 +545,16 @@ def index_etf_package_direct(
     manifest_files = {}
     label_cache = {}
     writer_connection = None
-    progress(0.02, "登记 ETF 基本资料")
+
+    def report_progress(fraction, message):
+        # Long registration batches hold one SQLite write transaction.  The
+        # job observer persists progress through a second connection, so the
+        # batch must be committed before reporting or SQLite reports a lock.
+        if writer_connection is not None:
+            writer_connection.commit()
+        progress(fraction, message)
+
+    report_progress(0.02, "登记 ETF 基本资料")
 
     @contextmanager
     def batch_db():
@@ -779,7 +788,7 @@ def index_etf_package_direct(
                         {"label_convention": "end", "source_verified": True},
                     )
                     if position % 250 == 0:
-                        progress(0.05 + 0.15 * position / max(1, len(stats)), f"登记日线 {position}/{len(stats)}")
+                        report_progress(0.05 + 0.15 * position / max(1, len(stats)), f"登记日线 {position}/{len(stats)}")
             stock_daily_path = root / "stock_daily.parquet"
             if "stock" in assets and stock_daily_path.is_file():
                 with _reader() as db_source:
@@ -804,7 +813,7 @@ def index_etf_package_direct(
                         {"label_convention": "end", "source_verified": True},
                     )
                     if position % 250 == 0:
-                        progress(0.05 + 0.15 * position / max(1, len(stock_stats)), f"登记股票日线 {position}/{len(stock_stats)}")
+                        report_progress(0.05 + 0.15 * position / max(1, len(stock_stats)), f"登记股票日线 {position}/{len(stock_stats)}")
         minute_items = []
         for asset in assets:
             for timeframe in PACKAGE_TIMEFRAMES:
@@ -832,7 +841,7 @@ def index_etf_package_direct(
             for asset, timeframe, path, count, first, last, error in executor.map(inspect, minute_items):
                 inspected += 1
                 if inspected % 250 == 0 or inspected == len(minute_items):
-                    progress(0.2 + 0.75 * inspected / max(1, len(minute_items)), f"登记行情文件 {inspected}/{len(minute_items)}")
+                    report_progress(0.2 + 0.75 * inspected / max(1, len(minute_items)), f"登记行情文件 {inspected}/{len(minute_items)}")
                 if error:
                     errors.append(f"{path.name} {timeframe}: {error}")
                 else:
@@ -861,6 +870,7 @@ def index_etf_package_direct(
                     )
                 if cancelled():
                     raise InterruptedError("任务已取消")
+    writer_connection = None
     if manifest_files:
         manifest = repository.package.manifest()
         manifest["files"].update(manifest_files)
@@ -868,7 +878,7 @@ def index_etf_package_direct(
         manifest["package_version"] = int(manifest.get("package_version", 0)) + 1
         repository.package.publish(manifest)
     physical_files = len(manifest_files)
-    progress(0.95, f"已登记 {physical_files} 个原始文件")
+    report_progress(0.95, f"已登记 {physical_files} 个原始文件")
     service.store.state("market-source-package", {
         "folder": str(root), "rows": rows_count, "files": physical_files,
         "updated_at": now,

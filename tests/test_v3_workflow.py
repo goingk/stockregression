@@ -151,7 +151,7 @@ def test_v3_statistical_profile_does_not_read_validation_dates():
     assert scientific._statistical_profile(config, changed, generation) == profile
 
 
-def test_v3_landscape_endpoint_returns_full_candidates_and_pca(tmp_path):
+def test_v3_landscape_endpoint_returns_full_candidates_and_slices(tmp_path):
     store = Store(tmp_path)
     base = {
         "symbol": "159611.SZ", "start_date": "2024-01-02", "frequency": "1d",
@@ -180,7 +180,98 @@ def test_v3_landscape_endpoint_returns_full_candidates_and_pca(tmp_path):
         assert response.status_code == 200
         payload = response.json()
         assert len(payload["points"]) == 3
-        assert payload["pca"]["explained_variance"]
+        assert "pca" not in payload
+        assert payload["slices"]["buy_step|sell_step"]["total"] == 3
+
+
+def test_landscape_sampling_covers_parameter_space_and_includes_relative_best(tmp_path):
+    store = Store(tmp_path)
+    base = {
+        "symbol": "159611.SZ", "start_date": "2024-01-02", "frequency": "1d",
+        "initial_shares": 1000, "min_shares": 0, "max_shares": None,
+        "buy_shares": 100, "sell_shares": 100, "grid_mode": "trailing",
+    }
+    points = []
+    for index in range(40):
+        points.append({
+            "candidate_id": index + 1,
+            "params": {
+                **base, "schema_version": 3,
+                "buy_step": .01 + index * .001, "sell_step": .02 + (index % 7) * .001,
+            },
+            "is_center": False, "is_baseline": False, "evaluation_status": "completed",
+            "validation_excess_original": index / 1000,
+            "validation_excess_stress": index / 2000,
+            "validation_return_original": .02, "max_drawdown": .1,
+            "trade_count": 10, "peak_invested": 10000,
+        })
+    result = {
+        "protocol_version": 3,
+        "config": {
+            "protocol_version": 3, "base": base,
+            "ranges": {"buy_step": {"low": .01, "high": .05}, "sell_step": {"low": .02, "high": .026}},
+        },
+        "evidence": {"candidate_archives": {"current": points}},
+    }
+    result_id = store.save_result("optimization", result, "159611.SZ", "landscape sample")
+    with TestClient(create_app(str(tmp_path), start_jobs=False)) as client:
+        payload = client.get(f"/api/v1/results/{result_id}/landscape?limit=5").json()
+
+    assert payload["total"] == 40
+    assert payload["sampled"] is True
+    assert len(payload["points"]) == 5
+    assert len({point["params"]["buy_step"] for point in payload["points"]}) > 1
+    assert payload["focus"]["candidate_id"] == 40
+    assert any(point["is_focus"] for point in payload["points"])
+    assert payload["top_candidates"][0]["candidate_id"] == 40
+    assert payload["top_candidates"][0]["rank"] == 1
+    plane = payload["slices"]["buy_step|sell_step"]
+    assert plane["total"] == 40
+    assert plane["sampled"] is False
+    assert len(plane["points"]) == 40
+    assert any(point["is_focus"] for point in plane["points"])
+    neighborhood = payload["focus_neighborhood"]
+    assert neighborhood["available"] is True
+    assert neighborhood["expected_count"] > 0
+    assert neighborhood["evaluated_count"] > 0
+    assert neighborhood["evaluated_count"] + neighborhood["missing_count"] == neighborhood["expected_count"]
+
+
+def test_v4_landscape_exposes_independent_buy_and_sell_spacing_slices(tmp_path):
+    store = Store(tmp_path)
+    base = {
+        "symbol": "159611.SZ", "start_date": "2024-01-02", "frequency": "1d",
+        "initial_shares": 1000, "min_shares": 0, "max_shares": None,
+        "buy_shares": 100, "sell_shares": 100, "grid_mode": "geometric",
+    }
+    points = []
+    for index, (buy_step, sell_step) in enumerate(((.02, .03), (.02, .04), (.03, .03), (.03, .04)), start=1):
+        points.append({
+            "candidate_id": index,
+            "params": {**base, "schema_version": 3, "buy_step": buy_step, "sell_step": sell_step},
+            "is_center": index == 3, "is_baseline": False, "evaluation_status": "completed",
+            "validation_excess_original": .01 * index, "validation_excess_stress": .005 * index,
+            "validation_return_original": .02 * index, "validation_return_stress": .015 * index,
+            "max_drawdown": .1, "trade_count": 10, "peak_invested": 10000,
+            "folds": [{"excess_return": .001 * index, "grid_return": .002 * index, "baseline_return": .001, "max_drawdown": .05}],
+        })
+    result = {
+        "protocol_version": 4,
+        "config": {
+            "protocol_version": 4, "base": base,
+            "strategy": {"neighborhood_fields": ["buy_step", "sell_step"]},
+            "ranges": {"buy_step": {"low": .02, "high": .03}, "sell_step": {"low": .03, "high": .04}},
+        },
+        "evidence": {"candidate_archives": {"current": points}, "search_candidate_archives": {"current": points}},
+    }
+    result_id = store.save_result("optimization", result, "159611.SZ", "v4 landscape")
+    with TestClient(create_app(str(tmp_path), start_jobs=False)) as client:
+        payload = client.get(f"/api/v1/results/{result_id}/landscape").json()
+
+    assert payload["parameters"][:2] == ["buy_step", "sell_step"]
+    assert "pca" not in payload
+    assert payload["slices"]["buy_step|sell_step"]["total"] == 4
+    assert payload["focus_neighborhood"]["dimensions"] == ["buy_step", "sell_step"]
 
 
 def test_v4_strategy_catalog_defaults_to_max_volume_geometric_research(tmp_path):
@@ -190,7 +281,10 @@ def test_v4_strategy_catalog_defaults_to_max_volume_geometric_research(tmp_path)
         strategy = response.json()["strategies"][0]
         assert strategy["grid_mode"] == "geometric"
         assert strategy["default_ranking_mode"] == "max_volume"
-        assert strategy["units"] == {"grid_step": .001, "shares": 100}
+        assert strategy["units"] == {
+            "buy_step": .001, "sell_step": .001, "sell_shares": 100.0, "buy_shares": 100.0,
+            "min_shares": 500.0, "max_shares": 500.0, "shares": 100,
+        }
 
 
 def test_v2_config_conversion_removes_cash_budget_and_preserves_null_bound(tmp_path):

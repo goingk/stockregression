@@ -34,10 +34,10 @@ export function savedGridParameters(value: unknown): ResultParameter[] {
   const modeNames: Record<string, string> = { trailing: '移动网格', arithmetic: '等差网格', geometric: '等比网格' }
   const mode = typeof config.grid_mode === 'string' ? config.grid_mode : ''
   const rows: ResultParameter[] = [{ key: 'grid_mode', label: '网格模式', value: modeNames[mode] ?? (mode || '—') }]
-  if (mode === 'trailing') {
-    rows.push({ key: 'buy_step', label: '买入步长', value: percentText(config.buy_step) }, { key: 'sell_step', label: '卖出步长', value: percentText(config.sell_step) })
-  } else if (mode === 'arithmetic' || mode === 'geometric') {
-    rows.push({ key: 'grid_step', label: '网格间距', value: percentText(config.grid_step) })
+  if (finite(config.buy_step) || finite(config.sell_step)) {
+    rows.push({ key: 'buy_step', label: '买入间距', value: percentText(config.buy_step) }, { key: 'sell_step', label: '卖出间距', value: percentText(config.sell_step) })
+  } else if ((mode === 'arithmetic' || mode === 'geometric') && finite(config.grid_step)) {
+    rows.push({ key: 'grid_step', label: '旧版网格间距', value: percentText(config.grid_step) })
   }
   const reference = finite(funding.reference_price) ? funding.reference_price : config.reference_price
   const referenceMode = config.reference_price_mode === 'auto' ? '自动参考' : config.reference_price_mode === 'manual' ? '手动参考' : ''

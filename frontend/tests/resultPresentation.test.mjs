@@ -24,16 +24,20 @@ test('saved trailing grid parameters show only active steps and the actual saved
   assert.equal(rows.initial_equity.value, '19,250.00 元')
 })
 
-test('arithmetic and geometric grids use only grid_step; absent values remain absent', () => {
+test('arithmetic and geometric grids show separate buy and sell spacing', () => {
   for (const grid_mode of ['arithmetic', 'geometric']) {
     const rows = parameterMap({ schema_version: 2, config: { grid_mode, buy_step: .03, sell_step: .04 } })
-    assert.equal(rows.grid_step.value, '—')
-    assert.equal(rows.buy_step, undefined)
-    assert.equal(rows.sell_step, undefined)
+    assert.equal(rows.grid_step, undefined)
+    assert.equal(rows.buy_step.value, '3.00%')
+    assert.equal(rows.sell_step.value, '4.00%')
     for (const key of ['reference_price', 'lower_price', 'upper_price', 'initial_shares', 'min_shares', 'max_shares', 'buy_shares', 'sell_shares', 'reserve_cash', 'initial_equity']) assert.equal(rows[key].value, '—', key)
   }
   assert.equal(parameterMap({ config: {} }).grid_mode.value, '—')
   assert.equal(parameterMap({ config: {} }).grid_step, undefined)
+  const legacy = parameterMap({ config: { grid_mode: 'geometric', grid_step: .05 } })
+  assert.equal(legacy.grid_step.value, '5.00%')
+  assert.equal(legacy.buy_step, undefined)
+  assert.equal(legacy.sell_step, undefined)
 })
 
 test('legacy parameters keep cash and ratio units without new share defaults', () => {

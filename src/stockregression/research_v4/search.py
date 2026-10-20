@@ -113,7 +113,7 @@ def statistical_coordinates(space: ParameterSpace, profile: dict[str, Any]) -> l
         values = []
         for name in space.active:
             dim = space.dimensions[name]
-            if name == "grid_step":
+            if name in {"buy_step", "sell_step"}:
                 try:
                     tick = value_to_ticks(name, float(raw))
                 except (TypeError, ValueError):
@@ -128,6 +128,29 @@ def statistical_coordinates(space: ParameterSpace, profile: dict[str, Any]) -> l
     return output
 
 
+def axis_sweep_coordinates(space: ParameterSpace, fields: Iterable[str]) -> list[tuple[int, ...]]:
+    """Probe every lattice value of fields that are fixed during fine search."""
+    wanted = [name for name in space.active if name in set(fields)]
+    if not wanted or not space.active:
+        return []
+    index_of = {name: index for index, name in enumerate(space.active)}
+    anchor = [dim.low + dim.width // 2 for dim in (space.dimensions[name] for name in space.active)]
+    if not space.legal(anchor):
+        fallback = coarse_coordinates(space, 1000)
+        if not fallback:
+            return []
+        anchor = list(space.active_coords(fallback[0]))
+    output = []
+    for name in wanted:
+        position = index_of[name]
+        for tick in space.coords(name):
+            values = list(anchor)
+            values[position] = tick
+            if space.legal(values):
+                output.append(space.full_coordinate(values))
+    return list(dict.fromkeys(output))
+
+
 def initial_training_coordinates(space: ParameterSpace, config: OptimizationConfig, asof: str) -> list[tuple[int, ...]]:
     budget = int(config.strategy.training_budget)
     total = space.size()
@@ -140,7 +163,9 @@ def initial_training_coordinates(space: ParameterSpace, config: OptimizationConf
     sample_budget = max(1, budget // 4)
     coarse = coarse_coordinates(space, coarse_budget)
     sample = stratified_coordinates(space, sample_budget, seed)
-    return _dedupe([*coarse, *sample], budget)
+    fixed_in_fine = [name for name in space.active if name not in set(config.strategy.neighborhood_fields)]
+    sweep = axis_sweep_coordinates(space, fixed_in_fine)
+    return _dedupe([*coarse, *sweep, *sample], budget)
 
 
 def refine_coordinates(
@@ -150,6 +175,7 @@ def refine_coordinates(
     existing: set[tuple[int, ...]],
     limit: int,
     recommendation_count: int,
+    movable_fields: Iterable[str] | None = None,
 ) -> list[tuple[int, ...]]:
     if limit <= 0 or not space.active:
         return []
@@ -170,7 +196,11 @@ def refine_coordinates(
             break
     output: list[tuple[int, ...]] = []
     used = set(existing)
-    max_width = max((space.dimensions[name].width for name in space.active), default=0)
+    movable = set(space.active if movable_fields is None else movable_fields)
+    movable = {name for name in space.active if name in movable}
+    if not movable:
+        return []
+    max_width = max((space.dimensions[name].width for name in movable), default=0)
     stride = max(1, 1 << max(0, int(math.ceil(math.log2(max(1, max_width))))))
     while stride >= 1 and len(output) < limit:
         for region in regions:
@@ -179,6 +209,9 @@ def refine_coordinates(
             for name in space.active:
                 dim = space.dimensions[name]
                 index = space.fields.index(name)
+                if name not in movable:
+                    axes.append((center[index],))
+                    continue
                 radius = max(1, stride) if dim.width >= 2 else 0
                 axes.append(tuple(range(max(dim.low, center[index] - radius), min(dim.high, center[index] + radius) + 1)))
             for active in product(*axes):
@@ -207,11 +240,16 @@ def box_coordinates(
     space: ParameterSpace,
     center: tuple[int, ...],
     radii: dict[str, int],
+    movable_fields: Iterable[str] | None = None,
 ) -> list[tuple[int, ...]] | None:
     axes: list[tuple[int, ...]] = []
+    movable = set(space.active if movable_fields is None else movable_fields)
     for name in space.active:
-        index = space.fields.index(name)
+        index = space._field_index[name]
         dim = space.dimensions[name]
+        if name not in movable:
+            axes.append((center[index],))
+            continue
         radius = int(radii.get(name, 0))
         low, high = center[index] - radius, center[index] + radius
         if radius < 1 or low < dim.low or high > dim.high:
@@ -221,8 +259,10 @@ def box_coordinates(
         return [center]
     output = []
     for active in product(*axes):
-        if space.legal(active):
-            output.append(space.full_coordinate(active))
+        if not space.legal(active):
+            continue
+        coordinate = space.full_coordinate(active)
+        output.append(coordinate)
     return output
 
 
@@ -259,14 +299,19 @@ def build_validation_plan(
             break
     selected: dict[tuple[int, ...], int] = {}
     centers: dict[tuple[int, ...], dict[str, Any]] = {}
+    movable = {name for name in space.active if name in set(config.strategy.neighborhood_fields)}
     base_radii = {
-        name: value_to_ticks(name, config.strategy.fixed_half_widths.get(name, UNITS[name]))
-        if config.strategy.ranking_mode == "fixed_mean" else 1
+        name: (
+            value_to_ticks(name, config.strategy.fixed_half_widths.get(name, UNITS[name]))
+            if config.strategy.ranking_mode == "fixed_mean" else 1
+        ) if name in movable else 0
         for name in space.active
     }
     for region_id, seed in enumerate(seeds, start=1):
-        center = space.shift_inside(seed)
-        points = box_coordinates(space, center, base_radii)
+        center = space.shift_inside(seed, movable)
+        if not movable:
+            continue
+        points = box_coordinates(space, center, base_radii, movable_fields=movable)
         if points is None:
             continue
         if len(selected) + sum(point not in selected for point in points) > budget:
@@ -282,10 +327,10 @@ def build_validation_plan(
     while changed and len(selected) < budget:
         changed = False
         for center in list(centers):
-            for name in space.active:
+            for name in movable:
                 candidate = dict(radii[center])
                 candidate[name] += 1
-                points = box_coordinates(space, center, candidate)
+                points = box_coordinates(space, center, candidate, movable_fields=movable)
                 if points is None:
                     continue
                 additions = [point for point in points if point not in selected]
@@ -304,6 +349,7 @@ def build_validation_plan(
         "budget": budget,
         "method": config.strategy.search_method,
         "ranking": config.strategy.ranking_mode,
+        "neighborhood_fields": sorted(movable),
         "coordinates": [list(item) for item in coordinates],
         "centers": [list(item) for item in centers],
         "radii": [[list(center), radii[center]] for center in centers],

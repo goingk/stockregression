@@ -40,6 +40,14 @@ def _method(config: OptimizationConfig, total: int) -> str:
     return "hierarchical"
 
 
+def _movable_fields(space: ParameterSpace, config: OptimizationConfig) -> tuple[str, ...]:
+    selected = set(config.strategy.neighborhood_fields)
+    movable = tuple(name for name in space.active if name in selected)
+    if space.active and not movable:
+        raise ValueError("细搜索邻域至少需要一个落在有效搜索范围内的可移动参数")
+    return movable
+
+
 def _empty_result(
     config: OptimizationConfig,
     space: ParameterSpace,
@@ -47,6 +55,7 @@ def _empty_result(
     reasons: list[str],
     history_dates: pd.DatetimeIndex,
 ) -> dict[str, Any]:
+    movable = tuple(name for name in space.active if name in set(config.strategy.neighborhood_fields))
     fallback = space.params(space.full_coordinate(tuple(space.dimensions[name].low for name in space.active)))
     return {
         "status": "insufficient_history",
@@ -72,6 +81,7 @@ def _empty_result(
             "validation_folds": [],
             "search_method": config.strategy.search_method,
             "ranking_mode": config.strategy.ranking_mode,
+            "neighborhood_fields": list(movable),
         },
         "_ranked_rows": [],
         "_family_rows": [],
@@ -116,6 +126,7 @@ def select_at(
     history = _history(data, asof)
     as_of = history[-1] if len(history) else (pd.Timestamp(asof).normalize() if asof is not None else None)
     space = ParameterSpace(config)
+    movable = _movable_fields(space, config)
     reasons: list[str] = []
     generation, folds, split, window_reasons = scientific._folds_for_history(history)
     reasons.extend(window_reasons)
@@ -173,6 +184,7 @@ def select_at(
             existing=set(training_coordinates),
             limit=remaining,
             recommendation_count=int(config.strategy.recommendation_count),
+            movable_fields=movable,
         )
         if extra:
             training_rows.extend(evaluator.evaluate_training(extra))
@@ -211,6 +223,7 @@ def select_at(
         rows,
         ranking_mode=config.strategy.ranking_mode,
         fixed_half_widths=config.strategy.fixed_half_widths,
+        neighborhood_fields=movable,
         max_drawdown=float(config.max_drawdown),
         min_trades=int(config.min_trades),
         global_exhaustive=global_coverage,
@@ -282,7 +295,8 @@ def select_at(
         "grid_mode": "geometric",
         "search_method": method,
         "ranking_mode": config.strategy.ranking_mode,
-        "units": {"grid_step": 0.001, "shares": 100},
+        "neighborhood_fields": list(movable),
+        "units": {**UNITS, "shares": 100},
         "training_budget": int(config.strategy.training_budget),
         "validation_budget": int(config.strategy.validation_budget),
         "legal_combination_count": int(total),
@@ -362,6 +376,7 @@ def estimate_search(config: OptimizationConfig, data: DataBundle) -> dict[str, A
     if config.base.grid_mode != "geometric":
         raise ValueError("v4 参数研究只支持等比网格")
     space = ParameterSpace(config)
+    movable = _movable_fields(space, config)
     dates = pd.DatetimeIndex(data.calendar)
     eval_start = pd.Timestamp(config.base.start_date).normalize()
     asof = scientific._known_preceding_close(data, eval_start)
@@ -369,16 +384,16 @@ def estimate_search(config: OptimizationConfig, data: DataBundle) -> dict[str, A
     generation, folds, split, reasons = scientific._folds_for_history(history)
     total = space.size()
     method = _method(config, total)
-    if config.strategy.ranking_mode == "fixed_mean" and space.active:
+    if config.strategy.ranking_mode == "fixed_mean" and movable:
         radii = {
             name: value_to_ticks(name, config.strategy.fixed_half_widths.get(name, UNITS[name]))
-            for name in space.active
+            for name in movable
         }
-        minimum_neighborhood = math.prod(2 * radii[name] + 1 for name in space.active)
-        neighborhood_possible = all(2 * radii[name] + 1 <= space.dimensions[name].count for name in space.active)
+        minimum_neighborhood = math.prod(2 * radii[name] + 1 for name in movable)
+        neighborhood_possible = all(2 * radii[name] + 1 <= space.dimensions[name].count for name in movable)
     else:
-        minimum_neighborhood = space.min_box_size()
-        neighborhood_possible = all(space.dimensions[name].count >= 3 for name in space.active) if space.active else True
+        minimum_neighborhood = space.min_box_size(movable)
+        neighborhood_possible = all(space.dimensions[name].count >= 3 for name in movable) if movable else False
     if not neighborhood_possible:
         reasons = [*reasons, "有效搜索范围无法容纳完整对称最小邻域；只能产生单点诊断"]
     if method == "exhaustive" and (
@@ -401,15 +416,16 @@ def estimate_search(config: OptimizationConfig, data: DataBundle) -> dict[str, A
         "strategy_id": config.strategy.strategy_id,
         "grid_mode": "geometric",
         "ranking_mode": config.strategy.ranking_mode,
+        "neighborhood_fields": list(movable),
         "fields": list(space.fields),
         "active_fields": list(space.active),
-        "units": {"grid_step": 0.001, "shares": 100},
+        "units": {**UNITS, "shares": 100},
         "effective_bounds": {
             name: {
                 "low_ticks": dim.low,
                 "high_ticks": dim.high,
-                "low": dim.low * dim.unit if name == "grid_step" else dim.low * 100,
-                "high": dim.high * dim.unit if name == "grid_step" else dim.high * 100,
+                "low": dim.low * dim.unit if name in {"buy_step", "sell_step"} else dim.low * 100,
+                "high": dim.high * dim.unit if name in {"buy_step", "sell_step"} else dim.high * 100,
                 "fixed": dim.fixed,
             }
             for name, dim in space.dimensions.items()
@@ -438,7 +454,7 @@ def strategy_descriptions() -> dict[str, Any]:
             "label": "等比网格正超额邻域",
             "grid_mode": "geometric",
             "fields": list(FIELDS),
-            "units": {"grid_step": 0.001, "shares": 100},
+            "units": {**UNITS, "shares": 100},
             "search_methods": ["auto", "hierarchical", "exhaustive"],
             "ranking_modes": ["max_volume", "fixed_mean"],
             "default_ranking_mode": "max_volume",
@@ -448,9 +464,10 @@ def strategy_descriptions() -> dict[str, Any]:
                 "recommendation_count": 10,
                 "max_shares_mode": "search",
                 "slippage_mode": "configured",
+                "neighborhood_fields": ["buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares"],
                 "fixed_half_widths": {
-                    "grid_step": 0.001, "sell_shares": 100, "buy_shares": 100,
-                    "min_shares": 100, "max_shares": 100,
+                    "buy_step": 0.001, "sell_step": 0.001, "sell_shares": 100, "buy_shares": 100,
+                    "min_shares": 500, "max_shares": 500,
                 },
             },
         }]

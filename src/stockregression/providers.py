@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
+import re
 import threading
 from functools import wraps, lru_cache
 from datetime import datetime
@@ -19,6 +21,10 @@ from .quality import canonical_frame
 
 _BAOSTOCK_LOCK = threading.RLock()
 _AKSHARE_HTTP_LOCK = threading.RLock()
+_SINA_LOCAL = threading.local()
+_BAOSTOCK_LOCAL = threading.local()
+_MARKET_CALENDAR_CACHE: dict[tuple[int, str, str], pd.DataFrame] = {}
+_SINA_MINUTE_URL = "https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataService.getKLineData"
 
 
 def serialized_baostock(function):
@@ -27,6 +33,26 @@ def serialized_baostock(function):
         with _BAOSTOCK_LOCK:
             return function(*args, **kwargs)
     return call
+
+
+def _baostock_session():
+    """Keep one authenticated BaoStock session per worker process."""
+    import baostock as bs
+
+    active = getattr(_BAOSTOCK_LOCAL, "module", None)
+    if active is not bs or not getattr(_BAOSTOCK_LOCAL, "logged_in", False):
+        with contextlib.redirect_stdout(io.StringIO()):
+            login = bs.login()
+        if login.error_code != "0":
+            raise RuntimeError("BaoStock 登录失败：" + login.error_msg)
+        _BAOSTOCK_LOCAL.module = bs
+        _BAOSTOCK_LOCAL.logged_in = True
+    return bs
+
+
+def _baostock_reset() -> None:
+    _BAOSTOCK_LOCAL.logged_in = False
+    _BAOSTOCK_LOCAL.module = None
 TDX_SERVERS = [("180.153.18.170", 7709), ("180.153.18.172", 80), ("202.108.253.139", 80), ("60.191.117.167", 7709)]
 
 
@@ -60,26 +86,23 @@ def latest_closed_date():
 @serialized_baostock
 def fetch_latest_trading_date(as_of: str):
     """Resolve a closed calendar date through the exchange calendar, not weekdays."""
-    import baostock as bs
     end = pd.Timestamp(as_of)
-    with contextlib.redirect_stdout(io.StringIO()):
-        login = bs.login()
-        if login.error_code != "0":
-            raise RuntimeError("交易日历登录失败：" + login.error_msg)
-        try:
-            result = bs.query_trade_dates(str((end - pd.Timedelta(days=40)).date()), str(end.date()))
-            if result.error_code != "0":
-                raise RuntimeError("交易日历查询失败：" + result.error_msg)
-            dates = []
-            while result.next():
-                row = dict(zip(result.fields, result.get_row_data()))
-                if row.get("is_trading_day") == "1":
-                    dates.append(pd.Timestamp(row["calendar_date"]))
-            if not dates:
-                raise RuntimeError("最近 40 天未返回有效交易日")
-            return max(dates)
-        finally:
-            bs.logout()
+    try:
+        bs = _baostock_session()
+        result = bs.query_trade_dates(str((end - pd.Timedelta(days=40)).date()), str(end.date()))
+        if result.error_code != "0":
+            raise RuntimeError("交易日历查询失败：" + result.error_msg)
+        dates = []
+        while result.next():
+            row = dict(zip(result.fields, result.get_row_data()))
+            if row.get("is_trading_day") == "1":
+                dates.append(pd.Timestamp(row["calendar_date"]))
+        if not dates:
+            raise RuntimeError("最近 40 天未返回有效交易日")
+        return max(dates)
+    except Exception:
+        _baostock_reset()
+        raise
 
 
 def fetch_instruments(_legacy_revision: str | None = None) -> list[dict]:
@@ -154,52 +177,84 @@ def fetch_tdx(symbol: str, earliest=None, cancelled=lambda: False) -> pd.DataFra
 
 
 def fetch_sina(symbol: str) -> pd.DataFrame:
-    import akshare as ak
     code, exchange = normalize_symbol(symbol).split(".")
-    # EastMoney's trends2 minute endpoint (fund_etf_hist_min_em) reports a
-    # 0.000 open for every historical session (observed for ETFs on
-    # 2026-10-12..15). The Sina minute feed returns full OHLC for stocks and
-    # ETFs alike, so both go through it.
-    with bounded_akshare_http():
-        frame = ak.stock_zh_a_minute(symbol=exchange.lower() + code, period="1", adjust="")
+    # AKShare's unadjusted helper performs extra adjusted-daily requests. Use
+    # the documented Sina payload directly so one security costs one request.
+    frame = _fetch_sina_minute(exchange.lower() + code)
     if frame is None or frame.empty:
         raise RuntimeError("新浪未返回近期分钟行情")
     frame = canonical_frame(frame, source="sina")
     return frame[frame.timestamp < latest_closed_date() + pd.Timedelta(days=1)].copy()
 
 
+def _sina_session():
+    import requests
+
+    session = getattr(_SINA_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 stockregression/0.1",
+            "Accept": "text/javascript,application/json,*/*",
+        })
+        _SINA_LOCAL.session = session
+    return session
+
+
+def _decode_sina_payload(text: str) -> list[dict]:
+    match = re.search(r"=\s*\((.*)\)\s*;?\s*$", text, flags=re.DOTALL)
+    if match:
+        text = match.group(1).strip()
+    while text.startswith("(") and text.endswith(")"):
+        text = text[1:-1].strip()
+    payload = json.loads(text)
+    if not isinstance(payload, list):
+        raise ValueError("新浪分钟响应不是记录列表")
+    return payload
+
+
+def _fetch_sina_minute(sina_symbol: str) -> pd.DataFrame:
+    response = _sina_session().get(
+        _SINA_MINUTE_URL,
+        params={"symbol": sina_symbol, "scale": "1", "ma": "no", "datalen": "1970"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = _decode_sina_payload(response.text)
+    frame = pd.DataFrame(payload)
+    if frame.empty:
+        return frame
+    return frame.iloc[:, :7].copy()
+
+
 @serialized_baostock
 def fetch_reference_5m(symbol: str, start, end) -> pd.DataFrame:
     # BaoStock serves unadjusted 5-minute bars for A shares and listed ETFs
     # alike, and is independent of the Sina minute feed used for recent bars.
-    import baostock as bs
     code, exchange = normalize_symbol(symbol).split(".")
-    with contextlib.redirect_stdout(io.StringIO()):
-        login = bs.login()
-        if login.error_code != "0":
-            raise RuntimeError("BaoStock 参考分钟登录失败")
-        try:
-            result = bs.query_history_k_data_plus(exchange.lower() + "." + code,
-                "date,time,open,high,low,close,volume,amount", start_date=str(pd.Timestamp(start).date()),
-                end_date=str(pd.Timestamp(end).date()), frequency="5", adjustflag="3")
-            if result.error_code != "0":
-                raise RuntimeError("BaoStock 参考分钟失败：" + result.error_msg)
-            output = []
-            while result.next():
-                output.append(result.get_row_data())
-            frame = pd.DataFrame(output, columns=result.fields)
-            if frame.empty:
-                raise RuntimeError("没有独立5分钟参考数据")
-            frame["timestamp"] = pd.to_datetime(frame.time, format="%Y%m%d%H%M%S%f")
-            frame = frame.drop(columns=["time", "date"])
-            return canonical_frame(frame, source="baostock_5m")
-        finally:
-            bs.logout()
+    try:
+        bs = _baostock_session()
+        result = bs.query_history_k_data_plus(exchange.lower() + "." + code,
+            "date,time,open,high,low,close,volume,amount", start_date=str(pd.Timestamp(start).date()),
+            end_date=str(pd.Timestamp(end).date()), frequency="5", adjustflag="3")
+        if result.error_code != "0":
+            raise RuntimeError("BaoStock 参考分钟失败：" + result.error_msg)
+        output = []
+        while result.next():
+            output.append(result.get_row_data())
+        frame = pd.DataFrame(output, columns=result.fields)
+        if frame.empty:
+            raise RuntimeError("没有独立5分钟参考数据")
+        frame["timestamp"] = pd.to_datetime(frame.time, format="%Y%m%d%H%M%S%f")
+        frame = frame.drop(columns=["time", "date"])
+        return canonical_frame(frame, source="baostock_5m")
+    except Exception:
+        _baostock_reset()
+        raise
 
 
 @serialized_baostock
 def fetch_stock_daily(symbol: str, start, end, cancelled=lambda: False):
-    import baostock as bs
     code, exchange = normalize_symbol(symbol).split(".")
     bs_code = exchange.lower() + "." + code
     start, end = str(pd.Timestamp(start).date()), str(pd.Timestamp(end).date())
@@ -214,27 +269,25 @@ def fetch_stock_daily(symbol: str, start, end, cancelled=lambda: False):
             output.append(result.get_row_data())
         return pd.DataFrame(output, columns=result.fields)
 
-    with contextlib.redirect_stdout(io.StringIO()):
-        login = bs.login()
-        if login.error_code != "0":
-            raise RuntimeError("BaoStock 登录失败：" + login.error_msg)
-        try:
-            basic = rows(bs.query_stock_basic(code=bs_code))
-            metadata = {}
-            if not basic.empty:
-                row = basic.iloc[0]
-                metadata = {"name": row.get("code_name", symbol), "listing_date": row.get("ipoDate") or None, "delisting_date": row.get("outDate") or None}
-                if metadata.get("listing_date"):
-                    start = max(start, str(metadata["listing_date"]))
-            daily = rows(bs.query_history_k_data_plus(bs_code,
-                "date,open,high,low,close,preclose,volume,amount,tradestatus,isST",
-                start_date=start, end_date=end, frequency="d", adjustflag="3"))
-            if daily.empty:
-                raise RuntimeError("BaoStock 未返回所选股票的日线")
-            daily = canonical_frame(daily, daily=True)
-            return daily, metadata
-        finally:
-            bs.logout()
+    try:
+        bs = _baostock_session()
+        basic = rows(bs.query_stock_basic(code=bs_code))
+        metadata = {}
+        if not basic.empty:
+            row = basic.iloc[0]
+            metadata = {"name": row.get("code_name", symbol), "listing_date": row.get("ipoDate") or None, "delisting_date": row.get("outDate") or None}
+            if metadata.get("listing_date"):
+                start = max(start, str(metadata["listing_date"]))
+        daily = rows(bs.query_history_k_data_plus(bs_code,
+            "date,open,high,low,close,preclose,volume,amount,tradestatus,isST",
+            start_date=start, end_date=end, frequency="d", adjustflag="3"))
+        if daily.empty:
+            raise RuntimeError("BaoStock 未返回所选股票的日线")
+        daily = canonical_frame(daily, daily=True)
+        return daily, metadata
+    except Exception:
+        _baostock_reset()
+        raise
 
 
 @serialized_baostock
@@ -257,27 +310,24 @@ def fetch_etf_daily(symbol: str, start, end, source: str = "baostock", cancelled
         return daily
     if source != "baostock":
         raise ValueError("未知 ETF 日线来源：" + source)
-    import baostock as bs
-    with contextlib.redirect_stdout(io.StringIO()):
-        login = bs.login()
-        if login.error_code != "0":
-            raise RuntimeError("BaoStock ETF 日线登录失败：" + login.error_msg)
-        try:
-            result = bs.query_history_k_data_plus(
-                exchange.lower() + "." + code,
-                "date,open,high,low,close,preclose,volume,amount,tradestatus",
-                start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date()),
-                frequency="d", adjustflag="3",
-            )
-            if result.error_code != "0":
-                raise RuntimeError("BaoStock ETF 日线失败：" + result.error_msg)
-            rows = []
-            while result.next():
-                if cancelled():
-                    raise InterruptedError("任务已取消")
-                rows.append(result.get_row_data())
-        finally:
-            bs.logout()
+    try:
+        bs = _baostock_session()
+        result = bs.query_history_k_data_plus(
+            exchange.lower() + "." + code,
+            "date,open,high,low,close,preclose,volume,amount,tradestatus",
+            start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date()),
+            frequency="d", adjustflag="3",
+        )
+        if result.error_code != "0":
+            raise RuntimeError("BaoStock ETF 日线失败：" + result.error_msg)
+        rows = []
+        while result.next():
+            if cancelled():
+                raise InterruptedError("任务已取消")
+            rows.append(result.get_row_data())
+    except Exception:
+        _baostock_reset()
+        raise
     if not rows:
         raise RuntimeError("BaoStock ETF 日线未返回所选区间数据")
     return canonical_frame(pd.DataFrame(rows, columns=result.fields), daily=True)
@@ -336,33 +386,45 @@ def fetch_etf_auxiliary(symbol, start, end, cancelled=lambda: False, daily_sourc
 @serialized_baostock
 def fetch_market_calendar(start, end, cancelled=lambda: False) -> pd.DataFrame:
     """Fetch the exchange calendar without requesting a security's daily bars."""
-    import baostock as bs
-    with contextlib.redirect_stdout(io.StringIO()):
-        login = bs.login()
-        if login.error_code != "0":
-            raise RuntimeError("交易日历登录失败：" + login.error_msg)
-        try:
-            result = bs.query_trade_dates(
-                start_date=str(pd.Timestamp(start).date()),
-                end_date=str(pd.Timestamp(end).date()),
-            )
-            if result.error_code != "0":
-                raise RuntimeError("交易日历失败：" + result.error_msg)
-            records = []
-            while result.next():
-                if cancelled():
-                    raise InterruptedError("任务已取消")
-                records.append(result.get_row_data())
-        finally:
-            bs.logout()
+    try:
+        bs = _baostock_session()
+    except Exception:
+        _baostock_reset()
+        raise
+    cache_key = (
+        id(bs),
+        str(pd.Timestamp(start).date()), str(pd.Timestamp(end).date()),
+    )
+    cached = _MARKET_CALENDAR_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+    try:
+        result = bs.query_trade_dates(
+            start_date=str(pd.Timestamp(start).date()),
+            end_date=str(pd.Timestamp(end).date()),
+        )
+        if result.error_code != "0":
+            raise RuntimeError("交易日历失败：" + result.error_msg)
+        records = []
+        while result.next():
+            if cancelled():
+                raise InterruptedError("任务已取消")
+            records.append(result.get_row_data())
+    except Exception:
+        _baostock_reset()
+        raise
     frame = pd.DataFrame(records, columns=result.fields)
     if frame.empty:
         return pd.DataFrame({"date": pd.to_datetime([])})
-    return pd.DataFrame({
+    result = pd.DataFrame({
         "date": pd.to_datetime(
             frame.loc[frame.is_trading_day == "1", "calendar_date"]
         )
     })
+    if len(_MARKET_CALENDAR_CACHE) >= 64:
+        _MARKET_CALENDAR_CACHE.clear()
+    _MARKET_CALENDAR_CACHE[cache_key] = result.copy()
+    return result
 
 
 @serialized_baostock
@@ -399,26 +461,23 @@ def fetch_market_actions(symbol, start, end, cancelled=lambda: False) -> tuple[p
             except Exception as exc:
                 warnings.append(f"{year} ETF 分红/拆分资料未核验：{exc}")
     else:
-        import baostock as bs
         bs_code = exchange.lower() + "." + code
-        with contextlib.redirect_stdout(io.StringIO()):
-            login = bs.login()
-            if login.error_code != "0":
-                raise RuntimeError("公司行动登录失败：" + login.error_msg)
-            try:
-                for year in years:
-                    if cancelled():
-                        raise InterruptedError("任务已取消")
-                    result = bs.query_dividend_data(
-                        bs_code, year=str(year), yearType="operate"
-                    )
-                    if result.error_code != "0":
-                        warnings.append(f"{year} 公司行动失败：{result.error_msg}")
-                        continue
-                    while result.next():
-                        records.append(result.get_row_data())
-            finally:
-                bs.logout()
+        try:
+            bs = _baostock_session()
+            for year in years:
+                if cancelled():
+                    raise InterruptedError("任务已取消")
+                result = bs.query_dividend_data(
+                    bs_code, year=str(year), yearType="operate"
+                )
+                if result.error_code != "0":
+                    warnings.append(f"{year} 公司行动失败：{result.error_msg}")
+                    continue
+                while result.next():
+                    records.append(result.get_row_data())
+        except Exception:
+            _baostock_reset()
+            raise
     metadata = {
         "actions_verified": not warnings,
         "actions_checked_years": years,

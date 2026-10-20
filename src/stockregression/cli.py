@@ -65,7 +65,7 @@ def serve(port: int = 8000, open_browser: bool = False):
 
 
 @app.command()
-def sync(mode: str = "daily", symbol: list[str] = typer.Option(None), scope: str | None = None, resume: bool = False, retry_failed: bool = False, workers: int = 2, dry_run: bool = False):
+def sync(mode: str = "daily", symbol: list[str] = typer.Option(None), scope: str | None = None, resume: bool = False, retry_failed: bool = False, workers: int = 4, dry_run: bool = False):
     """无网页时独立补数；mode 为 history/daily/repair。"""
     if mode not in ("history", "daily", "repair"):
         raise typer.BadParameter("mode 为 history/daily/repair")
@@ -162,7 +162,7 @@ def data_import_folder(
     dry_run: bool = typer.Option(False, "--dry-run"),
     resume: bool = typer.Option(True, "--resume/--fresh"),
     calendar_path: Path | None = typer.Option(None, "--calendar-path"),
-    workers: int = typer.Option(2, "--workers", min=1, max=4),
+    workers: int = typer.Option(4, "--workers", min=1, max=4),
     skip_invalid_rows: bool = typer.Option(False, "--skip-invalid-rows"),
     import_mode: str = typer.Option("merge", "--import-mode"),
 ):
@@ -192,7 +192,7 @@ def data_import_etf_package(
     label_convention: str = typer.Option("auto", "--label-convention"),
     dry_run: bool = typer.Option(False, "--dry-run"),
     resume: bool = typer.Option(True, "--resume/--fresh"),
-    workers: int = typer.Option(2, "--workers", min=1, max=4),
+    workers: int = typer.Option(4, "--workers", min=1, max=4),
     skip_invalid_rows: bool = typer.Option(False, "--skip-invalid-rows"),
 ):
     """扫描并导入 ETF 基本资料、日线和分钟 Parquet 数据包。"""
@@ -214,7 +214,7 @@ def data_rebuild_parquet(
     dry_run: bool = typer.Option(False, "--dry-run"),
     reset: bool = typer.Option(False, "--reset"),
     resume: bool = typer.Option(False, "--resume"),
-    workers: int = typer.Option(2, "--workers", min=1, max=4),
+    workers: int = typer.Option(4, "--workers", min=1, max=4),
 ):
     """清理旧行情并从 ETF 数据包建立新的 Parquet 行情库。"""
     settings = load_settings()
@@ -253,7 +253,7 @@ def data_sync(
     resume: bool = typer.Option(False, "--resume"),
     retry_failed: bool = typer.Option(False, "--retry-failed"),
     initialize: bool = typer.Option(False, "--initialize"),
-    workers: int = typer.Option(2, "--workers", min=1, max=4),
+    workers: int = typer.Option(4, "--workers", min=1, max=4),
 ):
     """更新日线或 1 分钟基础行情；粗周期按需生成。"""
     timeframes = frequency or ["1day", "1min"]

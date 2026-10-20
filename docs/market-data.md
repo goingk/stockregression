@@ -1,5 +1,11 @@
 # 周期行情数据管理
 
+## 同步与校验并发
+
+线上同步默认下载并发为 4，实际值还受“计算资源”设置和共享 CPU 预算限制。新浪分钟使用带超时和连接复用的专用适配器，每只证券只发送一次未复权分钟请求。BaoStock 日线批处理最多使用两个独立进程，每个进程维护自己的会话和登录；网页任务、CLI 与计划任务通过同一数据目录下的槽位文件限制来源并发。
+
+校验先检查行情版本、文件状态、规则版本和逐日校验账本。完整且无异常变化的区间直接复用，不再读取行情正文。需要重验时按自然月划分，最多 4 个进程独立计算，父进程汇总进度；历史修订仍只重验受影响日期。任务工作集预算限制并行月份和中间帧数量。
+
 行情由 `stockregression.market_data` 管理。系统维护一个当前数据包，作为唯一的正式行情来源。行情浏览、回测、预览和参数研究都读取该数据包；线上增量、历史补齐、手动导入和本地聚合也都写回该数据包。
 
 ## 基础底座、增量覆盖与合规截止
@@ -18,10 +24,12 @@ SQLite 中的 `catalog.sqlite` 保存可重建索引、任务、配置和结果�
 
 ## 数据包
 
-活动数据包固定为仓库中的 `datasets/datasets/ETF数据更新至2026.9.30`。`.local/settings.json` 的 `package_dir` 或环境变量 `STOCKREGRESSION_PACKAGE_DIR` 只能指向该目录；应用不会回退到旧 `package/`、`manifests/` 或 `parquet/` 快照。应用数据目录与行情数据包是两个概念。
+活动 ETF 数据包固定为应用数据目录下的 `data/dataset/etf/`；股票数据包预留为 `data/dataset/stock/`，两者使用相同的 Parquet 布局。`.local/settings.json` 的 `package_dir` 或环境变量 `STOCKREGRESSION_PACKAGE_DIR` 只能指向当前活动数据包；应用不会回退到旧 `package/`、`manifests/` 或 `parquet/` 快照。`data/` 下的其他子目录保存索引、任务、结果和日志，行情正文只放在 `data/dataset/<asset>/`。
+
+ETF 数据包目录为 `data/dataset/etf/`，股票数据包目录为 `data/dataset/stock/`。两者分别使用以下布局：
 
 ```text
-数据包/
+data/dataset/etf/
   etf_basic_data.parquet
   etf_daily.parquet
   etf_1min/<代码>.parquet
@@ -32,6 +40,20 @@ SQLite 中的 `catalog.sqlite` 保存可重建索引、任务、配置和结果�
   etf_1week/<代码>.parquet
   etf_1month/<代码>.parquet
 
+  auxiliary/
+    calendars/SH.parquet
+    calendars/SZ.parquet
+    actions/<代码>.parquet
+
+  .stockregression/
+    manifest.json
+    quality/
+    history/
+    staging/
+    transactions/
+    locks/
+
+data/dataset/stock/
   stock_basic_data.parquet
   stock_daily.parquet
   stock_1min/<代码>.parquet
@@ -209,6 +231,8 @@ uv run --frozen stockregression data probe --source eastmoney --capability etf_d
 用户确认后提交一个父任务，按依赖执行。只缺日历或公司行动时，只补相应辅助资料；已有完整行情不会因辅助资料缺口被无意义重写。
 
 父任务保留每步状态。部分成功后，已发布数据立即有效；重试只处理失败或剩余缺口。完成后重新判断原请求，并提供返回回测或研究草稿的入口。
+
+数据包的辅助交易日历可能只包含最近一段增量。历史校验、覆盖判断和缺口修补会结合包内日线的实际交易日期，并保留历史失败记录；不会仅按这份短日历缩小已校验范围。仅缺质量核验时直接在本地先校验日线、再校验目标周期，无需重新下载或导入。准备任务只校验请求区间及必要的日线前置历史，显示已校验／待校验天数；同月行情批量读取，已通过日期可复用。
 
 ## 本地聚合
 

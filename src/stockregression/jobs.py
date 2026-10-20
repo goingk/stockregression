@@ -5,6 +5,7 @@ import json
 import multiprocessing
 import os
 import shutil
+import subprocess
 import threading
 import time
 import traceback
@@ -18,7 +19,10 @@ from .market_data.package import import_etf_package, index_etf_package_direct
 from .market_data.maintenance import rebuild_state, update_rebuild_state
 from .market_data.preparation import MarketPreparationService
 from .market_data.sync import MarketDataSyncService
+from .performance import PerformanceTrace, activate_performance, reset_performance
 from .research_preparation import prepare_research_bundle
+from .resources import ResourceLease, clear_stale_leases
+from .settings import load_settings
 from .source_health import probe_source
 from .storage import Store
 
@@ -52,7 +56,7 @@ def _research_protocol_hash(config: OptimizationConfig) -> str:
         payload["protocol_thresholds"] = {
             "strategy": config.strategy.model_dump(mode="json"),
             "grid_mode": "geometric",
-            "grid_step_unit": 0.001,
+            "spacing_unit": 0.001,
             "share_unit": 100,
             "negative_tolerance": 1e-12,
             "funding_mode": "top_up_on_fill",
@@ -116,7 +120,26 @@ def execute_job(root: str, job_id: str, observer=None):
     job = store.job(job_id)
     if not job:
         return
-    store.update_job(job_id, status="running", message="正在执行", pid=os.getpid())
+    configured = load_settings()
+    trace = PerformanceTrace(job_id=job_id)
+    lease = ResourceLease(store, job_id, configured.performance)
+    cpu_units = lease.acquire()
+    performance_tokens = activate_performance(
+        cpu_budget=cpu_units,
+        workspace_mb=configured.performance.workspace_mb,
+        trace=trace,
+        rebalance=lease.rebalance,
+        blas_threads=configured.performance.blas_threads,
+    )
+    trace.update(
+        cpu_budget=cpu_units,
+        workspace_budget_mb=configured.performance.workspace_mb,
+        performance_settings=configured.performance.model_dump(mode="json"),
+    )
+    store.update_job(
+        job_id, status="running",
+        message=f"正在执行 · {cpu_units} 个计算线程", pid=os.getpid(),
+    )
     last_progress = 0.0
     last_cancel_check = 0.0
     cancel_state = False
@@ -133,9 +156,12 @@ def execute_job(root: str, job_id: str, observer=None):
         nonlocal last_progress
         tick = time.monotonic()
         if tick - last_progress > 0.4 or fraction <= 0 or fraction >= 1:
-            store.update_job(job_id, progress=max(0, min(1, float(fraction))), message=str(message))
+            rendered = str(message)
+            if job.get("kind") in {"backtest", "optimization", "batch", "batch_backtest"} and 0 < fraction < 1:
+                rendered += f" · {max(1, lease.units)} 线程"
+            store.update_job(job_id, progress=max(0, min(1, float(fraction))), message=rendered)
             if observer:
-                observer(fraction, str(message))
+                observer(fraction, rendered)
             last_progress = tick
     try:
         service = DataService(store)
@@ -146,31 +172,35 @@ def execute_job(root: str, job_id: str, observer=None):
             from .engine import run_backtest
             config = BacktestConfig.model_validate(payload["config"])
             progress(0.01, "检查本地行情并准备回测数据")
-            bundle = service.ensure_bundle(config, payload.get("version"), lambda fraction, message: progress(0.02 + 0.30 * fraction, message), cancelled)
+            with trace.measure("data_preparation"):
+                bundle = service.ensure_bundle(config, payload.get("version"), lambda fraction, message: progress(0.02 + 0.30 * fraction, message), cancelled)
             payload["version"] = bundle.version
             store.update_job(job_id, payload=payload)
             progress(0.33, "行情准备完成，开始回测")
-            result = run_backtest(config, bundle, lambda fraction, message: progress(0.33 + 0.67 * fraction, message), cancelled)
+            with trace.measure("backtest"):
+                result = run_backtest(config, bundle, lambda fraction, message: progress(0.33 + 0.67 * fraction, message), cancelled)
             symbol, title = config.symbol, "现金补足网格 / 定投 / 买入持有" if config.schema_version == 3 else "股数网格 / 定投 / 买入持有" if config.schema_version == 2 else "网格 / 定投 / 初始全仓"
         elif kind == "optimization":
             from .optimization import optimize
             config = OptimizationConfig.model_validate(payload["config"])
             scientific = config.protocol_version in (2, 3, 4)
             progress(0.01, "检查本地行情并准备研究数据" if not scientific else "准备评估区间及前置 504 个交易日")
-            if scientific:
-                bundle = prepare_research_bundle(
-                    service,
-                    config.base,
-                    payload.get("version"),
-                    lambda fraction, message: progress(0.02 + 0.30 * fraction, message),
-                    cancelled,
-                )
-            else:
-                bundle = service.ensure_bundle(config.base, payload.get("version"), lambda fraction, message: progress(0.02 + 0.30 * fraction, message), cancelled)
+            with trace.measure("data_preparation"):
+                if scientific:
+                    bundle = prepare_research_bundle(
+                        service,
+                        config.base,
+                        payload.get("version"),
+                        lambda fraction, message: progress(0.02 + 0.30 * fraction, message),
+                        cancelled,
+                    )
+                else:
+                    bundle = service.ensure_bundle(config.base, payload.get("version"), lambda fraction, message: progress(0.02 + 0.30 * fraction, message), cancelled)
             payload["version"] = bundle.version
             store.update_job(job_id, payload=payload)
             progress(0.33, "行情准备完成，开始科学参数研究" if scientific else "行情准备完成，开始参数搜索")
-            result = optimize(config, bundle, lambda fraction, message: progress(0.33 + 0.67 * fraction, message), cancelled)
+            with trace.measure("research"):
+                result = optimize(config, bundle, lambda fraction, message: progress(0.33 + 0.67 * fraction, message), cancelled)
             result["diagnostics"] = bundle.metadata.get("diagnostics", {})
             result["source_events"] = bundle.metadata.get("source_events", [])
             symbol = config.base.symbol
@@ -212,7 +242,7 @@ def execute_job(root: str, job_id: str, observer=None):
                 label_convention=payload.get("label_convention", "auto"),
                 adjustment=payload.get("adjustment", "none"), etf_category=payload.get("etf_category"),
                 resume=payload.get("resume", True), calendar_path=payload.get("calendar_path"),
-                workers=payload.get("workers", 2), skip_invalid_rows=payload.get("skip_invalid_rows", False),
+                workers=payload.get("workers", configured.performance.download_workers), skip_invalid_rows=payload.get("skip_invalid_rows", False),
                 import_mode=payload.get("import_mode", "merge"),
                 progress=progress, cancelled=cancelled,
             )
@@ -224,7 +254,7 @@ def execute_job(root: str, job_id: str, observer=None):
                 market, payload["folder"], timeframes=payload.get("timeframes"),
                 symbols=payload.get("symbols"),
                 label_convention=payload.get("label_convention", "auto"),
-                resume=payload.get("resume", True), workers=payload.get("workers", 2),
+                resume=payload.get("resume", True), workers=payload.get("workers", configured.performance.download_workers),
                 skip_invalid_rows=payload.get("skip_invalid_rows", False),
                 progress=progress, cancelled=cancelled,
             )
@@ -263,7 +293,7 @@ def execute_job(root: str, job_id: str, observer=None):
                     selected, timeframe, payload.get("mode", "incremental"),
                     start=payload.get("start_date"), end=payload.get("end_date"),
                     resume=payload.get("resume", False), retry_failed=payload.get("retry_failed", False),
-                    workers=payload.get("workers", 2),
+                    workers=payload.get("workers", configured.performance.download_workers),
                     progress=progress, cancelled=cancelled,
                 )
                 combined.append(one)
@@ -350,6 +380,8 @@ def execute_job(root: str, job_id: str, observer=None):
                 title += " · 已取消"
             elif result.get("status") == "partial":
                 title += " · 部分完成"
+        if isinstance(result, dict):
+            result["performance"] = trace.snapshot()
         result_id = store.save_result(kind, result, symbol, title)
         sync_error = None
         if failed_sync:
@@ -376,6 +408,8 @@ def execute_job(root: str, job_id: str, observer=None):
         store.update_job(job_id, status="failed", message="任务失败，查看原因后可重试", error=str(exc))
     finally:
         _cleanup_uploaded_input(store, job_id)
+        lease.release()
+        reset_performance(performance_tokens)
 
 
 class JobManager:
@@ -391,6 +425,7 @@ class JobManager:
         for job in store.jobs(1000):
             if job["status"] == "running" and (not job.get("pid") or not _pid_alive(job["pid"])):
                 store.update_job(job["id"], status="failed", error="应用或计算进程中断；原数据版本保留，请重新运行", message="执行中断")
+        clear_stale_leases(store)
         self.thread.start()
 
     def _loop(self):
@@ -404,6 +439,7 @@ class JobManager:
                     job = store.job(job_id)
                     if job and job["status"] == "running":
                         store.update_job(job_id, status="failed", error="计算进程异常退出", message="进程中断")
+                    _release_job_lease(store, job_id)
             if len(self.active) >= self.workers:
                 continue
             queued = [job for job in reversed(store.jobs(1000)) if job["status"] == "queued"]
@@ -413,7 +449,9 @@ class JobManager:
                     continue
                 # Claim before spawn so two dispatcher ticks cannot duplicate a job.
                 store.update_job(job["id"], status="running", message="正在启动计算进程")
-                process = context.Process(target=execute_job, args=(self.root, job["id"]), daemon=True)
+                # Batch workers spawn their own BaoStock/validation children.
+                # A daemonic parent is forbidden from creating those children.
+                process = context.Process(target=execute_job, args=(self.root, job["id"]), daemon=False)
                 try:
                     process.start()
                     store.update_job(job["id"], pid=process.pid)
@@ -429,9 +467,31 @@ class JobManager:
             store.update_job(job_id, cancel_requested=1)
             process.join(timeout=3)
             if process.is_alive():
-                process.terminate()
+                _terminate_process_tree(process.pid)
                 process.join(timeout=1)
                 store.update_job(job_id, status="cancelled", message="应用已退出；计算任务已停止")
+            _release_job_lease(store, job_id)
+
+
+def _terminate_process_tree(pid: int | None) -> None:
+    """Cancel a job together with validation/session child processes."""
+    if not pid:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        return
+    try:
+        os.kill(int(pid), 15)
+    except OSError:
+        pass
+
+
+def _release_job_lease(store: Store, job_id: str) -> None:
+    with store.db() as db:
+        db.execute("DELETE FROM resource_leases WHERE job_id=?", (job_id,))
 
 
 def _pid_alive(pid: int) -> bool:

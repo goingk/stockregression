@@ -206,7 +206,8 @@ export interface BacktestConfig {
   grid_mode: 'trailing' | 'arithmetic' | 'geometric'
   buy_step: number
   sell_step: number
-  grid_step: number
+  /** Legacy schema 1 result field. New share-account configs always send buy_step and sell_step. */
+  grid_step?: number
   reference_price: number | null
   lower_price: number | null
   upper_price: number | null

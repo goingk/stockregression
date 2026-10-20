@@ -107,7 +107,7 @@ def fake_run_backtest(config, data, *, progress=None, cancelled=None, summary_on
     if progress:
         progress(0.5, "fixture")
     close_mean = float(data.daily["close"].mean()) if not data.daily.empty else 0.0
-    edge = float(config.buy_step if config.grid_mode == "trailing" else config.grid_step)
+    edge = float((config.buy_step + config.sell_step) / 2)
     metrics = {
         "total_return": 0.05 + edge,
         "cagr": 0.05 + edge,
@@ -200,10 +200,10 @@ def test_sampled_position_limits_remain_mergeable_and_legal(monkeypatch):
         assert params["sell_quantity"]["mode"] == "equity_ratio"
 
 
-def test_fixed_grid_mode_searches_grid_step(monkeypatch):
+def test_fixed_grid_mode_searches_buy_and_sell_spacing(monkeypatch):
     install_fake(monkeypatch)
     base = BacktestConfig(
-        symbol="600000.SH",
+        schema_version=3, symbol="600000.SH",
         start_date=date(2024, 1, 2),
         grid_mode="arithmetic",
     )
@@ -211,13 +211,16 @@ def test_fixed_grid_mode_searches_grid_step(monkeypatch):
         base=base,
         mode="historical",
         n_trials=2,
-        ranges={"grid_step": SearchRange(low=0.04, high=0.04)},
+        ranges={
+            "buy_step": SearchRange(low=0.04, high=0.04),
+            "sell_step": SearchRange(low=0.04, high=0.04),
+        },
     )
 
     result = optimization.optimize(config, make_bundle())
 
-    assert all(row["params"]["grid_step"] == 0.04 for row in result["historical"]["candidates"])
-    assert all("buy_step" not in row["params"] and "sell_step" not in row["params"] for row in result["historical"]["candidates"])
+    assert all(row["params"]["buy_step"] == 0.04 and row["params"]["sell_step"] == 0.04 for row in result["historical"]["candidates"])
+    assert all("grid_step" not in row["params"] for row in result["historical"]["candidates"])
 
 
 def test_invalid_position_samples_are_skipped(monkeypatch):

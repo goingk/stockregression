@@ -1,3 +1,4 @@
+import { researchQuantityUnit } from '../workbenchDefaults'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { EChartsOption } from 'echarts'
 import { FlaskConical, RefreshCw, RotateCcw } from 'lucide-react'
@@ -11,7 +12,7 @@ import { useTasks } from '../TaskCenter'
 import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, Field, Loading, NumField, PageHeader, SelectInput, configError, configPayload, loadConfig, percent, revealConfigError, useErrorMessage } from '../components'
 import { formatPValue, reviewBootstrapEvidence } from '../researchEvidence'
 import type { BacktestConfig, BacktestResult, DataDiagnostics, DataPreparationRequest, DataSourceEvent, Job } from '../types'
-import { defaultSearchRanges, percentageRanges as pctRange, rangeNames, researchRangesForSymbol, validResearchDefaults } from '../workbenchDefaults'
+import { defaultSearchRanges, percentageRanges as pctRange, rangeNames, researchConfigForSubmission, researchRangesForSymbol, validResearchDefaults } from '../workbenchDefaults'
 import type { ResearchDefaults, SearchRange as Range } from '../workbenchDefaults'
 
 type Dict = Record<string, unknown>
@@ -19,7 +20,7 @@ type Candidate = Dict & { params?: Dict; metrics?: Record<string, number | null>
 type SearchConfig = { base?: BacktestConfig; mode?: string; protocol_version?: number; n_trials?: number; local_search_budget?: number; seed?: number; ranges?: Dict; [key: string]: unknown }
 type TestRun = Partial<BacktestResult> & { strategies?: Record<string, { metrics?: Record<string, number | null>; equity?: Array<{ timestamp: string; equity: number }> }> }
 type RecommendationRegion = { region_id?: number; center_params?: Dict; radii?: Dict; normalized_volume?: number; combination_count?: number; completed_count?: number; center_excess_return?: number | null; mean_excess_return?: number | null; min_excess_return?: number | null; complete?: boolean; maximum_search_complete?: boolean; global_exhaustive?: boolean; stress?: Dict }
-type Recommendation = { params?: Dict | null; recommended_params?: Dict | null; diagnostic_params?: Dict; as_of?: string; score?: unknown; status?: string; reasons?: unknown; candidates?: Candidate[]; diagnostics?: Dict; recommendation_status?: string; recommendation_regions?: RecommendationRegion[] }
+type Recommendation = { params?: Dict | null; recommended_params?: Dict | null; diagnostic_params?: Dict | null; as_of?: string; score?: unknown; raw_score?: unknown; status?: string; reasons?: unknown; candidates?: Candidate[]; diagnostics?: Dict; recommendation_status?: string; recommendation_regions?: RecommendationRegion[] }
 type OptimizationResult = {
   protocol_version?: number; mode?: string; seed?: number; n_trials?: number; data_version?: string; label?: string; warnings?: string[]
   config?: SearchConfig; protocol?: Dict; is_demo?: boolean; quality?: Dict; diagnostics?: DataDiagnostics; source_events?: DataSourceEvent[]; computation?: Dict; locked_funding?: Dict
@@ -43,7 +44,8 @@ export type Props = {
   onRestore?: () => void
   onPrepareData?: (request: DataPreparationRequest) => void
 }
-const labels: Record<string, string> = { buy_step: '买入步长', sell_step: '卖出步长', grid_step: '网格间距', buy_ratio: '旧版买入比例', sell_ratio: '旧版卖出比例', initial_position: '旧版初始仓位', min_position: '旧版最小仓位', max_position: '旧版最大仓位', buy_shares: '每次买入股数', sell_shares: '每次卖出股数', initial_shares: '初始持股', min_shares: '最低持股', max_shares: '最高持股' }
+const labels: Record<string, string> = { buy_step: '买入间距', sell_step: '卖出间距', grid_step: '旧版网格间距', buy_ratio: '旧版买入比例', sell_ratio: '旧版卖出比例', initial_position: '旧版初始仓位', min_position: '旧版最小仓位', max_position: '旧版最大仓位', buy_shares: '每次买入股数', sell_shares: '每次卖出股数', initial_shares: '初始持股', min_shares: '最低持股', max_shares: '最高持股' }
+const v4ResearchFieldNames = ['buy_step', 'sell_step', 'sell_shares', 'buy_shares', 'min_shares', 'max_shares'] as const
 function revealDisclosure(id: string) {
   const element = document.querySelector<HTMLDetailsElement>(`details[data-disclosure="${id}"]`)
   if (!element) return
@@ -301,7 +303,7 @@ function constraintLabel(value: boolean | undefined) {
 }
 
 export default function ResearchPage({ base, settings, onSettingsChange, onBaseChange, onLoadConfig, requestedJobId, onRequestHandled, onSelectedJobChange, onFeeDefaultsEdit, onDefaultsEdit, onRestore, onPrepareData }: Props) {
-  const { protocol_version: protocolVersion, selection_target: selectionTarget, rebalance_days: rebalanceDays, bootstrap_reps: bootstrapReps, mode, n_trials: trials, local_search_budget: localSearchBudget, seed, top_candidates: topCandidates, max_drawdown: maxDrawdown, min_trades: minTrades, min_history_days: minHistoryDays, min_minute_ratio: minMinuteRatio, ranking_mode: rankingMode, search_method: searchMethod, training_budget: trainingBudget, validation_budget: validationBudget, recommendation_count: recommendationCount, max_shares_mode: maxSharesMode, slippage_mode: slippageMode, fixed_half_widths: fixedHalfWidths } = settings
+  const { protocol_version: protocolVersion, selection_target: selectionTarget, rebalance_days: rebalanceDays, bootstrap_reps: bootstrapReps, mode, n_trials: trials, local_search_budget: localSearchBudget, seed, top_candidates: topCandidates, max_drawdown: maxDrawdown, min_trades: minTrades, min_history_days: minHistoryDays, min_minute_ratio: minMinuteRatio, ranking_mode: rankingMode, search_method: searchMethod, training_budget: trainingBudget, validation_budget: validationBudget, recommendation_count: recommendationCount, max_shares_mode: maxSharesMode, slippage_mode: slippageMode, neighborhood_fields: neighborhoodFields, fixed_half_widths: fixedHalfWidths } = settings
   const tasks = useTasks()
   const researchJobs = useMemo(() => tasks.jobs.filter(isOptimizationJob), [tasks.jobs])
   const viewableJobs = useMemo(() => researchJobs.filter(job => Boolean(job.result_id)), [researchJobs])
@@ -319,7 +321,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const jobRequests = useRef(new Map<string, Promise<Job>>())
   const resultRequests = useRef(new Map<string, Promise<OptimizationResult>>())
   const err = useErrorMessage()
-  useEffect(() => { setSearchPreview(null) }, [base, settings])
+  useEffect(() => { setSearchPreview(null); setError('') }, [base, settings])
   const isStarBoard = base.symbol.startsWith('688') || base.symbol.startsWith('689')
   const selectedJob = researchJobs.find(job => job.id === selectedJobId) ?? (fallbackJob?.id === selectedJobId ? fallbackJob : null)
   const selectedResultKey = selectedJob?.result_id && ['completed', 'cancelled'].includes(selectedJob.status) ? selectedJob.id + ':' + selectedJob.result_id : ''
@@ -384,31 +386,37 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     setSearchPreview(null)
   }
   const submit = async () => {
-    const baseError = configError(base)
+    const v4Base = researchConfigForSubmission(base, protocolVersion, maxSharesMode)
+    const baseError = configError(v4Base)
     if (baseError) { setError(baseError); revealConfigError(baseError); return }
-    if (!validResearchDefaults(settings)) { setError('请填写有效研究设置；搜索上限应不小于下限，步长须为正数，股数须以 100 为单位。'); revealDisclosure('research-search-ranges'); return }
+    if (!validResearchDefaults(settings)) { setError('请填写有效研究设置；搜索上限应不小于下限，步长须为正数，买卖数量须以 100 为单位，持仓上下限须以 500 为单位。'); revealDisclosure('research-search-ranges'); return }
     const minimumBuyShares = isStarBoard ? 200 : 100
     if (ranges.buy_shares.low < minimumBuyShares || ranges.buy_shares.high < minimumBuyShares) {
       setError('每次买入搜索范围下限应至少为 ' + minimumBuyShares + ' 股 / 份。')
       revealDisclosure('research-search-ranges')
       return
     }
+    const submittedNeighborhoodFields = neighborhoodFields.filter(name => !(name === 'max_shares' && maxSharesMode === 'unlimited'))
+    if (protocolVersion === 4 && !submittedNeighborhoodFields.length) {
+      setError('请至少勾选一个细搜索邻域参数。')
+      revealDisclosure('research-search-ranges')
+      return
+    }
     setBusy(true); setError(''); setDataIssue(null)
     try {
       const submittedRanges = Object.fromEntries(Object.entries(ranges).filter(([name]) => {
-        if (protocolVersion === 4) return ['grid_step', 'buy_shares', 'sell_shares', 'min_shares', 'max_shares'].includes(name) && !(name === 'max_shares' && maxSharesMode === 'unlimited')
+        if (protocolVersion === 4) return v4ResearchFieldNames.includes(name as typeof v4ResearchFieldNames[number]) && !(name === 'max_shares' && maxSharesMode === 'unlimited')
         if (protocolVersion >= 2 && name === 'initial_shares') return false
         if (protocolVersion >= 3 && base.max_shares === null && name === 'max_shares') return false
-        return !['buy_step', 'sell_step', 'grid_step'].includes(name) || (base.grid_mode === 'trailing' ? name !== 'grid_step' : name === 'grid_step')
+        return name !== 'grid_step'
       }))
-      const v4Base = { ...base, grid_mode: 'geometric' as const, max_shares: protocolVersion === 4 && maxSharesMode === 'unlimited' ? null : base.max_shares }
       const common = {
         base: configPayload(v4Base), protocol_version: protocolVersion, n_trials: trials, local_search_budget: localSearchBudget, seed, top_candidates: topCandidates,
         max_drawdown: maxDrawdown, min_trades: minTrades, min_minute_ratio: minMinuteRatio, ranges: submittedRanges,
         strategy: protocolVersion === 4 ? {
           search_method: searchMethod, ranking_mode: rankingMode, training_budget: trainingBudget,
           validation_budget: validationBudget, recommendation_count: recommendationCount,
-          max_shares_mode: maxSharesMode, slippage_mode: slippageMode, fixed_half_widths: fixedHalfWidths,
+          max_shares_mode: maxSharesMode, slippage_mode: slippageMode, neighborhood_fields: submittedNeighborhoodFields, fixed_half_widths: fixedHalfWidths,
         } : undefined,
       }
       const request = protocolVersion >= 2
@@ -518,7 +526,11 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const fixed = result?.fixed
   const adaptive = result?.adaptive
   const current = fixed?.current
-  const currentRecommended = Number(actualVersion) >= 3 ? current?.recommended_params ?? current?.params : current?.params
+  const explicitlyUnqualified = current?.recommendation_status === 'no_qualified' || current?.status === 'no_qualified'
+  const currentRecommended = Number(actualVersion) >= 3
+    ? current?.recommended_params ?? (explicitlyUnqualified ? undefined : current?.params ?? undefined)
+    : current?.params
+  const relativeBest = current?.diagnostic_params ?? (currentRecommended ? undefined : current?.params ?? undefined)
   const adaptiveRecommended = adaptive?.latest_params
   const fixedRun = runOf(fixed?.test_result)
   const adaptiveRun = runOf(adaptive?.test_result)
@@ -544,8 +556,8 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const adaptiveAdviceDiffers = Boolean(adaptiveRecommended && (!currentRecommended || JSON.stringify(adaptiveRecommended) !== JSON.stringify(currentRecommended) || adaptive?.latest_as_of !== current?.as_of))
   const curveRun = curveMode === 'fixed' ? fixedRun : adaptiveRun
   const rangeNamesToShow = protocolVersion === 4
-    ? (['grid_step', 'sell_shares', 'buy_shares', 'min_shares', 'max_shares'] as string[]).filter(name => !(name === 'max_shares' && maxSharesMode === 'unlimited'))
-    : knownRangeNames.filter(name => (protocolVersion === 1 || name !== 'initial_shares') && !(protocolVersion === 3 && base.max_shares === null && name === 'max_shares') && (!pctRange.has(name) || (base.grid_mode === 'trailing' ? name !== 'grid_step' : name === 'grid_step')))
+    ? v4ResearchFieldNames.filter(name => !(name === 'max_shares' && maxSharesMode === 'unlimited'))
+    : knownRangeNames.filter(name => (protocolVersion === 1 || name !== 'initial_shares') && !(protocolVersion === 3 && base.max_shares === null && name === 'max_shares'))
   const schemeLabel = selectionTarget === 'both' ? '固定 + 自适应' : selectionTarget === 'fixed' ? '固定参数' : '每季自适应'
   const landscapeDecisions = [
     { value: 'current:0', label: '当前建议决策' },
@@ -553,6 +565,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     ...(fixed?.as_of ? [{ value: 'fixed:0', label: '固定方案决策' }] : []),
   ]
   const rangesSummary = rangeNamesToShow.map(name => labels[name] + ' ' + rangeValue(name, ranges[name].low) + '–' + rangeValue(name, ranges[name].high)).join(' · ')
+  const visibleFineSearchFields = rangeNamesToShow.filter(name => neighborhoodFields.includes(name))
   const savedRanges = actualRanges && Object.keys(actualRanges).length ? <div className='table-wrap'><table><thead><tr><th>参数</th><th>下限</th><th>上限</th><th>步长</th></tr></thead><tbody>{Object.entries(actualRanges).map(([key, raw]) => { const range = record(raw); return <tr key={key}><td>{labels[key] ?? key}</td><td>{range ? rangeValue(key, range.low) : '—'}</td><td>{range ? rangeValue(key, range.high) : '—'}</td><td>{range ? rangeValue(key, range.step) : '—'}</td></tr> })}</tbody></table></div> : <Empty title='任务中未保存搜索范围' />
 
   return <>
@@ -590,7 +603,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
           </> : <div className='result-meta'><Badge tone='amber'>旧版研究 v1</Badge><span>{jobModeLabel(mode)}</span></div>}
           {protocolVersion === 4 && <>
             <div className='form-grid two'>
-              <Field label='研究策略'><div className='result-meta'><Badge tone='blue'>等比网格正超额邻域 v1</Badge><span>五维整数刻度搜索</span></div></Field>
+              <Field label='研究策略'><div className='result-meta'><Badge tone='blue'>等比网格正超额邻域 v1</Badge><span>六维整数刻度搜索</span></div></Field>
               <Field label='推荐模式'><SelectInput value={rankingMode} onChange={event => updateSettings({ ranking_mode: event.target.value as ResearchDefaults['ranking_mode'] })}><option value='max_volume'>最大正超额收益邻域</option><option value='fixed_mean'>固定邻域平均超额收益</option></SelectInput></Field>
               <Field label='搜索方法'><SelectInput value={searchMethod} onChange={event => updateSettings({ search_method: event.target.value as ResearchDefaults['search_method'] })}><option value='auto'>自动（小空间穷举）</option><option value='hierarchical'>分层搜索</option><option value='exhaustive'>完整枚举</option></SelectInput></Field>
               <NumField label='训练预算（唯一参数点）' min={1} max={1000000} step='1' value={trainingBudget} onChange={next => next != null && updateSettings({ training_budget: next })} />
@@ -599,22 +612,42 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
               <Field label='最高持股研究方式'><SelectInput value={maxSharesMode} onChange={event => updateSettings({ max_shares_mode: event.target.value as ResearchDefaults['max_shares_mode'] })}><option value='search'>搜索有限上限</option><option value='unlimited'>固定不限</option></SelectInput></Field>
               <Field label='滑点处理'><SelectInput value={slippageMode} onChange={event => updateSettings({ slippage_mode: event.target.value as ResearchDefaults['slippage_mode'] })}><option value='configured'>按当前配置</option><option value='zero'>不考虑滑点</option></SelectInput></Field>
             </div>
-            <p className='field-hint'>等比网格最小间距 0.1 个百分点；交易与持股数量最小单位 100。研究只搜索这五维，基础配置中的对应值不参与搜索。</p>
-            {rankingMode === 'fixed_mean' && <div className='form-grid two'>{Object.entries(fixedHalfWidths).filter(([name]) => !(name === 'max_shares' && maxSharesMode === 'unlimited')).map(([name, value]) => <NumField key={name} label={(labels[name] ?? name) + '半宽'} min={name === 'grid_step' ? .1 : 100} step={name === 'grid_step' ? '.1' : '100'} percentValue={name === 'grid_step'} suffix={name === 'grid_step' ? '%' : undefined} value={value} onChange={next => next != null && updateSettings({ fixed_half_widths: { ...fixedHalfWidths, [name]: next } })} hint={name === 'grid_step' ? '按 0.1 个百分点步进' : '按 100 股 / 份步进'} />)}</div>}
+            <p className='field-hint'>买入间距与卖出间距独立搜索，最小刻度均为 0.1 个百分点；买卖数量单位 100 股 / 份，持仓上下限单位 500 股 / 份。研究只搜索这六维，基础配置中的对应值不参与搜索。</p>
+            {rankingMode === 'fixed_mean' && <div className='form-grid two'>{Object.entries(fixedHalfWidths).filter(([name]) => !(name === 'max_shares' && maxSharesMode === 'unlimited')).map(([name, value]) => { const priceStep = name === 'buy_step' || name === 'sell_step'; return <NumField key={name} label={(labels[name] ?? name) + '半宽'} min={priceStep ? .1 : researchQuantityUnit(name)} step={priceStep ? '.1' : String(researchQuantityUnit(name))} percentValue={priceStep} suffix={priceStep ? '%' : undefined} value={value} onChange={next => next != null && updateSettings({ fixed_half_widths: { ...fixedHalfWidths, [name]: next } })} hint={priceStep ? '按 0.1 个百分点步进' : `按 ${researchQuantityUnit(name)} 股 / 份步进`} /> })}</div>}
           </>}
           {protocolVersion === 3
             ? <NumField label='局部网格搜索预算' min={1} max={5000} step='1' value={localSearchBudget} onChange={next => next != null && updateSettings({ local_search_budget: next })} hint='统计中心各自展开中心及正负一步；超过预算时停止提交并提示调整范围。' />
             : protocolVersion !== 4 && <NumField label={protocolVersion === 2 ? '每个决策点基础试验数' : '旧版每种模式试验数'} min={1} max={5000} step='1' value={trials} onChange={next => next != null && updateSettings({ n_trials: next })} hint={protocolVersion === 2 ? '邻域压力测试会增加额外计算。' : '历史与稳健模式各自执行此次数。'} />}
-          {protocolVersion === 4 && searchPreview && <p className={searchPreview.status === 'budget_exceeded' || searchPreview.minimum_neighborhood_possible === false ? 'inline-warning' : 'field-hint'}>合法组合 {String(searchPreview.legal_combination_count ?? '—')} 个 · {String(searchPreview.search_method ?? '—')} · 验证预算 {String(searchPreview.validation_budget ?? validationBudget)} · 最小邻域 {String(searchPreview.minimum_neighborhood_size ?? '—')} 点{searchPreview.full_504_day_history ? '' : ' · 前置历史不足'}{searchPreview.minimum_neighborhood_possible === false ? ' · 范围无法容纳完整对称邻域' : ''}</p>}
+          {protocolVersion === 4 && searchPreview && <p className={searchPreview.status === 'budget_exceeded' || searchPreview.minimum_neighborhood_possible === false ? 'inline-warning' : 'field-hint'}>合法组合 {String(searchPreview.legal_combination_count ?? '—')} 个 · {String(searchPreview.search_method ?? '—')} · 细搜索 {Array.isArray(searchPreview.neighborhood_fields) ? searchPreview.neighborhood_fields.length : '—'} 个参数 · 验证预算 {String(searchPreview.validation_budget ?? validationBudget)} · 最小邻域 {String(searchPreview.minimum_neighborhood_size ?? '—')} 点{searchPreview.full_504_day_history ? '' : ' · 前置历史不足'}{searchPreview.minimum_neighborhood_possible === false ? ' · 范围无法容纳完整对称邻域' : ''}</p>}
           {protocolVersion === 3 && searchPreview && <p className={searchPreview.status === 'budget_exceeded' ? 'inline-warning' : 'field-hint'}>局部网格预计 {String(searchPreview.expected ?? '—')} / {String(searchPreview.budget ?? localSearchBudget)} 组，统计中心 {String(searchPreview.statistical_center_count ?? '—')} 个{searchPreview.status === 'budget_exceeded' ? '；已超过预算，研究未提交。' : '。'}</p>}
           <div className='research-launch-action'><Button busy={busy} onClick={() => void submit()}><FlaskConical size={15} />启动参数研究</Button><small>{protocolVersion >= 2 ? schemeLabel + ' · 前置 504 日训练' : '旧版兼容协议'} · 设置自动记忆</small></div>
           <Disclosure id='research-search-ranges' title='可调搜索范围' summary={rangesSummary}>
-            <p className='field-hint'>{protocolVersion === 4 ? '仅搜索等比网格间距、买卖数量及持股边界；最小单位固定为 0.1 个百分点和 100 股 / 份，范围步长不控制研究精度。' : protocolVersion === 2 ? '固定账户初始持股与现金，只搜索网格步长和交易边界。' : '股数以 100 股 / 份为单位。'}</p>
-            <div className='range-grid'>{rangeNamesToShow.map(name => <div className='range-row' key={name}><div><strong>{labels[name]}</strong><small>{pctRange.has(name) ? '步长（%）' : '股 / 份'}</small></div>{(['low', 'high', 'step'] as const).map(key => {
+            <p className='field-hint'>{protocolVersion === 4 ? '勾选“邻域移动”的参数会在细搜索邻域中向两侧移动；未勾选参数不在邻域中移动，但粗搜索会逐一探测其每个合法刻度。当前细搜索包含 ' + visibleFineSearchFields.length + ' 个参数。买卖间距单位均为 0.1 个百分点，买卖数量单位 100 股 / 份，持仓上下限单位 500 股 / 份。' : protocolVersion === 2 ? '固定账户初始持股与现金，分别搜索买入间距、卖出间距和交易边界。' : '股数以 100 股 / 份为单位。'}</p>
+            <div className='research-range-grid'>{rangeNamesToShow.map(name => {
+              const unit = researchQuantityUnit(name)
               const minimum = name === 'buy_shares' ? isStarBoard ? 200 : 100 : name === 'sell_shares' ? 100 : 0
-              if (protocolVersion === 4 && key === 'step') return <div key={key}><small>基础单位</small><strong>{pctRange.has(name) ? '0.1 个百分点' : '100 股 / 份'}</strong></div>
-              return <NumField key={key} label={key === 'low' ? '下限' : key === 'high' ? '上限' : '步长'} value={ranges[name][key]} percentValue={pctRange.has(name)} step={protocolVersion === 4 && pctRange.has(name) ? '.1' : pctRange.has(name) ? 'any' : '100'} min={pctRange.has(name) ? protocolVersion === 4 ? .1 : .000001 : key === 'step' ? 100 : minimum} onChange={next => next != null && updateRange(name, key, next)} />
-            })}</div>)}</div>
+              const fineSearchEnabled = neighborhoodFields.includes(name)
+              return <div className='research-range-card' key={name}>
+                <div className='research-range-heading'>
+                  <div className='research-range-title'>
+                    {protocolVersion === 4 && <label className='research-field-toggle' title='勾选后该参数会在细搜索邻域中移动；未勾选时仅在粗搜索中逐格探测，邻域内固定为中心值'>
+                      <input type='checkbox' aria-label={`${labels[name]}参与细搜索邻域移动`} checked={fineSearchEnabled} disabled={fineSearchEnabled && visibleFineSearchFields.length === 1} onChange={event => {
+                        const selected = new Set(neighborhoodFields)
+                        if (event.target.checked) selected.add(name)
+                        else selected.delete(name)
+                        updateSettings({ neighborhood_fields: v4ResearchFieldNames.filter(item => selected.has(item)) })
+                      }} />
+                      <span>邻域移动</span>
+                    </label>}
+                    <strong>{labels[name]}</strong>
+                  </div>
+                  <small>{protocolVersion === 4 ? `单位 ${pctRange.has(name) ? '0.1 个百分点' : `${unit} 股 / 份`}` : pctRange.has(name) ? '百分比（%）' : '股 / 份'}</small>
+                </div>
+                <div className='research-range-inputs'>{(['low', 'high', 'step'] as const).filter(key => protocolVersion !== 4 || key !== 'step').map(key =>
+                  <NumField key={key} label={key === 'low' ? '下限' : key === 'high' ? '上限' : '步长'} value={ranges[name][key]} percentValue={pctRange.has(name)} step={protocolVersion === 4 ? pctRange.has(name) ? '.1' : String(unit) : pctRange.has(name) ? 'any' : '100'} min={pctRange.has(name) ? protocolVersion === 4 ? .1 : .000001 : key === 'step' ? 100 : minimum} onChange={next => next != null && updateRange(name, key, next)} />
+                )}</div>
+              </div>
+            })}</div>
             <Button variant='quiet' onClick={() => updateSettings({ ranges: defaultSearchRanges() })}><RotateCcw size={14} />恢复默认范围</Button>
           </Disclosure>
           <Disclosure id='research-constraints' title='选择与样本约束' summary={'回撤 ≤ ' + percent(maxDrawdown) + ' · 成交 ≥ ' + minTrades + ' · 分钟覆盖 ≥ ' + percent(minMinuteRatio)}>
@@ -661,7 +694,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
             {isV2Result && !finalPeriodComplete && <p className='inline-warning'>末段核验样本不足{finalDays == null ? '' : '（' + finalDays + ' / ' + finalRequiredDays + ' 个交易日）'}，不能据此得出显著性结论。</p>}
             {researchWarnings.length > 0 && <div className='warning-list'>{researchWarnings.map((warning, index) => <div key={index}><span className='warning-dot' />{warning}</div>)}</div>}
           </Card>
-          {Number(actualVersion) >= 3 && selectedJob?.result_id && <ResearchLandscape resultId={selectedJob.result_id} defaultParams={currentRecommended ?? current?.params ?? undefined} decisionOptions={landscapeDecisions} regionOptions={(current?.recommendation_regions ?? []).map(region => ({ value: String(region.region_id ?? ''), label: '区域 ' + String(region.region_id ?? '') }))} />}
+          {Number(actualVersion) >= 3 && selectedJob?.result_id && <ResearchLandscape resultId={selectedJob.result_id} defaultParams={relativeBest} decisionOptions={landscapeDecisions} qualified={Boolean(currentRecommended)} regionOptions={(current?.recommendation_regions ?? []).map(region => ({ value: String(region.region_id ?? ''), label: '区域 ' + String(region.region_id ?? '') }))} />}
           {Number(actualVersion) === 4 && current && <Card title='最大正超额收益邻域' subtitle='邻域内全部合法离散组合必须在原成本下超额收益为正；双倍成本只作诊断。'>
             {(current.recommendation_regions ?? []).length === 0 ? <p className='inline-warning'>本次冻结参数域没有发现完整正超额邻域，正式推荐为空。</p> : <div className='table-wrap'><table><thead><tr><th>排名</th><th>中心参数</th><th>体积</th><th>组合数</th><th>平均超额</th><th>最低超额</th><th>峰值超额</th><th>状态</th><th>压力诊断</th><th></th></tr></thead><tbody>{(current.recommendation_regions ?? []).map((region, index) => <tr key={region.region_id ?? index}><td>{region.region_id ?? index + 1}</td><td><ParameterBadges params={region.center_params ?? {}} compact /></td><td>{percent(n(region.normalized_volume), 4)}</td><td>{valueText('组合数', region.completed_count)} / {valueText('组合数', region.combination_count)}</td><td>{percent(n(region.mean_excess_return), 4)}</td><td>{percent(n(region.min_excess_return), 4)}</td><td>{percent(n(region.center_excess_return), 4)}</td><td>{region.complete && region.maximum_search_complete ? '完整验证' : '未完成'}{region.global_exhaustive ? ' · 全局穷尽' : ' · 冻结域'}</td><td>{String(region.stress?.status ?? '未计算')}{region.stress?.mean_excess_return != null ? ' · 均值 ' + percent(n(region.stress.mean_excess_return), 2) : ''}</td><td><Button variant='quiet' onClick={() => loadV2(region.center_params, current.as_of)}>载入</Button></td></tr>)}</tbody></table></div>}
           </Card>}
@@ -684,8 +717,12 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
             </Card>
             {(current || adaptiveRecommended) && <Card title='下一期参考参数' className='research-recommendations' subtitle='参数只使用当时或之前可用的数据；通过邻域稳健性检查才列为合格推荐，相对最佳仅作研究对照。'>
               {current && <section className='research-next-period'>
-                <div className='research-recommendation-head'><div><strong>{currentRecommended ? '当前合格推荐' : '暂无合格推荐'}</strong><small>决策日期 {current.as_of ?? '—'} · {statusText(current.status)}</small></div><Button variant='secondary' onClick={() => loadV2(currentRecommended ?? undefined, current.as_of)} disabled={!currentRecommended || !originalBase}>载入当前参数</Button></div>
-                {currentRecommended ? <ParameterBadges params={currentRecommended} /> : <p className='inline-warning'>{Number(actualVersion) === 4 ? '冻结参数域内没有发现完整且全部为正的局部邻域。相对最佳参数仅在候选明细中保留。' : '没有参数同时通过双成本、80% 正超额邻点和邻域第 25 百分位门槛。相对最佳参数仅在候选明细中保留。'}</p>}
+                <div className='research-recommendation-head'><div><strong>{currentRecommended ? '当前合格推荐' : relativeBest ? '相对最佳参数 · 仅诊断' : '暂无合格推荐'}</strong><small>决策日期 {current.as_of ?? '—'} · {statusText(current.status)}</small></div><Button variant='secondary' onClick={() => loadV2(currentRecommended ?? relativeBest, current.as_of)} disabled={!(currentRecommended ?? relativeBest) || !originalBase}>{currentRecommended ? '载入当前参数' : '载入相对最佳'}</Button></div>
+                {currentRecommended ? <ParameterBadges params={currentRecommended} /> : relativeBest ? <>
+                  <ParameterBadges params={relativeBest} />
+                  <div className='research-relative-best-note'><Badge tone='amber'>未通过资格验证</Badge><span>当前筛选下验证超额收益 {current.score == null ? '—' : percent(n(current.score))}</span></div>
+                  <p className='inline-warning'>{Number(actualVersion) === 4 ? `全量候选中存在收益更高的单点，但没有形成完整且全部为正的局部邻域。上方为相对最佳单点，不能替代合格推荐。` : '没有参数同时通过双成本、80% 正超额邻点和邻域第 25 百分位门槛。上方为相对最佳单点，仅作研究对照。'}</p>
+                </> : <p className='inline-warning'>{Number(actualVersion) === 4 ? '冻结参数域内没有发现完整且全部为正的局部邻域，本次也没有可用的相对最佳单点。' : '没有参数同时通过双成本、80% 正超额邻点和邻域第 25 百分位门槛。'}</p>}
                 <Assessment recommendation={current} familyEvidence={currentFamilyBootstrap} />
               </section>}
               {adaptiveAdviceDiffers && <section className='research-next-period'>
@@ -710,14 +747,14 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
               <Card title='当前完整候选族内部验证' subtitle='族级检验描述本次择参的不确定性；样本已经用于选择，不属于独立样本外检验。'><FamilyBootstrapPanel value={currentFamilyBootstrap} /></Card>
               <Card title='末 126 个交易日核验' subtitle='固定与自适应的真实连续样本外轨迹，对同现金被动持有做配对比较。'><Final126Evidence value={finalCheck} /></Card>
             </Disclosure>
-            <Disclosure id='research-candidate-details' title='候选评分与稳健性' summary={v2Candidates.length + ' 组候选 · 展示最多 ' + topCandidates + ' 组'}>
+            {Number(actualVersion) === 3 && <Disclosure id='research-candidate-details' title='候选评分与稳健性' summary={v2Candidates.length + ' 组候选 · 展示最多 ' + topCandidates + ' 组'}>
               <div className='research-summary-states'>{v2Candidates.slice(0, 5).map((candidate, index) => <div key={String(candidate.candidate_id ?? index)}><small>候选 {String(candidate.candidate_id ?? index + 1)} · {candidate.is_center ? '中心' : '邻点'}</small><Badge tone={candidate.recommendation_eligible ? 'green' : candidate.island_suspect ? 'red' : 'amber'}>{candidate.recommendation_eligible ? '稳健性通过' : candidate.island_suspect ? '疑似收益孤岛' : candidate.robustness_status === 'failed' ? '邻域未通过' : '未评价'}</Badge><strong>正邻点 {percent(candidate.neighbor_positive_ratio as number | undefined)} · 第25百分位 {percent(candidate.neighbor_q25_excess as number | undefined)}</strong></div>)}</div>
               <p className='field-hint'>得分、分窗表现、邻域压力和成本共同展示；约束与统计证据分别判断。展示上限不减少实际验证数。</p>
               {v2Candidates.length ? <div className='table-wrap scroll-table'><table><thead><tr><th>综合得分</th><th>原始得分</th><th>约束</th><th>成本得分</th><th>各窗表现</th><th>邻域压力</th><th>参数</th></tr></thead><tbody>{v2Candidates.slice(0, topCandidates).map((candidate, index) => {
                 const eligible = eligibleOf(candidate); const folds = candidate.folds ?? candidate.windows; const stress = candidate.stress_folds ?? candidate.neighbor_scores ?? candidate.neighbor_count; const costs = candidate.cost_scores ?? candidate.cost_score ?? candidate.cost_adjusted_score
                 return <tr key={String(candidate.id ?? index)}><td>{valueText('selection_score', candidate.selection_score ?? candidate.score)}</td><td>{valueText('raw_score', candidate.raw_score)}</td><td><Badge tone={eligible === true ? 'green' : eligible === false ? 'amber' : 'neutral'}>{eligible === true ? '满足' : eligible === false ? '未满足' : '—'}</Badge><small>{reasonList(candidate.constraint_reasons).join('；')}</small></td><td><details><summary>{shortSummary(costs)}</summary><EvidenceFields value={costs} /></details></td><td><details><summary>{shortSummary(folds)}</summary><pre className='json-preview'>{JSON.stringify(folds ?? {}, null, 2)}</pre></details></td><td><details><summary>{shortSummary(stress)}</summary><pre className='json-preview'>{JSON.stringify(stress ?? {}, null, 2)}</pre></details></td><td><ParameterBadges params={paramsOf(candidate)} compact /></td></tr>
               })}</tbody></table></div> : <Empty title='暂无候选明细' />}
-            </Disclosure>
+            </Disclosure>}
           </> : <>
             <div className='research-legacy-banner'>这是旧版 {actualMode ?? '研究'} 方法的结果。旧版历史最优或切分验证可查看和载入，但不等于科学研究 v2 的跨窗与邻域验证通过。</div>
             <Card title='旧版历史最优候选' subtitle='搜索区间内得分最高的历史候选。' action={<Button variant='secondary' onClick={() => loadLegacy('historical')} disabled={!result.historical?.best_params || !originalBase}>载入旧版历史参数</Button>}>

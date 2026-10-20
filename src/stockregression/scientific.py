@@ -21,8 +21,8 @@ Cancelled = Callable[[], bool]
 
 _ACTIVE_FIELDS = {
     "trailing": ("buy_step", "sell_step"),
-    "arithmetic": ("grid_step",),
-    "geometric": ("grid_step",),
+    "arithmetic": ("buy_step", "sell_step"),
+    "geometric": ("buy_step", "sell_step"),
 }
 _SHARE_FIELDS = ("min_shares", "max_shares", "buy_shares", "sell_shares")
 _COST_MULTIPLIERS = (1.0, 2.0)
@@ -2733,7 +2733,7 @@ def optimize_scientific(
             "local_search_budget": None if int(config.protocol_version) == 4 else int(config.local_search_budget) if protocol_v3 else None,
             "strategy": config.strategy.model_dump(mode="json") if int(config.protocol_version) == 4 else None,
             "grid_mode": "geometric" if int(config.protocol_version) == 4 else config.base.grid_mode,
-            "grid_step_unit": 0.001 if int(config.protocol_version) == 4 else None,
+            "spacing_unit": 0.001 if int(config.protocol_version) == 4 else None,
             "share_unit": 100 if int(config.protocol_version) == 4 else None,
             "positive_neighbor_ratio": None if int(config.protocol_version) == 4 else _V3_POSITIVE_NEIGHBOR_RATIO if protocol_v3 else None,
             "neighbor_quantile": None if int(config.protocol_version) == 4 else 0.25 if protocol_v3 else None,

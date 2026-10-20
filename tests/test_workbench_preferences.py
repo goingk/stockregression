@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -6,6 +7,15 @@ from pydantic import ValidationError
 
 from stockregression import settings
 from stockregression.api import create_app
+
+
+def test_default_storage_paths_keep_asset_packages_under_data(settings_file):
+    loaded = settings.load_settings()
+
+    assert Path(loaded.data_dir) == settings.DEFAULT_DATA_DIR
+    assert Path(loaded.package_dir) == settings.DEFAULT_DATASET_DIR / "etf"
+    assert Path(loaded.package_dir).parent == settings.DEFAULT_DATASET_DIR
+    assert settings.DEFAULT_STOCK_PACKAGE_DIR == settings.DEFAULT_DATASET_DIR / "stock"
 
 
 @pytest.fixture
@@ -19,7 +29,7 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
     defaults = settings.load_settings().workbench_defaults.model_dump()
     assert defaults["grid"] == {
         "grid_mode": "trailing", "buy_step": 0.03, "sell_step": 0.03,
-        "grid_step": 0.03, "lower_price": None, "upper_price": None,
+        "lower_price": None, "upper_price": None,
     }
     assert defaults["position"] == {
         "initial_shares": 1000, "min_shares": 0, "max_shares": 2000,
@@ -37,7 +47,6 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
     assert defaults["research"]["ranges"] == {
         "buy_step": {"low": 0.005, "high": 0.1, "step": 0.005},
         "sell_step": {"low": 0.005, "high": 0.1, "step": 0.005},
-        "grid_step": {"low": 0.005, "high": 0.1, "step": 0.005},
         "buy_shares": {"low": 100.0, "high": 1000.0, "step": 100.0},
         "sell_shares": {"low": 100.0, "high": 1000.0, "step": 100.0},
         "initial_shares": {"low": 0.0, "high": 2000.0, "step": 100.0},
@@ -116,7 +125,7 @@ def test_old_settings_gain_workbench_defaults_without_losing_existing_values(set
     {"research": {"min_minute_ratio": 1.1}},
     {"research": {"ranges": {"buy_shares": {"high": 99}}}},
     {"research": {"ranges": {"buy_step": {"low": 0.2, "high": 0.1}}}},
-    {"research": {"ranges": {"grid_step": {"step": 0}}}},
+    {"research": {"ranges": {"buy_step": {"step": 0}}}},
     {"research": {"ranges": {"unknown": {"low": 0, "high": 1, "step": 1}}}},
 ])
 def test_invalid_workbench_preferences_do_not_replace_saved_settings(settings_file, patch):
@@ -166,7 +175,7 @@ def test_settings_api_merges_workbench_defaults_and_keeps_fee_defaults(settings_
     with TestClient(app) as client:
         initial = client.get("/api/v1/settings").json()
         assert initial["workbench_defaults"]["grid"]["grid_mode"] == "trailing"
-        assert len(initial["workbench_defaults"]["research"]["ranges"]) == 8
+        assert len(initial["workbench_defaults"]["research"]["ranges"]) == 7
 
         response = client.put("/api/v1/settings", json={
             "fee_defaults": {"commission_rate": 0},

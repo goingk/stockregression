@@ -134,6 +134,13 @@ class Store:
                 );
             """)
             db.executescript("""
+                CREATE TABLE IF NOT EXISTS resource_leases(
+                    job_id TEXT PRIMARY KEY, pid INTEGER NOT NULL, kind TEXT NOT NULL,
+                    units INTEGER NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS resource_leases_kind ON resource_leases(kind);
+            """)
+            db.executescript("""
                 CREATE TABLE IF NOT EXISTS research_registry(
                     registry_id TEXT PRIMARY KEY,
                     protocol_hash TEXT NOT NULL,

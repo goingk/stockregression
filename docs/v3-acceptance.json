@@ -71,7 +71,6 @@
     "dual_cost_neighborhood_gate": true,
     "no_qualified_is_not_presented_as_recommendation": true,
     "adaptive_pause_preserves_account": true,
-    "full_candidate_landscape_endpoint": true,
-    "pca_excluded_from_ranking": true
+    "full_candidate_landscape_endpoint": true
   }
 }

@@ -137,7 +137,7 @@ export function defaultConfig(feeDefaults: FeeDefaults = readFeeDefaults()): Bac
   return {
     schema_version: 3, symbol: '600000.SH', start_date: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`, end_date: current,
     frequency: '1m', initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 100,
-    grid_mode: 'trailing', buy_step: .03, sell_step: .03, grid_step: .03,
+    grid_mode: 'trailing', buy_step: .03, sell_step: .03,
     reference_price: null, reference_price_mode: 'auto', lower_price: null, upper_price: null,
     fees: { ...feeDefaults, slippage_bps: 5 }, dca: { frequency: 'monthly', shares: 100, initial_shares: 0 },
   }
@@ -148,7 +148,7 @@ export function configPayload(value: BacktestConfig) {
   delete result.reserve_cash
   if (Object.prototype.hasOwnProperty.call(value, 'selection_asof')) result.selection_asof = value.selection_asof
   for (const key of ['initial_cash', 'initial_position', 'min_position', 'max_position', 'buy_quantity', 'sell_quantity', 'dca_frequency']) delete result[key]
-  for (const key of value.grid_mode === 'trailing' ? ['grid_step'] : ['buy_step', 'sell_step']) delete result[key]
+  if (Number(value.schema_version) >= 2) delete result.grid_step
   return result
 }
 
@@ -180,7 +180,7 @@ export function configError(value: BacktestConfig): string {
   const minDcaShares = isStarBoard ? 200 : lotSize
   if (!Number.isInteger(value.dca.shares) || value.dca.shares < minDcaShares || value.dca.shares % lotSize !== 0) return `定投数量应为 ${lotSize} 的正整数倍，至少 ${minDcaShares}`
   if (!Number.isInteger(value.dca.initial_shares) || value.dca.initial_shares < 0 || value.dca.initial_shares % lotSize !== 0) return `定投初始持仓应为 ${lotSize} 的整数倍`
-  if (!validWorkbenchGroup('grid', strategyDefaults(value).grid)) return '请填写有效网格步长，价格下限必须小于上限'
+  if (!validWorkbenchGroup('grid', strategyDefaults(value).grid)) return '请填写有效的买入、卖出间距，价格下限必须小于上限'
   if (!validFeeDefaults(value.fees) || !Number.isFinite(value.fees.slippage_bps) || value.fees.slippage_bps < 0 || value.fees.slippage_bps > 1000) return '请填写有效的费用与滑点'
   return ''
 }
@@ -258,7 +258,7 @@ export function ConfigForm({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit,
   const [referenceError, setReferenceError] = useState('')
   const set = <K extends keyof BacktestConfig>(key: K, next: BacktestConfig[K]) => {
     onChange(previous => ({ ...previous, [key]: next }))
-    const group = key === 'dca' ? 'dca' : ['grid_mode', 'buy_step', 'sell_step', 'grid_step', 'lower_price', 'upper_price'].includes(key) ? 'grid' : ['initial_shares', 'min_shares', 'max_shares', 'buy_shares', 'sell_shares'].includes(key) ? 'position' : null
+    const group = key === 'dca' ? 'dca' : ['grid_mode', 'buy_step', 'sell_step', 'lower_price', 'upper_price'].includes(key) ? 'grid' : ['initial_shares', 'min_shares', 'max_shares', 'buy_shares', 'sell_shares'].includes(key) ? 'position' : null
     if (group) onDefaultsEdit?.(group, { ...value, [key]: next })
   }
   const unit = /^[15]/.test(value.symbol) ? '份' : '股'
@@ -294,8 +294,9 @@ export function ConfigForm({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit,
       <NumField label="参考价格" value={value.reference_price} onChange={next => onChange(previous => ({ ...previous, reference_price: next, reference_price_mode: next == null ? 'auto' : 'manual' }))} suffix="元" min={.001} hint={reference ? `${reference.reference_date} 收盘 ${reference.reference_price} 元 · ${value.reference_price_mode === 'auto' ? '自动' : '手动'}` : '开始日期前最近交易日收盘价'} />
     </div>{referenceError && value.reference_price == null && value.reference_price_mode === 'auto' && <p className="inline-warning">{referenceError}</p>}</div>
     <div className="form-section" data-validation-group="grid"><div className="section-title"><span>02</span><strong>网格规则</strong></div><div className="form-grid two">
-      {purpose === 'research' ? <Field label="研究网格"><div className="result-meta"><Badge tone="blue">等比网格</Badge><span>v4 研究固定使用单一网格间距</span></div></Field> : <Field label="网格模式"><SelectInput value={value.grid_mode} onChange={event => set('grid_mode', event.target.value as BacktestConfig['grid_mode'])}><option value="trailing">移动网格</option><option value="arithmetic">等差网格</option><option value="geometric">等比网格</option></SelectInput></Field>}
-      {(purpose === 'research' ? 'geometric' : value.grid_mode) === 'trailing' ? <><NumField label="买入步长" value={value.buy_step ?? .03} onChange={next => next != null && set('buy_step', next)} percentValue suffix="%" min={.01} max={100} /><NumField label="卖出步长" value={value.sell_step ?? .03} onChange={next => next != null && set('sell_step', next)} percentValue suffix="%" min={.01} max={100} /></> : <NumField label="网格间距" value={value.grid_step ?? .03} onChange={next => next != null && set('grid_step', next)} percentValue suffix="%" min={purpose === 'research' ? .1 : .01} max={100} hint={purpose === 'research' ? '研究正式刻度以 0.1 个百分点为最小单位；此处仅作普通回测字段。' : value.grid_mode === 'arithmetic' && value.reference_price ? `固定每格约 ${(value.reference_price * (value.grid_step ?? .03)).toFixed(3)} 元` : undefined} />}
+      {purpose === 'research' ? <Field label="研究网格"><div className="result-meta"><Badge tone="blue">等比网格</Badge><span>买卖间距分别搜索与展示</span></div></Field> : <Field label="网格模式"><SelectInput value={value.grid_mode} onChange={event => set('grid_mode', event.target.value as BacktestConfig['grid_mode'])}><option value="trailing">移动网格</option><option value="arithmetic">等差网格</option><option value="geometric">等比网格</option></SelectInput></Field>}
+      <NumField label="买入间距" value={value.buy_step ?? .03} onChange={next => next != null && set('buy_step', next)} percentValue suffix="%" min={purpose === 'research' ? .1 : .01} max={100} hint="参考价下方每隔该幅度设置买入网格" />
+      <NumField label="卖出间距" value={value.sell_step ?? .03} onChange={next => next != null && set('sell_step', next)} percentValue suffix="%" min={purpose === 'research' ? .1 : .01} max={100} hint={purpose === 'research' ? '参考价上方每隔该幅度设置卖出网格；正式刻度 0.1 个百分点' : '参考价上方每隔该幅度设置卖出网格'} />
       <Disclosure id={`config-${purpose}-price-bounds`} title="价格边界" summary={`${value.lower_price ?? '不限'} ～ ${value.upper_price ?? '不限'}`} className="form-disclosure full-width"><div className="form-grid two">
       <NumField label="价格下限" value={value.lower_price} onChange={next => set('lower_price', next)} suffix="元" min={.001} />
       <NumField label="价格上限" value={value.upper_price} onChange={next => set('upper_price', next)} suffix="元" min={.001} />

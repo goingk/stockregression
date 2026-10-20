@@ -7,6 +7,10 @@ import math
 import numpy as np
 import pandas as pd
 from .rules import instrument_terms, commissions_and_taxes, round_to_tick, round_money, fee_rates, transfer_fee_terms, calculated_price_limits, etf_price_limit_rate
+from .performance import (
+    blas_thread_limit, current_workspace_bytes, rebalance_cpu_budget,
+    record_count, record_details,
+)
 
 _CACHE = OrderedDict()
 BUY_HOLD_INITIAL_SHARES = 1000
@@ -171,6 +175,10 @@ def _parameter_arrays(config, prepared, parameter_schedule):
         if days and index <= days[-1]:
             raise ValueError("换参生效日期必须严格递增")
         params = dict(row["params"])
+        if "grid_step" in params:
+            params.setdefault("buy_step", params["grid_step"])
+            params.setdefault("sell_step", params["grid_step"])
+            params.pop("grid_step", None)
         if "initial_shares" in params and params["initial_shares"] != config.initial_shares:
             raise ValueError("换参不能改变初始持股")
         from .models import BacktestConfig
@@ -343,18 +351,36 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
     options = _options(base, prepared, money, cost_multiplier=cost_multiplier)
     empty_days, empty_values = np.zeros(0, dtype=np.int64), np.zeros((0, 7), dtype=np.float64)
     old_threads = None
+    active_threads = 1
     if engine._NUMBA_FASTPATH_ENABLED and parallel and len(values) > 1:
-        import os
         from numba import get_num_threads, set_num_threads
         old_threads = get_num_threads()
-        set_num_threads(min(old_threads, 8, max(1, (os.cpu_count() or 2) // 2)))
+        active_threads = min(old_threads, rebalance_cpu_budget())
+        set_num_threads(active_threads)
+    bytes_per_candidate = max(
+        8192,
+        len(dates) * 8 + max(1, len(fold_ranges)) * 72 + 128,
+    )
+    chunk_size = max(1, min(256, int(current_workspace_bytes() // (bytes_per_candidate * 4))))
+    record_details(
+        research_threads=active_threads,
+        research_chunk_size=chunk_size,
+    )
     try:
-        for begin in range(0, len(values), 64):
+        for begin in range(0, len(values), chunk_size):
             if cancelled and cancelled():
                 raise InterruptedError("研究已取消")
-            end = min(begin + 64, len(values))
+            end = min(begin + chunk_size, len(values))
             if old_threads is not None:
-                r, m, f, s = simulate_research_batch(prepared["arrays"], options, values[begin:end], fold_ids, len(fold_ranges))
+                refreshed = min(old_threads, rebalance_cpu_budget())
+                if refreshed != active_threads:
+                    active_threads = refreshed
+                    set_num_threads(active_threads)
+                with blas_thread_limit(1):
+                    r, m, f, s = simulate_research_batch(
+                        prepared["arrays"], options, values[begin:end],
+                        fold_ids, len(fold_ranges),
+                    )
                 returns[:, begin:end], metric_values[begin:end], fold_values[begin:end], funding_stats[begin:end] = r, m, f, s
             else:
                 runner = simulate if engine._NUMBA_FASTPATH_ENABLED else getattr(simulate, "py_func", simulate)
@@ -365,6 +391,7 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
                     output = runner(*prepared["arrays"], *individual, empty_days, empty_values,
                                     fold_ids, len(fold_ranges), True, False)
                     returns[:, index], metric_values[index], fold_values[index], funding_stats[index] = output[5][0], output[0][0], output[-2], output[-1][0]
+            record_count("research_candidates", end - begin)
         if cancelled and cancelled():
             raise InterruptedError("研究已取消")
     finally:

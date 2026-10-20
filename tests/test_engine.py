@@ -82,6 +82,24 @@ def test_new_shares_obey_t_plus_one():
     assert any(row["reason"] == "t_plus_1" for row in grid["rejections"])
 
 
+def test_fixed_grid_uses_independent_buy_and_sell_spacing():
+    config = _config(
+        "2024-01-02", schema_version=3, grid_mode="geometric",
+        buy_step=.10, sell_step=.20,
+    )
+    assert engine._cell(10.0, 10.0, config) == 0
+    assert engine._cell(9.95, 10.0, config) == 0
+    assert engine._cell(9.0, 10.0, config) == -1
+    assert engine._cell(8.19, 10.0, config) == -1
+    assert engine._cell(8.1, 10.0, config) == -2
+    assert engine._cell(10.05, 10.0, config) == 0
+    assert engine._cell(12.0, 10.0, config) == 1
+    narrow_sell = config.model_copy(update={"sell_step": .02})
+    assert engine._cell(10.25, 10.0, narrow_sell) > 0
+    for price in (8.1, 9.0, 9.95, 10.0, 10.25, 12.0):
+        assert engine._nb_cell(price, 10.0, 2, config.buy_step, config.sell_step) == engine._cell(price, 10.0, config)
+
+
 def test_pending_order_is_cancelled_on_real_suspension_and_daily_fallback_is_one_bar():
     bars = [
         _bar("2024-01-02 09:31", 10.0, 9.0),

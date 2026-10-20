@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import hashlib
 import io
+import multiprocessing
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait,
+)
 from contextlib import redirect_stdout
 
 import pandas as pd
 
 from ..models import normalize_symbol
-from ..providers import fetch_sina, fetch_tdx, latest_closed_date, serialized_baostock
+from ..performance import SharedSlots, effective_cpu_budget, record_count, record_details
+from ..providers import (
+    _baostock_reset, _baostock_session, fetch_sina, fetch_tdx,
+    latest_closed_date, serialized_baostock,
+)
+from ..settings import load_settings
 from ..source_health import SourceRouter, fetch_auxiliary_routed, market_for_symbol
+from ..storage import Store
 from ..rules import instrument_terms
 from ..quality import minute_slots
 from .models import MarketDataError
@@ -24,15 +33,39 @@ SOURCE_VERSION = "market-sync-v2-package"
 DAILY_BATCH_SIZE = 128
 
 
+def _prepare_daily_worker(root: str, package_dir: str | None, symbol: str, mode: str, start, end):
+    store = Store(root)
+    service = MarketDataService(store, package_dir=package_dir)
+    return MarketDataSyncService(service)._prepare_daily(
+        symbol, mode, start, end, lambda: False
+    )
+
+
+def _terminate_executor(executor) -> None:
+    if isinstance(executor, ProcessPoolExecutor):
+        for process in list(getattr(executor, "_processes", {}).values()):
+            try:
+                process.terminate()
+            except Exception:
+                pass
+    executor.shutdown(wait=False, cancel_futures=True)
+
+
 class MarketDataSyncService:
     def __init__(self, service: MarketDataService):
         self.service = service
         self.store = service.store
         self.repository = service.repository
+        configured = load_settings().performance
+        self.download_capacity = min(
+            int(configured.download_workers),
+            effective_cpu_budget(configured),
+        )
+        record_details(download_workers=self.download_capacity)
 
     def sync(
         self, symbols: list[str], timeframe: str, mode: str, *, start=None, end=None,
-        resume=False, retry_failed=False, workers=2, progress=lambda *_: None, cancelled=lambda: False,
+        resume=False, retry_failed=False, workers=4, progress=lambda *_: None, cancelled=lambda: False,
     ) -> dict:
         timeframe = normalize_timeframe(timeframe)
         if timeframe not in {"1day", "1min"}:
@@ -110,7 +143,7 @@ class MarketDataSyncService:
                 return "failure", {"symbol": symbol, "reason": str(exc)}
 
         cursor = 0
-        worker_count = max(1, min(4, int(workers or 1)))
+        worker_count = self._worker_count(workers)
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             while cursor < len(symbols):
                 if cancelled():
@@ -141,7 +174,7 @@ class MarketDataSyncService:
         results, failures, skipped = [], [], []
         total = len(symbols)
         completed = 0
-        worker_count = max(1, min(4, int(workers or 1)))
+        worker_count = self._worker_count(workers)
         for batch_start in range(0, total, DAILY_BATCH_SIZE):
             if cancelled():
                 raise InterruptedError("任务已取消")
@@ -162,31 +195,58 @@ class MarketDataSyncService:
                 active.append(symbol)
                 self.store.sync_item(run_key, symbol, status="running", mode=mode)
             prepared = []
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            executor = None
+            if len(active) > 1 and worker_count >= 4:
+                executor = ProcessPoolExecutor(
+                    max_workers=min(2, worker_count),
+                    mp_context=multiprocessing.get_context("spawn"),
+                )
+                futures = {
+                    executor.submit(
+                        _prepare_daily_worker,
+                        str(self.store.root), str(self.repository.package_dir),
+                        symbol, mode, start, end,
+                    ): symbol for symbol in active
+                }
+            else:
+                executor = ThreadPoolExecutor(max_workers=worker_count)
                 futures = {
                     executor.submit(
                         self._prepare_daily, symbol, mode, start, end, cancelled
                     ): symbol for symbol in active
                 }
-                for future in as_completed(futures):
-                    symbol = futures[future]
-                    try:
-                        value = future.result()
-                        if value.get("skipped"):
-                            skipped.append(value)
+            try:
+                pending = set(futures)
+                while pending:
+                    if cancelled():
+                        raise InterruptedError("任务已取消")
+                    done, pending = wait(
+                        pending, timeout=0.5, return_when=FIRST_COMPLETED
+                    )
+                    for future in done:
+                        symbol = futures[future]
+                        try:
+                            value = future.result()
+                            if value.get("skipped"):
+                                skipped.append(value)
+                                self.store.sync_item(
+                                    run_key, symbol, status="completed", mode=mode,
+                                    message=value.get("message"),
+                                )
+                            else:
+                                prepared.append(value)
+                        except InterruptedError:
+                            raise
+                        except Exception as exc:
+                            failures.append({"symbol": symbol, "reason": str(exc)})
                             self.store.sync_item(
-                                run_key, symbol, status="completed", mode=mode,
-                                message=value.get("message"),
+                                run_key, symbol, status="failed", mode=mode, error=str(exc)
                             )
-                        else:
-                            prepared.append(value)
-                    except InterruptedError:
-                        raise
-                    except Exception as exc:
-                        failures.append({"symbol": symbol, "reason": str(exc)})
-                        self.store.sync_item(
-                            run_key, symbol, status="failed", mode=mode, error=str(exc)
-                        )
+            except InterruptedError:
+                _terminate_executor(executor)
+                raise
+            finally:
+                executor.shutdown(wait=True, cancel_futures=True)
             if prepared:
                 for source in prepared:
                     symbol = source["symbol"]
@@ -425,8 +485,7 @@ class MarketDataSyncService:
         calendar_saved = self.repository.auxiliary(symbol, "calendar")
         if not calendar_saved:
             raise MarketDataError("缺口修补需要本地交易日历；请先导入或同步交易日历资料")
-        calendar = pd.DatetimeIndex(pd.to_datetime(pd.DataFrame(calendar_saved["payload"])["date"])).normalize().unique().sort_values()
-        calendar = calendar[(calendar >= start) & (calendar <= end)]
+        calendar = self.repository.trading_days(symbol, start, end)
         if not len(calendar):
             return []
         spec = timeframe_spec(timeframe)
@@ -497,21 +556,29 @@ class MarketDataSyncService:
     def _fetch(self, symbol, timeframe, mode, start, end, cancelled):
         metadata: dict = {}
         if timeframe == "1day":
-            daily, actions, calendar, source_metadata = fetch_auxiliary_routed(
-                self.store, symbol, start, end, cancelled
-            )
+            record_count("download_requests", 1)
+            with SharedSlots(
+                self.store.root, "daily-source", self.download_capacity
+            ).acquire(cancelled):
+                daily, actions, calendar, source_metadata = fetch_auxiliary_routed(
+                    self.store, symbol, start, end, cancelled
+                )
             metadata = {**source_metadata, "actions": actions, "calendar": calendar}
             frame, source = daily, metadata.get("daily_source", "baostock")
             metadata.setdefault("label_convention", "end")
             return frame, source, metadata
         if timeframe == "1min":
-            frame, source, route = SourceRouter(self.store).call(
-                "recent_minute", market_for_symbol(symbol),
-                {
-                    "sina": lambda: fetch_sina(symbol),
-                    "tdx": lambda: fetch_tdx(symbol, earliest=start, cancelled=cancelled),
-                },
-            )
+            record_count("download_requests", 1)
+            with SharedSlots(
+                self.store.root, "recent-minute-source", self.download_capacity
+            ).acquire(cancelled):
+                frame, source, route = SourceRouter(self.store).call(
+                    "recent_minute", market_for_symbol(symbol),
+                    {
+                        "sina": lambda: fetch_sina(symbol),
+                        "tdx": lambda: fetch_tdx(symbol, earliest=start, cancelled=cancelled),
+                    },
+                )
             metadata["label_convention"] = "end"
             metadata["recent_minute_route"] = route
             frame = frame[(frame.timestamp >= start - pd.Timedelta(days=1)) & (frame.timestamp <= end + pd.Timedelta(days=1))].copy()
@@ -522,25 +589,30 @@ class MarketDataSyncService:
         metadata["calendar"] = self._trade_calendar(start, end)
         return frame, "baostock", metadata
 
+    def _worker_count(self, workers) -> int:
+        configured = load_settings().performance
+        requested = max(1, int(workers or 1))
+        return max(1, min(
+            requested, int(configured.download_workers),
+            effective_cpu_budget(configured), 4,
+        ))
+
     @staticmethod
     @serialized_baostock
     def _trade_calendar(start, end):
-        import baostock as bs
-        with redirect_stdout(io.StringIO()):
-            login = bs.login()
-            if login.error_code != "0":
-                raise MarketDataError("BaoStock 日历登录失败：" + login.error_msg)
-            try:
-                result = bs.query_trade_dates(
-                    start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date())
-                )
-                if result.error_code != "0":
-                    raise MarketDataError("BaoStock 日历失败：" + result.error_msg)
-                rows = []
-                while result.next():
-                    rows.append(result.get_row_data())
-            finally:
-                bs.logout()
+        try:
+            bs = _baostock_session()
+            result = bs.query_trade_dates(
+                start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date())
+            )
+            if result.error_code != "0":
+                raise MarketDataError("BaoStock 日历失败：" + result.error_msg)
+            rows = []
+            while result.next():
+                rows.append(result.get_row_data())
+        except Exception:
+            _baostock_reset()
+            raise
         frame = pd.DataFrame(rows, columns=result.fields)
         if frame.empty:
             return frame
@@ -549,7 +621,6 @@ class MarketDataSyncService:
     @staticmethod
     @serialized_baostock
     def _baostock_history(symbol, timeframe, start, end):
-        import baostock as bs
         code, exchange = normalize_symbol(symbol).split(".")
         frequency = {"5min": "5", "15min": "15", "30min": "30", "60min": "60", "1week": "w", "1month": "m"}[timeframe]
         if timeframe in MINUTE_TIMEFRAMES:
@@ -558,23 +629,21 @@ class MarketDataSyncService:
             fields = "date,open,high,low,close,preclose,volume,amount,tradestatus,isST"
         else:
             fields = "date,open,high,low,close,volume,amount,pctChg"
-        with redirect_stdout(io.StringIO()):
-            login = bs.login()
-            if login.error_code != "0":
-                raise MarketDataError("BaoStock 登录失败：" + login.error_msg)
-            try:
-                result = bs.query_history_k_data_plus(
-                    exchange.lower() + "." + code, fields,
-                    start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date()),
-                    frequency=frequency, adjustflag="3",
-                )
-                if result.error_code != "0":
-                    raise MarketDataError("BaoStock 行情失败：" + result.error_msg)
-                rows = []
-                while result.next():
-                    rows.append(result.get_row_data())
-            finally:
-                bs.logout()
+        try:
+            bs = _baostock_session()
+            result = bs.query_history_k_data_plus(
+                exchange.lower() + "." + code, fields,
+                start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date()),
+                frequency=frequency, adjustflag="3",
+            )
+            if result.error_code != "0":
+                raise MarketDataError("BaoStock 行情失败：" + result.error_msg)
+            rows = []
+            while result.next():
+                rows.append(result.get_row_data())
+        except Exception:
+            _baostock_reset()
+            raise
         frame = pd.DataFrame(rows, columns=result.fields)
         if frame.empty:
             return frame

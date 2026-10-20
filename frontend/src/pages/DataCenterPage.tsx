@@ -9,7 +9,8 @@ import Disclosure from '../Disclosure'
 import { useTasks } from '../TaskCenter'
 import type { Coverage, DataDiagnostics, Instrument, WatchItem } from '../types'
 
-type SettingsResponse = { data_dir?: string; active_data_dir?: string; active_package_dir?: string; package_dir?: string | null; restart_required?: boolean; market_cache_mb?: number; market_cache?: { used_bytes?: number; budget_bytes?: number; hits?: number; misses?: number }; schedule?: { enabled?: boolean; daily_time?: string; weekly_day?: string; weekly_time?: string }; [key: string]: unknown }
+type PerformanceSettings = { cpu_budget_mode: 'auto' | 'custom'; cpu_budget?: number | null; download_workers: number; validation_workers: number; blas_threads: number; workspace_mb: number }
+type SettingsResponse = { data_dir?: string; active_data_dir?: string; active_package_dir?: string; package_dir?: string | null; restart_required?: boolean; market_cache_mb?: number; market_cache?: { used_bytes?: number; budget_bytes?: number; hits?: number; misses?: number }; schedule?: { enabled?: boolean; daily_time?: string; weekly_day?: string; weekly_time?: string }; performance?: PerformanceSettings; [key: string]: unknown }
 type ScheduleDraft = { daily_time: string; weekly_day: string; weekly_time: string }
 const JOB_TERMINAL = new Set(['completed', 'partial', 'failed', 'cancelled'])
 
@@ -51,6 +52,7 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
   const [scheduleDraft, setScheduleDraft] = useState<Partial<ScheduleDraft>>({})
   const [dataDirDraft, setDataDirDraft] = useState<string | null>(null)
   const [cacheMbDraft, setCacheMbDraft] = useState<number | null>(null)
+  const [performanceDraft, setPerformanceDraft] = useState<PerformanceSettings | null>(null)
   const dataDirDraftEdited = useRef(false)
   const [syncMode, setSyncMode] = useState<'history' | 'daily' | 'repair'>('daily')
   const [syncTimeframe, setSyncTimeframe] = useState('1day')
@@ -70,6 +72,7 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
       setWatchlist(items); setSettings(config)
       if (!dataDirDraftEdited.current) setDataDirDraft(config.data_dir ?? '')
       setCacheMbDraft(current => current ?? Number(config.market_cache_mb ?? 256))
+      setPerformanceDraft(current => current ?? config.performance ?? { cpu_budget_mode: 'auto', cpu_budget: null, download_workers: 4, validation_workers: 4, blas_threads: 8, workspace_mb: 8192 })
       setActiveSymbol((old) => old || items[0]?.symbol || '')
     } catch (e) { setError(err(e)) } finally { setLoading(false) }
   }, [err])
@@ -172,6 +175,13 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
     const value = Math.max(0, Math.round(Number(cacheMbDraft ?? settings.market_cache_mb ?? 256)))
     void runAction('cache', () => put<SettingsResponse>('/settings', { market_cache_mb: value }), () => `行情与预览缓存上限已设为 ${value} MiB。`)
   }
+  const savePerformance = () => {
+    const value = performanceDraft ?? { cpu_budget_mode: 'auto' as const, cpu_budget: null, download_workers: 4, validation_workers: 4, blas_threads: 8, workspace_mb: 8192 }
+    void runAction('performance', () => put<SettingsResponse>('/settings', { performance: value }), () => '计算资源设置已保存，将在后续任务中生效。')
+  }
+  const setPerformanceValue = (key: keyof PerformanceSettings, value: string | number | null) => {
+    setPerformanceDraft(current => ({ ...(current ?? { cpu_budget_mode: 'auto', cpu_budget: null, download_workers: 4, validation_workers: 4, blas_threads: 8, workspace_mb: 8192 }), [key]: value }))
+  }
   const profiles = useMemo(() => {
     const value = coverage?.profiles
     if (Array.isArray(value)) return value.map((profile, index) => ({ source: String((profile as Record<string, unknown>)?.source ?? (profile as Record<string, unknown>)?.name ?? `来源 ${index + 1}`), profile }))
@@ -242,6 +252,16 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
             <div className="card-bottom"><Button variant="secondary" busy={busy === 'data-dir'} onClick={saveDataDirectory}>保存数据目录</Button></div>
             <Field label="行情与预览缓存上限（MiB）" hint="按需使用，不会启动时预分配；0 表示关闭跨请求缓存。回测任务工作内存单独计算。"><TextInput type="number" min={0} max={16384} value={cacheMbDraft ?? settings.market_cache_mb ?? 256} onChange={e => setCacheMbDraft(Number(e.target.value))} /></Field>
             <div className="card-bottom"><Button variant="quiet" busy={busy === 'cache'} onClick={saveCacheBudget}>保存缓存设置</Button><span className="muted-copy">{settings.market_cache ? `已用 ${prettyBytes(settings.market_cache.used_bytes)} / ${prettyBytes(settings.market_cache.budget_bytes)}` : ''}</span></div>
+            <div className="schedule-head"><div><strong>计算资源</strong><small>默认自动使用本机 75% 逻辑核心，为网页和日常操作保留余量</small></div><Badge tone="blue">本机</Badge></div>
+            <div className="schedule-grid">
+              <Field label="CPU 预算"><SelectInput value={performanceDraft?.cpu_budget_mode ?? 'auto'} onChange={e => setPerformanceValue('cpu_budget_mode', e.target.value)}><option value="auto">自动</option><option value="custom">指定线程</option></SelectInput></Field>
+              <Field label="CPU 线程上限"><TextInput type="number" min={1} max={128} disabled={(performanceDraft?.cpu_budget_mode ?? 'auto') === 'auto'} value={performanceDraft?.cpu_budget ?? ''} onChange={e => setPerformanceValue('cpu_budget', e.target.value ? Number(e.target.value) : null)} /></Field>
+              <Field label="下载并发"><TextInput type="number" min={1} max={8} value={performanceDraft?.download_workers ?? 4} onChange={e => setPerformanceValue('download_workers', Number(e.target.value))} /></Field>
+              <Field label="校验进程"><TextInput type="number" min={1} max={4} value={performanceDraft?.validation_workers ?? 4} onChange={e => setPerformanceValue('validation_workers', Number(e.target.value))} /></Field>
+              <Field label="矩阵线程"><TextInput type="number" min={1} max={16} value={performanceDraft?.blas_threads ?? 8} onChange={e => setPerformanceValue('blas_threads', Number(e.target.value))} /></Field>
+              <Field label="任务工作集（MiB）"><TextInput type="number" min={256} max={65536} value={performanceDraft?.workspace_mb ?? 8192} onChange={e => setPerformanceValue('workspace_mb', Number(e.target.value))} /></Field>
+            </div>
+            <div className="card-bottom"><Button variant="quiet" busy={busy === 'performance'} onClick={savePerformance}>保存计算资源设置</Button></div>
           </div>
           <div className="schedule-box"><div className="schedule-head"><div><strong>自动更新计划</strong><small>{schedule.enabled ? '当前已启用' : '当前已停用'}</small></div><Badge tone={schedule.enabled ? 'green' : 'neutral'}>{schedule.enabled ? '启用' : '停用'}</Badge></div>
             <div className="schedule-grid"><Field label="每日时间"><TextInput type="time" value={scheduleDraft.daily_time ?? schedule.daily_time ?? '18:30'} onInput={(e) => setScheduleValue('daily_time', e.currentTarget.value)} onChange={(e) => setScheduleValue('daily_time', e.target.value)} /></Field><Field label="每周星期"><SelectInput value={scheduleDraft.weekly_day ?? schedule.weekly_day ?? 'SAT'} onChange={(e) => setScheduleValue('weekly_day', e.target.value)}>{[['MON', '周一'], ['TUE', '周二'], ['WED', '周三'], ['THU', '周四'], ['FRI', '周五'], ['SAT', '周六'], ['SUN', '周日']].map(([v, l]) => <option key={v} value={v}>{l}</option>)}</SelectInput></Field><Field label="每周时间"><TextInput type="time" value={scheduleDraft.weekly_time ?? schedule.weekly_time ?? '10:00'} onInput={(e) => setScheduleValue('weekly_time', e.currentTarget.value)} onChange={(e) => setScheduleValue('weekly_time', e.target.value)} /></Field></div>

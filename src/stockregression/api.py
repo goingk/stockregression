@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import shutil
 import uuid
 from contextlib import asynccontextmanager
+from itertools import combinations, product
 from pathlib import Path, PurePosixPath
 
 import pandas as pd
@@ -29,6 +31,7 @@ from .market_data.cache import cache_settings, configure_cache
 from .market_data.package import scan_etf_package
 from .market_data.preparation import MarketPreparationService
 from .market_data.timeframes import normalize_timeframe, public_timeframe
+from .performance import effective_cpu_budget, logical_cpu_count
 from .rules import instrument_terms
 from .research_preparation import preparation_config
 from .schedule import configure_schedule
@@ -43,7 +46,7 @@ class SyncRequest(BaseModel):
     scope: Literal["market", "watchlist", "selected"] | None = None
     resume: bool = False
     retry_failed: bool = False
-    workers: int = Field(default=2, ge=1, le=4)
+    workers: int = Field(default=4, ge=1, le=4)
 
 
 class MarketSyncRequest(BaseModel):
@@ -58,7 +61,7 @@ class MarketSyncRequest(BaseModel):
     resume: bool = False
     retry_failed: bool = False
     initialize: bool = False
-    workers: int = Field(default=2, ge=1, le=4)
+    workers: int = Field(default=4, ge=1, le=4)
 
 
 class MarketImportRequest(BaseModel):
@@ -85,7 +88,7 @@ class MarketBatchRequest(BaseModel):
     etf_category: str | None = None
     resume: bool = True
     calendar_path: str | None = None
-    workers: int = Field(default=2, ge=1, le=4)
+    workers: int = Field(default=4, ge=1, le=4)
     skip_invalid_rows: bool = False
     import_mode: Literal["merge", "snapshot"] = "merge"
 
@@ -97,7 +100,7 @@ class MarketPackageRequest(BaseModel):
     symbols: list[str] | None = None
     label_convention: Literal["auto", "start", "end"] = "auto"
     resume: bool = True
-    workers: int = Field(default=2, ge=1, le=4)
+    workers: int = Field(default=4, ge=1, le=4)
     skip_invalid_rows: bool = False
 
 
@@ -207,6 +210,204 @@ def _compact_v2_result(value, top_candidates: int, parent_key: str | None = None
     if isinstance(value, tuple):
         return [_compact_v2_result(item, top_candidates, parent_key) for item in value]
     return value
+
+
+def _landscape_metric(row: dict, sample: str, cost: str, fold: int | None) -> float | None:
+    if sample == "training":
+        value = row.get("training_excess_return")
+    elif fold is not None:
+        folds = row.get("folds") if isinstance(row.get("folds"), list) else []
+        value = folds[fold].get("excess_return") if fold < len(folds) and isinstance(folds[fold], dict) else None
+    else:
+        value = row.get("validation_excess_stress" if cost == "stress" else "validation_excess_original")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(float(value)):
+        return float(value)
+    return None
+
+
+def _landscape_point(row: dict, sample: str, cost: str, fold: int | None, fallback_id: int | None = None) -> dict:
+    folds = row.get("folds", []) if sample == "validation" else []
+    folds = folds if isinstance(folds, list) else []
+    status = row.get("evaluation_status") if sample == "validation" else row.get("status")
+    if sample == "training":
+        grid_value, baseline_value = row.get("training_return"), row.get("training_baseline_return")
+    elif fold is not None and fold < len(folds) and isinstance(folds[fold], dict):
+        evidence_row = folds[fold]
+        grid_value, baseline_value = evidence_row.get("grid_return"), evidence_row.get("baseline_return")
+    else:
+        grid_value = row.get("validation_return_stress" if cost == "stress" else "validation_return_original")
+        baseline_value = None
+    return {
+        "candidate_id": row.get("candidate_id", row.get("search_id", fallback_id)),
+        "params": row.get("params", {}), "is_center": bool(row.get("is_center")),
+        "is_baseline": bool(row.get("is_baseline")), "is_focus": False,
+        "status": status or "unknown",
+        "excess_return": _landscape_metric(row, sample, cost, fold),
+        "grid_return": grid_value, "baseline_return": baseline_value,
+        "drawdown": row.get("max_drawdown") if sample == "validation" else row.get("training_drawdown"),
+        "trade_count": row.get("trade_count") if sample == "validation" else row.get("training_trade_count"),
+        "peak_invested": row.get("peak_invested"), "folds": folds,
+        "neighbor_candidate_ids": row.get("neighbor_candidate_ids", []),
+        "neighbor_of_candidate_ids": row.get("neighbor_of_candidate_ids", []),
+        "robustness_status": row.get("robustness_status"),
+        "neighbor_positive_ratio": row.get("neighbor_positive_ratio"),
+        "neighbor_q25_excess": row.get("neighbor_q25_excess"),
+        "island_suspect": row.get("island_suspect", False),
+        "neighbor_boundary_clipped_count": row.get("neighbor_boundary_clipped_count", 0),
+        "region_ids": row.get("region_ids", []),
+    }
+
+
+def _landscape_rank_key(row: dict, sample: str, cost: str, fold: int | None, index: int) -> tuple[float, int]:
+    value = _landscape_metric(row, sample, cost, fold)
+    candidate_id = row.get("candidate_id", row.get("search_id", index + 1))
+    try:
+        identity = int(candidate_id)
+    except (TypeError, ValueError):
+        identity = index + 1
+    return (value if value is not None else -math.inf, -identity)
+
+
+def _landscape_sample_indices(total: int, limit: int, focus: int | None) -> list[int]:
+    if total <= 0:
+        return []
+    if limit >= total:
+        return list(range(total))
+    if limit == 1:
+        return [focus if focus is not None else 0]
+    indices = {round(index * (total - 1) / (limit - 1)) for index in range(limit)}
+    if focus is not None and focus not in indices:
+        indices.add(focus)
+        if len(indices) > limit:
+            removable = sorted(value for value in indices if value not in (0, total - 1, focus))
+            if removable:
+                indices.remove(removable[len(removable) // 2])
+            else:
+                indices.remove(total - 1 if total - 1 != focus else 0)
+    return sorted(indices)[:limit]
+
+
+def _landscape_same(left, right) -> bool:
+    if left is None and right is None:
+        return True
+    try:
+        return abs(float(left) - float(right)) < 1e-9
+    except (TypeError, ValueError):
+        return left == right
+
+
+def _landscape_slices(
+    archive: list[dict], focus_params: dict, names: list[str],
+    sample: str, cost: str, fold: int | None, limit: int = 2500,
+) -> dict[str, dict]:
+    """Return complete two-dimensional planes through the relative-best point.
+
+    A neighborhood slice is complete: every legal candidate in that plane is
+    available in the result archive, so blank heatmap cells should only mean an
+    unevaluated or invalid combination.
+    """
+    output = {}
+    for x_name, y_name in combinations(names, 2):
+        fixed = [name for name in names if name not in (x_name, y_name)]
+        rows = [
+            row for row in archive
+            if all(_landscape_same(row.get("params", {}).get(name), focus_params.get(name)) for name in fixed)
+        ]
+        if not rows:
+            continue
+        focus_index = next((
+            index for index, row in enumerate(rows)
+            if all(_landscape_same(row.get("params", {}).get(name), focus_params.get(name)) for name in names)
+        ), None)
+        if len(rows) > limit:
+            indices = _landscape_sample_indices(len(rows), limit, focus_index)
+            sampled = True
+        else:
+            indices = list(range(len(rows)))
+            sampled = False
+        points = []
+        for index in indices:
+            point = _landscape_point(rows[index], sample, cost, fold, index + 1)
+            point["is_focus"] = index == focus_index
+            points.append(point)
+        output["|".join(sorted((x_name, y_name)))] = {
+            "x": x_name, "y": y_name, "points": points,
+            "total": len(rows), "sampled": sampled,
+        }
+    return output
+
+
+def _landscape_param_key(params: dict, names: list[str]) -> tuple:
+    values = []
+    for name in names:
+        value = params.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            values.append(round(float(value), 9))
+        else:
+            values.append(value)
+    return tuple(values)
+
+
+def _landscape_neighborhood(
+    archive: list[dict], focus_params: dict, names: list[str],
+    sample: str, cost: str, fold: int | None, fields: list[str] | None = None,
+) -> dict:
+    """Summarize the immediate full-dimensional neighbor box for the focus."""
+    axes = []
+    selected = set(names if fields is None else fields)
+    for name in names:
+        if name not in selected:
+            continue
+        values = sorted({
+            float(row["params"][name])
+            for row in archive
+            if isinstance(row.get("params", {}).get(name), (int, float))
+        })
+        if len(values) < 2 or not isinstance(focus_params.get(name), (int, float)):
+            continue
+        center = float(focus_params[name])
+        index = min(range(len(values)), key=lambda item: abs(values[item] - center))
+        choices = values[max(0, index - 1):index + 2]
+        if center not in choices:
+            choices = sorted({*choices, center})
+        axes.append((name, choices[:3]))
+    if not axes:
+        return {"available": False, "expected_count": 0, "evaluated_count": 0}
+    lookup = {_landscape_param_key(row["params"], names): row for row in archive}
+    expected = math.prod(len(choices) for _, choices in axes) - 1
+    values = []
+    completed = 0
+    missing = 0
+    for combination in product(*(choices for _, choices in axes)):
+        if all(
+            abs(combination[index] - float(focus_params.get(name, combination[index]))) < 1e-9
+            for index, (name, _) in enumerate(axes)
+        ):
+            continue
+        params = {**focus_params, **{
+            name: combination[index] for index, (name, _) in enumerate(axes)
+        }}
+        row = lookup.get(_landscape_param_key(params, names))
+        if row is None:
+            missing += 1
+            continue
+        completed += 1
+        value = _landscape_metric(row, sample, cost, fold)
+        if value is not None:
+            values.append(value)
+    return {
+        "available": True,
+        "dimensions": [name for name, _ in axes],
+        "expected_count": expected,
+        "evaluated_count": completed,
+        "missing_count": missing,
+        "positive_count": sum(value > 1e-12 for value in values),
+        "positive_ratio": sum(value > 1e-12 for value in values) / len(values) if values else None,
+        "q25_excess": float(np.percentile(values, 25)) if values else None,
+        "min_excess": min(values) if values else None,
+        "max_excess": max(values) if values else None,
+        "all_positive": bool(values) and len(values) == expected and all(value > 1e-12 for value in values),
+    }
 
 
 def _quality_dates(result: dict) -> tuple[str | None, str | None]:
@@ -564,7 +765,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             target = Path(payload.folder).expanduser().resolve()
             if data_dir is None and initial_package and target != Path(initial_package).resolve():
                 raise ValueError(
-                    "项目已固定使用 ETF 数据更新至2026.9.30；如需切换基础数据包，请修改本机设置中的 package_dir 后重启"
+                    "项目已固定使用当前 ETF 数据包；如需切换基础数据包，请修改本机设置中的 package_dir 后重启"
                 )
             values = payload.model_dump()
             values["folder"] = str(target)
@@ -1160,87 +1361,82 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
         if region_id is not None:
             archive = [row for row in archive if region_id in (row.get("region_ids") or [])]
         total_points = len(archive)
-        archive = archive[offset:offset + limit]
         if not archive:
             return {"result_id": result_id, "decision": decision, "sample": sample,
                     "cost": cost, "fold": fold, "region_id": region_id, "offset": offset,
-                    "limit": limit, "total": total_points, "points": [], "pca": None, "bounds": None}
+                    "limit": limit, "total": total_points, "points": [], "bounds": None,
+                    "focus": None, "focus_neighborhood": None, "top_candidates": [], "slices": {},
+                    "sampled": False, "center_count": 0}
+        focus_index = max(
+            range(total_points),
+            key=lambda index: _landscape_rank_key(archive[index], sample, cost, fold, index),
+        )
+        if offset > 0:
+            selected_indices = list(range(offset, min(total_points, offset + limit)))
+            sampled = False
+        else:
+            selected_indices = _landscape_sample_indices(total_points, limit, focus_index)
+            sampled = len(selected_indices) < total_points
         config = result.get("config", {})
-        base = config.get("base", config)
-        active = ["buy_step", "sell_step"] if base.get("grid_mode", "trailing") == "trailing" else ["grid_step"]
-        active += ["min_shares", "max_shares", "buy_shares", "sell_shares"]
-        names = [name for name in active if any(row.get("params", {}).get(name) is not None for row in archive)]
+        ordered_names = [
+            "buy_step", "sell_step", "sell_shares", "buy_shares",
+            "min_shares", "max_shares", "grid_step",
+        ]
+        names = [
+            name for name in ordered_names
+            if any(row.get("params", {}).get(name) is not None for row in archive)
+        ]
         points = []
-        for row_index, row in enumerate(archive):
-            params = row.get("params", {})
-            status = row.get("evaluation_status") if sample == "validation" else row.get("status")
-            folds = row.get("folds", []) if sample == "validation" else []
-            if sample == "training":
-                value, grid_value, baseline_value = row.get("training_excess_return"), row.get("training_return"), row.get("training_baseline_return")
-            elif fold is not None and fold < len(folds):
-                evidence_row = folds[fold] or {}
-                value, grid_value, baseline_value = evidence_row.get("excess_return"), evidence_row.get("grid_return"), evidence_row.get("baseline_return")
-            else:
-                value = row.get("validation_excess_stress" if cost == "stress" else "validation_excess_original")
-                grid_value = row.get("validation_return_stress" if cost == "stress" else "validation_return_original")
-                baseline_value = None
-            points.append({
-                "candidate_id": row.get("candidate_id", row.get("search_id", row_index + 1)),
-                "params": params, "is_center": bool(row.get("is_center")),
-                "is_baseline": bool(row.get("is_baseline")), "status": status or "unknown",
-                "excess_return": value, "grid_return": grid_value, "baseline_return": baseline_value,
-                "drawdown": row.get("max_drawdown") if sample == "validation" else row.get("training_drawdown"),
-                "trade_count": row.get("trade_count") if sample == "validation" else row.get("training_trade_count"),
-                "peak_invested": row.get("peak_invested"), "folds": folds,
-                "neighbor_candidate_ids": row.get("neighbor_candidate_ids", []),
-                "neighbor_of_candidate_ids": row.get("neighbor_of_candidate_ids", []),
-                "robustness_status": row.get("robustness_status"),
-                "neighbor_positive_ratio": row.get("neighbor_positive_ratio"),
-                "neighbor_q25_excess": row.get("neighbor_q25_excess"),
-                "island_suspect": row.get("island_suspect", False),
-                "neighbor_boundary_clipped_count": row.get("neighbor_boundary_clipped_count", 0),
-                "region_ids": row.get("region_ids", []),
-            })
-        pca = None
-        ranges = config.get("ranges", {}) or {}
-        dimensions = []
-        for name in names:
-            values = [float(point["params"][name]) for point in points if isinstance(point["params"].get(name), (int, float)) and np.isfinite(float(point["params"][name]))]
-            if values and max(values) - min(values) > 0:
-                dimensions.append(name)
-        if len(dimensions) >= 2:
-            matrix = []
-            for point in points:
-                vector = []
-                for name in dimensions:
-                    value = float(point["params"].get(name, 0.0))
-                    search_range = ranges.get(name, {}) or {}
-                    low, high = float(search_range.get("low", value)), float(search_range.get("high", value))
-                    vector.append((value - low) / (high - low) if high > low else 0.0)
-                matrix.append(vector)
-            values = np.asarray(matrix, dtype=np.float64)
-            centered = values - values.mean(axis=0, keepdims=True)
-            _, singular, components = np.linalg.svd(centered, full_matrices=False)
-            variance = singular ** 2
-            explained = variance[:2] / variance.sum() if variance.sum() > 0 else np.zeros(2)
-            coords = centered @ components[:2].T
-            if coords.shape[1] < 2:
-                coords = np.column_stack([coords[:, 0], np.zeros(len(coords))])
-            for index, point in enumerate(points):
-                point["pca"] = [float(coords[index, 0]), float(coords[index, 1])]
-            pca = {
-                "parameters": dimensions,
-                "explained_variance": [float(value) for value in explained],
-                "loadings": [[float(value) for value in components[i, :]] for i in range(min(2, len(components)))],
-            }
+        for index in selected_indices:
+            point = _landscape_point(archive[index], sample, cost, fold, index + 1)
+            point["is_focus"] = index == focus_index
+            points.append(point)
+
+        ranked_indices = sorted(
+            range(total_points),
+            key=lambda index: _landscape_rank_key(archive[index], sample, cost, fold, index),
+            reverse=True,
+        )
+        top_candidates = []
+        for rank, index in enumerate(ranked_indices[:min(10, total_points)], start=1):
+            point = _landscape_point(archive[index], sample, cost, fold, index + 1)
+            point["is_focus"] = index == focus_index
+            point["rank"] = rank
+            top_candidates.append(point)
+        focus = next((point for point in points if point["is_focus"]), None)
+        if focus is None:
+            focus = _landscape_point(archive[focus_index], sample, cost, fold, focus_index + 1)
+            focus["is_focus"] = True
+        slices = _landscape_slices(
+            archive, archive[focus_index].get("params", {}), names, sample, cost, fold,
+        )
+        neighborhood_fields = None
+        strategy = config.get("strategy") if isinstance(config, dict) else None
+        stored_fields = strategy.get("neighborhood_fields") if isinstance(strategy, dict) else None
+        if isinstance(stored_fields, list):
+            mapped_fields = []
+            for name in stored_fields:
+                legacy_grid = name == "grid_step" and "grid_step" in names and not {"buy_step", "sell_step"}.issubset(names)
+                for mapped in ((str(name),) if legacy_grid else (("buy_step", "sell_step") if name == "grid_step" else (str(name),))):
+                    if mapped not in mapped_fields:
+                        mapped_fields.append(mapped)
+            neighborhood_fields = [name for name in mapped_fields if name in names] or None
+        focus_neighborhood = _landscape_neighborhood(
+            archive, archive[focus_index].get("params", {}), names, sample, cost, fold,
+            fields=neighborhood_fields,
+        )
         finite = [float(point["excess_return"]) for point in points if isinstance(point.get("excess_return"), (int, float)) and np.isfinite(float(point["excess_return"]))]
         return {
             "result_id": result_id, "decision": decision, "decision_index": decision_index,
             "sample": sample, "cost": cost, "fold": fold, "region_id": region_id,
             "offset": offset, "limit": limit, "total": total_points, "parameters": names,
-            "points": points, "pca": pca,
+            "points": points,
             "bounds": {"min": min(finite), "max": max(finite)} if finite else None,
             "center_count": sum(bool(point["is_center"]) for point in points),
+            "focus": focus, "focus_neighborhood": focus_neighborhood,
+            "top_candidates": top_candidates,
+            "slices": slices,
+            "sampled": sampled, "sample_strategy": "even" if sampled else "page",
         }
 
     @app.get("/api/v1/results/{result_id}/export")
@@ -1301,6 +1497,21 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             "package_dir": current.package_dir or package_dir,
             "restart_required": current.data_dir != root or bool(current.package_dir and current.package_dir != package_dir),
             "market_cache": cache_settings(),
+        }
+
+    @app.get("/api/v1/performance")
+    def performance_status():
+        current = load_settings()
+        with store.db() as db:
+            leases = [dict(row) for row in db.execute(
+                "SELECT job_id,pid,kind,units,updated_at FROM resource_leases ORDER BY updated_at DESC"
+            ).fetchall()]
+        return {
+            "logical_cpus": logical_cpu_count(),
+            "effective_cpu_budget": effective_cpu_budget(current.performance),
+            "settings": current.performance.model_dump(mode="json"),
+            "active_leases": leases,
+            "reserved_cpu_units": sum(int(row.get("units") or 0) for row in leases),
         }
 
     @app.put("/api/v1/settings")

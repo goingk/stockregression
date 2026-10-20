@@ -11,7 +11,6 @@ wheels/
 node_modules/
 frontend/dist/
 data/
-datasets/
 .cache/
 .pytest_cache/
 .coverage

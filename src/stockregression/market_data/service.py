@@ -2,17 +2,23 @@ from __future__ import annotations
 
 import hashlib
 import math
+import multiprocessing
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 
 from ..models import BacktestConfig, normalize_symbol
+from ..performance import (
+    blas_thread_limit, effective_cpu_budget, effective_setting, record_count,
+    record_seconds,
+)
+from ..settings import load_settings
 from ..quality import QUALITY_RULES_VERSION
 from ..price_validation import (
     PRICE_VALIDATION_VERSION, anomalies_in_range, anomaly_records, anomaly_summary,
@@ -78,6 +84,19 @@ def _raise_price_not_ready(
         f"{context}仍有 {len(anomalies)} 条无效价格（{', '.join(stamps)}）；请修正源记录后重新校验",
         gaps=[{"kind": "price_quality", "timeframe": timeframe, "anomalies": samples}],
     )
+
+
+def _validate_month_worker(
+    root: str, package_dir: str | None, symbol: str, timeframe: str,
+    adjustment: str, mode: str, start: str, end: str,
+):
+    """Validate one independent month without sharing pandas or SQLite state."""
+    service = MarketDataService(Store(root), package_dir=package_dir)
+    with blas_thread_limit(1):
+        return validate_incremental(
+            service, symbol, timeframe, mode=mode, start=start, end=end,
+            progress=lambda *_: None, cancelled=lambda: False,
+        )
 
 
 class MarketDataService:
@@ -757,7 +776,7 @@ class MarketDataService:
 
     def import_folder(
         self, folder, timeframe, *, recursive=False, label_convention="auto", adjustment="none",
-        etf_category=None, resume=True, calendar_path=None, workers=2, skip_invalid_rows=False,
+        etf_category=None, resume=True, calendar_path=None, workers=4, skip_invalid_rows=False,
         import_mode="merge",
         progress=lambda *_: None, cancelled=lambda: False,
     ) -> dict:
@@ -1018,30 +1037,56 @@ class MarketDataService:
         self, symbol: str, timeframe: str, *, adjustment="none",
         label_convention: str | None = None, mode: str = "incremental",
         start=None, end=None,
+        progress: Callable[[float, str], None] = lambda *_: None,
+        cancelled: Callable[[], bool] = lambda: False,
     ) -> dict:
+        if cancelled():
+            raise InterruptedError("任务已取消")
         symbol, timeframe = normalize_symbol(symbol), normalize_timeframe(timeframe)
         dataset = self.repository.dataset(symbol, timeframe, adjustment)
         if not dataset:
             raise MarketDataError("没有可校验的本地行情")
+        if mode not in {"incremental", "full"}:
+            raise MarketDataError("校验模式应为 incremental 或 full")
         requested_start = start or dataset.get("first_time")
         requested_end = end or dataset.get("last_time")
-        quality_probe = self.repository.bars(
-            symbol, timeframe, adjustment=adjustment,
-            start=requested_start, end=requested_end,
+        anomaly_cache_key = (
+            f"validation-anomalies:{self.repository.package_id}:{symbol}:{timeframe}:"
+            f"{dataset.get('current_version')}:p{PRICE_VALIDATION_VERSION}"
         )
-        existing_anomalies = _price_anomaly_rows(
-            quality_probe, requested_start, requested_end
-        )
+        cached_anomaly_count = self.store.state(anomaly_cache_key)
+        existing_anomalies = pd.DataFrame()
+        quality_probe = pd.DataFrame()
+        cache_hit = False
         if (
             mode == "incremental" and label_convention is None
             and self._validation_covers(dataset, requested_start, requested_end)
-            and existing_anomalies.empty
+            and (cached_anomaly_count is None or int(cached_anomaly_count) == 0)
         ):
             state = self.repository.validation_state(
                 symbol, timeframe, adjustment=adjustment,
                 start=requested_start, end=requested_end,
             )
             if not state.get("failed") and not state.get("pending"):
+                if cached_anomaly_count is None:
+                    quality_probe = self.repository.bars(
+                        symbol, timeframe, adjustment=adjustment,
+                        start=requested_start, end=requested_end,
+                    )
+                    existing_anomalies = _price_anomaly_rows(
+                        quality_probe, requested_start, requested_end
+                    )
+                    cached_anomaly_count = len(existing_anomalies)
+                    self.store.state(anomaly_cache_key, int(cached_anomaly_count))
+                cache_hit = int(cached_anomaly_count) == 0
+        if cache_hit:
+            state = self.repository.validation_state(
+                symbol, timeframe, adjustment=adjustment,
+                start=requested_start, end=requested_end,
+            )
+            if not state.get("failed") and not state.get("pending"):
+                record_count("validation_cache_hits", 1)
+                progress(1.0, f"{timeframe} 已有有效校验，复用 {state.get('validated_days', 0)} 日")
                 return {
                     "symbol": symbol, "timeframe": timeframe, "status": "complete",
                     "pending_validation": [],
@@ -1055,11 +1100,23 @@ class MarketDataService:
                     "verified_from": state.get("verified_from"),
                     "verified_through": state.get("verified_through"),
                 }
-        frame = self.repository.active_rows(symbol, timeframe, adjustment)
+        if quality_probe.empty:
+            record_count("validation_cache_misses", 1)
+            quality_probe = self.repository.bars(
+                symbol, timeframe, adjustment=adjustment,
+                start=requested_start, end=requested_end,
+            )
+            existing_anomalies = _price_anomaly_rows(
+                quality_probe, requested_start, requested_end
+            )
+            self.store.state(anomaly_cache_key, int(len(existing_anomalies)))
+        frame = self.repository.active_rows(
+            symbol, timeframe, adjustment,
+            start=None if label_convention not in (None, "auto") else requested_start,
+            end=None if label_convention not in (None, "auto") else requested_end,
+        )
         if frame.empty:
             raise MarketDataError("没有可校验的本地行情")
-        if mode not in {"incremental", "full"}:
-            raise MarketDataError("校验模式应为 incremental 或 full")
         ledger_changed = False
         if label_convention is not None and timeframe in MINUTE_TIMEFRAMES:
             if label_convention not in {"auto", "start", "end"}:
@@ -1105,11 +1162,17 @@ class MarketDataService:
                 self.refresh_snapshot(symbol)
                 self.repository.invalidate_all_validations(symbol, adjustment)
                 ledger_changed = True
-        ledger = validate_incremental(
-            self, symbol, timeframe, mode=mode, start=start, end=end,
+        validation_started = time.perf_counter()
+        ledger = self._validate_ledger(
+            symbol, timeframe, mode=mode, adjustment=adjustment,
+            start=start, end=end, progress=progress, cancelled=cancelled,
         )
-        state = self.repository.validation_state(symbol, timeframe, adjustment=adjustment)
-        status = "complete" if state.get("verified_through") and not state.get("failed") else "partial"
+        record_seconds("validation", time.perf_counter() - validation_started)
+        state = self.repository.validation_state(
+            symbol, timeframe, adjustment=adjustment,
+            start=requested_start, end=requested_end,
+        )
+        status = "complete" if state.get("verified_through") and not state.get("failed") and not state.get("pending") else "partial"
         pending = list(state.get("pending") or [])
         if state.get("failed"):
             pending.append(f"{len(state['failed'])} 个交易日未通过校验")
@@ -1135,6 +1198,84 @@ class MarketDataService:
             "pending_validation": pending, "report": validation_report,
             "verified_from": state.get("verified_from"),
             "verified_through": state.get("verified_through"),
+        }
+
+    def _validate_ledger(
+        self, symbol: str, timeframe: str, *, mode: str, adjustment: str,
+        start=None, end=None, progress: Callable[[float, str], None] = lambda *_: None,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> dict:
+        """Validate independent months in parallel and commit from the parent."""
+        dataset = self.repository.dataset(symbol, timeframe, adjustment)
+        if not dataset:
+            raise MarketDataError("没有可校验的本地行情")
+        first = pd.Timestamp(start or dataset["first_time"]).normalize()
+        last = pd.Timestamp(end or dataset["last_time"]).normalize()
+        months: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        cursor = first.to_period("M").start_time.normalize()
+        while cursor <= last:
+            month_end = (cursor + pd.offsets.MonthBegin(1)).normalize() - pd.Timedelta(days=1)
+            months.append((max(first, cursor), min(last, month_end)))
+            cursor += pd.offsets.MonthBegin(1)
+        configured = load_settings().performance
+        workers = min(
+            effective_setting(configured, "validation_workers", 4, 4),
+            effective_cpu_budget(configured), max(1, len(months)),
+            max(1, int(configured.workspace_mb) // 256),
+        )
+        if len(months) <= 1 or workers <= 1:
+            return validate_incremental(
+                self, symbol, timeframe, mode=mode, start=first, end=last,
+                progress=progress, cancelled=cancelled,
+            )
+        executor = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=multiprocessing.get_context("spawn"),
+        )
+        futures = {
+            executor.submit(
+                _validate_month_worker,
+                str(self.store.root), str(self.repository.package_dir),
+                symbol, timeframe, adjustment, mode,
+                str(month_start.date()), str(month_end.date()),
+            ): (month_start, month_end)
+            for month_start, month_end in months
+        }
+        checked = skipped = failed = 0
+        completed = 0
+        try:
+            pending = set(futures)
+            while pending:
+                if cancelled():
+                    raise InterruptedError("任务已取消")
+                done, pending = wait(
+                    pending, timeout=0.5, return_when=FIRST_COMPLETED
+                )
+                for future in done:
+                    result = future.result()
+                    checked += int(result.get("checked_days", 0) or 0)
+                    skipped += int(result.get("skipped_days", 0) or 0)
+                    failed += int(result.get("failed_days", 0) or 0)
+                    completed += 1
+                    record_count("validation_months", 1)
+                    progress(
+                        completed / max(1, len(months)),
+                        f"校验 {timeframe}：{completed}/{len(months)} 个月完成 · {workers} 进程",
+                    )
+        except BaseException:
+            for process in list(getattr(executor, "_processes", {}).values()):
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            executor.shutdown(wait=True, cancel_futures=True)
+        return {
+            "symbol": symbol, "timeframe": timeframe, "mode": mode,
+            "checked_days": checked, "skipped_days": skipped,
+            "failed_days": failed, "parallel_workers": workers,
         }
 
     def readiness(self, config: BacktestConfig, version: str | None = None) -> dict:
@@ -1298,6 +1439,8 @@ class MarketDataService:
     def _validation_covers(self, dataset: dict | None, start, end) -> bool:
         if not dataset:
             return False
+        if dataset.get("file_status") not in {None, "readable"}:
+            return False
         state = self.repository.validation_state(
             str(dataset.get("symbol")), str(dataset.get("timeframe")),
             adjustment=str(dataset.get("adjustment") or "none"),
@@ -1307,9 +1450,17 @@ class MarketDataService:
         verified_through = state.get("verified_through")
         if not verified_from or not verified_through:
             return False
+        # Weekend boundaries may sit outside the last trading date. A weekday
+        # beyond both the source and the known calendar is still uncovered.
+        known_start = min(pd.Timestamp(dataset["first_time"]).normalize(), pd.Timestamp(state.get("calendar_start") or dataset["first_time"]).normalize())
+        known_end = max(pd.Timestamp(dataset["last_time"]).normalize(), pd.Timestamp(state.get("calendar_end") or dataset["last_time"]).normalize())
+        if pd.offsets.BDay().rollforward(pd.Timestamp(start).normalize()) < known_start:
+            return False
+        if pd.offsets.BDay().rollback(pd.Timestamp(end).normalize()) > known_end:
+            return False
         return (
-            pd.Timestamp(verified_from).normalize() <= pd.Timestamp(start).normalize()
-            and pd.Timestamp(verified_through).normalize() >= pd.Timestamp(end).normalize()
+            pd.Timestamp(verified_from).normalize() <= pd.Timestamp(state.get("expected_start") or start).normalize()
+            and pd.Timestamp(verified_through).normalize() >= pd.Timestamp(state.get("expected_end") or end).normalize()
             and not state.get("failed") and not state.get("pending")
         )
 

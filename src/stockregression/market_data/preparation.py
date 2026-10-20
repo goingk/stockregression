@@ -38,7 +38,7 @@ class MarketPreparationService:
                 "reason": "补齐交易日历和公司行动资料",
             })
         daily_gap = any(
-            str(gap.get("timeframe") or "") == "1day"
+            (str(gap.get("timeframe") or "") == "1day" and gap.get("kind") not in {"quality", "calendar", "actions"})
             or str(gap.get("kind")) in {"daily", "reference_price"}
             for gap in gaps
         )
@@ -48,7 +48,7 @@ class MarketPreparationService:
                 "symbol": config.symbol, "start": str(history_start.date()),
                 "end": str(end.date()), "reason": "补齐日线及开始日前置收盘",
             })
-        target_gap = any(str(gap.get("timeframe") or "") == target for gap in gaps)
+        target_gap = any(str(gap.get("timeframe") or "") == target and gap.get("kind") not in {"quality", "calendar", "actions"} for gap in gaps)
         if target != "1day" and target_gap:
             dataset = self.repository.dataset(config.symbol, target)
             if target == "1min" and dataset is None:
@@ -63,10 +63,14 @@ class MarketPreparationService:
                     "symbol": config.symbol, "start": str(history_start.date()),
                     "end": str(end.date()), "reason": f"准备 {target} 行情",
                 })
-        steps.append({
-            "kind": "validate", "symbol": config.symbol,
-            "timeframe": target, "reason": "发布包内行情并重新判断本次请求是否可用",
-        })
+        for timeframe in dict.fromkeys(("1day", target)):
+            steps.append({
+                "kind": "validate", "symbol": config.symbol,
+                "timeframe": timeframe,
+                "start": str(history_start.date()) if timeframe == "1day" else str(start.date()),
+                "end": str(end.date()),
+                "reason": "核验本次区间内的日线及前置收盘" if timeframe == "1day" else "核验本次区间内的包内行情",
+            })
         return {
             "symbol": config.symbol,
             "frequency": config.frequency,
@@ -103,7 +107,7 @@ class MarketPreparationService:
         for index, step in enumerate(steps):
             if cancelled():
                 raise InterruptedError("任务已取消")
-            progress(index / total, f"准备 {step.get('kind')} {step.get('timeframe', '')}")
+            progress(0.95 * index / total, f"准备 {step.get('kind')} {step.get('timeframe', '')}")
             try:
                 if step["kind"] == "import":
                     raise MarketDataError(step["reason"])
@@ -121,13 +125,17 @@ class MarketPreparationService:
                         start=step.get("start"), end=step.get("end"), resume=False,
                         workers=1,
                         progress=lambda fraction, message, offset=index: progress(
-                            (offset + float(fraction)) / total, message
+                            0.95 * (offset + float(fraction)) / total, message
                         ),
                         cancelled=cancelled,
                     )
                 elif step["kind"] == "validate":
                     result = self.service.revalidate(
-                        config.symbol, step["timeframe"]
+                        config.symbol, step["timeframe"], start=step["start"], end=step["end"],
+                        progress=lambda fraction, message, offset=index: progress(
+                            0.95 * (offset + float(fraction)) / total, message
+                        ),
+                        cancelled=cancelled,
                     )
                 else:
                     raise MarketDataError("未知的数据准备步骤：" + str(step.get("kind")))

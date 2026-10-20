@@ -5,7 +5,7 @@ from typing import Any
 
 import pandas as pd
 
-from ..price_validation import anomalies_from_attrs
+from ..price_validation import anomalies_in_range
 from .models import MarketDataError
 from .quality import validate_and_fill
 from .repository import VALIDATION_RULES_VERSION, _json, _time_text, utc_now
@@ -32,28 +32,19 @@ def _dependency_hash(repository, symbol: str, timeframe: str) -> str:
     calendar = repository.auxiliary(symbol, "calendar")
     actions = repository.auxiliary(symbol, "actions")
     daily = repository.dataset(symbol, "1day")
+    target = repository.dataset(symbol, timeframe)
     payload = {
         "rules": VALIDATION_RULES_VERSION,
         "calendar": (calendar or {}).get("version"),
         "actions": (actions or {}).get("version"),
         "daily": int(daily["current_version"]) if daily else None,
+        "target": int(target["current_version"]) if target else None,
     }
     return hashlib.sha256(_json(payload).encode()).hexdigest()
 
 
 def _calendar_days(service, symbol: str, start, end) -> pd.DatetimeIndex:
-    calendar = service._calendar(symbol)
-    values = pd.DatetimeIndex([])
-    if calendar is not None and not calendar.empty and "date" in calendar:
-        values = pd.DatetimeIndex(pd.to_datetime(calendar.date, errors="coerce").dropna())
-    daily = service.repository.active_rows(
-        symbol, "1day", start=pd.Timestamp(start).normalize(), end=pd.Timestamp(end).normalize()
-    )
-    if not daily.empty and "timestamp" in daily:
-        values = values.append(pd.DatetimeIndex(pd.to_datetime(daily.timestamp, errors="coerce").dropna()))
-    return values.normalize().unique().sort_values().intersection(
-        pd.date_range(pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize())
-    )
+    return service.repository.trading_days(symbol, start, end)
 
 
 def validate_incremental(
@@ -134,11 +125,14 @@ def validate_incremental(
     dependency = _dependency_hash(repository, symbol, timeframe)
     checked: list[dict] = []
     checked_days = 0
+    month_key = None
+    month_frame = pd.DataFrame()
+    month_days = pd.DatetimeIndex([])
     for index, day in enumerate(targets, start=1):
         if cancelled():
             raise InterruptedError("任务已取消")
         day = pd.Timestamp(day).normalize()
-        progress(index / max(1, len(targets)), f"校验 {day.date()} {timeframe}")
+        progress((index - 1) / max(1, len(targets)), f"校验 {timeframe}：{index - 1}/{len(targets)} 日 · {day.date()}")
         report: dict[str, Any] = {}
         status = "failed"
         reason = None
@@ -168,8 +162,25 @@ def validate_incremental(
                 reason = "缺少对应日线，无法确认交易状态与分钟依赖"
         part = pd.DataFrame()
         if not skip_minute and status != "suspended":
-            part = repository.active_rows(symbol, timeframe, start=day, end=day)
-            price_anomalies = anomalies_from_attrs(part)
+            # Package files often contain years of data. Read a bounded month
+            # once, rather than reopening/filtering the source for every day.
+            key = day.to_period("M")
+            if key != month_key:
+                month_frame = repository.active_rows(
+                    symbol, timeframe, start=max(lower, key.start_time),
+                    end=min(upper, key.end_time.normalize()),
+                )
+                month_days = pd.DatetimeIndex(month_frame.timestamp).normalize()
+                month_key = key
+            part = month_frame.loc[month_days == day].copy()
+            price_anomalies = anomalies_in_range(month_frame, day, day)
+            part.attrs["price_anomaly_rows"] = price_anomalies.to_dict("records")
+            blocked = pd.DatetimeIndex(pd.to_datetime(
+                month_frame.attrs.get("blocked_timestamps", []), errors="coerce",
+            ).dropna())
+            part.attrs["blocked_timestamps"] = [
+                stamp.isoformat() for stamp in blocked if stamp.normalize() == day
+            ]
             if not price_anomalies.empty:
                 status = "failed"
                 reason = f"存在 {len(price_anomalies)} 条无效价格，已隔离且禁止补造"
@@ -226,7 +237,10 @@ def validate_incremental(
             "checked_at": utc_now(),
         })
         checked_days += 1
+    if cancelled():
+        raise InterruptedError("任务已取消")
     repository.record_day_validations(checked)
+    progress(1.0, f"校验 {timeframe}：{checked_days}/{len(targets)} 日完成")
     state = repository.validation_state(symbol, timeframe, start=lower, end=upper)
     passed = sum(row["status"] == "passed" for row in checked)
     suspended = sum(row["status"] == "suspended" for row in checked)

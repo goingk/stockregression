@@ -79,7 +79,7 @@ def test_research_fold_drawdown_includes_intraday_path():
 def test_identical_schedule_is_exactly_the_same_continuous_account(grid_mode):
     config, bundle = market()
     config = config.model_copy(update={"grid_mode": grid_mode})
-    params = {"buy_step": .03, "sell_step": .03} if grid_mode == "trailing" else {"grid_step": .03}
+    params = {"buy_step": .03, "sell_step": .03}
     schedule = [{"effective_date": str(bundle.calendar[index].date()),
                  "decision_date": str(bundle.calendar[index - 1].date()), "params": params}
                 for index in (2, 4, 6)]

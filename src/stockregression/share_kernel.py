@@ -22,12 +22,22 @@ def _nb_sell_lot(requested, available, board_code):
     return max(0, min(requested, available) // 100 * 100)
 
 @_jit(cache=True)
-def _nb_cell(price, anchor, grid_mode, step):
+def _nb_cell(price, anchor, grid_mode, buy_step, sell_step):
     if price <= 0 or anchor <= 0:
         return 0
     if grid_mode == 1:
-        return int(math.floor((price - anchor) / max(anchor * step, 0.001) + 1e-10))
-    return int(math.floor(math.log(price / anchor) / math.log(1 + step) + 1e-10))
+        if price < anchor:
+            if buy_step >= 1.0:
+                return -1
+            width = max(anchor * buy_step, 0.001)
+            return -int(math.floor((anchor - price) / width + 1e-10))
+        width = max(anchor * sell_step, 0.001)
+        return int(math.floor((price - anchor) / width + 1e-10))
+    if price < anchor:
+        if buy_step >= 1.0:
+            return -1
+        return -int(math.floor(math.log(anchor / price) / math.log(1.0 / (1.0 - buy_step)) + 1e-10))
+    return int(math.floor(math.log(price / anchor) / math.log(1.0 + sell_step) + 1e-10))
 
 
 @_jit(cache=True)
@@ -43,7 +53,7 @@ def _nb_grid_intent(close, position, reference, anchor, active_cell,
         elif reference > 0 and close >= reference * (1.0 + sell_step) and position > min_shares:
             side, requested = 2, sell_shares
     else:
-        index = _nb_cell(close, anchor, grid_mode, grid_step)
+        index = _nb_cell(close, anchor, grid_mode, buy_step, sell_step)
         if index < active_cell and position < max_shares:
             side, requested = 1, buy_shares
         elif index > active_cell and position > min_shares:
@@ -377,7 +387,7 @@ def simulate(
                         rejection_n += 1
                     pending_side[0], pending_quantity[0], pending_reason[0] = 0, 0, 0
                     if grid_mode != 0:
-                        active_cell[0] = _nb_cell(last_grid_price, fixed_anchor[0], grid_mode, grid_step)
+                        active_cell[0] = _nb_cell(last_grid_price, fixed_anchor[0], grid_mode, buy_step, sell_step)
                     if i > 0 and prior_signal_allowed and not params_paused:
                         intent = _nb_grid_intent(prior_close, shares[0] + share_receivable[0],
                             reference[0], fixed_anchor[0], active_cell[0], grid_mode,
@@ -532,7 +542,7 @@ def simulate(
                                 fixed_anchor[account] = reference_price if reference_price > 0 else result[5]
                             if reference[account] == 0:
                                 reference[account] = fixed_anchor[account]
-                            active_cell[account] = _nb_cell(result[5], fixed_anchor[account], grid_mode, grid_step)
+                            active_cell[account] = _nb_cell(result[5], fixed_anchor[account], grid_mode, buy_step, sell_step)
                             has_active_cell[account] = True
 
             if not traded and account == 1 and dca_due and dca_last_day != day_id:
@@ -597,9 +607,9 @@ def simulate(
                     intent_reason = 5
             else:
                 anchor = fixed_anchor[0] if fixed_anchor[0] > 0 else reference[0]
-                index = _nb_cell(close, anchor, grid_mode, grid_step)
+                index = _nb_cell(close, anchor, grid_mode, buy_step, sell_step)
                 if not has_active_cell[0]:
-                    active_cell[0] = _nb_cell(reference[0] if reference[0] > 0 else close, anchor, grid_mode, grid_step)
+                    active_cell[0] = _nb_cell(reference[0] if reference[0] > 0 else close, anchor, grid_mode, buy_step, sell_step)
                     has_active_cell[0] = True
                 lower_ok = lower_price <= 0 or close >= lower_price
                 upper_ok = upper_price <= 0 or close <= upper_price

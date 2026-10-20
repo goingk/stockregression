@@ -41,7 +41,8 @@ def _check_ranges(config: OptimizationConfig) -> None:
         raise ValueError(f"不支持的搜索参数: {', '.join(unknown)}")
 
     for name, search_range in config.ranges.items():
-        if name in {"buy_step", "sell_step", "grid_step"} and name not in (("buy_step", "sell_step") if config.base.grid_mode == "trailing" else ("grid_step",)):
+        active_steps = ("buy_step", "sell_step") if config.base.schema_version in (2, 3) or config.base.grid_mode == "trailing" else ("grid_step",)
+        if name in {"buy_step", "sell_step", "grid_step"} and name not in active_steps:
             continue
         low, high = float(search_range.low), float(search_range.high)
         step = search_range.step
@@ -310,11 +311,17 @@ def _parameters_for_trial(
     ranges = config.ranges
     params: dict[str, Any] = {}
 
-    active_steps = ("buy_step", "sell_step") if base.grid_mode == "trailing" else ("grid_step",)
-    for name in active_steps:
-        params[name] = (
-            _sample(trial, name, ranges[name]) if name in ranges else float(getattr(base, name))
-        )
+    legacy_grid = base.schema_version not in (2, 3) and base.grid_mode != "trailing"
+    if legacy_grid:
+        legacy_step = _sample(trial, "grid_step", ranges["grid_step"]) if "grid_step" in ranges else float(base.grid_step)
+        params["grid_step"] = legacy_step
+        params["buy_step"] = legacy_step
+        params["sell_step"] = legacy_step
+    else:
+        for name in ("buy_step", "sell_step"):
+            params[name] = (
+                _sample(trial, name, ranges[name]) if name in ranges else float(getattr(base, name))
+            )
 
     if base.schema_version == 2:
         for name in ("initial_shares", "min_shares", "max_shares", "buy_shares", "sell_shares"):

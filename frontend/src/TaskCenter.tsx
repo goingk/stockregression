@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
-import { Bell, CheckCircle2, ChevronRight, LoaderCircle, RefreshCw, X } from 'lucide-react'
+import { AlertCircle, Bell, CheckCircle2, ChevronRight, LoaderCircle, RefreshCw, X } from 'lucide-react'
 import { get, post } from './api'
 import { Badge, Button, Empty, JobProgress } from './components'
 import { isActiveJob, mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds, taskLabel, taskStatusLabel } from './taskState'
@@ -143,8 +143,8 @@ export function TaskProvider({ children, onOpenResult }: { children: ReactNode; 
   </div>
   return <TaskContext.Provider value={value}>{children}
     <div className="task-toasts" aria-label="任务通知">
-      {notices.slice(-3).reverse().map(notice => <section className={`task-toast ${notice.error || notice.job?.status === 'failed' ? 'failed' : ''}`} key={notice.id}>
-        <div className="task-toast-head"><span className="task-toast-icon">{notice.submitting || (notice.job && isActiveJob(notice.job)) ? <LoaderCircle className="spin" size={17} /> : <CheckCircle2 size={17} />}</span><strong>{notice.label}</strong><button className="icon-button" onClick={() => removeNotice(notice.id)} aria-label="收起任务提示"><X size={15} /></button></div>
+      {notices.slice(-3).reverse().map(notice => <section className={`task-toast ${notice.error || notice.job?.status === 'failed' ? 'failed' : notice.job?.status === 'partial' ? 'partial' : ''}`} key={notice.id}>
+        <div className="task-toast-head"><span className="task-toast-icon">{notice.submitting || (notice.job && isActiveJob(notice.job)) ? <LoaderCircle className="spin" size={17} /> : notice.error || notice.job?.status === 'failed' || notice.job?.status === 'partial' ? <AlertCircle size={17} /> : <CheckCircle2 size={17} />}</span><strong>{notice.label}</strong>{notice.job?.status === 'partial' && <Badge tone="amber">部分完成</Badge>}<button className="icon-button" onClick={() => removeNotice(notice.id)} aria-label="收起任务提示"><X size={15} /></button></div>
         <div role="status" className="task-toast-message">{notice.error ?? (notice.submitting ? '正在提交…' : notice.job?.message || '操作完成')}</div>
         {notice.job && <><JobProgress progress={notice.job.progress} status={notice.job.status} />{jobActions(notice.job)}</>}
       </section>)}

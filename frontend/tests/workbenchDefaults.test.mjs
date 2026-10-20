@@ -1,6 +1,22 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { defaultWorkbenchDefaults, normalizeRememberedResearchDefaults, normalizeWorkbenchDefaults, researchRangesForSymbol, strategyDefaults, validResearchDefaults, validWorkbenchGroup, workbenchConfig } from '../src/workbenchDefaults.ts'
+import { defaultWorkbenchDefaults, normalizeRememberedResearchDefaults, normalizeWorkbenchDefaults, researchConfigForSubmission, researchRangesForSymbol, strategyDefaults, validResearchDefaults, validWorkbenchGroup, workbenchConfig } from '../src/workbenchDefaults.ts'
+
+test('v4 holding bounds use 500 shares while order quantities keep 100 shares', () => {
+  const value = defaultWorkbenchDefaults().research
+  value.ranges.min_shares.high = 1500
+  value.ranges.buy_shares.low = 200
+  assert.equal(validResearchDefaults(value), true)
+  value.ranges.min_shares.high = 1200
+  assert.equal(validResearchDefaults(value), false)
+  const old = defaultWorkbenchDefaults().research
+  old.fixed_half_widths.min_shares = 100
+  old.fixed_half_widths.max_shares = 600
+  const migrated = normalizeRememberedResearchDefaults(old)
+  assert.equal(migrated.fixed_half_widths.min_shares, 500)
+  assert.equal(migrated.fixed_half_widths.max_shares, 1000)
+  assert.equal(validResearchDefaults(migrated), true)
+})
 
 test('all four groups keep valid zero values and independent default copies', () => {
   const value = defaultWorkbenchDefaults()
@@ -34,6 +50,26 @@ test('new workspaces use the v4 geometric neighborhood defaults', () => {
   assert.equal(research.bootstrap_reps, 10000)
   assert.equal(research.n_trials, 1000)
   assert.equal(research.local_search_budget, 3000)
+  assert.deepEqual(research.neighborhood_fields, ['buy_step', 'sell_step', 'sell_shares', 'buy_shares', 'min_shares', 'max_shares'])
+})
+
+test('older saved research defaults gain all fine-search fields while empty selections are rejected', () => {
+  const saved = defaultWorkbenchDefaults().research
+  delete saved.neighborhood_fields
+  assert.deepEqual(normalizeWorkbenchDefaults({ research: saved }).research.neighborhood_fields, ['buy_step', 'sell_step', 'sell_shares', 'buy_shares', 'min_shares', 'max_shares'])
+  const empty = defaultWorkbenchDefaults().research
+  empty.neighborhood_fields = []
+  assert.equal(validResearchDefaults(empty), false)
+  assert.deepEqual(normalizeRememberedResearchDefaults(empty).neighborhood_fields, ['buy_step', 'sell_step', 'sell_shares', 'buy_shares', 'min_shares', 'max_shares'])
+})
+
+test('v4 submission ignores a stale hidden maximum holding when research mode changes', () => {
+  const base = { initial_shares: 100000, max_shares: 2000, grid_mode: 'trailing' }
+  const unlimited = researchConfigForSubmission(base, 4, 'unlimited')
+  assert.equal(unlimited.max_shares, null)
+  assert.equal(unlimited.grid_mode, 'geometric')
+  const searched = researchConfigForSubmission(base, 4, 'search')
+  assert.equal(searched.max_shares, 100000)
 })
 
 test('legacy saved research settings fill v4 fields while preserving every remembered range', () => {
@@ -70,7 +106,7 @@ test('remembered fields and inactive grid search ranges all survive blank workbe
   const memory = defaultWorkbenchDefaults()
   memory.grid.grid_mode = 'geometric'
   memory.grid.buy_step = .025
-  memory.grid.grid_step = .045
+  memory.grid.sell_step = .045
   memory.grid.lower_price = 8
   memory.grid.upper_price = 30
   memory.position.initial_shares = 1200
@@ -119,14 +155,32 @@ test('STAR minimums affect the displayed and submitted range without overwriting
 
 test('v4 research ranges use 0.1 percentage point and 100 share lattice endpoints', () => {
   const value = defaultWorkbenchDefaults()
-  value.research.ranges.grid_step = { low: .011, high: .021, step: .0005 }
+  value.research.ranges.buy_step = { low: .011, high: .021, step: .0005 }
   assert.equal(validWorkbenchGroup('research', value.research), true)
-  value.research.ranges.grid_step.high = .0215
+  value.research.ranges.buy_step.high = .0215
   assert.equal(validWorkbenchGroup('research', value.research), false)
-  value.research.ranges.grid_step.high = .021
+  value.research.ranges.buy_step.high = .021
   value.research.ranges.buy_shares.high = 1050
   assert.equal(validWorkbenchGroup('research', value.research), false)
-  const remembered = normalizeWorkbenchDefaults({ research: { ...value.research, ranges: { ...value.research.ranges, grid_step: { low: .0105, high: .021, step: .0005 } } } }).research
-  assert.deepEqual(remembered.ranges.grid_step, { low: .0105, high: .021, step: .0005 })
+  const remembered = normalizeWorkbenchDefaults({ research: { ...value.research, ranges: { ...value.research.ranges, grid_step: { low: .0105, high: .021, step: .0005 }, buy_step: undefined, sell_step: undefined } } }).research
+  assert.deepEqual(remembered.ranges.buy_step, { low: .0105, high: .021, step: .0005 })
+  assert.deepEqual(remembered.ranges.sell_step, { low: .0105, high: .021, step: .0005 })
   assert.equal(validResearchDefaults(remembered), false)
+})
+
+test('legacy single grid settings migrate to separate buy and sell spacing', () => {
+  const saved = defaultWorkbenchDefaults().research
+  delete saved.ranges.buy_step
+  delete saved.ranges.sell_step
+  saved.ranges.grid_step = { low: .008, high: .024, step: .001 }
+  saved.neighborhood_fields = ['grid_step', 'buy_shares']
+  delete saved.fixed_half_widths.buy_step
+  delete saved.fixed_half_widths.sell_step
+  saved.fixed_half_widths.grid_step = .002
+  const migrated = normalizeRememberedResearchDefaults(saved)
+  assert.deepEqual(migrated.ranges.buy_step, saved.ranges.grid_step)
+  assert.deepEqual(migrated.ranges.sell_step, saved.ranges.grid_step)
+  assert.deepEqual(migrated.neighborhood_fields, ['buy_step', 'sell_step', 'buy_shares'])
+  assert.equal(migrated.fixed_half_widths.buy_step, .002)
+  assert.equal(migrated.fixed_half_widths.sell_step, .002)
 })

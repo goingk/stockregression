@@ -333,12 +333,22 @@ def _nb_sell_lot(requested: int, available: int, board_code: int) -> int:
 
 
 @_jit(cache=True)
-def _nb_cell(price: float, anchor: float, grid_mode: int, step: float) -> int:
+def _nb_cell(price: float, anchor: float, grid_mode: int, buy_step: float, sell_step: float) -> int:
     if price <= 0 or anchor <= 0:
         return 0
     if grid_mode == 1:
-        return int(math.floor((price - anchor) / max(anchor * step, 0.01) + 1e-10))
-    return int(math.floor(math.log(price / anchor) / math.log(1.0 + step) + 1e-10))
+        if price < anchor:
+            if buy_step >= 1.0:
+                return -1
+            width = max(anchor * buy_step, 0.01)
+            return -int(math.floor((anchor - price) / width + 1e-10))
+        width = max(anchor * sell_step, 0.01)
+        return int(math.floor((price - anchor) / width + 1e-10))
+    if price < anchor:
+        if buy_step >= 1.0:
+            return -1
+        return -int(math.floor(math.log(anchor / price) / math.log(1.0 / (1.0 - buy_step)) + 1e-10))
+    return int(math.floor(math.log(price / anchor) / math.log(1.0 + sell_step) + 1e-10))
 
 
 @_jit(cache=True)
@@ -700,7 +710,7 @@ def _nb_simulate(
                                 fixed_anchor[account] = reference_price if reference_price > 0 else result[5]
                             if reference[account] == 0:
                                 reference[account] = fixed_anchor[account]
-                            active_cell[account] = _nb_cell(result[5], fixed_anchor[account], grid_mode, grid_step)
+                            active_cell[account] = _nb_cell(result[5], fixed_anchor[account], grid_mode, buy_step, sell_step)
                             has_active_cell[account] = True
 
             if not traded and account == 0 and not started[account]:
@@ -708,7 +718,7 @@ def _nb_simulate(
                     started[account] = True
                     reference[account] = reference_price if reference_price > 0 else opening
                     fixed_anchor[account] = reference_price if reference_price > 0 else opening
-                    active_cell[account] = _nb_cell(opening, fixed_anchor[account], grid_mode, grid_step)
+                    active_cell[account] = _nb_cell(opening, fixed_anchor[account], grid_mode, buy_step, sell_step)
                     has_active_cell[account] = True
                 else:
                     raw_quantity = int(math.floor(initial_cash * initial_position / opening)) if opening > 0 else 0
@@ -750,7 +760,7 @@ def _nb_simulate(
                         started[account] = True
                         reference[account] = result[5]
                         fixed_anchor[account] = reference_price if reference_price > 0 else result[5]
-                        active_cell[account] = _nb_cell(result[5], fixed_anchor[account], grid_mode, grid_step)
+                        active_cell[account] = _nb_cell(result[5], fixed_anchor[account], grid_mode, buy_step, sell_step)
                         has_active_cell[account] = True
                         traded = True
 
@@ -853,9 +863,9 @@ def _nb_simulate(
                     intent_reason = 5
             else:
                 anchor = fixed_anchor[0] if fixed_anchor[0] > 0 else reference[0]
-                index = _nb_cell(close, anchor, grid_mode, grid_step)
+                index = _nb_cell(close, anchor, grid_mode, buy_step, sell_step)
                 if not has_active_cell[0]:
-                    active_cell[0] = _nb_cell(reference[0] if reference[0] > 0 else close, anchor, grid_mode, grid_step)
+                    active_cell[0] = _nb_cell(reference[0] if reference[0] > 0 else close, anchor, grid_mode, buy_step, sell_step)
                     has_active_cell[0] = True
                 lower_ok = lower_price <= 0 or close >= lower_price
                 upper_ok = upper_price <= 0 or close <= upper_price
@@ -969,10 +979,18 @@ def _cell(price: float, anchor: float, config: BacktestConfig) -> int:
     if price <= 0 or anchor <= 0:
         return 0
     if config.grid_mode == "arithmetic":
-        step = max(anchor * config.grid_step, 0.01)
-        return int(math.floor((price - anchor) / step + 1e-10))
-    ratio = 1 + config.grid_step
-    return int(math.floor(math.log(price / anchor) / math.log(ratio) + 1e-10))
+        if price < anchor:
+            if config.buy_step >= 1.0:
+                return -1
+            width = max(anchor * config.buy_step, 0.01)
+            return -int(math.floor((anchor - price) / width + 1e-10))
+        width = max(anchor * config.sell_step, 0.01)
+        return int(math.floor((price - anchor) / width + 1e-10))
+    if price < anchor:
+        if config.buy_step >= 1.0:
+            return -1
+        return -int(math.floor(math.log(anchor / price) / math.log(1.0 / (1.0 - config.buy_step)) + 1e-10))
+    return int(math.floor(math.log(price / anchor) / math.log(1.0 + config.sell_step) + 1e-10))
 
 
 def _position_shares(ledger: _Ledger) -> float:

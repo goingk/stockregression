@@ -373,7 +373,7 @@ export default function DataManagementPage({
     if (!packageFolder.trim()) { setError('请填写数据包目录。'); return }
     void run('登记数据包', () => post('/data/import-package', {
       folder: packageFolder.trim(), format: 'package', timeframes: null, symbols: null,
-      label_convention: 'auto', resume: true, workers: 2, skip_invalid_rows: false,
+      label_convention: 'auto', resume: true, workers: 4, skip_invalid_rows: false,
     }), '已提交当前数据包的幂等登记；现有数据版本和结果会保留。')
   }
 

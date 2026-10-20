@@ -10,15 +10,16 @@ from typing import Any, Iterable, Iterator
 from ..models import BacktestConfig, OptimizationConfig, SearchRange
 
 
-FIELDS = ("grid_step", "sell_shares", "buy_shares", "min_shares", "max_shares")
+FIELDS = ("buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares")
 LABELS = {
-    "grid_step": "网格间距",
+    "buy_step": "买入间距",
+    "sell_step": "卖出间距",
     "sell_shares": "每次卖出",
     "buy_shares": "每次买入",
     "min_shares": "最低持股",
     "max_shares": "最高持股",
 }
-UNITS = {"grid_step": 0.001, **{name: 100.0 for name in FIELDS if name != "grid_step"}}
+UNITS = {"buy_step": 0.001, "sell_step": 0.001, "sell_shares": 100.0, "buy_shares": 100.0, "min_shares": 500.0, "max_shares": 500.0}
 
 
 def _strict_tick(value: float, unit: float, name: str) -> int:
@@ -28,7 +29,7 @@ def _strict_tick(value: float, unit: float, name: str) -> int:
         raise ValueError(f"{LABELS[name]}不是有效数值") from exc
     nearest = int(scaled.to_integral_value())
     if abs(scaled - Decimal(nearest)) > Decimal("0.0000001"):
-        requirement = "0.1 个百分点" if name == "grid_step" else "100 股 / 份"
+        requirement = "0.1 个百分点" if name in {"buy_step", "sell_step"} else f"{int(unit)} 股 / 份"
         raise ValueError(f"{LABELS[name]}必须以 {requirement} 为单位")
     return nearest
 
@@ -38,7 +39,7 @@ def value_to_ticks(name: str, value: float) -> int:
 
 
 def ticks_to_value(name: str, value: int) -> float | int:
-    return float(value) * UNITS[name] if name == "grid_step" else int(value) * 100
+    return float(value) * UNITS[name] if name in {"buy_step", "sell_step"} else int(value) * int(UNITS[name])
 
 
 @dataclass(frozen=True)
@@ -81,7 +82,7 @@ class ParameterSpace:
                 raise ValueError(f"v4 研究缺少 {LABELS[name]} 搜索范围")
             search_range = raw if isinstance(raw, SearchRange) else SearchRange.model_validate(raw)
             low, high = value_to_ticks(name, search_range.low), value_to_ticks(name, search_range.high)
-            if name == "grid_step":
+            if name in {"buy_step", "sell_step"}:
                 minimum, maximum = 1, 1000
             elif name in ("sell_shares", "buy_shares"):
                 minimum, maximum = 1, 10**9
@@ -91,9 +92,9 @@ class ParameterSpace:
             if low > high:
                 raise ValueError(f"{LABELS[name]}搜索范围无合法值")
             if name == "min_shares":
-                high = min(high, self.initial_shares // 100)
+                high = min(high, self.initial_shares // int(UNITS[name]))
             elif name == "max_shares":
-                low = max(low, self.initial_shares // 100)
+                low = max(low, math.ceil(self.initial_shares / UNITS[name]))
             if low > high:
                 raise ValueError(f"{LABELS[name]}与固定初始持股不相容")
             dimensions[name] = Dimension(name, low, high, UNITS[name])
@@ -114,6 +115,12 @@ class ParameterSpace:
                 raise ValueError("每次买入数量低于该标的最低买入量")
         self.active = tuple(name for name, dim in self.dimensions.items() if not dim.fixed)
         self.fixed = {name: dim.low for name, dim in self.dimensions.items() if dim.fixed}
+        self._field_index = {name: index for index, name in enumerate(self.fields)}
+        self._active_indices = tuple(self._field_index[name] for name in self.active)
+        self._active_lows = tuple(self.dimensions[name].low for name in self.active)
+        self._active_highs = tuple(self.dimensions[name].high for name in self.active)
+        self._min_index = self._field_index.get("min_shares")
+        self._max_index = self._field_index.get("max_shares")
         self._check_fixed_values()
 
     def _check_fixed_values(self) -> None:
@@ -174,7 +181,7 @@ class ParameterSpace:
                 return False
         if "min_shares" in vals and "max_shares" in vals and vals["min_shares"] > vals["max_shares"]:
             return False
-        if "min_shares" not in vals and "max_shares" in vals and vals["max_shares"] < self.initial_shares // 100:
+        if "min_shares" not in vals and "max_shares" in vals and vals["max_shares"] * UNITS["max_shares"] < self.initial_shares:
             return False
         return True
 
@@ -206,8 +213,9 @@ class ParameterSpace:
         others = math.prod(self.dimensions[name].count for name in self.active if name not in {"min_shares", "max_shares"})
         return valid_pairs * others
 
-    def min_box_size(self) -> int:
-        return 3 ** len(self.active) if self.active else 1
+    def min_box_size(self, fields: Iterable[str] | None = None) -> int:
+        selected = self.active if fields is None else tuple(name for name in self.active if name in set(fields))
+        return 3 ** len(selected) if selected else 1
 
     def center_with_radius(self, coordinate: tuple[int, ...], coordinate_index: int) -> int | None:
         if coordinate_index < 0 or self.max_unlimited and coordinate_index >= len(self.fields):
@@ -215,16 +223,17 @@ class ParameterSpace:
         name = self.fields[coordinate_index]
         return coordinate[coordinate_index] if name in self.active else None
 
-    def shift_inside(self, coordinate: tuple[int, ...]) -> tuple[int, ...]:
+    def shift_inside(self, coordinate: tuple[int, ...], fields: Iterable[str] | None = None) -> tuple[int, ...]:
         values = list(coordinate)
+        selected = set(self.active if fields is None else fields)
         for index, name in enumerate(self.fields):
-            if name not in self.active:
+            if name not in self.active or name not in selected:
                 continue
             dim = self.dimensions[name]
             if dim.width < 2:
                 continue
             values[index] = min(dim.high - 1, max(dim.low + 1, values[index]))
-        if "min_shares" in self.active and "max_shares" in self.active:
+        if {"min_shares", "max_shares"} <= selected:
             min_index = self.fields.index("min_shares")
             max_index = self.fields.index("max_shares")
             min_dim, max_dim = self.dimensions["min_shares"], self.dimensions["max_shares"]
@@ -259,28 +268,35 @@ class ParameterSpace:
             dim = self.dimensions[name]
             if dim.width <= 0:
                 continue
-            volume *= min(1.0, 2.0 * int(radii[name]) * dim.unit / (dim.width * dim.unit))
+            radius = int(radii.get(name, 0))
+            if radius <= 0:
+                continue
+            volume *= min(1.0, 2.0 * radius * dim.unit / (dim.width * dim.unit))
         return float(volume)
 
-    def neighbor_offsets(self, diagonal: bool = True) -> Iterator[tuple[int, ...]]:
+    def neighbor_offsets(self, diagonal: bool = True, fields: Iterable[str] | None = None) -> Iterator[tuple[int, ...]]:
         if not self.active:
             return
-        choices = (-1, 0, 1) if diagonal else tuple((1 if index == 0 else 0) for index in range(len(self.active)))
-        for offset in product(choices, repeat=len(self.active)):
-            if any(offset):
-                yield offset
+        selected = set(self.active if fields is None else fields)
+        indices = [index for index, name in enumerate(self.active) if name in selected]
+        if not indices:
+            return
+        choices = (-1, 0, 1) if diagonal else (1,)
+        for selected_offset in product(choices, repeat=len(indices)):
+            if not any(selected_offset):
+                continue
+            offset = [0] * len(self.active)
+            for index, value in zip(indices, selected_offset):
+                offset[index] = value
+            yield tuple(offset)
 
     def neighbor(self, coordinate: tuple[int, ...], offset: tuple[int, ...]) -> tuple[int, ...] | None:
         values = list(coordinate)
-        for active_index, name in enumerate(self.active):
-            index = self.fields.index(name)
-            dim = self.dimensions[name]
+        for active_index, index in enumerate(self._active_indices):
             value = values[index] + offset[active_index]
-            if value < dim.low or value > dim.high:
+            if value < self._active_lows[active_index] or value > self._active_highs[active_index]:
                 return None
             values[index] = value
-        if "min_shares" in self.active and "max_shares" in self.active:
-            by_name = dict(zip(FIELDS, values))
-            if by_name["min_shares"] > by_name["max_shares"]:
-                return None
+        if self._min_index is not None and self._max_index is not None and values[self._min_index] > values[self._max_index]:
+            return None
         return tuple(values)

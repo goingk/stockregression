@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from stockregression.research_statistics import (
+    _bootstrap_counts,
     paired_stationary_bootstrap,
     stationary_bootstrap_indices,
 )
@@ -15,6 +16,21 @@ def test_stationary_bootstrap_indices_are_reproducible_and_keep_circular_blocks(
     assert first.shape == (40,)
     assert np.all((0 <= first) & (first < 40))
     assert np.any(np.diff(first) % 40 == 1)
+
+
+def test_compiled_bootstrap_counts_match_stationary_index_reference():
+    rng = np.random.default_rng(21)
+    starts = rng.integers(0, 40, size=40)
+    restart = rng.random(40) < 0.2
+    indices = np.empty(40, dtype=np.int64)
+    indices[0] = starts[0]
+    for day in range(1, 40):
+        indices[day] = starts[day] if restart[day] else (indices[day - 1] + 1) % 40
+
+    assert np.array_equal(
+        _bootstrap_counts(starts, restart, 40),
+        np.bincount(indices, minlength=40).astype(np.float64),
+    )
 
 
 def test_paired_bootstrap_uses_same_family_resamples_and_reports_sensitivity():

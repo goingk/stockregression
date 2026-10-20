@@ -334,6 +334,101 @@ def test_inventory_and_minute_coverage_use_dates_not_rows(tmp_path):
     assert inventory["stats"]["bytes"] > 0
 
 
+def test_package_preparation_validates_history_with_only_a_recent_calendar(tmp_path, monkeypatch):
+    from stockregression.market_data.preparation import MarketPreparationService
+    from stockregression.market_data.sync import MarketDataSyncService
+
+    package = tmp_path / "package"
+    package.mkdir()
+    _etf_package(package)
+    daily_path = package / "etf_daily.parquet"
+    minute_path = package / "etf_1min" / "510050.SH.parquet"
+    daily = pd.read_parquet(daily_path)
+    minute = pd.read_parquet(minute_path).reset_index()
+    offsets = [0, 1, 2, 3, 4, 7]  # Includes the Friday before a weekend start.
+    daily_parts, minute_parts = [], []
+    for offset in offsets:
+        part = daily.copy()
+        part["trade_date"] += pd.Timedelta(days=offset)
+        daily_parts.append(part)
+        part = minute.copy()
+        part["trade_date"] += pd.Timedelta(days=offset)
+        part["trade_time"] += pd.Timedelta(days=offset)
+        minute_parts.append(part)
+    pd.concat(daily_parts).to_parquet(daily_path, index=False)
+    pd.concat(minute_parts).set_index(["trade_date", "trade_time"]).to_parquet(minute_path)
+    original_bytes = minute_path.read_bytes()
+    service = MarketDataService(Store(tmp_path / "data"))
+    index_etf_package_direct(service, package, timeframes=["1day", "1min"], symbols=["510050.SH"])
+    # Simulate the imported package carrying only its latest auxiliary increment.
+    service.repository.save_auxiliary("510050.SH", "calendar", [{"date": "2026-01-12"}], verified=True)
+    service.repository.save_auxiliary("510050.SH", "actions", [], verified=True)
+    monkeypatch.setattr(MarketDataSyncService, "sync", lambda *args, **kwargs: pytest.fail("quality-only preparation must stay local"))
+    config = BacktestConfig(
+        schema_version=3, symbol="510050.SH", start_date=pd.Timestamp("2026-01-06").date(),
+        end_date=pd.Timestamp("2026-01-12").date(), frequency="1m",
+    )
+    preparation = MarketPreparationService(service)
+    plan = preparation.plan(config)
+    assert [(step["kind"], step.get("timeframe")) for step in plan["steps"]] == [
+        ("validate", "1day"), ("validate", "1min"),
+    ]
+    progress = []
+    result = preparation.execute(config, progress=lambda fraction, message: progress.append((fraction, message)))
+    assert result["status"] == "completed", result
+    assert result["remaining_gaps"] == []
+    assert service.readiness(config)["ready"]
+    assert any("/" in message and "校验" in message for _, message in progress)
+    assert [value for value, _ in progress] == sorted(value for value, _ in progress)
+    assert minute_path.read_bytes() == original_bytes
+    assert preparation.execute(config)["mode"] == "already_ready"
+    weekend_config = config.model_copy(update={"start_date": pd.Timestamp("2026-01-10").date()})
+    assert service.readiness(weekend_config)["ready"]
+    daily_dataset = service.repository.dataset("510050.SH", "1day")
+    assert not service._validation_covers(daily_dataset, "2026-01-06", "2026-01-13")
+    # A date present in imported daily history must remain pending if its minute
+    # validation is absent, even though it predates the auxiliary calendar.
+    service.repository.invalidate_day_validations("510050.SH", "1min", ["2026-01-07"])
+    state = service.repository.validation_state("510050.SH", "1min", start="2026-01-06", end="2026-01-12")
+    assert "2026-01-07" in state["pending"]
+    assert not service.readiness(config)["ready"]
+
+
+def test_revalidation_is_bounded_and_reuses_month_reads(tmp_path, monkeypatch):
+    package = tmp_path / "package"
+    package.mkdir()
+    _etf_package(package)
+    service = MarketDataService(Store(tmp_path / "data"))
+    index_etf_package_direct(service, package, timeframes=["1day", "1min"], symbols=["510050.SH"])
+    reads = []
+    original = service.repository.active_rows
+
+    def read(symbol, timeframe, *args, **kwargs):
+        if timeframe == "1min":
+            reads.append((kwargs.get("start"), kwargs.get("end")))
+        return original(symbol, timeframe, *args, **kwargs)
+
+    monkeypatch.setattr(service.repository, "active_rows", read)
+    cancelled = lambda: True
+    with pytest.raises(InterruptedError):
+        service.revalidate("510050.SH", "1min", start="2026-01-05", end="2026-01-05", cancelled=cancelled)
+    assert not reads
+    service.revalidate("510050.SH", "1min", start="2026-01-05", end="2026-01-05")
+    assert reads and all(start is not None and end is not None for start, end in reads)
+    reads.clear()
+    monkeypatch.setattr(
+        service.repository, "bars",
+        lambda *args, **kwargs: pytest.fail("clean validation must not rescan bars"),
+    )
+    monkeypatch.setattr(
+        service.repository, "active_rows",
+        lambda *args, **kwargs: pytest.fail("clean validation must not rescan source rows"),
+    )
+    cached = service.revalidate("510050.SH", "1min", start="2026-01-05", end="2026-01-05")
+    assert cached["report"]["cached"] is True
+    assert reads == []
+
+
 def test_failed_increment_publication_keeps_previous_version(tmp_path, monkeypatch):
     service = MarketDataService(Store(tmp_path / "data"))
     first_day = pd.DatetimeIndex(["2026-01-05"])

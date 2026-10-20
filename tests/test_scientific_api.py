@@ -200,7 +200,8 @@ def test_old_research_preferences_fill_new_defaults_and_keep_custom_ranges():
     assert old.protocol_version == 4
     assert old.n_trials == 321
     assert old.mode == "robust"
-    assert len(old.ranges) == 8
+    assert len(old.ranges) == 7
+    assert {"buy_step", "sell_step"} <= set(old.ranges)
     assert old.selection_target == "both"
     assert old.rebalance_days == 63
     assert old.bootstrap_reps == 10_000

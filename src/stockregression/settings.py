@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Literal
@@ -10,6 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 PROJECT_ROOT = Path(os.environ.get("STOCKREGRESSION_HOME", Path(__file__).resolve().parents[2])).resolve()
 SETTINGS_FILE = PROJECT_ROOT / ".local" / "settings.json"
+DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
+DEFAULT_DATASET_DIR = DEFAULT_DATA_DIR / "dataset"
+DEFAULT_ETF_PACKAGE_DIR = DEFAULT_DATASET_DIR / "etf"
+DEFAULT_STOCK_PACKAGE_DIR = DEFAULT_DATASET_DIR / "stock"
+DEFAULT_PACKAGE_DIR = DEFAULT_ETF_PACKAGE_DIR
 
 
 class ScheduleSettings(BaseModel):
@@ -33,9 +39,22 @@ class GridDefaults(_WorkbenchPreference):
     grid_mode: Literal["trailing", "arithmetic", "geometric"] = "trailing"
     buy_step: float = Field(default=0.03, gt=0, le=1)
     sell_step: float = Field(default=0.03, gt=0, le=1)
-    grid_step: float = Field(default=0.03, gt=0, le=1)
     lower_price: float | None = Field(default=None, gt=0)
     upper_price: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_single_spacing(cls, values):
+        if isinstance(values, dict) and "grid_step" in values:
+            values = dict(values)
+            legacy = values.pop("grid_step")
+            if values.get("grid_mode", "trailing") != "trailing":
+                values["buy_step"] = legacy
+                values["sell_step"] = legacy
+            else:
+                values.setdefault("buy_step", legacy)
+                values.setdefault("sell_step", legacy)
+        return values
 
     @model_validator(mode="after")
     def ordered_prices(self):
@@ -81,7 +100,6 @@ class ResearchRangeDefaults(_WorkbenchPreference):
 _RESEARCH_RANGE_DEFAULTS = {
     "buy_step": {"low": 0.005, "high": 0.1, "step": 0.005},
     "sell_step": {"low": 0.005, "high": 0.1, "step": 0.005},
-    "grid_step": {"low": 0.005, "high": 0.1, "step": 0.005},
     "buy_shares": {"low": 100, "high": 1000, "step": 100},
     "sell_shares": {"low": 100, "high": 1000, "step": 100},
     "initial_shares": {"low": 0, "high": 2000, "step": 100},
@@ -111,9 +129,14 @@ class ResearchDefaults(_WorkbenchPreference):
     recommendation_count: int = Field(default=10, ge=1, le=100)
     max_shares_mode: Literal["search", "unlimited"] = "search"
     slippage_mode: Literal["configured", "zero"] = "configured"
+    neighborhood_fields: list[Literal[
+        "buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares"
+    ]] = Field(default_factory=lambda: [
+        "buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares",
+    ])
     fixed_half_widths: dict[str, float] = Field(default_factory=lambda: {
-        "grid_step": 0.001, "sell_shares": 100, "buy_shares": 100,
-        "min_shares": 100, "max_shares": 100,
+        "buy_step": 0.001, "sell_step": 0.001, "sell_shares": 100, "buy_shares": 100,
+        "min_shares": 500, "max_shares": 500,
     })
     ranges: dict[str, ResearchRangeDefaults] = Field(default_factory=lambda: {
         key: ResearchRangeDefaults.model_validate(value) for key, value in _RESEARCH_RANGE_DEFAULTS.items()
@@ -124,12 +147,39 @@ class ResearchDefaults(_WorkbenchPreference):
     def migrate_protocol(cls, values):
         if isinstance(values, dict):
             values = dict(values)
+            if isinstance(values.get("ranges"), dict):
+                ranges = dict(values["ranges"])
+                legacy = ranges.pop("grid_step", None)
+                if legacy is not None:
+                    ranges["buy_step"] = legacy
+                    ranges["sell_step"] = legacy
+                values["ranges"] = ranges
+            if isinstance(values.get("neighborhood_fields"), list):
+                fields = values["neighborhood_fields"]
+                if "grid_step" in fields:
+                    migrated_fields = []
+                    for name in fields:
+                        for mapped in (("buy_step", "sell_step") if name == "grid_step" else (name,)):
+                            if mapped not in migrated_fields:
+                                migrated_fields.append(mapped)
+                    values["neighborhood_fields"] = migrated_fields
             if isinstance(values.get("fixed_half_widths"), dict):
-                values["fixed_half_widths"] = {
-                    "grid_step": .001, "sell_shares": 100, "buy_shares": 100,
-                    "min_shares": 100, "max_shares": 100,
-                    **values["fixed_half_widths"],
+                saved_widths = dict(values["fixed_half_widths"])
+                legacy = saved_widths.pop("grid_step", None)
+                merged_widths = {
+                    "buy_step": .001, "sell_step": .001, "sell_shares": 100, "buy_shares": 100,
+                    "min_shares": 500, "max_shares": 500,
+                    **saved_widths,
                 }
+                if legacy is not None:
+                    merged_widths["buy_step"] = legacy
+                    merged_widths["sell_step"] = legacy
+                values["fixed_half_widths"] = merged_widths
+            if isinstance(values.get("fixed_half_widths"), dict):
+                for name in ("min_shares", "max_shares"):
+                    raw = values["fixed_half_widths"].get(name, 500)
+                    if isinstance(raw, (int, float)) and raw > 0:
+                        values["fixed_half_widths"][name] = max(500, math.ceil(raw / 500) * 500)
             if values.get("protocol_version") in (1, 2, 3):
                 values["protocol_version"] = 4
         return values
@@ -138,7 +188,7 @@ class ResearchDefaults(_WorkbenchPreference):
     def valid_ranges(self):
         expected = set(_RESEARCH_RANGE_DEFAULTS)
         if set(self.ranges) != expected:
-            raise ValueError("搜索范围必须包含全部八个支持参数")
+            raise ValueError("搜索范围必须包含全部七个支持参数")
         for name, value in self.ranges.items():
             if name.endswith("_shares"):
                 minimum = 100 if name in {"buy_shares", "sell_shares"} else 0
@@ -146,20 +196,28 @@ class ResearchDefaults(_WorkbenchPreference):
                     raise ValueError(f"股数搜索范围 {name} 必须以 100 为单位，交易量至少 100")
             else:
                 if value.low <= 0 or value.high > 1:
-                    raise ValueError(f"网格步长搜索范围 {name} 必须位于 (0, 1]")
+                    raise ValueError(f"网格间距搜索范围 {name} 必须位于 (0, 1]")
         return self
 
     @model_validator(mode="after")
     def valid_fixed_half_widths(self):
-        allowed = {"grid_step", "sell_shares", "buy_shares", "min_shares", "max_shares"}
+        allowed = {"buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares"}
         if set(self.fixed_half_widths) != allowed:
-            raise ValueError("固定邻域半宽必须包含五个 v4 参数")
+            raise ValueError("固定邻域半宽必须包含六个 v4 参数")
         if any(float(value) <= 0 for value in self.fixed_half_widths.values()):
             raise ValueError("固定邻域半宽必须为正数")
-        if abs(float(self.fixed_half_widths["grid_step"]) / 0.001 - round(float(self.fixed_half_widths["grid_step"]) / 0.001)) > 1e-7:
-            raise ValueError("网格间距半宽必须对齐 0.001")
-        if any(abs(float(self.fixed_half_widths[name]) / 100 - round(float(self.fixed_half_widths[name]) / 100)) > 1e-7 for name in ("sell_shares", "buy_shares", "min_shares", "max_shares")):
-            raise ValueError("数量邻域半宽必须对齐 100")
+        if any(abs(float(self.fixed_half_widths[name]) / 0.001 - round(float(self.fixed_half_widths[name]) / 0.001)) > 1e-7 for name in ("buy_step", "sell_step")):
+            raise ValueError("买卖间距半宽必须对齐 0.001")
+        if any(abs(float(self.fixed_half_widths[name]) / (500 if name in {"min_shares", "max_shares"} else 100) - round(float(self.fixed_half_widths[name]) / (500 if name in {"min_shares", "max_shares"} else 100))) > 1e-7 for name in ("sell_shares", "buy_shares", "min_shares", "max_shares")):
+            raise ValueError("交易数量半宽必须对齐 100，持股边界半宽必须对齐 500")
+        return self
+
+    @model_validator(mode="after")
+    def valid_neighborhood_fields(self):
+        if not self.neighborhood_fields:
+            raise ValueError("细搜索邻域至少需要一个可移动参数")
+        if len(set(self.neighborhood_fields)) != len(self.neighborhood_fields):
+            raise ValueError("细搜索邻域参数不能重复")
         return self
 
 
@@ -170,14 +228,30 @@ class WorkbenchDefaults(_WorkbenchPreference):
     research: ResearchDefaults = Field(default_factory=ResearchDefaults)
 
 
+class PerformanceSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cpu_budget_mode: Literal["auto", "custom"] = "auto"
+    cpu_budget: int | None = Field(default=None, ge=1, le=128)
+    download_workers: int = Field(default=4, ge=1, le=8)
+    validation_workers: int = Field(default=4, ge=1, le=4)
+    blas_threads: int = Field(default=8, ge=1, le=16)
+    workspace_mb: int = Field(default=8192, ge=256, le=65536)
+
+    @model_validator(mode="after")
+    def valid_custom_budget(self):
+        if self.cpu_budget_mode == "custom" and self.cpu_budget is None:
+            raise ValueError("指定计算预算时必须填写 CPU 线程数")
+        return self
+
+
 class Settings(BaseModel):
-    data_dir: str = str(PROJECT_ROOT / "data")
-    package_dir: str | None = str(
-        PROJECT_ROOT / "datasets" / "datasets" / "ETF数据更新至2026.9.30"
-    )
+    data_dir: str = str(DEFAULT_DATA_DIR)
+    package_dir: str | None = str(DEFAULT_PACKAGE_DIR)
     schedule: ScheduleSettings = Field(default_factory=ScheduleSettings)
     fee_defaults: FeeDefaults = Field(default_factory=FeeDefaults)
     workbench_defaults: WorkbenchDefaults = Field(default_factory=WorkbenchDefaults)
+    performance: PerformanceSettings = Field(default_factory=PerformanceSettings)
     host: str = "127.0.0.1"
     port: int = 8000
     max_workers: int = Field(default=2, ge=1, le=8)
@@ -204,7 +278,7 @@ def save_settings(values: dict) -> Settings:
     with FileLock(str(SETTINGS_FILE.with_suffix(".lock")), timeout=10):
         previous = load_settings().model_dump()
         values = dict(values)
-        for key in ("schedule", "fee_defaults"):
+        for key in ("schedule", "fee_defaults", "performance"):
             if key in values and isinstance(values[key], dict):
                 values[key] = {**previous[key], **values[key]}
         if isinstance(values.get("workbench_defaults"), dict):

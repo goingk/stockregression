@@ -3,58 +3,51 @@ import type { EChartsOption } from 'echarts'
 import { get } from './api'
 import ChartView from './ChartView'
 import { Badge, Card, Empty, Field, Loading, SelectInput } from './components'
+import {
+  chooseLandscapeAxes,
+  formatLandscapeAxis,
+  formatLandscapeNumber,
+  formatLandscapeParameter,
+  landscapeLabels,
+  landscapeSliceKey,
+  landscapeValue,
+  type LandscapePoint,
+  type LandscapeResponse,
+} from './landscapeData'
 
 type Dict = Record<string, unknown>
-type LandscapePoint = {
-  candidate_id: number
-  params: Dict
-  is_center: boolean
-  is_baseline: boolean
-  status: string
-  excess_return: number | null
-  grid_return: number | null
-  baseline_return: number | null
-  drawdown: number | null
-  trade_count: number | null
-  peak_invested: number | null
-  neighbor_candidate_ids: number[]
-  neighbor_of_candidate_ids: number[]
-  robustness_status: string | null
-  neighbor_positive_ratio: number | null
-  neighbor_q25_excess: number | null
-  island_suspect: boolean
-  pca?: [number, number]
-  folds: Dict[]
-}
-type LandscapeResponse = {
-  parameters: string[]
-  points: LandscapePoint[]
-  bounds: { min: number; max: number } | null
-  pca: { parameters: string[]; explained_variance: number[]; loadings: number[][] } | null
-}
-
-const labels: Record<string, string> = {
-  buy_step: '买入步长', sell_step: '卖出步长', grid_step: '网格间距',
-  min_shares: '最低持股', max_shares: '最高持股', buy_shares: '每次买入', sell_shares: '每次卖出',
-}
 
 function number(value: number, digits = 2) {
-  return value.toLocaleString('zh-CN', { maximumFractionDigits: digits })
+  return formatLandscapeNumber(value, digits)
 }
-function ratio(value: number | null) {
+
+function ratio(value: number | null | undefined) {
   return value == null || !Number.isFinite(value) ? '—' : `${(value * 100).toFixed(2)}%`
 }
+
 function same(left: unknown, right: unknown) {
   if (left == null && right == null) return true
   const a = Number(left), b = Number(right)
   return Number.isFinite(a) && Number.isFinite(b) ? Math.abs(a - b) < 1e-9 : left === right
 }
 
-export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, regionOptions = [] }: {
+function ParameterChips({ point }: { point: LandscapePoint }) {
+  return <div className='research-parameter-badges research-landscape-params'>
+    {Object.entries(point.params).filter(([name, value]) => name !== 'initial_shares' && value != null).map(([name, value]) =>
+      <span key={name}><small>{landscapeLabels[name] ?? name}</small><strong>{formatLandscapeParameter(name, value)}</strong></span>)}
+  </div>
+}
+
+function pointFromEvent(raw: unknown): LandscapePoint | undefined {
+  return ((raw as { data?: { item?: LandscapePoint } }).data ?? {}).item
+}
+
+export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, regionOptions = [], qualified = false }: {
   resultId: string
   defaultParams?: Dict
   decisionOptions: Array<{ value: string; label: string }>
   regionOptions?: Array<{ value: string; label: string }>
+  qualified?: boolean
 }) {
   const [decision, setDecision] = useState(decisionOptions[0]?.value ?? 'current')
   const [sample, setSample] = useState<'training' | 'validation'>('validation')
@@ -62,8 +55,8 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
   const [fold, setFold] = useState('total')
   const [metric, setMetric] = useState<'excess' | 'grid'>('excess')
   const [region, setRegion] = useState('all')
-  const [xName, setXName] = useState('buy_step')
-  const [yName, setYName] = useState('sell_step')
+  const [xName, setXName] = useState('')
+  const [yName, setYName] = useState('')
   const [data, setData] = useState<LandscapeResponse | null>(null)
   const [selected, setSelected] = useState<LandscapePoint | null>(null)
   const [error, setError] = useState('')
@@ -74,77 +67,150 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
   useEffect(() => {
     let active = true
     setLoading(true); setError('')
-    const query = new URLSearchParams({ decision: decisionKind, decision_index: String(decisionIndex), sample, cost })
+    const query = new URLSearchParams({ decision: decisionKind, decision_index: String(decisionIndex), sample, cost, limit: '1000' })
     if (fold !== 'total') query.set('fold', fold)
     if (region !== 'all') query.set('region_id', region)
     void get<LandscapeResponse>(`/results/${encodeURIComponent(resultId)}/landscape?${query}`)
-      .then(value => { if (active) setData(value) })
+      .then(value => {
+        if (!active) return
+        setData(value)
+        setSelected(null)
+      })
       .catch(cause => { if (active) setError(cause instanceof Error ? cause.message : String(cause)) })
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
   }, [resultId, decisionKind, decisionIndex, sample, cost, fold, region])
 
   const parameters = data?.parameters ?? []
+  const axisSignature = parameters.join('|')
   useEffect(() => {
     if (!parameters.length) return
-    if (!parameters.includes(xName)) setXName(parameters[0])
-    if (!parameters.includes(yName) || parameters[1] === yName) setYName(parameters.find(name => name !== xName) ?? parameters[0])
-  }, [parameters, xName, yName])
+    const [nextX, nextY] = chooseLandscapeAxes(parameters, data?.points ?? [], xName, yName)
+    if (nextX !== xName) setXName(nextX)
+    if (nextY !== yName) setYName(nextY)
+  }, [axisSignature, data, xName, yName])
 
   const center = useMemo(() => {
+    if (data?.focus?.params) return data.focus.params
     if (defaultParams && data?.points.some(point => Object.keys(defaultParams).every(name => same(point.params[name], defaultParams[name])))) return defaultParams
     return data?.points.find(point => point.is_center && !point.is_baseline)?.params ?? data?.points[0]?.params ?? {}
   }, [data, defaultParams])
 
-  const slice = useMemo(() => (data?.points ?? []).filter(point => Object.keys(center).every(name => name === xName || name === yName || name === 'initial_shares' || same(point.params[name], center[name]))), [data, center, xName, yName])
-  const valueOf = (point: LandscapePoint) => metric === 'grid' ? point.grid_return : point.excess_return
+  const validPair = Boolean(xName && yName && xName !== yName)
+  const fixedNames = useMemo(() => parameters.filter(name => name !== xName && name !== yName), [parameters, xName, yName])
+  const activeSlice = data?.slices?.[landscapeSliceKey(xName, yName)]
+  const slice = useMemo(() => {
+    if (!validPair) return []
+    if (activeSlice) return activeSlice.points
+    return (data?.points ?? []).filter(point => fixedNames.every(name => same(point.params[name], center[name])))
+  }, [data, center, fixedNames, validPair, activeSlice])
+  const valueOf = (point: LandscapePoint) => landscapeValue(point, metric)
   const metricValues = (data?.points ?? []).map(valueOf).filter((value): value is number => value != null && Number.isFinite(value))
-  const min = metricValues.length ? Math.min(...metricValues) : -0.1
-  const max = metricValues.length ? Math.max(...metricValues) : 0.1
-  const span = Math.max(Math.abs(min), Math.abs(max), 0.001)
+  const rawMin = metricValues.length ? Math.min(...metricValues) : -0.1
+  const rawMax = metricValues.length ? Math.max(...metricValues) : 0.1
+  const padding = rawMin === rawMax ? Math.max(Math.abs(rawMin) * 0.1, 0.001) : 0
+  const minValue = rawMin - padding
+  const maxValue = rawMax + padding
   const xs = [...new Set(slice.map(point => Number(point.params[xName])).filter(Number.isFinite))].sort((a, b) => a - b)
   const ys = [...new Set(slice.map(point => Number(point.params[yName])).filter(Number.isFinite))].sort((a, b) => a - b)
+  const showCellLabels = xs.length * ys.length <= 120
 
-  const heatmapOption = useMemo(() => ({
-    animation: false,
-    tooltip: { formatter: (raw: unknown) => {
-      const params = (raw as { data?: unknown }).data as [number, number, number, LandscapePoint] | undefined
-      if (!params) return ''
-      const point = params[3]
-      return `${point.is_center ? '<b>中心候选</b><br/>' : ''}${Object.entries(point.params).filter(([key, value]) => key !== 'initial_shares' && value != null).map(([key, value]) => `${labels[key] ?? key}: ${number(Number(value), key.includes('step') ? 4 : 0)}`).join('<br/>')}<br/>超额收益: ${ratio(point.excess_return)}<br/>网格收益: ${ratio(point.grid_return)}<br/>状态: ${point.status}${point.pca ? '' : ''}`
-    } },
-    grid: { left: 70, right: 25, top: 22, bottom: 55 },
-    xAxis: { type: 'category', name: labels[xName] ?? xName, data: xs.map(value => number(value, xName.includes('step') ? 4 : 0)), splitArea: { show: true } },
-    yAxis: { type: 'category', name: labels[yName] ?? yName, data: ys.map(value => number(value, yName.includes('step') ? 4 : 0)), splitArea: { show: true } },
-    visualMap: { min: -span, max: span, calculable: true, orient: 'horizontal', left: 'center', bottom: 0, inRange: { color: ['#b42318', '#f3f4f6', '#067647'] }, formatter: (value: unknown) => `${(Number(value) * 100).toFixed(1)}%` },
-    series: [{
-      type: 'heatmap',
-      data: slice.map(point => [xs.indexOf(Number(point.params[xName])), ys.indexOf(Number(point.params[yName])), valueOf(point) ?? null, point]),
-      label: { show: true, formatter: (raw: unknown) => {
-        const value = ((raw as { data?: [number, number, number] }).data ?? [])[2]
-        return typeof value === 'number' ? `${(value * 100).toFixed(1)}%` : '未完成'
+  const heatmapOption = useMemo(() => {
+    const xIndex = new Map(xs.map((value, index) => [value, index]))
+    const yIndex = new Map(ys.map((value, index) => [value, index]))
+    const focus = data?.focus
+    const focusX = focus ? xIndex.get(Number(focus.params[xName])) : undefined
+    const focusY = focus ? yIndex.get(Number(focus.params[yName])) : undefined
+    return {
+      animation: false,
+      tooltip: { formatter: (raw: unknown) => {
+        const point = pointFromEvent(raw)
+        if (!point) return ''
+        return `${point.is_focus ? '<b>相对最佳单点</b><br/>' : ''}${point.is_center ? '<b>推荐区域中心</b><br/>' : ''}${Object.entries(point.params).filter(([key, value]) => key !== 'initial_shares' && value != null).map(([key, value]) => `${landscapeLabels[key] ?? key}: ${formatLandscapeParameter(key, value)}`).join('<br/>')}<br/>相对全仓超额: ${ratio(point.excess_return)}<br/>网格收益: ${ratio(point.grid_return)}<br/>最大回撤: ${ratio(point.drawdown)}<br/>成交笔数: ${point.trade_count == null ? '—' : number(Number(point.trade_count), 0)}`
       } },
-      emphasis: { itemStyle: { borderColor: '#111827', borderWidth: 2 } },
-    }],
-  }) as unknown as EChartsOption, [slice, xs, ys, xName, yName, min, max, span, metric])
-
-  const pcaOption = useMemo(() => ({
-    animation: false,
-    tooltip: { formatter: (raw: unknown) => {
-      const point = ((raw as { data?: unknown }).data as [number, number, number, LandscapePoint] | undefined)?.[3]
-      return point ? `${point.is_center ? '中心候选<br/>' : ''}超额收益 ${ratio(point.excess_return)}<br/>${Object.entries(point.params).filter(([key]) => key !== 'initial_shares').map(([key, value]) => `${labels[key] ?? key} ${String(value)}`).join('<br/>')}` : ''
-    } },
-    grid: { left: 55, right: 25, top: 25, bottom: 45 },
-    xAxis: { type: 'value', name: `PC1 ${((data?.pca?.explained_variance[0] ?? 0) * 100).toFixed(1)}%`, splitLine: { lineStyle: { color: '#e6e8ee' } } },
-    yAxis: { type: 'value', name: `PC2 ${((data?.pca?.explained_variance[1] ?? 0) * 100).toFixed(1)}%`, splitLine: { lineStyle: { color: '#e6e8ee' } } },
-    visualMap: { min: -span, max: span, show: false, inRange: { color: ['#b42318', '#f3f4f6', '#067647'] } },
-    series: [{ type: 'scatter', symbolSize: (value: unknown) => ((value as [number, number, number, LandscapePoint])[3].is_center ? 13 : 7), data: (data?.points ?? []).filter(point => point.pca).map(point => [point.pca![0], point.pca![1], valueOf(point) ?? null, point]) }],
-  }) as unknown as EChartsOption, [data, span, metric])
+      grid: { left: 78, right: 34, top: 42, bottom: 92 },
+      xAxis: {
+        type: 'category', name: landscapeLabels[xName] ?? xName, nameLocation: 'middle', nameGap: 40,
+        data: xs.map(value => formatLandscapeAxis(xName, value)),
+        axisLabel: { rotate: xs.length > 10 ? 35 : 0, hideOverlap: true, fontSize: 10, margin: 11 },
+        splitArea: { show: true },
+      },
+      yAxis: {
+        type: 'category', name: landscapeLabels[yName] ?? yName, nameLocation: 'middle', nameGap: 48,
+        data: ys.map(value => formatLandscapeAxis(yName, value)),
+        axisLabel: { fontSize: 10 }, splitArea: { show: true },
+      },
+      visualMap: {
+        type: 'continuous', dimension: 2, seriesIndex: 0, min: minValue, max: maxValue,
+        calculable: true, orient: 'horizontal', left: 'center', bottom: 8, itemWidth: 12, itemHeight: 190,
+        text: ['较高', '较低'], textGap: 8,
+        inRange: { color: ['#b42318', '#f5f2ef', '#067647'] },
+        formatter: (value: unknown) => `${(Number(value) * 100).toFixed(1)}%`,
+      },
+      series: [
+        {
+          type: 'heatmap',
+          data: slice.map(point => ({
+            value: [xIndex.get(Number(point.params[xName])), yIndex.get(Number(point.params[yName])), valueOf(point) ?? null],
+            item: point,
+          })),
+          label: {
+            show: showCellLabels,
+            formatter: (raw: unknown) => {
+              const value = ((raw as { data?: { value?: [number, number, number] } }).data?.value ?? [])[2]
+              return typeof value === 'number' ? `${(value * 100).toFixed(1)}%` : '未完成'
+            },
+            fontSize: 9,
+          },
+          itemStyle: { borderColor: '#ffffff', borderWidth: 1 },
+          emphasis: { itemStyle: { borderColor: '#18212f', borderWidth: 2 } },
+        },
+        {
+          type: 'scatter', z: 5, symbol: 'pin', symbolSize: 26,
+          data: focus && focusX != null && focusY != null ? [{ value: [focusX, focusY], item: focus }] : [],
+          itemStyle: { color: '#1d4ed8', borderColor: '#ffffff', borderWidth: 1.5 },
+          label: { show: true, formatter: '相对最佳', position: 'top', color: '#1d4ed8', fontSize: 10, fontWeight: 600 },
+        },
+      ],
+    } as unknown as EChartsOption
+  }, [slice, xs, ys, xName, yName, metric, minValue, maxValue, data?.focus, showCellLabels])
 
   if (loading && !data) return <Loading label='读取参数收益分布' />
   if (error) return <Empty title='参数收益分布不可用' detail={error} />
   if (!data || !data.points.length) return <Empty title='暂无参数收益分布' detail='本次研究没有可展示的训练或验证候选。' />
-  return <Card title='参数收益分布' subtitle='二维切片固定其余参数；PCA 仅作全局浏览，邻域判断始终使用原参数空间。' action={<Badge tone='blue'>{data.points.length} 个点</Badge>}>
+
+  const ranking = data.top_candidates.length ? data.top_candidates : data.focus ? [data.focus] : []
+  const focusValue = data.focus?.excess_return ?? null
+  return <Card
+    title='参数收益分布'
+    subtitle='先看相对最佳参数，再用二维切片判断它周围是否稳定。横纵轴以外的参数固定为相对最佳单点。'
+    action={<Badge tone='blue'>{loading ? '读取中…' : `${data.total.toLocaleString()} 个候选 · 当前切片 ${slice.length.toLocaleString()}`}</Badge>}
+  >
+    {data.focus && <div className={`research-landscape-focus ${qualified ? 'verified' : 'diagnostic'}`}>
+      <div className='research-landscape-focus-copy'>
+        <small>{qualified ? '全量候选中的相对最佳单点' : '相对最佳单点 · 仅作研究对照'}</small>
+        <strong>相对全仓超额 {ratio(focusValue)}</strong>
+        <span>从全部 {data.total.toLocaleString()} 个候选中按当前筛选选出；候选 #{data.focus.candidate_id ?? '—'}。{qualified ? '是否成为正式推荐仍取决于完整邻域验证。' : '它没有通过完整正超额邻域验证，不能当作合格推荐。'}</span>
+      </div>
+      <ParameterChips point={data.focus} />
+    </div>}
+
+    {data.focus_neighborhood?.available && <div className={`research-neighborhood-check ${data.focus_neighborhood.all_positive ? 'passed' : 'failed'}`}>
+      <div><strong>{data.focus_neighborhood.all_positive ? '所选细搜索邻域全为正' : '所选细搜索邻域已计算，但没有通过'}</strong><span>二维切片只是其中一个截面；下面的数字来自本次勾选参与邻域移动的参数，未勾选参数保持中心值。</span></div>
+      <div className='research-neighborhood-stats'>
+        <span><small>已计算邻点</small><strong>{data.focus_neighborhood.evaluated_count} / {data.focus_neighborhood.expected_count}</strong></span>
+        <span><small>正收益邻点</small><strong>{data.focus_neighborhood.positive_count ?? '—'}（{ratio(data.focus_neighborhood.positive_ratio)}）</strong></span>
+        <span><small>邻点第 25 百分位</small><strong>{ratio(data.focus_neighborhood.q25_excess)}</strong></span>
+      </div>
+      <p>{data.focus_neighborhood.all_positive ? '最小即时邻域内收益均为正；是否成为正式推荐仍以完整邻域表的体积与资格为准。' : '只要即时邻点中存在负收益，就不构成完整正超额邻域。因此本次正式推荐为空，而不是邻域没有计算。'}</p>
+    </div>}
+
+    <div className='research-chart-guide'>
+      <span><b>每个格子</b>是一组参数</span>
+      <span><b>绿色</b>表示当前筛选内相对更高，红色更低；数值仍可能为负</span>
+      <span><b>空白</b>表示该组合不合法、未计算或超出切片显示上限，不做插值</span>
+    </div>
+
     <div className='form-grid four research-landscape-controls'>
       <Field label='研究决策'><SelectInput value={decision} onChange={event => setDecision(event.target.value)}>{decisionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>
       <Field label='样本用途'><SelectInput value={sample} onChange={event => setSample(event.target.value as 'training' | 'validation')}><option value='validation'>内部验证</option><option value='training'>训练搜索</option></SelectInput></Field>
@@ -152,14 +218,60 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
       <Field label='验证窗口'><SelectInput value={fold} onChange={event => setFold(event.target.value)} disabled={sample === 'training'}><option value='total'>整个验证段</option>{[0, 1, 2, 3].map(index => <option key={index} value={index}>窗口 {index + 1}</option>)}</SelectInput></Field>
       <Field label='着色指标'><SelectInput value={metric} onChange={event => setMetric(event.target.value as 'excess' | 'grid')}><option value='excess'>相对全仓超额</option><option value='grid'>网格收益</option></SelectInput></Field>
       {regionOptions.length > 1 && <Field label='推荐区域'><SelectInput value={region} onChange={event => setRegion(event.target.value)}><option value='all'>全部候选</option>{regionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>}
-      <Field label='横轴'><SelectInput value={xName} onChange={event => setXName(event.target.value)}>{parameters.map(name => <option key={name} value={name}>{labels[name] ?? name}</option>)}</SelectInput></Field>
-      <Field label='纵轴'><SelectInput value={yName} onChange={event => setYName(event.target.value)}>{parameters.map(name => <option key={name} value={name}>{labels[name] ?? name}</option>)}</SelectInput></Field>
+      <Field label='横轴参数'><SelectInput value={xName} onChange={event => {
+        const next = event.target.value
+        if (next === yName) setYName(xName)
+        setXName(next)
+      }}>{parameters.map(name => <option key={name} value={name}>{landscapeLabels[name] ?? name}</option>)}</SelectInput></Field>
+      <Field label='纵轴参数'><SelectInput value={yName} onChange={event => {
+        const next = event.target.value
+        if (next === xName) setXName(yName)
+        setYName(next)
+      }}>{parameters.map(name => <option key={name} value={name}>{landscapeLabels[name] ?? name}</option>)}</SelectInput></Field>
     </div>
-    <div className='research-landscape-grid'>
-      <div><h4>参数切片</h4><ChartView option={heatmapOption} height={390} onEvents={{ click: raw => { const point = (((raw as { data?: unknown }).data as [number, number, number, LandscapePoint] | undefined)?.[3]); if (point) setSelected(point) } }} /></div>
-      {data.pca && <div><h4>PCA 概览</h4><ChartView option={pcaOption} height={390} onEvents={{ click: raw => { const point = (((raw as { data?: unknown }).data as [number, number, number, LandscapePoint] | undefined)?.[3]); if (point) setSelected(point) } }} /><p className='field-hint'>解释方差 {((data.pca.explained_variance[0] + data.pca.explained_variance[1]) * 100).toFixed(1)}%；图上距离不能替代真实邻点。</p></div>}
-    </div>
-    <p className='field-hint'>当前切片固定于 {Object.entries(center).filter(([key, value]) => key !== xName && key !== yName && key !== 'initial_shares' && value != null).map(([key, value]) => `${labels[key] ?? key}=${number(Number(value), key.includes('step') ? 4 : 0)}`).join('，') || '中心参数'}。</p>
-    {selected && <details open><summary>候选 {selected.candidate_id} 明细</summary><pre className='json-preview'>{JSON.stringify({ params: selected.params, status: selected.status, excess_return: selected.excess_return, grid_return: selected.grid_return, drawdown: selected.drawdown, trade_count: selected.trade_count, peak_invested: selected.peak_invested, robustness_status: selected.robustness_status, neighbor_positive_ratio: selected.neighbor_positive_ratio, neighbor_q25_excess: selected.neighbor_q25_excess, island_suspect: selected.island_suspect, neighbor_candidate_ids: selected.neighbor_candidate_ids, folds: selected.folds }, null, 2)}</pre></details>}
+
+    <p className='field-hint research-landscape-sampling'>{activeSlice ? `参数切片读取固定其余参数后的完整平面，共 ${activeSlice.total.toLocaleString()} 个候选${activeSlice.sampled ? `；当前超过显示上限，图中等距展示 ${activeSlice.points.length.toLocaleString()} 个` : '，邻域判断不依赖全空间抽样'}。` : '当前组合没有可读取的二维平面，已回退到全空间抽样点。'}</p>
+
+    {validPair ? <div>
+      <div>
+        <h4>参数切片 · {landscapeLabels[xName] ?? xName} × {landscapeLabels[yName] ?? yName}</h4>
+        {slice.length ? <ChartView option={heatmapOption} height={420} onEvents={{ click: raw => { const point = pointFromEvent(raw); if (point) setSelected(point) } }} /> : <div className='research-chart-empty'><Empty title='当前切片没有候选' detail='尝试切换横纵轴、样本或研究决策。' /></div>}
+      </div>
+    </div> : <p className='inline-warning'>可用参数不足两个，无法形成二维切片。相对最佳参数仍显示在上方。</p>}
+
+    <p className='field-hint'>当前切片固定于 {fixedNames.filter(name => center[name] != null).map(name => `${landscapeLabels[name] ?? name}=${formatLandscapeParameter(name, center[name])}`).join('，') || '相对最佳单点的其余参数'}。</p>
+
+    <section className='research-candidate-ranking'>
+      <div className='research-candidate-ranking-head'>
+        <div><strong>全量候选排名</strong><small>按当前筛选的相对全仓超额排序，显示前 {ranking.length} 名</small></div>
+        <span>相对最佳 #{data.focus?.candidate_id ?? '—'}</span>
+      </div>
+      {ranking.length ? <div className='table-wrap'><table><thead><tr><th>排名</th><th>收益</th><th>参数</th><th>状态</th></tr></thead><tbody>{ranking.map(candidate => {
+        const candidateValue = candidate.excess_return
+        return <tr key={candidate.candidate_id} className={candidate.is_focus ? 'focus-row' : ''}>
+          <td>{candidate.rank ?? (candidate.is_focus ? 1 : '—')}</td>
+          <td><strong>{ratio(candidateValue)}</strong></td>
+          <td><div className='research-inline-params'>{Object.entries(candidate.params).filter(([name, value]) => name !== 'initial_shares' && value != null).map(([name, value]) => <span key={name}>{landscapeLabels[name] ?? name} {formatLandscapeParameter(name, value)}</span>)}</div></td>
+          <td><button type='button' className='text-link' onClick={() => setSelected(candidate)}>{candidate.is_focus ? '相对最佳 · 查看' : candidate.is_center ? '推荐中心 · 查看' : '查看'}</button></td>
+        </tr>
+      })}</tbody></table></div> : <Empty title='没有可排名的候选' />}
+    </section>
+
+    {selected && <section className='research-selected-candidate'>
+      <div className='research-selected-head'>
+        <div><strong>候选 #{selected.candidate_id ?? '—'}</strong><span>{selected.is_focus ? '相对最佳单点' : selected.is_center ? '推荐区域中心' : selected.is_baseline ? '对照策略' : '普通候选'} · {selected.status === 'completed' ? '已计算' : selected.status}</span></div>
+        <button type='button' className='text-link' onClick={() => setSelected(null)}>收起</button>
+      </div>
+      <ParameterChips point={selected} />
+      <div className='research-selected-metrics'>
+        <span><small>相对全仓超额</small><strong>{ratio(selected.excess_return)}</strong></span>
+        <span><small>网格收益</small><strong>{ratio(selected.grid_return)}</strong></span>
+        <span><small>最大回撤</small><strong>{ratio(selected.drawdown)}</strong></span>
+        <span><small>成交笔数</small><strong>{selected.trade_count == null ? '—' : number(Number(selected.trade_count), 0)}</strong></span>
+        <span><small>邻点正收益占比</small><strong>{ratio(selected.is_focus && data.focus_neighborhood ? data.focus_neighborhood.positive_ratio : selected.neighbor_positive_ratio)}</strong></span>
+        <span><small>邻点第 25 百分位</small><strong>{ratio(selected.is_focus && data.focus_neighborhood ? data.focus_neighborhood.q25_excess : selected.neighbor_q25_excess)}</strong></span>
+      </div>
+      {selected.folds.length > 0 && <details><summary>查看 {selected.folds.length} 个验证窗口的收益证据</summary><pre className='json-preview'>{JSON.stringify(selected.folds, null, 2)}</pre></details>}
+    </section>}
   </Card>
 }

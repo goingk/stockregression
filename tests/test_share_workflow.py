@@ -92,7 +92,7 @@ def test_buy_hold_and_dca_are_independent_of_grid_funding_fields():
         assert dca_variant["strategies"][name] == baseline["strategies"][name]
     assert dca_variant["strategies"]["dca"] != baseline["strategies"]["dca"]
     raw = config.model_dump(mode="json")
-    raw.update(initial_shares=0, min_shares=0, max_shares=0, grid_mode="arithmetic", grid_step=.15, reference_price_mode="manual", reference_price=20)
+    raw.update(initial_shares=0, min_shares=0, max_shares=0, grid_mode="arithmetic", buy_step=.15, sell_step=.15, reference_price_mode="manual", reference_price=20)
     gridless = engine.run_backtest(BacktestConfig.model_validate(raw), bundle)
     assert gridless["funding"]["initial_equity"] == 0
     assert gridless["strategies"]["grid"]["metrics"]["total_return"] is None
@@ -121,12 +121,15 @@ def test_compiled_and_interpreted_share_accounting_match(monkeypatch):
 def test_fee_decimals_quantities_and_inactive_fields():
     config, _ = fixture()
     raw = config.model_dump(mode="json")
-    raw.update(grid_mode="geometric", buy_step=0, sell_step="", fees={"commission_rate": .00012345})
+    raw.update(grid_mode="geometric", buy_step=.02, sell_step=.04, fees={"commission_rate": .00012345})
     parsed = BacktestConfig.model_validate(raw)
     assert parsed.fees.commission_rate == .00012345
-    assert "buy_step" not in parsed.model_dump()
-    search = OptimizationConfig.model_validate({"base": raw, "ranges": {"buy_step": {"low": -1, "high": -2, "step": 0}, "buy_shares": {"low": 100, "high": 200, "step": 100}}})
-    assert set(search.ranges) == {"buy_shares"}
+    assert parsed.buy_step == .02 and parsed.sell_step == .04
+    assert "grid_step" not in parsed.model_dump()
+    with pytest.raises(ValueError):
+        BacktestConfig.model_validate({**raw, "buy_step": 0})
+    with pytest.raises(ValueError):
+        OptimizationConfig.model_validate({"base": raw, "ranges": {"buy_step": {"low": -1, "high": -2, "step": .01}, "buy_shares": {"low": 100, "high": 200, "step": 100}}})
     for value in (1, 99, 150, 100.5):
         with pytest.raises(ValueError):
             BacktestConfig.model_validate({**raw, "buy_shares": value})

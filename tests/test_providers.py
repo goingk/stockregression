@@ -23,25 +23,19 @@ def sina_frame(open_values=None):
     })
 
 
-def fake_akshare(monkeypatch, frame):
+def fake_sina_minute(monkeypatch, frame):
     calls = []
 
-    def stock_zh_a_minute(symbol, period, adjust):
+    def fetch(symbol):
         calls.append(symbol)
         return frame
 
-    def fund_etf_hist_min_em(**_kwargs):
-        raise AssertionError("ETF 近期分钟不再使用东财 trends2 接口（历史交易日开盘价为 0）")
-
-    monkeypatch.setitem(sys.modules, "akshare", types.SimpleNamespace(
-        stock_zh_a_minute=stock_zh_a_minute,
-        fund_etf_hist_min_em=fund_etf_hist_min_em,
-    ))
+    monkeypatch.setattr(providers, "_fetch_sina_minute", fetch)
     return calls
 
 
 def test_fetch_sina_uses_sina_minute_feed_for_etf(monkeypatch):
-    calls = fake_akshare(monkeypatch, sina_frame())
+    calls = fake_sina_minute(monkeypatch, sina_frame())
 
     frame = providers.fetch_sina("159611.SZ")
 
@@ -52,10 +46,68 @@ def test_fetch_sina_uses_sina_minute_feed_for_etf(monkeypatch):
 
 
 def test_fetch_sina_rejects_non_positive_prices(monkeypatch):
-    fake_akshare(monkeypatch, sina_frame([0.0, 10.1, 10.2]))
+    fake_sina_minute(monkeypatch, sina_frame([0.0, 10.1, 10.2]))
 
     with pytest.raises(DataQualityError, match="非正价格"):
         providers.fetch_sina("159611.SZ")
+
+
+def test_sina_minute_adapter_reuses_session_and_makes_one_request(monkeypatch):
+    calls = []
+
+    class Response:
+        text = 'var _=(([{"day":"2026-10-16 15:00:00","open":"1.0","high":"1.1","low":"0.9","close":"1.05","volume":"100","amount":"105"}]));'
+
+        def raise_for_status(self):
+            return None
+
+    class Session:
+        headers = {}
+
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return Response()
+
+    session = Session()
+    monkeypatch.setattr(providers, "_SINA_LOCAL", types.SimpleNamespace(session=session))
+    monkeypatch.setattr(providers, "latest_closed_date", lambda: pd.Timestamp("2026-10-19"))
+
+    first = providers.fetch_sina("159611.SZ")
+    second = providers.fetch_sina("159611.SZ")
+
+    assert len(calls) == 2
+    assert calls[0][0] == providers._SINA_MINUTE_URL
+    assert calls[0][1]["params"] == {"symbol": "sz159611", "scale": "1", "ma": "no", "datalen": "1970"}
+    assert calls[0][1]["timeout"] == 15
+    assert len(first) == len(second) == 1
+
+
+def test_baostock_session_is_reused_within_worker(monkeypatch):
+    calls = {"login": 0, "logout": 0}
+
+    def login():
+        calls["login"] += 1
+        return types.SimpleNamespace(error_code="0", error_msg="")
+
+    def logout():
+        calls["logout"] += 1
+
+    basic_fields = "code,code_name,ipoDate,outDate"
+    daily_fields = "date,open,high,low,close,preclose,volume,amount,tradestatus,isST"
+    basic_rows = [["sh.600000", "浦发银行", "1999-11-10", ""]]
+    daily_rows = [["2026-10-16", "10", "10.2", "9.9", "10.1", "10", "100", "1000", "1", "0"]]
+    monkeypatch.setitem(sys.modules, "baostock", types.SimpleNamespace(
+        login=login,
+        logout=logout,
+        query_stock_basic=lambda **kwargs: FakeBaostockResult(basic_fields, basic_rows),
+        query_history_k_data_plus=lambda *args, **kwargs: FakeBaostockResult(daily_fields, daily_rows),
+    ))
+    monkeypatch.setattr(providers, "_BAOSTOCK_LOCAL", types.SimpleNamespace())
+
+    providers.fetch_stock_daily("600000.SH", "2026-10-01", "2026-10-16")
+    providers.fetch_stock_daily("600000.SH", "2026-10-01", "2026-10-16")
+
+    assert calls == {"login": 1, "logout": 0}
 
 
 class FakeBaostockResult:

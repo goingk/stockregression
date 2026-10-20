@@ -8,7 +8,7 @@
     [switch]$Initialize,
     [switch]$InstallSchedule,
     [switch]$DryRun,
-    [ValidateRange(1, 4)][int]$Workers = 2
+    [ValidateRange(1, 4)][int]$Workers = 4
 )
 $ErrorActionPreference = 'Stop'
 Push-Location -LiteralPath $PSScriptRoot

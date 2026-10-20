@@ -1,6 +1,6 @@
 import type { BacktestConfig } from './types'
 
-export type GridDefaults = Pick<BacktestConfig, 'grid_mode' | 'buy_step' | 'sell_step' | 'grid_step' | 'lower_price' | 'upper_price'>
+export type GridDefaults = Pick<BacktestConfig, 'grid_mode' | 'buy_step' | 'sell_step' | 'lower_price' | 'upper_price'>
 export type PositionDefaults = Pick<BacktestConfig, 'initial_shares' | 'min_shares' | 'max_shares' | 'buy_shares' | 'sell_shares'>
 export type SearchRange = { low: number; high: number; step: number }
 export interface ResearchDefaults {
@@ -24,6 +24,7 @@ export interface ResearchDefaults {
   recommendation_count: number
   max_shares_mode: 'search' | 'unlimited'
   slippage_mode: 'configured' | 'zero'
+  neighborhood_fields: string[]
   fixed_half_widths: Record<string, number>
   ranges: Record<string, SearchRange>
 }
@@ -36,12 +37,13 @@ export interface WorkbenchDefaults {
 export type StrategyDefaultsGroup = 'grid' | 'position' | 'dca'
 export type WorkbenchGroup = keyof WorkbenchDefaults
 
-export const percentageRanges = new Set(['buy_step', 'sell_step', 'grid_step'])
-export const rangeNames = ['buy_step', 'sell_step', 'grid_step', 'buy_shares', 'sell_shares', 'initial_shares', 'min_shares', 'max_shares'] as const
+export const percentageRanges = new Set(['buy_step', 'sell_step'])
+export const rangeNames = ['buy_step', 'sell_step', 'buy_shares', 'sell_shares', 'initial_shares', 'min_shares', 'max_shares'] as const
+const v4NeighborhoodFields = ['buy_step', 'sell_step', 'sell_shares', 'buy_shares', 'min_shares', 'max_shares'] as const
 
 export function defaultSearchRanges(): Record<string, SearchRange> {
   return {
-    buy_step: { low: .005, high: .1, step: .005 }, sell_step: { low: .005, high: .1, step: .005 }, grid_step: { low: .005, high: .1, step: .005 },
+    buy_step: { low: .005, high: .1, step: .005 }, sell_step: { low: .005, high: .1, step: .005 },
     buy_shares: { low: 100, high: 1000, step: 100 }, sell_shares: { low: 100, high: 1000, step: 100 },
     initial_shares: { low: 0, high: 2000, step: 100 }, min_shares: { low: 0, high: 1000, step: 100 }, max_shares: { low: 1000, high: 5000, step: 100 },
   }
@@ -54,12 +56,21 @@ export function researchRangesForSymbol(ranges: Record<string, SearchRange>, sym
     : ranges
 }
 
+export function researchConfigForSubmission(value: BacktestConfig, protocolVersion: number, maxSharesMode: ResearchDefaults['max_shares_mode']): BacktestConfig {
+  if (protocolVersion !== 4) return value
+  return {
+    ...value,
+    grid_mode: 'geometric',
+    max_shares: maxSharesMode === 'unlimited' ? null : Math.max(value.initial_shares, value.max_shares ?? value.initial_shares),
+  }
+}
+
 export function defaultWorkbenchDefaults(): WorkbenchDefaults {
   return {
-    grid: { grid_mode: 'trailing', buy_step: .03, sell_step: .03, grid_step: .03, lower_price: null, upper_price: null },
+    grid: { grid_mode: 'trailing', buy_step: .03, sell_step: .03, lower_price: null, upper_price: null },
     position: { initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 100 },
     dca: { frequency: 'monthly', shares: 100, initial_shares: 0 },
-    research: { protocol_version: 4, selection_target: 'both', rebalance_days: 63, bootstrap_reps: 10000, mode: 'both', n_trials: 1000, local_search_budget: 3000, seed: 42, top_candidates: 20, max_drawdown: .2, min_trades: 10, min_history_days: 504, min_minute_ratio: .95, ranking_mode: 'max_volume', search_method: 'auto', training_budget: 20000, validation_budget: 100000, recommendation_count: 10, max_shares_mode: 'search', slippage_mode: 'configured', fixed_half_widths: { grid_step: .001, sell_shares: 100, buy_shares: 100, min_shares: 100, max_shares: 100 }, ranges: defaultSearchRanges() },
+    research: { protocol_version: 4, selection_target: 'both', rebalance_days: 63, bootstrap_reps: 10000, mode: 'both', n_trials: 1000, local_search_budget: 3000, seed: 42, top_candidates: 20, max_drawdown: .2, min_trades: 10, min_history_days: 504, min_minute_ratio: .95, ranking_mode: 'max_volume', search_method: 'auto', training_budget: 20000, validation_budget: 100000, recommendation_count: 10, max_shares_mode: 'search', slippage_mode: 'configured', neighborhood_fields: [...v4NeighborhoodFields], fixed_half_widths: { buy_step: .001, sell_step: .001, sell_shares: 100, buy_shares: 100, min_shares: 500, max_shares: 500 }, ranges: defaultSearchRanges() },
   }
 }
 
@@ -68,6 +79,7 @@ function record(value: unknown): Record<string, unknown> | null {
 }
 const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value)
 const integer = (value: unknown, min: number, max = Number.MAX_SAFE_INTEGER): value is number => finite(value) && Number.isSafeInteger(value) && value >= min && value <= max
+export const researchQuantityUnit = (name: string) => name === 'min_shares' || name === 'max_shares' ? 500 : 100
 const quantity = (value: unknown, min = 0) => integer(value, min) && value % 100 === 0
 const fraction = (value: unknown, min = 0) => finite(value) && value >= min && value <= 1
 const step = (value: unknown) => finite(value) && value > 0 && value <= 1
@@ -85,16 +97,21 @@ export function validResearchDefaults(value: unknown): value is ResearchDefaults
     || !integer(item.training_budget, 1, 1000000) || !integer(item.validation_budget, 1, 2000000)
     || !integer(item.recommendation_count, 1, 100)
     || !['search', 'unlimited'].includes(String(item.max_shares_mode))
-    || !['configured', 'zero'].includes(String(item.slippage_mode))) return false
+    || !['configured', 'zero'].includes(String(item.slippage_mode))
+    || !Array.isArray(item.neighborhood_fields) || !item.neighborhood_fields.length
+    || !item.neighborhood_fields.every(name => v4NeighborhoodFields.includes(String(name) as typeof v4NeighborhoodFields[number]))
+    || new Set(item.neighborhood_fields).size !== item.neighborhood_fields.length) return false
   const halfWidths = record(item.fixed_half_widths)
-  if (!halfWidths || !['grid_step', 'sell_shares', 'buy_shares', 'min_shares', 'max_shares'].every(name => finite(halfWidths[name]) && Number(halfWidths[name]) > 0)) return false
-  if (Math.abs(Number(halfWidths.grid_step) * 1000 - Math.round(Number(halfWidths.grid_step) * 1000)) > 1e-8) return false
-  if (['sell_shares', 'buy_shares', 'min_shares', 'max_shares'].some(name => Math.abs(Number(halfWidths[name]) / 100 - Math.round(Number(halfWidths[name]) / 100)) > 1e-8)) return false
+  if (!halfWidths || !v4NeighborhoodFields.every(name => finite(halfWidths[name]) && Number(halfWidths[name]) > 0)) return false
+  if (['buy_step', 'sell_step'].some(name => Math.abs(Number(halfWidths[name]) * 1000 - Math.round(Number(halfWidths[name]) * 1000)) > 1e-8)) return false
+  if (['sell_shares', 'buy_shares', 'min_shares', 'max_shares'].some(name => Math.abs(Number(halfWidths[name]) / researchQuantityUnit(name) - Math.round(Number(halfWidths[name]) / researchQuantityUnit(name))) > 1e-8)) return false
   const ranges = record(item.ranges)
   return ranges != null && rangeNames.every(name => {
     const range = record(ranges[name])
     if (!range || !finite(range.low) || !finite(range.high) || !finite(range.step) || range.low > range.high || range.step <= 0) return false
-    if (Number(item.protocol_version) === 4 && name === 'grid_step'
+    if (Number(item.protocol_version) === 4 && ['min_shares', 'max_shares'].includes(name)
+      && (range.low % 500 !== 0 || range.high % 500 !== 0)) return false
+    if (Number(item.protocol_version) === 4 && percentageRanges.has(name)
       && (Math.abs(range.low * 1000 - Math.round(range.low * 1000)) > 1e-8 || Math.abs(range.high * 1000 - Math.round(range.high * 1000)) > 1e-8)) return false
     return percentageRanges.has(name)
       ? step(range.low) && step(range.high)
@@ -108,8 +125,9 @@ function normalizeResearchDefaults(value: unknown): ResearchDefaults {
   const defaults = defaultWorkbenchDefaults().research
   if (!item) return defaults
   const ranges = record(item.ranges)
+  const legacyRange = record(ranges?.grid_step)
   const normalizedRanges = Object.fromEntries(rangeNames.map((name) => {
-    const saved = record(ranges?.[name])
+    const saved = name === 'buy_step' || name === 'sell_step' ? legacyRange ?? record(ranges?.[name]) : record(ranges?.[name])
     const fallback = defaults.ranges[name]
     const candidate = saved && finite(saved.low) && finite(saved.high) && finite(saved.step)
       ? { low: saved.low, high: saved.high, step: saved.step }
@@ -117,10 +135,14 @@ function normalizeResearchDefaults(value: unknown): ResearchDefaults {
     return [name, candidate]
   })) as Record<string, SearchRange>
   const savedHalfWidths = record(item.fixed_half_widths)
+  const legacyHalfWidth = savedHalfWidths?.grid_step
   const normalizedHalfWidths = Object.fromEntries(Object.keys(defaults.fixed_half_widths).map((name) => {
-    const saved = savedHalfWidths?.[name]
-    return [name, finite(saved) && saved > 0 ? saved : defaults.fixed_half_widths[name]]
+    const saved = (name === 'buy_step' || name === 'sell_step') ? legacyHalfWidth ?? savedHalfWidths?.[name] : savedHalfWidths?.[name]
+    return [name, finite(saved) && saved > 0 ? (['min_shares', 'max_shares'].includes(name) ? Math.ceil(saved / 500) * 500 : saved) : defaults.fixed_half_widths[name]]
   })) as Record<string, number>
+  const savedNeighborhood = Array.isArray(item.neighborhood_fields)
+    ? item.neighborhood_fields.flatMap(name => String(name) === 'grid_step' ? ['buy_step', 'sell_step'] : [String(name)])
+    : null
   const merged: ResearchDefaults = {
     ...defaults,
     protocol_version: defaults.protocol_version,
@@ -143,6 +165,10 @@ function normalizeResearchDefaults(value: unknown): ResearchDefaults {
     recommendation_count: integer(item.recommendation_count, 1, 100) ? item.recommendation_count : defaults.recommendation_count,
     max_shares_mode: ['search', 'unlimited'].includes(String(item.max_shares_mode)) ? item.max_shares_mode as ResearchDefaults['max_shares_mode'] : defaults.max_shares_mode,
     slippage_mode: ['configured', 'zero'].includes(String(item.slippage_mode)) ? item.slippage_mode as ResearchDefaults['slippage_mode'] : defaults.slippage_mode,
+    neighborhood_fields: savedNeighborhood?.length
+      && savedNeighborhood.every(name => v4NeighborhoodFields.includes(name as typeof v4NeighborhoodFields[number]))
+      && new Set(savedNeighborhood).size === savedNeighborhood.length
+      ? savedNeighborhood : defaults.neighborhood_fields,
     fixed_half_widths: normalizedHalfWidths,
     ranges: normalizedRanges,
   }
@@ -170,7 +196,7 @@ export function validWorkbenchGroup<K extends WorkbenchGroup>(group: K, value: u
   if (!item) return false
   if (group === 'research') return validResearchDefaults(item)
   if (group === 'grid') return ['trailing', 'arithmetic', 'geometric'].includes(String(item.grid_mode))
-    && step(item.buy_step) && step(item.sell_step) && step(item.grid_step) && price(item.lower_price) && price(item.upper_price)
+    && step(item.buy_step) && step(item.sell_step) && price(item.lower_price) && price(item.upper_price)
     && (item.lower_price == null || item.upper_price == null || (item.lower_price as number) < (item.upper_price as number))
   if (group === 'position') return quantity(item.initial_shares) && quantity(item.min_shares) && (item.max_shares === null || quantity(item.max_shares))
     && quantity(item.buy_shares, 100) && quantity(item.sell_shares, 100)
@@ -194,9 +220,9 @@ export function normalizeRememberedResearchDefaults(value: unknown): ResearchDef
 }
 
 export function strategyDefaults(config: BacktestConfig): Pick<WorkbenchDefaults, StrategyDefaultsGroup> {
-  const { grid_mode, buy_step, sell_step, grid_step, lower_price, upper_price, initial_shares, min_shares, max_shares, buy_shares, sell_shares } = config
+  const { grid_mode, buy_step, sell_step, lower_price, upper_price, initial_shares, min_shares, max_shares, buy_shares, sell_shares } = config
   return {
-    grid: { grid_mode, buy_step, sell_step, grid_step, lower_price, upper_price },
+    grid: { grid_mode, buy_step, sell_step, lower_price, upper_price },
     position: { initial_shares, min_shares, max_shares, buy_shares, sell_shares },
     dca: { ...config.dca },
   }

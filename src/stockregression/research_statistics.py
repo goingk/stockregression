@@ -11,6 +11,36 @@ from typing import Any
 
 import numpy as np
 
+from .performance import blas_thread_limit, current_blas_threads, record_count
+
+try:
+    from numba import njit
+except ImportError:  # pragma: no cover - Numba is a runtime dependency
+    njit = None
+
+
+if njit is None:
+    def _bootstrap_counts(starts, restart, n_days):
+        indices = np.empty(n_days, dtype=np.int64)
+        indices[0] = starts[0]
+        for day in range(1, n_days):
+            indices[day] = starts[day] if restart[day] else (indices[day - 1] + 1) % n_days
+        return np.bincount(indices, minlength=n_days).astype(np.float64)
+else:
+    @njit(cache=True)
+    def _bootstrap_counts(starts, restart, n_days):
+        indices = np.empty(n_days, dtype=np.int64)
+        counts = np.zeros(n_days, dtype=np.float64)
+        indices[0] = starts[0]
+        counts[indices[0]] += 1.0
+        for day in range(1, n_days):
+            if restart[day]:
+                indices[day] = starts[day]
+            else:
+                indices[day] = (indices[day - 1] + 1) % n_days
+            counts[indices[day]] += 1.0
+        return counts
+
 
 def _returns_matrix(values: Any) -> np.ndarray:
     matrix = np.asarray(values, dtype=np.float64)
@@ -82,12 +112,15 @@ def _bootstrap_maxima(
         end = min(begin + chunk_size, reps)
         weights = np.empty((end - begin, n_days), dtype=np.float64)
         for offset in range(end - begin):
-            sample = stationary_bootstrap_indices(n_days, block_length, rng)
-            weights[offset] = np.bincount(sample, minlength=n_days)
+            starts = rng.integers(0, n_days, size=n_days)
+            restart = rng.random(n_days) < (1.0 / float(block_length))
+            weights[offset] = _bootstrap_counts(starts, restart, n_days)
         # Keep only block counts and the current product; never retain a
         # reps x days x candidates bootstrap tensor.
-        products = weights @ centered / n_days
+        with blas_thread_limit(current_blas_threads()):
+            products = weights @ centered / n_days
         maxima[begin:end] = np.max(products, axis=1)
+        record_count("bootstrap_replicates", end - begin)
         if progress:
             progress(end / max(1, reps))
     return maxima

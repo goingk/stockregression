@@ -6,11 +6,60 @@ import heapq
 import math
 from typing import Any, Callable, Iterable
 
+import numpy as np
+
+from ..performance import record_count, record_details
+
+try:
+    from numba import njit
+except ImportError:  # pragma: no cover - Numba is a runtime dependency
+    njit = None
+
 from .space import UNITS, ParameterSpace, value_to_ticks
 from .search import box_coordinates
 
 
 TOLERANCE = 1e-12
+
+
+if njit is None:
+    def _find_root(parent, index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def _component_labels(count, left, right, buckets):
+        parent = list(range(count))
+        for a, b, bucket in zip(left, right, buckets):
+            if buckets[a] != bucket or buckets[b] != bucket:
+                continue
+            ra, rb = _find_root(parent, int(a)), _find_root(parent, int(b))
+            if ra != rb:
+                parent[rb] = ra
+        return np.asarray([_find_root(parent, index) for index in range(count)], dtype=np.int64)
+else:
+    @njit(cache=True)
+    def _find_root(parent, index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    @njit(cache=True)
+    def _component_labels(count, left, right, buckets):
+        parent = np.arange(count, dtype=np.int64)
+        for edge in range(left.shape[0]):
+            a, b = left[edge], right[edge]
+            if buckets[a] != buckets[b]:
+                continue
+            ra, rb = _find_root(parent, a), _find_root(parent, b)
+            if ra != rb:
+                parent[rb] = ra
+        labels = np.empty(count, dtype=np.int64)
+        for index in range(count):
+            labels[index] = _find_root(parent, index)
+        return labels
 
 
 @dataclass
@@ -30,6 +79,7 @@ def _quantized(value: float) -> int:
 def analyze_platforms(
     space: ParameterSpace,
     rows: dict[tuple[int, ...], dict[str, Any]],
+    neighborhood_fields: Iterable[str] | None = None,
 ) -> list[Platform]:
     values = {
         key: float(row["validation_excess_original"])
@@ -38,27 +88,37 @@ def analyze_platforms(
         and isinstance(row.get("validation_excess_original"), (int, float))
         and math.isfinite(float(row["validation_excess_original"]))
     }
-    offsets = tuple(space.neighbor_offsets(diagonal=True))
-    components: list[list[tuple[int, ...]]] = []
-    assigned: set[tuple[int, ...]] = set()
-    for start in sorted(values):
-        if start in assigned:
-            continue
-        queue = [start]
-        assigned.add(start)
-        component = []
-        while queue:
-            current = queue.pop()
-            component.append(current)
-            bucket = _quantized(values[current])
-            for offset in offsets:
-                neighbor = space.neighbor(current, offset)
-                if neighbor is None or neighbor in assigned or neighbor not in values:
-                    continue
-                if _quantized(values[neighbor]) == bucket:
-                    assigned.add(neighbor)
-                    queue.append(neighbor)
-        components.append(sorted(component))
+    movable = tuple(name for name in space.active if neighborhood_fields is None or name in set(neighborhood_fields))
+    offsets = tuple(space.neighbor_offsets(diagonal=True, fields=movable))
+    # Follow each undirected adjacency once while building the equality graph.
+    forward_offsets = tuple(
+        offset for offset in offsets
+        if next((value for value in offset if value), 0) > 0
+    )
+    points = sorted(values)
+    index_of = {point: index for index, point in enumerate(points)}
+    buckets = np.asarray([_quantized(values[point]) for point in points], dtype=np.int64)
+    left, right = [], []
+    for index, point in enumerate(points):
+        for offset in forward_offsets:
+            neighbor = space.neighbor(point, offset)
+            neighbor_index = index_of.get(neighbor)
+            if neighbor_index is None or buckets[index] != buckets[neighbor_index]:
+                continue
+            left.append(index)
+            right.append(neighbor_index)
+    labels = _component_labels(
+        len(points),
+        np.asarray(left, dtype=np.int64),
+        np.asarray(right, dtype=np.int64),
+        buckets,
+    )
+    grouped: dict[int, list[tuple[int, ...]]] = {}
+    for point, label in zip(points, labels):
+        grouped.setdefault(int(label), []).append(point)
+    components = [sorted(component) for component in grouped.values()]
+    record_details(neighborhood_graph_edges=len(left))
+    record_count("neighborhood_points", len(points))
 
     component_of = {key: index for index, comp in enumerate(components) for key in comp}
     platforms = []
@@ -104,30 +164,34 @@ def maximum_positive_box(
     space: ParameterSpace,
     center: tuple[int, ...],
     values: dict[tuple[int, ...], float],
+    movable_fields: Iterable[str] | None = None,
 ) -> tuple[dict[str, int], list[tuple[int, ...]]] | None:
     """Branch-and-bound for the largest symmetric all-positive box."""
+    movable = [name for name in space.active if movable_fields is None or name in set(movable_fields)]
     if not space.active:
         if values.get(center, -math.inf) <= TOLERANCE:
             return None
         return {}, [center]
+    if not movable:
+        return None
     by_name = dict(zip(space.fields, center))
     upper = {}
-    for name in space.active:
+    for name in movable:
         dim = space.dimensions[name]
         tick = by_name[name]
         upper[name] = min(tick - dim.low, dim.high - tick)
         if upper[name] < 1:
             return None
-    one = {name: 1 for name in space.active}
-    minimum_points = box_coordinates(space, center, one)
+    one = {name: 1 for name in movable}
+    minimum_points = box_coordinates(space, center, one, movable_fields=movable)
     if not _all_positive(minimum_points, values):
         return None
-    high = tuple(upper[name] for name in space.active)
-    maximum_points = box_coordinates(space, center, dict(zip(space.active, high)))
+    high = tuple(upper[name] for name in movable)
+    maximum_points = box_coordinates(space, center, dict(zip(movable, high)), movable_fields=movable)
     if _all_positive(maximum_points, values):
-        return dict(zip(space.active, high)), list(maximum_points or [])
+        return dict(zip(movable, high)), list(maximum_points or [])
 
-    best_volume = math.prod(one[name] for name in space.active)
+    best_volume = math.prod(one[name] for name in movable)
     best_radii = one
     best_points = list(minimum_points or [])
     heap: list[tuple[int, tuple[int, ...]]] = [(-math.prod(high), high)]
@@ -138,8 +202,8 @@ def maximum_positive_box(
         if bound < best_volume or candidate in visited:
             continue
         visited.add(candidate)
-        radii = dict(zip(space.active, candidate))
-        points = box_coordinates(space, center, radii)
+        radii = dict(zip(movable, candidate))
+        points = box_coordinates(space, center, radii, movable_fields=movable)
         if _all_positive(points, values):
             best_volume = bound
             best_radii = radii
@@ -166,11 +230,15 @@ def fixed_box(
     center: tuple[int, ...],
     half_widths: dict[str, int],
     values: dict[tuple[int, ...], float],
+    movable_fields: Iterable[str] | None = None,
 ) -> tuple[dict[str, int], list[tuple[int, ...]]] | None:
-    radii = {name: int(half_widths.get(name, 1)) for name in space.active}
+    movable = [name for name in space.active if movable_fields is None or name in set(movable_fields)]
+    if not movable:
+        return None
+    radii = {name: int(half_widths.get(name, 1)) for name in movable}
     if any(radius < 1 for radius in radii.values()):
         return None
-    points = box_coordinates(space, center, radii)
+    points = box_coordinates(space, center, radii, movable_fields=movable)
     return (radii, points) if _all_positive(points, values) else None
 
 
@@ -186,7 +254,7 @@ def region_record(
 ) -> dict[str, Any]:
     values = [float(rows[point]["validation_excess_original"]) for point in points]
     coordinate = tuple(row["key"])
-    raw_volume = math.prod(int(radii[name]) for name in space.active) if space.active else 1
+    raw_volume = math.prod(int(radii.get(name, 0)) for name in space.active if int(radii.get(name, 0)) > 0) if space.active else 1
     return {
         "center_params": dict(row["params"]),
         "center_coordinate": list(coordinate),
@@ -243,6 +311,7 @@ def find_regions(
     max_drawdown: float,
     min_trades: int,
     global_exhaustive: bool,
+    neighborhood_fields: Iterable[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return ranked formal regions and all validated platform diagnostics."""
     values = {
@@ -256,7 +325,8 @@ def find_regions(
         name: value_to_ticks(name, fixed_half_widths.get(name, UNITS[name]))
         for name in space.active
     }
-    platforms = analyze_platforms(space, rows)
+    movable = tuple(name for name in space.active if neighborhood_fields is None or name in set(neighborhood_fields))
+    platforms = analyze_platforms(space, rows, neighborhood_fields=movable)
     regions: list[dict[str, Any]] = []
     diagnostics = []
     for platform in platforms:
@@ -278,9 +348,9 @@ def find_regions(
             if float(row.get("max_drawdown", math.inf)) > max_drawdown or int(row.get("trade_count", 0) or 0) < min_trades:
                 continue
             if ranking_mode == "max_volume":
-                found = maximum_positive_box(space, member, values)
+                found = maximum_positive_box(space, member, values, movable_fields=movable)
             else:
-                found = fixed_box(space, member, fixed_ticks, values)
+                found = fixed_box(space, member, fixed_ticks, values, movable_fields=movable)
             if found is None:
                 continue
             radii, points = found

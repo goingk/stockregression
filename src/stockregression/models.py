@@ -104,11 +104,19 @@ class BacktestConfig(BaseModel):
                 value["schema_version"] = 2
             if is_etf and value.get("schema_version") == 1:
                 raise ValueError("ETF 请使用 schema_version=2 的股数配置")
-        if isinstance(value, dict) and value.get("schema_version") in (2, 3):
+        if isinstance(value, dict):
             value = dict(value)
-            inactive = ("grid_step",) if value.get("grid_mode", "trailing") == "trailing" else ("buy_step", "sell_step")
-            for key in inactive:
-                value.pop(key, None)
+            # ``grid_step`` was the single spacing used by older fixed grids.
+            # New share-account configurations always carry both directions;
+            # map the legacy value when an older record explicitly stored it.
+            legacy = value.get("grid_step")
+            if legacy is not None:
+                if value.get("schema_version", 1) not in (2, 3) and value.get("grid_mode", "trailing") != "trailing":
+                    value["buy_step"] = legacy
+                    value["sell_step"] = legacy
+                else:
+                    value.setdefault("buy_step", legacy)
+                    value.setdefault("sell_step", legacy)
         return value
 
     @model_serializer(mode="wrap")
@@ -121,8 +129,7 @@ class BacktestConfig(BaseModel):
         if self.schema_version == 3:
             values.pop("reserve_cash", None)
         if self.schema_version in (2, 3):
-            for key in (("grid_step",) if self.grid_mode == "trailing" else ("buy_step", "sell_step")):
-                values.pop(key, None)
+            values.pop("grid_step", None)
         return values
 
     @model_validator(mode="after")
@@ -156,6 +163,9 @@ class SearchRange(BaseModel):
         return self
 
 
+NeighborhoodField = Literal["buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares"]
+
+
 class ResearchStrategySpec(BaseModel):
     """Versioned research algorithm configuration."""
 
@@ -169,28 +179,63 @@ class ResearchStrategySpec(BaseModel):
     recommendation_count: int = Field(default=10, ge=1, le=100)
     max_shares_mode: Literal["search", "unlimited"] = "search"
     slippage_mode: Literal["configured", "zero"] = "configured"
+    neighborhood_fields: list[NeighborhoodField] = Field(default_factory=lambda: [
+        "buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares",
+    ])
     fixed_half_widths: dict[str, float] = Field(default_factory=lambda: {
-        "grid_step": 0.001,
+        "buy_step": 0.001,
+        "sell_step": 0.001,
         "sell_shares": 100,
         "buy_shares": 100,
-        "min_shares": 100,
-        "max_shares": 100,
+        "min_shares": 500,
+        "max_shares": 500,
     })
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_single_spacing(cls, value):
+        if not isinstance(value, dict):
+            return value
+        value = dict(value)
+        fields = value.get("neighborhood_fields")
+        if isinstance(fields, list) and "grid_step" in fields:
+            migrated: list[str] = []
+            for name in fields:
+                names = ("buy_step", "sell_step") if name == "grid_step" else (str(name),)
+                for mapped in names:
+                    if mapped not in migrated:
+                        migrated.append(mapped)
+            value["neighborhood_fields"] = migrated
+        half_widths = value.get("fixed_half_widths")
+        if isinstance(half_widths, dict):
+            migrated_widths = dict(half_widths)
+            legacy = migrated_widths.pop("grid_step", None)
+            if legacy is not None:
+                migrated_widths.setdefault("buy_step", legacy)
+                migrated_widths.setdefault("sell_step", legacy)
+            value["fixed_half_widths"] = migrated_widths
+        return value
 
     @model_validator(mode="after")
     def valid_half_widths(self):
-        allowed = {"grid_step", "sell_shares", "buy_shares", "min_shares", "max_shares"}
+        if not self.neighborhood_fields:
+            raise ValueError("细搜索邻域至少需要一个可移动参数")
+        if len(set(self.neighborhood_fields)) != len(self.neighborhood_fields):
+            raise ValueError("细搜索邻域参数不能重复")
+        allowed = {"buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares"}
         if set(self.fixed_half_widths) - allowed:
             raise ValueError("固定邻域半宽包含不支持的参数")
         for name, value in self.fixed_half_widths.items():
             if float(value) <= 0:
                 raise ValueError("固定邻域半宽必须为正数")
-            if name == "grid_step":
+            if name in {"buy_step", "sell_step"}:
                 scaled = round(float(value) / 0.001)
                 if abs(float(value) / 0.001 - scaled) > 1e-7:
-                    raise ValueError("网格间距半宽必须对齐 0.001")
-            elif abs(float(value) / 100 - round(float(value) / 100)) > 1e-7:
-                raise ValueError("数量邻域半宽必须对齐 100")
+                    raise ValueError("买卖间距半宽必须对齐 0.001")
+            else:
+                unit = 500 if name in {"min_shares", "max_shares"} else 100
+                if abs(float(value) / unit - round(float(value) / unit)) > 1e-7:
+                    raise ValueError(f"{name} 邻域半宽必须对齐 {unit}")
         return self
 
 
@@ -273,7 +318,8 @@ class ResearchRequestV4(BaseModel):
             end_date=context.end_date, frequency=context.frequency,
             initial_shares=context.initial_shares, min_shares=0,
             max_shares=None if self.strategy.max_shares_mode == "unlimited" else max(2000, context.initial_shares),
-            buy_shares=100, sell_shares=100, grid_mode="geometric", grid_step=.03,
+            buy_shares=100, sell_shares=100, grid_mode="geometric",
+            buy_step=.03, sell_step=.03,
             fees=context.fees, reference_price_mode=context.reference_price_mode,
             reference_price=context.reference_price, lower_price=context.lower_price,
             upper_price=context.upper_price, dca=context.dca,
@@ -308,7 +354,6 @@ class OptimizationConfig(BaseModel):
     ranges: dict[str, SearchRange] = Field(default_factory=lambda: {
         "buy_step": SearchRange(low=0.005, high=0.10, step=0.005),
         "sell_step": SearchRange(low=0.005, high=0.10, step=0.005),
-        "grid_step": SearchRange(low=0.005, high=0.10, step=0.005),
         "buy_ratio": SearchRange(low=0.02, high=0.20, step=0.02),
         "sell_ratio": SearchRange(low=0.02, high=0.20, step=0.02),
         "initial_position": SearchRange(low=0.20, high=0.80, step=0.10),
@@ -373,20 +418,26 @@ class OptimizationConfig(BaseModel):
             raise ValueError("protocol_version=3/4 需要 base.schema_version=3")
         if base.schema_version not in (2, 3):
             return values
+        raw_ranges = values.get("ranges")
+        if isinstance(raw_ranges, dict) and "grid_step" in raw_ranges:
+            ranges = dict(raw_ranges)
+            legacy = ranges.pop("grid_step")
+            ranges.setdefault("buy_step", legacy)
+            ranges.setdefault("sell_step", legacy)
+            values["ranges"] = ranges
         if "ranges" not in values:
             values = {**values, "ranges": {
                 "buy_step": {"low": .005, "high": .1, "step": .005},
                 "sell_step": {"low": .005, "high": .1, "step": .005},
-                "grid_step": {"low": .005, "high": .1, "step": .005},
                 "buy_shares": {"low": 100, "high": 1000, "step": 100},
                 "sell_shares": {"low": 100, "high": 1000, "step": 100},
                 "min_shares": {"low": 0, "high": 1000, "step": 100},
                 "max_shares": {"low": 1000, "high": 5000, "step": 100},
             }}
         if values.get("protocol_version") == 4:
-            inactive = {"buy_step", "sell_step", "buy_ratio", "sell_ratio", "initial_position", "min_position", "max_position", "initial_shares"}
+            inactive = {"buy_ratio", "sell_ratio", "initial_position", "min_position", "max_position", "initial_shares"}
         else:
-            inactive = {"grid_step"} if base.grid_mode == "trailing" else {"buy_step", "sell_step"}
+            inactive: set[str] = set()
         if isinstance(values["ranges"], dict):
             values = {**values, "ranges": {key: value for key, value in values["ranges"].items() if key not in inactive}}
         return values
