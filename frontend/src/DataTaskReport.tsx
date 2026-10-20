@@ -2,11 +2,29 @@ import { Badge } from './components'
 import { reportFailures, reportReason, reportRows, syncReportRuns } from './dataReportModel'
 import { taskStatusLabel } from './taskState'
 
+const gapKindLabels: Record<string, string> = {
+  quality: '质量核验', range: '覆盖范围', reference_price: '前置收盘价',
+  bars: '行情缺失', fields: '字段缺失', calendar: '交易日历',
+  actions: '公司行动', price_quality: '价格质量', version: '数据版本',
+}
+
 export function DataTaskReport({ report }: { report: Record<string, unknown> }) {
   const runs = syncReportRuns(report)
   const failures = reportFailures(report)
   const steps = reportRows(report.steps)
+  const gaps = reportRows(report.remaining_gaps)
   return <>
+    {gaps.length > 0 && <div role="status">
+      <h3>数据缺口（{gaps.length}）</h3>
+      <div className="table-wrap"><table><thead><tr><th>类型</th><th>周期</th><th>原因</th></tr></thead><tbody>
+        {gaps.map((gap, index) => <tr key={index}>
+          <td>{gapKindLabels[String(gap.kind ?? '')] ?? String(gap.kind ?? '—')}</td>
+          <td>{String(gap.timeframe ?? '—')}</td>
+          <td className="task-report-reason">{reportReason(gap)}</td>
+        </tr>)}
+      </tbody></table></div>
+      <p className="muted-copy">准备步骤结束不等于数据可用；上述缺口补齐前，研究或回测仍会被拒绝。</p>
+    </div>}
     {runs.length > 0 && <>
       <p className="muted-copy">进度 100% 表示任务已处理结束。各周期的成功、跳过和失败情况如下；跳过项未执行更新。</p>
       <div className="table-wrap"><table><thead><tr><th>周期</th><th>状态</th><th>成功</th><th>跳过</th><th>失败</th></tr></thead><tbody>

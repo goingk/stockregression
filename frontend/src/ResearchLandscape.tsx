@@ -189,7 +189,7 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
   if (error) return <Empty title='参数收益分布不可用' detail={error} />
   if (!data || !data.points.length) return <Empty title='暂无参数收益分布' detail='本次研究没有可展示的训练或验证候选。' />
 
-  const ranking = data.top_candidates.length ? data.top_candidates : data.focus ? [data.focus] : []
+  const ranking = (data.top_candidates.length ? data.top_candidates : data.focus ? [data.focus] : []).slice(0, 3)
   const focusValue = data.focus?.excess_return ?? null
   const neighborhood = data.focus_neighborhood
   return <Card
@@ -295,7 +295,7 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
 
     <section className='research-candidate-ranking'>
       <div className='research-candidate-ranking-head'>
-        <div><strong>全量候选排名</strong><small>按当前筛选的相对全仓超额排序，显示前 {ranking.length} 名</small></div>
+        <div><strong>全量候选排名</strong><small>按当前筛选的相对全仓超额排序，只显示前 {ranking.length} 名</small></div>
         <span>相对最佳 #{data.focus?.candidate_id ?? '—'}</span>
       </div>
       {ranking.length ? <div className='table-wrap'><table><thead><tr><th>排名</th><th>收益</th><th>参数</th><th>状态</th></tr></thead><tbody>{ranking.map(candidate => {

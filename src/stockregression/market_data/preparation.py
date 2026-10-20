@@ -152,13 +152,19 @@ class MarketPreparationService:
             row.get("status") in {"completed", "skipped"} for row in results
         ) else "failed"
         progress(1.0, "数据准备结束")
+        if not remaining:
+            message = "本次请求已可运行"
+        elif status == "partial":
+            message = f"准备步骤已完成，但仍有 {len(remaining)} 项数据缺口，暂不可用"
+        else:
+            message = f"准备失败，仍有 {len(remaining)} 项数据缺口"
         return {
             "status": status, "mode": "preparation", "symbol": config.symbol,
             "frequency": config.frequency, "steps": results,
             "readiness": readiness, "remaining_gaps": remaining,
             "package_id": self.repository.package_id,
             "package_version": int(self.repository.package.manifest().get("package_version", 0)),
-            "message": "本次请求已可运行" if not remaining else f"仍有 {len(remaining)} 项缺口",
+            "message": message,
         }
 
     def _refresh_auxiliary(self, symbol, start, end, cancelled) -> dict:

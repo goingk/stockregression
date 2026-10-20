@@ -60,7 +60,8 @@ export function Stat({ label, value, note, tone = 'neutral' }: { label: string; 
 
 export function JobProgress({ progress, status }: { progress: number; status: string }) {
   const value = Math.max(0, Math.min(100, Math.round((progress || 0) * 100)))
-  return <div className="progress-wrap"><div className="progress"><i style={{ width: `${status === 'completed' ? 100 : value}%` }} /></div><span>{status === 'completed' ? '完成' : `${value}%`}</span></div>
+  const label = status === 'completed' ? '完成' : status === 'partial' && value >= 100 ? '100% · 有缺口' : `${value}%`
+  return <div className="progress-wrap"><div className="progress"><i style={{ width: `${status === 'completed' ? 100 : value}%` }} /></div><span>{label}</span></div>
 }
 
 export function useErrorMessage() {

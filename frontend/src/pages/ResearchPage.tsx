@@ -302,6 +302,86 @@ function ParameterBadges({ params, compact = false }: { params?: Dict; compact?:
   return <div className={'research-parameter-badges' + (compact ? ' compact' : '')}>{entries.map(([key, value]) => <span className='research-parameter-badge' key={key}><small>{labelOf(key)}</small><strong>{pctRange.has(key) ? rangeValue(key, value) : record(value) ? shortSummary(value) : valueText(key, value)}</strong></span>)}</div>
 }
 
+const peakParamNames = ['buy_step', 'sell_step', 'buy_shares', 'sell_shares'] as const
+
+function peakParamSubset(params?: Dict): Dict {
+  const source = params ?? {}
+  const subset = Object.fromEntries(
+    peakParamNames.filter(name => source[name] != null).map(name => [name, source[name]]),
+  )
+  return Object.keys(subset).length ? subset : source
+}
+
+function stressLabel(stress?: Dict): string {
+  const value = record(stress) ?? {}
+  const status = String(value.status ?? '')
+  const label = status === 'completed' ? '已完成' : status === 'partial' ? '部分完成' : status === 'failed' ? '失败' : '未计算'
+  return finite(value.mean_excess_return) ? label + ' · 均值 ' + percent(n(value.mean_excess_return), 2) : label
+}
+
+function RobustPeakRegions({ current, dateRange, onLoad }: {
+  current: Recommendation
+  dateRange?: { start_date: string; end_date: string }
+  onLoad: (params: Dict | undefined, selectionAsOf: string | undefined, dateRange?: { start_date: string; end_date: string }) => void
+}) {
+  const regions = current.recommendation_regions ?? []
+  if (!regions.length) return <p className='inline-warning'>本次没有 J 为正、约束合格且完成一格平台核验的推荐峰区；诊断候选不能替代正式推荐。</p>
+  const diagnostics = current.diagnostics ?? {}
+  const coverage = String(diagnostics.coverage_status ?? '')
+  const coverageLabel = coverage === 'global_exhaustive' ? '全局穷尽' : coverage === 'budgeted_local_peaks' ? '预算搜索' : coverage || '覆盖状态未知'
+  return <div className='research-peak-regions'>
+    <div className='research-peak-regions-head'>
+      <span>共 {regions.length} 个合格峰区 · 按 J 从高到低</span>
+      <span className='research-peak-regions-badges'>
+        <Badge tone={diagnostics.score_complete === true ? 'green' : 'amber'}>{diagnostics.score_complete === true ? '评分完整' : '评分不完整'}</Badge>
+        <Badge tone={diagnostics.local_peak_verified === true ? 'green' : 'amber'}>{diagnostics.local_peak_verified === true ? '峰值已核验' : '峰值未闭合'}</Badge>
+        <Badge tone={coverage === 'global_exhaustive' ? 'blue' : 'neutral'}>{coverageLabel}</Badge>
+      </span>
+    </div>
+    {regions.map((region, index) => {
+      const params = peakParamSubset(region.center_params)
+      const minPosition = finite(region.actual_min_pos_ratio) ? n(region.actual_min_pos_ratio).toFixed(3) : '—'
+      const maxPosition = finite(region.actual_max_pos_ratio) ? n(region.actual_max_pos_ratio).toFixed(3) : '—'
+      return <article className='research-peak-region' key={region.region_id ?? index}>
+        <div className='research-peak-region-main'>
+          <span className='research-peak-rank'>#{region.region_id ?? index + 1}</span>
+          <div className='research-peak-params'><ParameterBadges params={params} compact /></div>
+          <div className='research-peak-score'><small>稳健 J</small><strong>{percent(region.j_score, 4)}</strong></div>
+          <Button variant='quiet' onClick={() => onLoad(region.center_params, current.as_of, dateRange)}>{dateRange ? '载入评估回测' : '载入'}</Button>
+        </div>
+        <div className='research-peak-metrics'>
+          <span><small>中心 R</small><strong>{percent(region.center_excess_return, 4)}</strong></span>
+          <span><small>邻域均值</small><strong>{percent(region.mean_excess_return, 4)}</strong></span>
+          <span><small>下行风险</small><strong>{percent(region.downside_risk_tau, 4)}</strong></span>
+          <span><small>持仓惩罚</small><strong>{percent(region.pos_penalty, 4)}</strong></span>
+        </div>
+        <div className='research-peak-status'>
+          <Badge tone={region.score_complete === true ? 'green' : 'amber'}>{region.score_complete === true ? '评分完整' : '评分不完整'}</Badge>
+          <Badge tone={region.local_peak_verified === true ? 'green' : 'amber'}>{region.local_peak_verified === true ? '峰值已核验' : '峰值未闭合'}</Badge>
+          <Badge tone={region.global_exhaustive === true ? 'blue' : 'neutral'}>{region.global_exhaustive === true ? '全局穷尽' : '预算搜索'}</Badge>
+          <span>平台 {region.platform_size ?? '—'} 点</span>
+          <span>压力 {stressLabel(region.stress)}</span>
+        </div>
+        <details className='research-peak-details'>
+          <summary>持仓、成交与平台诊断</summary>
+          <div className='research-peak-detail-grid'>
+            <span><small>超正方体边长</small><strong>{valueText('超正方体边长', region.edge_length)}</strong></span>
+            <span><small>组合数</small><strong>{valueText('组合数', region.completed_count)} / {valueText('组合数', region.combination_count)}</strong></span>
+            <span><small>最低超额</small><strong>{percent(region.min_excess_return, 4)}</strong></span>
+            <span><small>持仓范围</small><strong>{minPosition} – {maxPosition}</strong></span>
+            <span><small>邻域最差上限</small><strong>{finite(region.neighborhood_max_eta) ? n(region.neighborhood_max_eta).toFixed(3) : '—'}</strong></span>
+            <span><small>正收益 / 安全垫</small><strong>{percent(region.pos_win_rate)} / {percent(region.safe_win_rate)}</strong></span>
+            <span><small>库存 / T+1</small><strong>{region.stockout_count ?? '—'} / {region.tplus1_block_count ?? '—'}</strong></span>
+            <span><small>最低持股</small><strong>{valueText('min_shares', region.center_params?.min_shares)}</strong></span>
+            <span><small>初始持股</small><strong>{valueText('initial_shares', region.center_params?.initial_shares)}</strong></span>
+            <span><small>最高持股</small><strong>{valueText('max_shares', region.center_params?.max_shares)}</strong></span>
+          </div>
+        </details>
+      </article>
+    })}
+  </div>
+}
+
 function ResultCurve({ run }: { run?: TestRun }) {
   if (!run) return <Empty title='暂无样本外结果' detail='当前方案没有可绘制的连续样本外回测。' />
   const curveReady = Array.isArray(run.strategies?.grid?.equity) && run.strategies.grid.equity.length > 0
@@ -777,8 +857,8 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
             {(current.recommendation_regions ?? []).length === 0 ? <p className='inline-warning'>本次没有形成可评价的完整超正方体，正式推荐为空。</p> : <div className='table-wrap'><table><thead><tr><th>排名</th><th>中心参数</th><th>边长</th><th>组合数</th><th>平均超额</th><th>最低超额</th><th>中心超额</th><th>状态</th><th>压力诊断</th><th></th></tr></thead><tbody>{(current.recommendation_regions ?? []).map((region, index) => <tr key={region.region_id ?? index}><td>{region.region_id ?? index + 1}</td><td><ParameterBadges params={region.center_params ?? {}} compact /></td><td>{valueText('超正方体边长', region.edge_length)}</td><td>{valueText('组合数', region.completed_count)} / {valueText('组合数', region.combination_count)}</td><td>{percent(n(region.mean_excess_return), 4)}</td><td>{percent(n(region.min_excess_return), 4)}</td><td>{percent(n(region.center_excess_return), 4)}</td><td>{region.complete ? '完整超正方体' : '未完成'}{region.global_exhaustive ? ' · 全局穷尽' : ' · 训练采样'}</td><td>{String(region.stress?.status ?? '未计算')}{region.stress?.mean_excess_return != null ? ' · 均值 ' + percent(n(region.stress.mean_excess_return), 2) : ''}</td><td><Button variant='quiet' onClick={() => loadV2(region.center_params, current.as_of, regionDateRange)}>{regionDateRange ? '载入评估回测' : '载入'}</Button></td></tr>)}</tbody></table></div>}
           </Card>}
           {isRobustResult && current && <Card title='四维稳健 J 峰区' subtitle='J = αR + (1−α)μΩ − βσ⁻Ω − Cpos；峰值按合格中心上的完整一格联合邻域判断，原始收益峰只作诊断。'>
-            <p className='field-hint'>训练时段：{firstString(historicalTrainingWindow, ['start']) ?? trainStart ?? '—'} 至 {firstString(historicalTrainingWindow, ['end']) ?? trainEnd ?? '—'}；搜索 {String(current.diagnostics?.search_method ?? '—')}，覆盖状态 {String(current.diagnostics?.coverage_status ?? '—')}。评分完整 {String(current.diagnostics?.score_complete ?? false)}，局部峰值核验 {String(current.diagnostics?.local_peak_verified ?? false)}，全局穷尽 {String(current.diagnostics?.global_exhaustive ?? false)}。</p>
-            {(current.recommendation_regions ?? []).length === 0 ? <p className='inline-warning'>本次没有 J 为正、约束合格且完成一格平台核验的推荐峰区；诊断候选不能替代正式推荐。</p> : <div className='table-wrap scroll-table'><table><thead><tr><th>排名</th><th>中心参数</th><th>J</th><th>中心 R</th><th>邻域均值</th><th>下行风险</th><th>持仓惩罚</th><th>持仓范围 / 股数倍</th><th>邻域最差上限</th><th>正收益 / 安全垫</th><th>库存 / T+1</th><th>平台</th><th>压力诊断</th><th></th></tr></thead><tbody>{(current.recommendation_regions ?? []).map((region, index) => <tr key={region.region_id ?? index}><td>{region.region_id ?? index + 1}</td><td><ParameterBadges params={region.center_params ?? {}} compact /></td><td>{finite(region.j_score) ? percent(region.j_score, 4) : '—'}</td><td>{finite(region.center_excess_return) ? percent(region.center_excess_return, 4) : '—'}</td><td>{finite(region.mean_excess_return) ? percent(region.mean_excess_return, 4) : '—'}</td><td>{finite(region.downside_risk_tau) ? percent(region.downside_risk_tau, 4) : '—'}</td><td>{finite(region.pos_penalty) ? percent(region.pos_penalty, 4) : '—'}</td><td>{finite(region.actual_min_pos_ratio) ? n(region.actual_min_pos_ratio).toFixed(3) : '—'} – {finite(region.actual_max_pos_ratio) ? n(region.actual_max_pos_ratio).toFixed(3) : '—'}</td><td>{finite(region.neighborhood_max_eta) ? n(region.neighborhood_max_eta).toFixed(3) : '—'}</td><td>{finite(region.pos_win_rate) ? percent(region.pos_win_rate) : '—'} / {finite(region.safe_win_rate) ? percent(region.safe_win_rate) : '—'}</td><td>{region.stockout_count ?? '—'} / {region.tplus1_block_count ?? '—'}</td><td>{region.score_complete ? '评分完整' : '不完整'} · {region.local_peak_verified ? '已核验' : '未闭合'}{region.platform_size != null ? ' · ' + String(region.platform_size) + ' 点' : ''}{region.global_exhaustive ? ' · 全局穷尽' : ' · 预算搜索'}</td><td>{String(region.stress?.status ?? '未计算')}{region.stress?.mean_excess_return != null ? ' · 均值 ' + percent(n(region.stress.mean_excess_return), 2) : ''}</td><td><Button variant='quiet' onClick={() => loadV2(region.center_params, current.as_of, regionDateRange)}>{regionDateRange ? '载入评估回测' : '载入'}</Button></td></tr>)}</tbody></table></div>}
+            <p className='field-hint'>训练时段：{firstString(historicalTrainingWindow, ['start']) ?? trainStart ?? '—'} 至 {firstString(historicalTrainingWindow, ['end']) ?? trainEnd ?? '—'}；搜索 {String(current.diagnostics?.search_method ?? '—')}。峰区按 J 排序，中心 R、邻域均值与下行风险均为训练期指标。</p>
+            <RobustPeakRegions current={current} dateRange={regionDateRange} onLoad={loadV2} />
             <p className='field-hint'>推荐中的最小／最大持仓是训练期实际观察范围，不自动成为实盘护栏；加载回测继续使用自然持仓，用户加入限制后形成新的回放配置。</p>
           </Card>}
           {Number(actualVersion) === 4 && actualStrategyVersion === 1 && current && <Card title='旧版最大正超额收益矩形邻域' subtitle='邻域内全部合法离散组合必须在原成本下超额收益为正；双倍成本只作诊断。'>
