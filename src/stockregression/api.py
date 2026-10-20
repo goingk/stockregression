@@ -292,8 +292,18 @@ def _landscape_point(row: dict, sample: str, cost: str, fold: int | None, fallba
         "neighbor_candidate_ids": row.get("neighbor_candidate_ids", []),
         "neighbor_of_candidate_ids": row.get("neighbor_of_candidate_ids", []),
         "robustness_status": row.get("robustness_status"),
-        "neighbor_positive_ratio": row.get("neighbor_positive_ratio"),
+        "neighbor_positive_ratio": row.get("neighbor_positive_ratio", row.get("pos_win_rate")),
         "neighbor_q25_excess": row.get("neighbor_q25_excess"),
+        "j_score": row.get("j_score"),
+        "neighborhood_mean": row.get("neighborhood_mean"),
+        "downside_risk_tau": row.get("downside_risk_tau"),
+        "pos_penalty": row.get("pos_penalty"),
+        "neighborhood_size": row.get("neighborhood_size"),
+        "neighborhood_support_size": row.get("neighborhood_support_size"),
+        "pos_win_rate": row.get("pos_win_rate"),
+        "safe_win_rate": row.get("safe_win_rate"),
+        "score_complete": row.get("score_complete"),
+        "score_missing_count": row.get("score_missing_count"),
         "island_suspect": row.get("island_suspect", False),
         "neighbor_boundary_clipped_count": row.get("neighbor_boundary_clipped_count", 0),
         "region_ids": row.get("region_ids", []),
@@ -425,6 +435,7 @@ def _landscape_neighborhood(
     values = []
     completed = 0
     missing = 0
+    metric_missing = 0
     for combination in product(*(choices for _, choices in axes)):
         if all(
             abs(combination[index] - float(focus_params.get(name, combination[index]))) < 1e-9
@@ -442,12 +453,17 @@ def _landscape_neighborhood(
         value = _landscape_metric(row, sample, cost, fold)
         if value is not None:
             values.append(value)
+        else:
+            metric_missing += 1
     return {
         "available": True,
         "dimensions": [name for name, _ in axes],
         "expected_count": expected,
         "evaluated_count": completed,
         "missing_count": missing,
+        "metric_count": len(values),
+        "metric_missing_count": metric_missing,
+        "metric_available": bool(values),
         "positive_count": sum(value > 1e-12 for value in values),
         "positive_ratio": sum(value > 1e-12 for value in values) / len(values) if values else None,
         "q25_excess": float(np.percentile(values, 25)) if values else None,

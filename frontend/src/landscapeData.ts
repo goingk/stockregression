@@ -19,6 +19,16 @@ export type LandscapePoint = {
   robustness_status: string | null
   neighbor_positive_ratio: number | null
   neighbor_q25_excess: number | null
+  j_score?: number | null
+  neighborhood_mean?: number | null
+  downside_risk_tau?: number | null
+  pos_penalty?: number | null
+  neighborhood_size?: number | null
+  neighborhood_support_size?: number | null
+  pos_win_rate?: number | null
+  safe_win_rate?: number | null
+  score_complete?: boolean | null
+  score_missing_count?: number | null
   island_suspect: boolean
   folds: LandscapeParams[]
 }
@@ -43,6 +53,9 @@ export type LandscapeNeighborhood = {
   expected_count: number
   evaluated_count: number
   missing_count?: number
+  metric_count?: number
+  metric_missing_count?: number
+  metric_available?: boolean
   positive_count?: number
   positive_ratio?: number | null
   q25_excess?: number | null

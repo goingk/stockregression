@@ -274,6 +274,63 @@ def test_v4_landscape_exposes_independent_buy_and_sell_spacing_slices(tmp_path):
     assert payload["focus_neighborhood"]["dimensions"] == ["buy_step", "sell_step"]
 
 
+def test_landscape_distinguishes_missing_validation_metrics_from_negative_returns(tmp_path):
+    store = Store(tmp_path)
+    base = {
+        "symbol": "159611.SZ", "start_date": "2024-01-02", "frequency": "1d",
+        "initial_shares": 1000, "min_shares": 0, "max_shares": None,
+        "buy_shares": 100, "sell_shares": 100, "grid_mode": "geometric",
+    }
+    points = []
+    pairs = [(.02, .02), (.01, .01), (.01, .02), (.01, .03), (.02, .01),
+             (.02, .03), (.03, .01), (.03, .02), (.03, .03)]
+    for index, (buy_step, sell_step) in enumerate(pairs, start=1):
+        center = index == 1
+        points.append({
+            "candidate_id": index, "params": {
+                **base, "schema_version": 3, "buy_step": buy_step, "sell_step": sell_step,
+            },
+            "is_center": center, "is_baseline": False, "evaluation_status": "completed",
+            "training_excess_return": .03 if center else .01 if buy_step == .02 or sell_step == .02 else 0.0,
+            "training_return": .05, "training_baseline_return": .02,
+            "training_drawdown": .1, "training_trade_count": 10,
+        })
+    result = {
+        "protocol_version": 4,
+        "config": {
+            "protocol_version": 4, "base": base,
+            "strategy": {"strategy_version": 4, "neighborhood_fields": ["buy_step", "sell_step"]},
+            "ranges": {"buy_step": {"low": .01, "high": .03}, "sell_step": {"low": .01, "high": .03}},
+        },
+        "evidence": {
+            "candidate_archives": {"current": points},
+            "search_candidate_archives": {"current": points},
+        },
+    }
+    result_id = store.save_result("optimization", result, "159611.SZ", "v4 training-only landscape")
+    with TestClient(create_app(str(tmp_path), start_jobs=False)) as client:
+        validation = client.get(
+            f"/api/v1/results/{result_id}/landscape?sample=validation"
+        ).json()
+        training = client.get(
+            f"/api/v1/results/{result_id}/landscape?sample=training"
+        ).json()
+
+    validation_neighborhood = validation["focus_neighborhood"]
+    assert validation["focus"]["candidate_id"] == 1
+    assert validation_neighborhood["available"] is True
+    assert validation_neighborhood["evaluated_count"] == 8
+    assert validation_neighborhood["metric_available"] is False
+    assert validation_neighborhood["metric_count"] == 0
+    assert validation_neighborhood["positive_count"] == 0
+    assert validation_neighborhood["all_positive"] is False
+
+    training_neighborhood = training["focus_neighborhood"]
+    assert training_neighborhood["metric_available"] is True
+    assert training_neighborhood["metric_count"] == training_neighborhood["evaluated_count"] == 8
+    assert training_neighborhood["positive_count"] == 4
+
+
 def test_v4_strategy_catalog_defaults_to_robust_j_geometric_research(tmp_path):
     with TestClient(create_app(str(tmp_path), start_jobs=False)) as client:
         response = client.get("/api/v1/research/strategies")

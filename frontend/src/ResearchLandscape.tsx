@@ -42,17 +42,20 @@ function pointFromEvent(raw: unknown): LandscapePoint | undefined {
   return ((raw as { data?: { item?: LandscapePoint } }).data ?? {}).item
 }
 
-export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, regionOptions = [], qualified = false, trainingOnly = false, validationLabel = '内部验证' }: {
+export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, regionOptions = [], qualified = false, trainingOnly = false, defaultSample = trainingOnly ? 'training' : 'validation', allowValidation = !trainingOnly, scoreKind = 'legacy', validationLabel = '内部验证' }: {
   resultId: string
   defaultParams?: Dict
   decisionOptions: Array<{ value: string; label: string }>
   regionOptions?: Array<{ value: string; label: string }>
   qualified?: boolean
   trainingOnly?: boolean
+  defaultSample?: 'training' | 'validation'
+  allowValidation?: boolean
+  scoreKind?: 'legacy' | 'hypercube' | 'robust_j'
   validationLabel?: string
 }) {
   const [decision, setDecision] = useState(decisionOptions[0]?.value ?? 'current')
-  const [sample, setSample] = useState<'training' | 'validation'>(trainingOnly ? 'training' : 'validation')
+  const [sample, setSample] = useState<'training' | 'validation'>(allowValidation ? defaultSample : 'training')
   const [cost, setCost] = useState<'original' | 'stress'>('original')
   const [fold, setFold] = useState('total')
   const [metric, setMetric] = useState<'excess' | 'grid'>('excess')
@@ -63,13 +66,18 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
   const [selected, setSelected] = useState<LandscapePoint | null>(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const activeSample = allowValidation ? sample : 'training'
+
+  useEffect(() => {
+    setSample(allowValidation ? defaultSample : 'training')
+  }, [allowValidation, defaultSample, resultId])
 
   const [decisionKind, decisionIndexText] = decision.split(':')
   const decisionIndex = Number(decisionIndexText || 0)
   useEffect(() => {
     let active = true
     setLoading(true); setError('')
-    const query = new URLSearchParams({ decision: decisionKind, decision_index: String(decisionIndex), sample, cost, limit: '1000' })
+    const query = new URLSearchParams({ decision: decisionKind, decision_index: String(decisionIndex), sample: activeSample, cost, limit: '1000' })
     if (fold !== 'total') query.set('fold', fold)
     if (region !== 'all') query.set('region_id', region)
     void get<LandscapeResponse>(`/results/${encodeURIComponent(resultId)}/landscape?${query}`)
@@ -81,7 +89,7 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
       .catch(cause => { if (active) setError(cause instanceof Error ? cause.message : String(cause)) })
       .finally(() => { if (active) setLoading(false) })
     return () => { active = false }
-  }, [resultId, decisionKind, decisionIndex, sample, cost, fold, region])
+  }, [resultId, decisionKind, decisionIndex, activeSample, cost, fold, region])
 
   const parameters = data?.parameters ?? []
   const axisSignature = parameters.join('|')
@@ -183,28 +191,70 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
 
   const ranking = data.top_candidates.length ? data.top_candidates : data.focus ? [data.focus] : []
   const focusValue = data.focus?.excess_return ?? null
+  const neighborhood = data.focus_neighborhood
   return <Card
     title={trainingOnly ? '训练候选收益分布' : '参数收益分布'}
-    subtitle={trainingOnly ? '训练搜索候选仅用于发现入口；正式参数域与两个代表点以内部验证结果为准。' : '先看相对最佳参数，再用二维切片判断它周围是否稳定。横纵轴以外的参数固定为相对最佳单点。'}
+    subtitle={trainingOnly
+      ? '训练搜索候选仅用于发现入口；正式参数域与两个代表点以内部验证结果为准。'
+      : scoreKind === 'robust_j'
+        ? '当前显示训练样本；稳健 J 的资格看 J、中心约束和峰值核验，正式推荐见峰区表。'
+        : scoreKind === 'hypercube'
+          ? '当前显示训练样本；超正方体按邻域平均超额评分，不要求每个邻点为正。'
+          : '先看相对最佳参数，再用二维切片判断它周围是否稳定。横纵轴以外的参数固定为相对最佳单点。'}
     action={<Badge tone='blue'>{loading ? '读取中…' : `${data.total.toLocaleString()} 个候选 · 当前切片 ${slice.length.toLocaleString()}`}</Badge>}
   >
     {data.focus && !trainingOnly && <div className={`research-landscape-focus ${qualified ? 'verified' : 'diagnostic'}`}>
       <div className='research-landscape-focus-copy'>
-        <small>{qualified ? '全量候选中的相对最佳单点' : '相对最佳单点 · 仅作研究对照'}</small>
+        <small>{scoreKind === 'legacy' ? (qualified ? '全量候选中的相对最佳单点' : '相对最佳单点 · 仅作研究对照') : '当前样本中的相对最佳单点'}</small>
         <strong>相对全仓超额 {ratio(focusValue)}</strong>
-        <span>从全部 {data.total.toLocaleString()} 个候选中按当前筛选选出；候选 #{data.focus.candidate_id ?? '—'}。{qualified ? '是否成为正式推荐仍取决于完整邻域验证。' : '它没有通过完整正超额邻域验证，不能当作合格推荐。'}</span>
+        <span>从全部 {data.total.toLocaleString()} 个候选中按当前筛选选出；候选 #{data.focus.candidate_id ?? '—'}。{qualified
+          ? (scoreKind === 'legacy' ? '是否成为正式推荐仍取决于完整邻域验证。' : '正式推荐以峰区表为准；这里用于观察参数分布。')
+          : (scoreKind === 'legacy' ? '它没有通过完整正超额邻域验证，不能当作合格推荐。' : '它没有通过当前策略的资格核验，不能当作合格推荐。')}</span>
       </div>
       <ParameterChips point={data.focus} />
     </div>}
 
-    {data.focus_neighborhood?.available && <div className={`research-neighborhood-check ${data.focus_neighborhood.all_positive ? 'passed' : 'failed'}`}>
-      <div><strong>{data.focus_neighborhood.all_positive ? '所选细搜索邻域全为正' : '所选细搜索邻域已计算，但没有通过'}</strong><span>二维切片只是其中一个截面；下面的数字来自本次勾选参与邻域移动的参数，未勾选参数保持中心值。</span></div>
-      <div className='research-neighborhood-stats'>
-        <span><small>已计算邻点</small><strong>{data.focus_neighborhood.evaluated_count} / {data.focus_neighborhood.expected_count}</strong></span>
-        <span><small>正收益邻点</small><strong>{data.focus_neighborhood.positive_count ?? '—'}（{ratio(data.focus_neighborhood.positive_ratio)}）</strong></span>
-        <span><small>邻点第 25 百分位</small><strong>{ratio(data.focus_neighborhood.q25_excess)}</strong></span>
+    {scoreKind === 'legacy' && neighborhood && neighborhood.available && (
+      neighborhood.metric_available === false ?
+        <div className='research-neighborhood-check'>
+          <div><strong>该样本没有收益数据</strong><span>邻点参数存在，但当前样本没有可用的收益指标；这不代表邻点收益为负。</span></div>
+          <div className='research-neighborhood-stats'>
+            <span><small>已计算邻点</small><strong>{neighborhood.evaluated_count} / {neighborhood.expected_count}</strong></span>
+            <span><small>收益指标</small><strong>缺失</strong></span>
+          </div>
+        </div>
+      : <div className={`research-neighborhood-check ${neighborhood.all_positive ? 'passed' : 'failed'}`}>
+        <div><strong>{neighborhood.all_positive ? '所选细搜索邻域全为正' : '所选细搜索邻域已计算，但没有通过'}</strong><span>二维切片只是其中一个截面；下面的数字来自本次勾选参与邻域移动的参数，未勾选参数保持中心值。</span></div>
+        <div className='research-neighborhood-stats'>
+          <span><small>已计算邻点</small><strong>{neighborhood.evaluated_count} / {neighborhood.expected_count}</strong></span>
+          <span><small>正收益邻点</small><strong>{neighborhood.positive_count ?? '—'}（{ratio(neighborhood.positive_ratio)}）</strong></span>
+          <span><small>邻点第 25 百分位</small><strong>{ratio(neighborhood.q25_excess)}</strong></span>
+        </div>
+        <p>{neighborhood.all_positive ? '最小即时邻域内收益均为正；是否成为正式推荐仍以完整邻域表的体积与资格为准。' : '只要即时邻点中存在负收益，就不构成完整正超额邻域；该点不能据此作为推荐。'}</p>
       </div>
-      <p>{data.focus_neighborhood.all_positive ? '最小即时邻域内收益均为正；是否成为正式推荐仍以完整邻域表的体积与资格为准。' : '只要即时邻点中存在负收益，就不构成完整正超额邻域。因此本次正式推荐为空，而不是邻域没有计算。'}</p>
+    )}
+
+    {scoreKind === 'robust_j' && data.focus && <div className='research-neighborhood-check passed'>
+      <div><strong>稳健 J 邻域（训练样本）</strong><span>四维一格联合邻域；邻点不需要全部为正。</span></div>
+      <div className='research-neighborhood-stats'>
+        <span><small>J</small><strong>{ratio(data.focus.j_score)}</strong></span>
+        <span><small>中心超额</small><strong>{ratio(data.focus.excess_return)}</strong></span>
+        <span><small>邻域均值</small><strong>{ratio(data.focus.neighborhood_mean)}</strong></span>
+        <span><small>正收益占比</small><strong>{ratio(data.focus.pos_win_rate ?? data.focus.neighbor_positive_ratio)}</strong></span>
+        <span><small>邻域点数</small><strong>{data.focus.neighborhood_size ?? '—'}</strong></span>
+        <span><small>评分完整</small><strong>{data.focus.score_complete === true ? '是' : data.focus.score_complete === false ? '否' : '—'}</strong></span>
+      </div>
+      <p>推荐资格由 J&gt;0、回撤/成交/持仓约束和局部峰值核验共同决定；邻点负收益会降低 J，不会直接取消资格。</p>
+    </div>}
+
+    {scoreKind === 'hypercube' && data.focus && <div className='research-neighborhood-check passed'>
+      <div><strong>超正方体平均超额</strong><span>训练样本内按固定边长计算邻域均值。</span></div>
+      <div className='research-neighborhood-stats'>
+        <span><small>中心超额</small><strong>{ratio(data.focus.excess_return)}</strong></span>
+        <span><small>最大回撤</small><strong>{ratio(data.focus.drawdown)}</strong></span>
+        <span><small>成交笔数</small><strong>{data.focus.trade_count == null ? '—' : number(Number(data.focus.trade_count), 0)}</strong></span>
+      </div>
+      <p>当前门槛是平均超额为正且中心满足约束；不要求每个邻点都为正。</p>
     </div>}
 
     <div className='research-chart-guide'>
@@ -215,9 +265,9 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
 
     <div className='form-grid four research-landscape-controls'>
       <Field label='研究决策'><SelectInput value={decision} onChange={event => setDecision(event.target.value)}>{decisionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>
-      <Field label='样本用途'><SelectInput value={sample} disabled={trainingOnly} onChange={event => setSample(event.target.value as 'training' | 'validation')}>{!trainingOnly && <option value='validation'>{validationLabel}</option>}<option value='training'>训练搜索</option></SelectInput></Field>
+      <Field label='样本用途'><SelectInput value={activeSample} disabled={!allowValidation} onChange={event => setSample(event.target.value as 'training' | 'validation')}>{allowValidation && <option value='validation'>{validationLabel}</option>}<option value='training'>训练搜索</option></SelectInput></Field>
       <Field label='成本情景'><SelectInput value={cost} onChange={event => setCost(event.target.value as 'original' | 'stress')}><option value='original'>原始成本</option><option value='stress'>双倍压力</option></SelectInput></Field>
-      <Field label='验证窗口'><SelectInput value={fold} onChange={event => setFold(event.target.value)} disabled={sample === 'training'}><option value='total'>整个验证段</option>{[0, 1, 2, 3].map(index => <option key={index} value={index}>窗口 {index + 1}</option>)}</SelectInput></Field>
+      <Field label='验证窗口'><SelectInput value={fold} onChange={event => setFold(event.target.value)} disabled={activeSample === 'training'}><option value='total'>整个验证段</option>{[0, 1, 2, 3].map(index => <option key={index} value={index}>窗口 {index + 1}</option>)}</SelectInput></Field>
       <Field label='着色指标'><SelectInput value={metric} onChange={event => setMetric(event.target.value as 'excess' | 'grid')}><option value='excess'>相对全仓超额</option><option value='grid'>网格收益</option></SelectInput></Field>
       {regionOptions.length > 1 && <Field label='推荐区域'><SelectInput value={region} onChange={event => setRegion(event.target.value)}><option value='all'>全部候选</option>{regionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>}
       <Field label='横轴参数'><SelectInput value={xName} onChange={event => {
