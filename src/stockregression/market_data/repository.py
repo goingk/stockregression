@@ -21,7 +21,10 @@ from filelock import FileLock
 
 from .cache import cached
 from .models import DataVersionNotFound, MarketDataError
-from .package_layout import PackageLayout, asset_type_for_symbol, auxiliary_relative_path, package_file_relative_path
+from .package_layout import (
+    PackageLayout, asset_type_for_symbol, auxiliary_relative_path,
+    package_file_relative_path, resolve_package_root,
+)
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe
 from ..price_validation import details_to_rows, price_issue_details, split_invalid_prices
 
@@ -112,7 +115,7 @@ class MarketDataRepository:
             self._initialize(db)
         previous_package = self.meta("package_dir") or self.meta("source_package_dir")
         selected_package = package_dir or previous_package
-        self.package = PackageLayout(selected_package or self.root / "package")
+        self.package = PackageLayout(resolve_package_root(selected_package or self.root / "package"))
         self.package_dir = self.package.root
         self.market_dir = self.package_dir
         self.staging_dir = self.package.staging_dir
@@ -136,7 +139,7 @@ class MarketDataRepository:
 
     def attach_package(self, package_dir: str | Path) -> None:
         previous = self.package_dir
-        self.package = PackageLayout(package_dir)
+        self.package = PackageLayout(resolve_package_root(package_dir))
         self.package_dir = self.package.root
         self.market_dir = self.package_dir
         self.staging_dir = self.package.staging_dir
@@ -945,6 +948,14 @@ class MarketDataRepository:
                    ORDER BY version"""
             ).fetchall()
             instrument_rows = db.execute("SELECT * FROM instruments").fetchall()
+            validation_rows = db.execute(
+                """SELECT symbol,timeframe,adjustment,trade_date,status,rules_version
+                   FROM parquet_day_validation ORDER BY trade_date"""
+            ).fetchall()
+            calendar_rows = db.execute(
+                """SELECT symbol,payload,updated_at FROM parquet_auxiliary_history
+                   WHERE kind='calendar' ORDER BY updated_at"""
+            ).fetchall()
         instruments = {row["symbol"]: dict(row) for row in instrument_rows}
         coverage_map: dict[tuple[str, str, str], list[dict]] = {}
         for row in coverage_rows:
@@ -961,6 +972,16 @@ class MarketDataRepository:
             increment_map.setdefault(
                 (row["symbol"], row["timeframe"], row["adjustment"]), []
             ).append(dict(row))
+        validation_map: dict[tuple[str, str, str], list[dict]] = {}
+        for row in validation_rows:
+            validation_map.setdefault(
+                (row["symbol"], row["timeframe"], row["adjustment"]), []
+            ).append(dict(row))
+        calendar_by_symbol = {}
+        for row in calendar_rows:
+            payload = _load(row["payload"], [])
+            calendar_by_symbol[row["symbol"]] = (self._calendar_dates(payload), bool(payload))
+        calendar_by_market = self._calendar_dates_by_market()
         manifest_files = self.package.manifest().get("files", {})
         selected_rows = [dict(row) for row in rows if not timeframe or row["timeframe"] == timeframe]
         symbols_all = sorted({row["symbol"] for row in selected_rows})
@@ -1002,8 +1023,15 @@ class MarketDataRepository:
                 if int(item.get("size") or 0) and path.stat().st_size != int(item["size"]):
                     file_status = "changed"
             stored = str(row.get("status") or "pending_validation")
-            compliance = self.validation_state(
-                row["symbol"], row["timeframe"], adjustment=row["adjustment"]
+            stored_calendar = calendar_by_symbol.get(row["symbol"])
+            if stored_calendar is not None:
+                calendar_dates, calendar_available = stored_calendar
+            else:
+                calendar_dates = calendar_by_market.get(row["symbol"][-2:], pd.DatetimeIndex([]))
+                calendar_available = bool(len(calendar_dates))
+            compliance = self._validation_from_parts(
+                row, validation_map.get(key, []), calendar_dates,
+                calendar_available=calendar_available,
             )
             quality_status = (
                 "failed" if compliance.get("failed") else
@@ -3120,33 +3148,39 @@ class MarketDataRepository:
                 changed.append(str(day.date()))
         return changed
 
-    def validation_state(
-        self, symbol: str, timeframe: str, *, adjustment: str = "none",
-        start=None, end=None,
+    @staticmethod
+    def _calendar_dates(payload) -> pd.DatetimeIndex:
+        if not payload:
+            return pd.DatetimeIndex([])
+        return pd.DatetimeIndex(pd.to_datetime(
+            [row.get("date") for row in payload], errors="coerce"
+        ).dropna()).normalize().unique().sort_values()
+
+    def _calendar_dates_by_market(self) -> dict[str, pd.DatetimeIndex]:
+        output = {}
+        for suffix in ("SH", "SZ"):
+            path = self.package.absolute(auxiliary_relative_path(f"000001.{suffix}", "calendar"))
+            if not path.is_file():
+                continue
+            try:
+                output[suffix] = self._calendar_dates(pd.read_parquet(path).to_dict("records"))
+            except (OSError, ValueError):
+                continue
+        return output
+
+    def _validation_from_parts(
+        self, dataset: dict, records: list[dict], calendar_dates: pd.DatetimeIndex,
+        *, calendar_available: bool | None = None, start=None, end=None,
     ) -> dict:
-        with self._connect() as db:
-            dataset_row = self._dataset_row(db, symbol, timeframe, adjustment)
-        dataset = dict(dataset_row) if dataset_row else None
-        if not dataset:
-            return {
-                "symbol": symbol, "timeframe": timeframe, "rules_version": VALIDATION_RULES_VERSION,
-                "verified_from": None, "verified_through": None, "validated_days": 0,
-                "failed": [], "pending": [], "calendar_available": False,
-            }
+        symbol, timeframe = dataset["symbol"], dataset["timeframe"]
         first = pd.Timestamp(start or dataset["first_time"]).normalize()
         last = pd.Timestamp(end or dataset["last_time"]).normalize()
-        records = self.day_validations(
-            symbol, timeframe, adjustment=adjustment, start=first, end=last
-        )
         by_day = {pd.Timestamp(row["trade_date"]).normalize(): row for row in records}
-        calendar = self.auxiliary(symbol, "calendar")
-        calendar_available = bool(calendar and calendar.get("payload"))
+        if calendar_available is None:
+            calendar_available = bool(len(calendar_dates))
         expected = pd.DatetimeIndex([])
         if calendar_available:
-            expected = pd.DatetimeIndex(pd.to_datetime(
-                [row.get("date") for row in calendar["payload"]], errors="coerce"
-            ).dropna()).normalize().unique().sort_values()
-            expected = expected[(expected >= first) & (expected <= last)]
+            expected = calendar_dates[(calendar_dates >= first) & (calendar_dates <= last)]
         if timeframe == "1day" and records:
             # Daily rows are themselves the local trading series. After full
             # validation, their persisted day records reconstruct the range
@@ -3199,6 +3233,31 @@ class MarketDataRepository:
             "calendar_available": calendar_available,
             "range_start": first.date().isoformat(), "range_end": last.date().isoformat(),
         }
+
+    def validation_state(
+        self, symbol: str, timeframe: str, *, adjustment: str = "none",
+        start=None, end=None,
+    ) -> dict:
+        with self._connect() as db:
+            dataset_row = self._dataset_row(db, symbol, timeframe, adjustment)
+        dataset = dict(dataset_row) if dataset_row else None
+        if not dataset:
+            return {
+                "symbol": symbol, "timeframe": timeframe, "rules_version": VALIDATION_RULES_VERSION,
+                "verified_from": None, "verified_through": None, "validated_days": 0,
+                "failed": [], "pending": [], "calendar_available": False,
+            }
+        first = pd.Timestamp(start or dataset["first_time"]).normalize()
+        last = pd.Timestamp(end or dataset["last_time"]).normalize()
+        records = self.day_validations(
+            symbol, timeframe, adjustment=adjustment, start=first, end=last
+        )
+        calendar = self.auxiliary(symbol, "calendar")
+        payload = calendar.get("payload") if calendar else None
+        return self._validation_from_parts(
+            dataset, records, self._calendar_dates(payload),
+            calendar_available=bool(payload), start=start, end=end,
+        )
 
     def archive_status(
         self, symbol: str, timeframe: str, adjustment: str = "none",

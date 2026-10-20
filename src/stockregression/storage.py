@@ -197,6 +197,8 @@ class Store:
     def _instrument(row):
         from .rules import instrument_terms
         item = dict(row)
+        if "has_data" in item:
+            item["has_data"] = bool(item["has_data"])
         metadata = json.loads(item.pop("metadata", "{}") or "{}")
         return instrument_terms(item["symbol"], {**item, **metadata})
 
@@ -212,7 +214,20 @@ class Store:
 
     def watches(self):
         with self.db() as db:
-            return [self._instrument(r) for r in db.execute("SELECT i.* FROM watchlist w JOIN instruments i USING(symbol) ORDER BY w.created_at").fetchall()]
+            market_index = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='parquet_datasets'"
+            ).fetchone()
+            if market_index:
+                rows = db.execute(
+                    "SELECT i.*, EXISTS(SELECT 1 FROM parquet_datasets d "
+                    "WHERE d.symbol=i.symbol AND d.row_count>0) AS has_data "
+                    "FROM watchlist w JOIN instruments i USING(symbol) ORDER BY w.created_at"
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT i.* FROM watchlist w JOIN instruments i USING(symbol) ORDER BY w.created_at"
+                ).fetchall()
+            return [self._instrument(r) for r in rows]
 
     def sync_item(self, run_key, symbol, **values):
         with self.db() as db:

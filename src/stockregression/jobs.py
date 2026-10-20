@@ -57,6 +57,8 @@ def _research_protocol_hash(config: OptimizationConfig) -> str:
             "negative_tolerance": 1e-12,
             "funding_mode": "top_up_on_fill",
             "pressure_is_diagnostic_only": True,
+            "validation_account_mode": "fresh_initial_config",
+            "validation_return_basis": "peak_invested_roi",
         }
     base = dict(payload.get("base", {}))
     for key in ("symbol", "start_date", "end_date"):

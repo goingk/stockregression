@@ -2,7 +2,7 @@
 
 基于 FastAPI、React、DuckDB、SQLite 和 Parquet 的本地中文研究工作台，支持沪深 A 股及场内 ETF 各周期行情管理、股数网格回测、固定股数定投和参数研究。界面按 1920×1080 桌面设计，并在当前电脑 3120×2080 显示器的 1560×1040 逻辑分辨率下检查；“行情”“数据管理”“策略回测”“参数研究”“结果分析”为独立页面。回测与研究各自保留草稿，通过明确操作传递配置；临时进度显示在右下角，任务历史和结果入口位于顶部任务中心。服务默认只监听 `127.0.0.1`；行情、配置、任务和结果保存在本机。
 
-正式行情固定来自 `datasets/datasets/ETF数据更新至2026.9.30`。旧格式快照、演示数据生成入口和旧数据迁移路径已移除；历史结果仍可查看和导出。
+正式行情固定来自相对项目根目录的 `data/dataset`；该索引目录下的数据包按资产分目录存放，`etf/` 是当前的 ETF 数据包。旧格式快照、演示数据生成入口和旧数据迁移路径已移除；历史结果仍可查看和导出。
 
 ## 启动
 
@@ -171,7 +171,7 @@ uv run --frozen stockregression data cleanup-legacy --apply
 
 旧 CLI 的代码、日线文件仍作为两个位置参数，兼容层把它们拆成独立的日线和 1 分钟任务；新的 `data` 命令要求明确周期。ETF 类型可明确指定 `stock/bond/crossborder/commodity/money`；股票无需填写。准确字段、时区与质量规则见[数据文件格式](docs/data-format.md)。没有日历文件时导入仍可完成，但质量状态会标记待核验，不能用普通工作日列表替代真实日历。
 
-默认应用目录为 `data/`，正式行情数据包固定为 `datasets/datasets/ETF数据更新至2026.9.30`。应用目录可通过界面或 `uv run --frozen stockregression set-data-dir D:\market\stockregression-data` 修改。环境变量 `STOCKREGRESSION_DATA_DIR`、`STOCKREGRESSION_PACKAGE_DIR` 和 `STOCKREGRESSION_HOME` 分别覆盖应用目录、数据包和设置根目录。
+默认应用目录为 `data/`，数据包索引为相对项目根目录的 `data/dataset`。应用目录可通过界面或 `uv run --frozen stockregression set-data-dir D:\market\stockregression-data` 修改。环境变量 `STOCKREGRESSION_DATA_DIR`、`STOCKREGRESSION_PACKAGE_DIR` 和 `STOCKREGRESSION_HOME` 分别覆盖应用目录、数据包和设置根目录；相对路径都按项目根目录解析。
 
 | 路径 | 内容 |
 | --- | --- |

@@ -18,7 +18,7 @@ SQLite 中的 `catalog.sqlite` 保存可重建索引、任务、配置和结果�
 
 ## 数据包
 
-活动数据包固定为仓库中的 `datasets/datasets/ETF数据更新至2026.9.30`。`.local/settings.json` 的 `package_dir` 或环境变量 `STOCKREGRESSION_PACKAGE_DIR` 只能指向该目录；应用不会回退到旧 `package/`、`manifests/` 或 `parquet/` 快照。应用数据目录与行情数据包是两个概念。
+数据包索引固定为仓库中的 `data/dataset`。`.local/settings.json` 的 `package_dir` 或环境变量 `STOCKREGRESSION_PACKAGE_DIR` 使用相对路径时按项目根目录解析；索引目录可以直接是一个数据包，也可以按资产分组，例如 `data/dataset/etf`。应用不会回退到旧 `package/`、`manifests/` 或 `parquet/` 快照。应用数据目录与行情数据包是两个概念。
 
 ```text
 数据包/

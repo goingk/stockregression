@@ -38,7 +38,7 @@ export default function MarketPanel({ onSelect, requestedReport, onReportHandled
   const refresh = useCallback(async () => {
     const items = await get<WatchItem[]>('/watchlist')
     setWatchlist(items)
-    setActive(old => old ?? items[0] ?? null)
+    setActive(old => old ?? items.find(item => item.has_data !== false) ?? items[0] ?? null)
   }, [])
   const finished = jobs.filter(job => ['completed', 'partial', 'failed', 'cancelled'].includes(job.status)).map(job => `${job.id}:${job.status}`).join(',')
   useEffect(() => {

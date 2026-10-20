@@ -70,7 +70,7 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
       setWatchlist(items); setSettings(config)
       if (!dataDirDraftEdited.current) setDataDirDraft(config.data_dir ?? '')
       setCacheMbDraft(current => current ?? Number(config.market_cache_mb ?? 256))
-      setActiveSymbol((old) => old || items[0]?.symbol || '')
+      setActiveSymbol((old) => old || items.find(item => item.has_data !== false)?.symbol || items[0]?.symbol || '')
     } catch (e) { setError(err(e)) } finally { setLoading(false) }
   }, [err])
 

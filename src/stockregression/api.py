@@ -27,12 +27,13 @@ from .market_data.aggregation import AggregationService
 from .market_data.models import DataVersionNotFound, MarketDataError
 from .market_data.cache import cache_settings, configure_cache
 from .market_data.package import scan_etf_package
+from .market_data.package_layout import resolve_package_root
 from .market_data.preparation import MarketPreparationService
 from .market_data.timeframes import normalize_timeframe, public_timeframe
 from .rules import instrument_terms
 from .research_preparation import preparation_config
 from .schedule import configure_schedule
-from .settings import PROJECT_ROOT, load_settings, save_settings
+from .settings import PROJECT_ROOT, load_settings, resolve_project_path, save_settings
 from .source_health import configured_sources, validate_source_settings
 from .storage import Store, dumps, json_safe, now_iso
 
@@ -391,7 +392,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     root = str(Path(data_dir or configured.data_dir).resolve())
     configure_cache(configured.market_cache_mb)
     store = Store(root)
-    initial_package = configured.package_dir if data_dir is None else None
+    initial_package = (
+        str(resolve_project_path(configured.package_dir))
+        if data_dir is None and configured.package_dir else None
+    )
     initial_market = MarketDataService(store, package_dir=initial_package)
     package_dir = str(initial_market.repository.package_dir)
     manager = JobManager(root, configured.max_workers)
@@ -564,7 +568,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             target = Path(payload.folder).expanduser().resolve()
             if data_dir is None and initial_package and target != Path(initial_package).resolve():
                 raise ValueError(
-                    "项目已固定使用 ETF 数据更新至2026.9.30；如需切换基础数据包，请修改本机设置中的 package_dir 后重启"
+                    "项目已固定使用 data/dataset 数据包索引；如需切换基础数据包，请修改本机设置中的 package_dir 后重启"
                 )
             values = payload.model_dump()
             values["folder"] = str(target)
@@ -1299,7 +1303,9 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             **current.model_dump(), "active_data_dir": root,
             "active_package_dir": package_dir,
             "package_dir": current.package_dir or package_dir,
-            "restart_required": current.data_dir != root or bool(current.package_dir and current.package_dir != package_dir),
+            "restart_required": current.data_dir != root or bool(
+                current.package_dir and resolve_package_root(current.package_dir) != Path(package_dir).resolve()
+            ),
             "market_cache": cache_settings(),
         }
 
@@ -1307,7 +1313,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
     def update_settings(payload: dict):
         try:
             if payload.get("package_dir"):
-                requested = Path(str(payload["package_dir"])).expanduser().resolve()
+                requested = resolve_package_root(str(payload["package_dir"]))
                 if requested != Path(package_dir).resolve():
                     raise ValueError("固定数据包目录不能通过设置切换到其他目录")
             validate_source_settings(store, payload)
@@ -1316,7 +1322,9 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True):
             return {
                 **values.model_dump(), "active_data_dir": root,
                 "active_package_dir": package_dir,
-                "restart_required": values.data_dir != root or bool(values.package_dir and values.package_dir != package_dir),
+                "restart_required": values.data_dir != root or bool(
+                    values.package_dir and resolve_package_root(values.package_dir) != Path(package_dir).resolve()
+                ),
                 "market_cache": cache_settings(),
             }
         except ValueError as exc:

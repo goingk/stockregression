@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from shutil import copy2
 
@@ -12,12 +13,15 @@ from stockregression.market_data import MarketDataService
 from stockregression.market_data.cache import ByteLRU, configure_cache
 from stockregression.market_data.maintenance import reset_market_storage
 from stockregression.market_data.package import import_etf_package, index_etf_package_direct
+from stockregression.market_data.package import scan_etf_package
+from stockregression.market_data.package_layout import resolve_package_root
 from stockregression.market_data.models import DataVersionNotFound
 from stockregression.models import BacktestConfig
 from stockregression.share_engine import funding
 from stockregression.storage import Store
 from stockregression.api import create_app
 from stockregression.jobs import execute_job
+from stockregression.settings import save_settings
 
 
 def _daily(days):
@@ -145,6 +149,42 @@ def _etf_package(root: Path) -> None:
     }).set_index(["trade_date", "trade_time"]).to_parquet(
         one_minute / "510050.SH.parquet"
     )
+
+
+def test_dataset_index_resolves_asset_subpackage(tmp_path):
+    dataset = tmp_path / "data" / "dataset"
+    etf = dataset / "etf"
+    etf.mkdir(parents=True)
+    (dataset / "stock").mkdir()
+    _etf_package(etf)
+
+    assert resolve_package_root(dataset) == etf.resolve()
+    assert scan_etf_package(dataset)["folder"] == str(etf.resolve())
+
+    service = MarketDataService(Store(tmp_path / "app"), package_dir=dataset)
+    assert service.repository.package_dir == etf.resolve()
+    assert service.repository.package_info()["path"] == str(etf.resolve())
+
+    (dataset / "stock" / "stock_daily.parquet").touch()
+    with pytest.raises(ValueError, match="多个数据包"):
+        resolve_package_root(dataset)
+
+
+def test_settings_store_project_paths_relative(tmp_path, monkeypatch):
+    import stockregression.settings as settings_module
+
+    monkeypatch.setattr(settings_module, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(settings_module, "SETTINGS_FILE", tmp_path / ".local" / "settings.json")
+    monkeypatch.delenv("STOCKREGRESSION_DATA_DIR", raising=False)
+    monkeypatch.delenv("STOCKREGRESSION_PACKAGE_DIR", raising=False)
+
+    saved = save_settings({"data_dir": "data", "package_dir": "data/dataset"})
+
+    assert saved.data_dir == str((tmp_path / "data").resolve())
+    assert saved.package_dir == str((tmp_path / "data" / "dataset").resolve())
+    stored = json.loads((tmp_path / ".local" / "settings.json").read_text(encoding="utf-8"))
+    assert stored["data_dir"] == "data"
+    assert stored["package_dir"] == "data/dataset"
 
 
 def test_etf_package_normalizes_units_and_opening_auction(tmp_path):
