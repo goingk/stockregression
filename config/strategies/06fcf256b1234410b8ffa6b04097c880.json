@@ -1,0 +1,40 @@
+{
+  "id": "06fcf256b1234410b8ffa6b04097c880",
+  "name": "浦发银行－近三年资金示例",
+  "config": {
+    "symbol": "600000.SH",
+    "start_date": "2023-10-15",
+    "end_date": null,
+    "frequency": "1m",
+    "initial_cash": 123456.0,
+    "initial_position": 0.5,
+    "min_position": 0.0,
+    "max_position": 1.0,
+    "grid_mode": "trailing",
+    "buy_step": 0.03,
+    "sell_step": 0.03,
+    "grid_step": 0.03,
+    "reference_price": null,
+    "lower_price": null,
+    "upper_price": null,
+    "buy_quantity": {
+      "mode": "equity_ratio",
+      "value": 0.1
+    },
+    "sell_quantity": {
+      "mode": "equity_ratio",
+      "value": 0.1
+    },
+    "fees": {
+      "commission_rate": 0.0003,
+      "min_commission": 5.0,
+      "slippage_bps": 5.0,
+      "share_face_value": 1.0,
+      "legacy_sh_transfer_rate": 0.001,
+      "legacy_sh_min_transfer": 1.0,
+      "legacy_sz_transfer_rate": 2.55e-05
+    },
+    "dca_frequency": "monthly"
+  },
+  "created_at": "2026-10-15T01:04:54.377163+00:00"
+}
