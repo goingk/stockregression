@@ -11,6 +11,7 @@ import Disclosure from '../Disclosure'
 import { useTasks } from '../TaskCenter'
 import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, Field, Loading, NumField, PageHeader, SelectInput, configError, configPayload, loadConfig, percent, revealConfigError, useErrorMessage } from '../components'
 import { formatPValue, reviewBootstrapEvidence } from '../researchEvidence'
+import { v4ValidationLoadInfo } from '../researchV4Validation'
 import type { BacktestConfig, BacktestResult, DataDiagnostics, DataPreparationRequest, DataSourceEvent, Job } from '../types'
 import { defaultSearchRanges, percentageRanges as pctRange, rangeNames, researchConfigForSubmission, researchRangesForSymbol, validResearchDefaults } from '../workbenchDefaults'
 import type { ResearchDefaults, SearchRange as Range } from '../workbenchDefaults'
@@ -453,7 +454,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     if (typeof sell_ratio === 'number') legacy.sell_quantity = { mode: 'equity_ratio', value: sell_ratio }
     void loadConfig(config).then(value => onLoadConfig(value.config)).catch(cause => setError(err(cause)))
   }
-  const loadV2 = (params: Dict | undefined, selectionAsOf: string | undefined) => {
+  const loadV2 = (params: Dict | undefined, selectionAsOf: string | undefined, dateRange?: { start_date: string; end_date: string }) => {
     if (!result || !params) { setError('当前研究结果没有可载入的参数。'); return }
     const originalBase = result.config?.base ?? searchConfigOf(selectedJob?.payload?.config)?.base
     if (!originalBase) { setError('这条研究任务未保存原始股票与区间配置，无法安全载入。请重新运行参数研究。'); return }
@@ -463,6 +464,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     const config: BacktestConfig = {
       ...originalBase,
       ...patch,
+      ...(dateRange ?? {}),
       grid_mode: Number(actualVersion) === 4 ? 'geometric' : patch.grid_mode ?? originalBase.grid_mode,
       initial_shares: finite(locked.initial_shares) ? locked.initial_shares : originalBase.initial_shares,
       selection_asof: selectionAsOf ?? originalBase.end_date ?? originalBase.start_date,
@@ -526,6 +528,8 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const fixed = result?.fixed
   const adaptive = result?.adaptive
   const current = fixed?.current
+  const regionValidation = v4ValidationLoadInfo(current?.diagnostics)
+  const regionDateRange = regionValidation.kind === 'fresh' ? regionValidation.dateRange : undefined
   const explicitlyUnqualified = current?.recommendation_status === 'no_qualified' || current?.status === 'no_qualified'
   const currentRecommended = Number(actualVersion) >= 3
     ? current?.recommended_params ?? (explicitlyUnqualified ? undefined : current?.params ?? undefined)
@@ -696,7 +700,10 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
           </Card>
           {Number(actualVersion) >= 3 && selectedJob?.result_id && <ResearchLandscape resultId={selectedJob.result_id} defaultParams={relativeBest} decisionOptions={landscapeDecisions} qualified={Boolean(currentRecommended)} regionOptions={(current?.recommendation_regions ?? []).map(region => ({ value: String(region.region_id ?? ''), label: '区域 ' + String(region.region_id ?? '') }))} />}
           {Number(actualVersion) === 4 && current && <Card title='最大正超额收益邻域' subtitle='邻域内全部合法离散组合必须在原成本下超额收益为正；双倍成本只作诊断。'>
-            {(current.recommendation_regions ?? []).length === 0 ? <p className='inline-warning'>本次冻结参数域没有发现完整正超额邻域，正式推荐为空。</p> : <div className='table-wrap'><table><thead><tr><th>排名</th><th>中心参数</th><th>体积</th><th>组合数</th><th>平均超额</th><th>最低超额</th><th>峰值超额</th><th>状态</th><th>压力诊断</th><th></th></tr></thead><tbody>{(current.recommendation_regions ?? []).map((region, index) => <tr key={region.region_id ?? index}><td>{region.region_id ?? index + 1}</td><td><ParameterBadges params={region.center_params ?? {}} compact /></td><td>{percent(n(region.normalized_volume), 4)}</td><td>{valueText('组合数', region.completed_count)} / {valueText('组合数', region.combination_count)}</td><td>{percent(n(region.mean_excess_return), 4)}</td><td>{percent(n(region.min_excess_return), 4)}</td><td>{percent(n(region.center_excess_return), 4)}</td><td>{region.complete && region.maximum_search_complete ? '完整验证' : '未完成'}{region.global_exhaustive ? ' · 全局穷尽' : ' · 冻结域'}</td><td>{String(region.stress?.status ?? '未计算')}{region.stress?.mean_excess_return != null ? ' · 均值 ' + percent(n(region.stress.mean_excess_return), 2) : ''}</td><td><Button variant='quiet' onClick={() => loadV2(region.center_params, current.as_of)}>载入</Button></td></tr>)}</tbody></table></div>}
+            {regionValidation.kind === 'fresh' && <p className='field-hint'>验证首日按初始配置重置账户，之后在验证窗口连续运行；收益按验证期间峰值投入本金计算。载入区域使用 {regionValidation.kind === 'fresh' ? regionValidation.dateRange.start_date : ''} 至 {regionValidation.kind === 'fresh' ? regionValidation.dateRange.end_date : ''}。平均超额是区域均值，中心超额对应中心参数。</p>}
+            {regionValidation.kind === 'legacy' && <p className='inline-warning'>该历史结果没有新验证口径标记；区域载入沿用原研究区间，不能据此复现新口径。</p>}
+            {regionValidation.kind === 'incomplete' && <p className='inline-warning'>该结果的验证口径或起止日期信息不完整；区域载入沿用原研究区间。</p>}
+            {(current.recommendation_regions ?? []).length === 0 ? <p className='inline-warning'>本次冻结参数域没有发现完整正超额邻域，正式推荐为空。</p> : <div className='table-wrap'><table><thead><tr><th>排名</th><th>中心参数</th><th>体积</th><th>组合数</th><th>平均超额</th><th>最低超额</th><th>中心超额</th><th>状态</th><th>压力诊断</th><th></th></tr></thead><tbody>{(current.recommendation_regions ?? []).map((region, index) => <tr key={region.region_id ?? index}><td>{region.region_id ?? index + 1}</td><td><ParameterBadges params={region.center_params ?? {}} compact /></td><td>{percent(n(region.normalized_volume), 4)}</td><td>{valueText('组合数', region.completed_count)} / {valueText('组合数', region.combination_count)}</td><td>{percent(n(region.mean_excess_return), 4)}</td><td>{percent(n(region.min_excess_return), 4)}</td><td>{percent(n(region.center_excess_return), 4)}</td><td>{region.complete && region.maximum_search_complete ? '完整验证' : '未完成'}{region.global_exhaustive ? ' · 全局穷尽' : ' · 冻结域'}</td><td>{String(region.stress?.status ?? '未计算')}{region.stress?.mean_excess_return != null ? ' · 均值 ' + percent(n(region.stress.mean_excess_return), 2) : ''}</td><td><Button variant='quiet' onClick={() => loadV2(region.center_params, current.as_of, regionDateRange)}>{regionDateRange ? '载入验证回测' : '载入'}</Button></td></tr>)}</tbody></table></div>}
           </Card>}
           {Number(actualVersion) === 3 && statisticalProfile && <Card title='统计画像与稳健性门槛' subtitle='统计量只形成少数中心；推荐资格由原参数空间的真实邻点、双成本和跨窗表现共同决定。'>
             <div className='research-summary-states'>
@@ -717,7 +724,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
             </Card>
             {(current || adaptiveRecommended) && <Card title='下一期参考参数' className='research-recommendations' subtitle='参数只使用当时或之前可用的数据；通过邻域稳健性检查才列为合格推荐，相对最佳仅作研究对照。'>
               {current && <section className='research-next-period'>
-                <div className='research-recommendation-head'><div><strong>{currentRecommended ? '当前合格推荐' : relativeBest ? '相对最佳参数 · 仅诊断' : '暂无合格推荐'}</strong><small>决策日期 {current.as_of ?? '—'} · {statusText(current.status)}</small></div><Button variant='secondary' onClick={() => loadV2(currentRecommended ?? relativeBest, current.as_of)} disabled={!(currentRecommended ?? relativeBest) || !originalBase}>{currentRecommended ? '载入当前参数' : '载入相对最佳'}</Button></div>
+                <div className='research-recommendation-head'><div><strong>{currentRecommended ? '当前合格推荐' : relativeBest ? '相对最佳参数 · 仅诊断' : '暂无合格推荐'}</strong><small>决策日期 {current.as_of ?? '—'} · {statusText(current.status)}</small></div><Button variant='secondary' onClick={() => loadV2(currentRecommended ?? relativeBest, current.as_of, Number(actualVersion) === 4 ? regionDateRange : undefined)} disabled={!(currentRecommended ?? relativeBest) || !originalBase}>{currentRecommended ? Number(actualVersion) === 4 && regionDateRange ? '载入验证回测' : '载入当前参数' : '载入相对最佳'}</Button></div>
                 {currentRecommended ? <ParameterBadges params={currentRecommended} /> : relativeBest ? <>
                   <ParameterBadges params={relativeBest} />
                   <div className='research-relative-best-note'><Badge tone='amber'>未通过资格验证</Badge><span>当前筛选下验证超额收益 {current.score == null ? '—' : percent(n(current.score))}</span></div>

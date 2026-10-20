@@ -8,7 +8,6 @@ from typing import Any, Callable, Iterable
 import numpy as np
 import pandas as pd
 
-from .. import optimization as legacy_optimization
 from ..models import BacktestConfig, DataBundle, OptimizationConfig
 from ..share_engine import research_batch
 from ..scientific import _buy_hold_returns, _compound_daily
@@ -27,17 +26,6 @@ def _chunks(values: list[tuple[int, ...]], size: int) -> Iterable[list[tuple[int
 def _finite(value: Any) -> float:
     number = float(value)
     return number if math.isfinite(number) else math.nan
-
-
-def aggregate_fold_profit(folds: list[dict[str, Any]]) -> tuple[float, float]:
-    """Return continuous interval profit and principal from chronological folds."""
-    if not folds:
-        return math.nan, math.nan
-    profit = sum(float(item.get("profit", 0.0) or 0.0) for item in folds)
-    principal = float(folds[0].get("principal", 0.0) or 0.0)
-    for previous, current in zip(folds, folds[1:]):
-        principal += float(current.get("principal", 0.0) or 0.0) - float(previous.get("end_assets", 0.0) or 0.0)
-    return profit, principal
 
 
 class BatchEvaluator:
@@ -68,14 +56,16 @@ class BatchEvaluator:
             "end_date": self.train_dates[-1].date(),
             "grid_mode": "geometric",
         })
-        self.train_data = legacy_optimization._slice_bundle(data, self.train_dates[0], self.train_dates[-1])
+        # The production engine bounds trading by config dates. Keep prior closes
+        # and corporate actions so initialization matches a standalone backtest.
+        self.train_data = data
         self._train_baseline = self._baseline(self.train_base, self.train_dates)
         self.validation_base = self.base.model_copy(update={
-            "start_date": self.train_dates[0].date(),
+            "start_date": self.validation_dates[0].date(),
             "end_date": self.validation_dates[-1].date(),
             "grid_mode": "geometric",
         })
-        self.validation_data = legacy_optimization._slice_bundle(data, self.train_dates[0], self.validation_dates[-1])
+        self.validation_data = data
         self._validation_baseline = self._baseline(self.validation_base, self.validation_dates)
         self._validation_folds = list(validation_folds) if validation_folds else self._fold_ranges()
 
@@ -110,9 +100,7 @@ class BatchEvaluator:
             result = research_batch(self.train_base, self.train_data, params, fold, cancelled=self.cancelled)
             for index, coordinate in enumerate(chunk):
                 evidence = result["fold_metrics"][index][0]
-                principal = float(evidence.get("principal", 0.0) or 0.0)
-                profit = float(evidence.get("profit", 0.0) or 0.0)
-                grid_return = profit / principal if principal > 0 else math.nan
+                grid_return = float(result["metrics"][index]["total_return"])
                 excess = grid_return - self._train_baseline if math.isfinite(grid_return) else math.nan
                 output.append({
                     "params": self.space.params(coordinate),
@@ -137,11 +125,13 @@ class BatchEvaluator:
         coordinate: tuple[int, ...],
         folds: list[dict[str, Any]],
         cost_key: str,
+        metrics: dict[str, Any],
         daily_dates: pd.DatetimeIndex | None = None,
         daily_values: np.ndarray | None = None,
     ) -> dict[str, Any]:
-        profit, principal = aggregate_fold_profit(folds)
-        grid_return = profit / principal if principal > 0 else math.nan
+        # Folds only diagnose risk; the whole validation interval is one fresh
+        # account, using the same peak-invested ROI as the production backtest.
+        grid_return = float(metrics["total_return"])
         excess = grid_return - self._validation_baseline if math.isfinite(grid_return) else math.nan
         drawdown = max((float(row.get("max_drawdown", 0.0) or 0.0) for row in folds), default=math.inf)
         trade_count = sum(int(row.get("trade_count", 0) or 0) for row in folds)
@@ -195,6 +185,7 @@ class BatchEvaluator:
                     coordinate,
                     result["fold_metrics"][index],
                     "original",
+                    result["metrics"][index],
                     dates[mask],
                     np.asarray(result["daily_returns"][mask, index], dtype=np.float64),
                 )
@@ -221,7 +212,9 @@ class BatchEvaluator:
                 cancelled=self.cancelled,
             )
             for index, coordinate in enumerate(chunk):
-                output[coordinate] = self._aggregate_validation(coordinate, result["fold_metrics"][index], "stress")
+                output[coordinate] = self._aggregate_validation(
+                    coordinate, result["fold_metrics"][index], "stress", result["metrics"][index],
+                )
         return output
 
 

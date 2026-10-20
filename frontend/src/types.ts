@@ -226,6 +226,7 @@ export interface Instrument {
 
 export interface WatchItem extends Instrument {
   coverage?: Record<string, unknown>
+  has_data?: boolean
 }
 
 export interface DataSourceSpan {

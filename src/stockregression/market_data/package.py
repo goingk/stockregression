@@ -21,6 +21,7 @@ from .reader import (
     check_declared_adjustment, check_declared_identity, check_declared_timeframe,
     file_fingerprint, normalize_frame, read_file,
 )
+from .package_layout import resolve_package_root
 from .repository import PARSER_VERSION
 from .service import MarketDataService, _params_hash
 from .timeframes import normalize_timeframe, timeframe_spec
@@ -124,7 +125,7 @@ def _detect_label(folder: Path, timeframe: str) -> tuple[str, str | None, str | 
 
 
 def scan_etf_package(folder: str | Path) -> dict:
-    root = Path(folder).expanduser().resolve()
+    root = resolve_package_root(folder)
     if not root.is_dir():
         raise MarketDataError("数据包目录不存在：" + str(root))
     assets = [
@@ -512,7 +513,7 @@ def index_etf_package_direct(
     cancelled=lambda: False,
 ) -> dict:
     """Idempotently index package files without deleting unrelated versions."""
-    root = Path(folder).expanduser().resolve()
+    root = resolve_package_root(folder)
     if not root.is_dir():
         raise MarketDataError("数据包目录不存在：" + str(root))
     wanted = {normalize_symbol(value) for value in symbols} if symbols else None

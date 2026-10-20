@@ -24,7 +24,7 @@ SQLite 中的 `catalog.sqlite` 保存可重建索引、任务、配置和结果�
 
 ## 数据包
 
-活动 ETF 数据包固定为应用数据目录下的 `data/dataset/etf/`；股票数据包预留为 `data/dataset/stock/`，两者使用相同的 Parquet 布局。`.local/settings.json` 的 `package_dir` 或环境变量 `STOCKREGRESSION_PACKAGE_DIR` 只能指向当前活动数据包；应用不会回退到旧 `package/`、`manifests/` 或 `parquet/` 快照。`data/` 下的其他子目录保存索引、任务、结果和日志，行情正文只放在 `data/dataset/<asset>/`。
+活动 ETF 数据包固定为应用数据目录下的 `data/dataset/etf/`；股票数据包预留为 `data/dataset/stock/`，两者使用相同的 Parquet 布局。`.local/settings.json` 的 `package_dir` 或环境变量 `STOCKREGRESSION_PACKAGE_DIR` 默认指向当前活动数据包，相对路径按项目根目录解析；应用不会回退到旧 `package/`、`manifests/` 或 `parquet/` 快照。`data/` 下的其他子目录保存索引、任务、结果和日志，行情正文只放在 `data/dataset/<asset>/`。
 
 ETF 数据包目录为 `data/dataset/etf/`，股票数据包目录为 `data/dataset/stock/`。两者分别使用以下布局：
 

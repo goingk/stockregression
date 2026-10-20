@@ -73,7 +73,7 @@ export default function DataCenterPage({ requestedReport, onReportHandled }: { r
       if (!dataDirDraftEdited.current) setDataDirDraft(config.data_dir ?? '')
       setCacheMbDraft(current => current ?? Number(config.market_cache_mb ?? 256))
       setPerformanceDraft(current => current ?? config.performance ?? { cpu_budget_mode: 'auto', cpu_budget: null, download_workers: 4, validation_workers: 4, blas_threads: 8, workspace_mb: 8192 })
-      setActiveSymbol((old) => old || items[0]?.symbol || '')
+      setActiveSymbol((old) => old || items.find(item => item.has_data !== false)?.symbol || items[0]?.symbol || '')
     } catch (e) { setError(err(e)) } finally { setLoading(false) }
   }, [err])
 

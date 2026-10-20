@@ -179,7 +179,7 @@ uv run --frozen stockregression data cleanup-legacy --apply
 
 旧 CLI 的代码、日线文件仍作为两个位置参数，兼容层把它们拆成独立的日线和 1 分钟任务；新的 `data` 命令要求明确周期。ETF 类型可明确指定 `stock/bond/crossborder/commodity/money`；股票无需填写。准确字段、时区与质量规则见[数据文件格式](docs/data-format.md)。没有日历文件时导入仍可完成，但质量状态会标记待核验，不能用普通工作日列表替代真实日历。
 
-默认应用目录为 `data/`，行情数据包按资产类型存放在其下的 `dataset/etf/` 和 `dataset/stock/`；当前活动 ETF 数据包为 `data/dataset/etf/`。索引、任务、结果和日志位于 `data/` 的其他子目录，行情 Parquet 正文只放在 `data/dataset/<asset>/`。应用目录可通过界面或 `uv run --frozen stockregression set-data-dir D:\market\stockregression-data` 修改。环境变量 `STOCKREGRESSION_DATA_DIR`、`STOCKREGRESSION_PACKAGE_DIR` 和 `STOCKREGRESSION_HOME` 分别覆盖应用目录、数据包和设置根目录。
+默认应用目录为 `data/`，行情数据包按资产类型存放在其下的 `dataset/etf/` 和 `dataset/stock/`；当前活动 ETF 数据包为 `data/dataset/etf/`。索引、任务、结果和日志位于 `data/` 的其他子目录，行情 Parquet 正文只放在 `data/dataset/<asset>/`。应用目录可通过界面或 `uv run --frozen stockregression set-data-dir D:\market\stockregression-data` 修改。环境变量 `STOCKREGRESSION_DATA_DIR`、`STOCKREGRESSION_PACKAGE_DIR` 和 `STOCKREGRESSION_HOME` 分别覆盖应用目录、数据包和设置根目录；相对路径都按项目根目录解析。
 
 | 路径（相对 `data/`） | 内容 |
 | --- | --- |

@@ -3,19 +3,20 @@ from itertools import product
 import json
 import math
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from stockregression.models import BacktestConfig, DataBundle, OptimizationConfig, ResearchRequestV4, ResearchStrategySpec
 from stockregression.jobs import _research_protocol_hash
 from stockregression.storage import Store
-from stockregression.research_v4.evaluator import aggregate_fold_profit
 from stockregression.research_v4.neighborhoods import (
     analyze_platforms,
     find_regions,
     maximum_positive_box,
 )
 from stockregression.research_v4.search import axis_sweep_coordinates, box_coordinates, build_validation_plan, refine_coordinates
+from stockregression.research_v4.selector import select_at
 from stockregression.research_v4.space import ParameterSpace, value_to_ticks
 
 
@@ -141,17 +142,6 @@ def test_v4_source_grid_and_search_values_do_not_define_research_space():
         "research_context": None,
     })
     assert _research_protocol_hash(first) == _research_protocol_hash(shifted)
-
-
-def test_v4_fold_ledger_aggregation_is_exact():
-    folds = [
-        {"profit": 20.0, "principal": 10_000.0, "end_assets": 10_020.0},
-        {"profit": 30.0, "principal": 10_020.0, "end_assets": 10_050.0},
-        {"profit": -5.0, "principal": 9_950.0, "end_assets": 9_945.0},
-    ]
-    profit, principal = aggregate_fold_profit(folds)
-    assert profit == 45.0
-    assert principal == 9_900.0
 
 
 def _space():
@@ -386,3 +376,38 @@ def test_v4_all_dimensions_fixed_is_a_single_diagnostic_point():
     assert space.active == ()
     assert space.size() == 1
     assert len(list(space.iterate())) == 1
+
+
+def test_v4_selection_exports_reproducible_validation_context():
+    from stockregression.share_engine import run_share_backtest
+
+    request = config()
+    dates = pd.bdate_range("2024-01-01", periods=169)
+    prices = 10 + np.sin(np.arange(len(dates)) / 2) * .8
+    daily = pd.DataFrame({
+        "date": dates, "open": prices, "close": prices,
+        "high": prices, "low": prices, "volume": 100000,
+        "preclose": np.r_[prices[0], prices[:-1]], "tradestatus": 1,
+    })
+    bars = daily.iloc[1:].copy()
+    bars["timestamp"] = bars.date + pd.Timedelta(hours=15)
+    bars["frequency"], bars["tradable"] = "1d", True
+    bundle = DataBundle(symbol=request.base.symbol, daily=daily,
+        bars=bars, calendar=dates[1:], quality={"minute_ratio": 1.0})
+    selected = select_at(request, request.base, bundle, dates[-1])
+    diagnostics = selected["diagnostics"]
+    assert diagnostics["validation_account_mode"] == "fresh_initial_config"
+    assert diagnostics["validation_return_basis"] == "peak_invested_roi"
+    assert diagnostics["validation_start"] == str(dates[85].date())
+    assert diagnostics["validation_end"] == str(dates[-1].date())
+    assert len(diagnostics["validation_folds"]) == 4
+    assert len(selected["candidate_archive"]) == ParameterSpace(request).size()
+    for candidate in selected["candidate_archive"]:
+        replay = request.base.model_copy(update={
+            **candidate["params"], "start_date": dates[85].date(),
+            "end_date": dates[-1].date(),
+        })
+        result = run_share_backtest(replay, bundle)
+        grid_return = result["strategies"]["grid"]["metrics"]["total_return"]
+        hold_return = result["strategies"]["buy_hold"]["metrics"]["total_return"]
+        assert candidate["validation_excess_original"] == pytest.approx(grid_return - hold_return)

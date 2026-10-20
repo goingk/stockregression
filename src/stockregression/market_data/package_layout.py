@@ -18,6 +18,49 @@ PACKAGE_SCHEMA_VERSION = 1
 ETF_PREFIXES = {"15", "16", "50", "51", "52", "56", "58"}
 MINUTE_TIMEFRAMES = {"1min", "5min", "15min", "30min", "60min"}
 _MANIFEST_THREAD_LOCK = threading.RLock()
+_ASSETS = ("etf", "stock")
+
+
+def is_package_root(path: str | Path) -> bool:
+    """Return whether a directory contains a market-data package."""
+    root = Path(path)
+    if not root.is_dir():
+        return False
+    if (root / ".stockregression" / "manifest.json").is_file():
+        return True
+    for asset in _ASSETS:
+        if (root / f"{asset}_basic_data.parquet").is_file():
+            return True
+        if (root / f"{asset}_daily.parquet").is_file():
+            return True
+        for timeframe in MINUTE_TIMEFRAMES:
+            folder = root / f"{asset}_{timeframe}"
+            if folder.is_dir() and next(iter(folder.glob("*.parquet")), None) is not None:
+                return True
+    return False
+
+
+def resolve_package_root(value: str | Path) -> Path:
+    """Resolve a dataset root such as ``data/dataset/etf``.
+
+    ``data/dataset`` may group packages by asset.  A directory that already
+    contains market files is used as-is; otherwise its immediate package
+    children are considered.  Several package children require an explicit
+    package path so one asset never silently hides another.
+    """
+    root = Path(value).expanduser().resolve()
+    if is_package_root(root) or not root.is_dir():
+        return root
+    candidates = [
+        child for child in sorted(root.iterdir())
+        if child.is_dir() and is_package_root(child)
+    ]
+    if not candidates:
+        return root
+    if len(candidates) > 1:
+        names = "、".join(str(child) for child in candidates)
+        raise ValueError("数据包索引目录包含多个数据包，请指向具体包目录：" + names)
+    return candidates[0]
 
 
 def utc_now() -> str:
@@ -71,6 +114,8 @@ class PackageLayout:
         self.transactions_dir = self.control / "transactions"
         self.locks_dir = self.control / "locks"
         self.manifest_path = self.control / "manifest.json"
+        self._manifest_cache: dict[str, Any] | None = None
+        self._manifest_cache_key: tuple[int, int] | None = None
         for path in (
             self.root,
             self.control,
@@ -111,6 +156,23 @@ class PackageLayout:
                     _MANIFEST_THREAD_LOCK.release()
         return Guard()
 
+    def _manifest_stat_key(self) -> tuple[int, int] | None:
+        try:
+            stat = self.manifest_path.stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    def _cached_manifest(self) -> dict[str, Any] | None:
+        if self._manifest_cache is not None and self._manifest_cache_key == self._manifest_stat_key():
+            return self._manifest_cache
+        return None
+
+    def _remember_manifest(self, value: dict[str, Any]) -> dict[str, Any]:
+        self._manifest_cache = value
+        self._manifest_cache_key = self._manifest_stat_key()
+        return value
+
     def _fresh_manifest(self, value: dict[str, Any] | None = None) -> dict[str, Any]:
         current = dict(value or {})
         now = utc_now()
@@ -131,12 +193,15 @@ class PackageLayout:
 
     def manifest(self) -> dict[str, Any]:
         with self._manifest_guard():
+            cached = self._cached_manifest()
+            if cached is not None:
+                return cached
             raw = self._load_manifest()
             value = self._fresh_manifest(raw)
             if value != raw:
                 value["updated_at"] = utc_now()
                 _atomic_json(self.manifest_path, value)
-            return value
+            return self._remember_manifest(value)
 
     def publish(self, manifest: dict[str, Any]) -> dict[str, Any]:
         with self._manifest_guard():
@@ -144,7 +209,7 @@ class PackageLayout:
             value["schema_version"] = PACKAGE_SCHEMA_VERSION
             value["updated_at"] = utc_now()
             _atomic_json(self.manifest_path, value)
-            return value
+            return self._remember_manifest(value)
 
     def record_file(
         self,
@@ -176,7 +241,7 @@ class PackageLayout:
             manifest["schema_version"] = PACKAGE_SCHEMA_VERSION
             manifest["updated_at"] = utc_now()
             _atomic_json(self.manifest_path, manifest)
-            return manifest
+            return self._remember_manifest(manifest)
 
     def record_auxiliary(self, relative_path: str, *, version: str, verified: bool) -> dict[str, Any]:
         relative_path = str(relative_path).replace("\\", "/")
@@ -194,7 +259,7 @@ class PackageLayout:
             manifest["schema_version"] = PACKAGE_SCHEMA_VERSION
             manifest["updated_at"] = utc_now()
             _atomic_json(self.manifest_path, manifest)
-            return manifest
+            return self._remember_manifest(manifest)
 
     def write_quality(self, symbol: str, timeframe: str, payload: dict[str, Any]) -> None:
         digest = hashlib.sha256(
@@ -239,6 +304,7 @@ class PackageLayout:
             manifest["schema_version"] = PACKAGE_SCHEMA_VERSION
             manifest["updated_at"] = utc_now()
             _atomic_json(self.manifest_path, manifest)
+            self._remember_manifest(manifest)
 
     def file_metadata(self, relative_path: str) -> dict[str, Any]:
         return dict(self.manifest()["files"].get(str(relative_path).replace("\\", "/")) or {})

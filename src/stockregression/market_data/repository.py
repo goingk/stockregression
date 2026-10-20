@@ -21,7 +21,10 @@ from filelock import FileLock
 
 from .cache import cached
 from .models import DataVersionNotFound, MarketDataError
-from .package_layout import PackageLayout, asset_type_for_symbol, auxiliary_relative_path, package_file_relative_path
+from .package_layout import (
+    PackageLayout, asset_type_for_symbol, auxiliary_relative_path,
+    package_file_relative_path, resolve_package_root,
+)
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe
 from ..price_validation import details_to_rows, price_issue_details, split_invalid_prices
 
@@ -112,7 +115,7 @@ class MarketDataRepository:
             self._initialize(db)
         previous_package = self.meta("package_dir") or self.meta("source_package_dir")
         selected_package = package_dir or previous_package
-        self.package = PackageLayout(selected_package or self.root / "package")
+        self.package = PackageLayout(resolve_package_root(selected_package or self.root / "package"))
         self.package_dir = self.package.root
         self.market_dir = self.package_dir
         self.staging_dir = self.package.staging_dir
@@ -136,7 +139,7 @@ class MarketDataRepository:
 
     def attach_package(self, package_dir: str | Path) -> None:
         previous = self.package_dir
-        self.package = PackageLayout(package_dir)
+        self.package = PackageLayout(resolve_package_root(package_dir))
         self.package_dir = self.package.root
         self.market_dir = self.package_dir
         self.staging_dir = self.package.staging_dir
@@ -944,12 +947,15 @@ class MarketDataRepository:
                 """SELECT symbol,timeframe,adjustment,version,path,size FROM parquet_increments
                    ORDER BY version"""
             ).fetchall()
-            validation_counts = db.execute(
-                """SELECT symbol,timeframe,adjustment,COUNT(*) AS validated_days
-                   FROM parquet_day_validation
-                   GROUP BY symbol,timeframe,adjustment"""
-            ).fetchall()
             instrument_rows = db.execute("SELECT * FROM instruments").fetchall()
+            validation_rows = db.execute(
+                """SELECT symbol,timeframe,adjustment,trade_date,status,rules_version
+                   FROM parquet_day_validation ORDER BY trade_date"""
+            ).fetchall()
+            calendar_rows = db.execute(
+                """SELECT symbol,payload,updated_at FROM parquet_auxiliary_history
+                   WHERE kind='calendar' ORDER BY updated_at"""
+            ).fetchall()
         instruments = {row["symbol"]: dict(row) for row in instrument_rows}
         coverage_map: dict[tuple[str, str, str], list[dict]] = {}
         for row in coverage_rows:
@@ -966,14 +972,21 @@ class MarketDataRepository:
             increment_map.setdefault(
                 (row["symbol"], row["timeframe"], row["adjustment"]), []
             ).append(dict(row))
-        validation_count_map = {
-            (row["symbol"], row["timeframe"], row["adjustment"]): int(row["validated_days"])
-            for row in validation_counts
-        }
+        validation_map: dict[tuple[str, str, str], list[dict]] = {}
+        for row in validation_rows:
+            validation_map.setdefault(
+                (row["symbol"], row["timeframe"], row["adjustment"]), []
+            ).append(dict(row))
+        calendar_by_symbol = {}
+        for row in calendar_rows:
+            payload = _load(row["payload"], [])
+            calendar_by_symbol[row["symbol"]] = (self._calendar_dates(payload), bool(payload))
+        calendar_by_market = self._calendar_dates_by_market()
         manifest_files = self.package.manifest().get("files", {})
         selected_rows = [dict(row) for row in rows if not timeframe or row["timeframe"] == timeframe]
         symbols_all = sorted({row["symbol"] for row in selected_rows})
         dataset_summaries = []
+        trading_dates_by_symbol: dict[str, pd.DatetimeIndex] = {}
         for row in selected_rows:
             key = (row["symbol"], row["timeframe"], row["adjustment"])
             coverage_rows_for_key = coverage_map.get(key, [])
@@ -1011,23 +1024,26 @@ class MarketDataRepository:
                 if int(item.get("size") or 0) and path.stat().st_size != int(item["size"]):
                     file_status = "changed"
             stored = str(row.get("status") or "pending_validation")
-            if validation_count_map.get(key, 0):
-                compliance = self.validation_state(
-                    row["symbol"], row["timeframe"], adjustment=row["adjustment"]
-                )
+            stored_calendar = calendar_by_symbol.get(row["symbol"])
+            if stored_calendar is not None:
+                calendar_dates, calendar_available = stored_calendar
             else:
-                # Avoid re-reading the shared calendar and package manifest for
-                # every unvalidated dataset.  Inventory only needs the summary;
-                # the full per-day audit is loaded when a dataset is queried.
-                compliance = {
-                    "symbol": row["symbol"], "timeframe": row["timeframe"],
-                    "rules_version": VALIDATION_RULES_VERSION,
-                    "verified_from": None, "verified_through": None,
-                    "validated_days": 0, "failed": [], "pending": [],
-                    "calendar_available": self.package.absolute(
-                        auxiliary_relative_path(row["symbol"], "calendar")
-                    ).is_file(),
-                }
+                calendar_dates = calendar_by_market.get(row["symbol"][-2:], pd.DatetimeIndex([]))
+                calendar_available = bool(len(calendar_dates))
+            records = validation_map.get(key, [])
+            expected_dates = None
+            if records:
+                if row["symbol"] not in trading_dates_by_symbol:
+                    same_symbol = [item for item in selected_rows if item["symbol"] == row["symbol"]]
+                    trading_dates_by_symbol[row["symbol"]] = self.trading_days(
+                        row["symbol"], min(item["first_time"] for item in same_symbol),
+                        max(item["last_time"] for item in same_symbol),
+                    )
+                expected_dates = trading_dates_by_symbol[row["symbol"]]
+            compliance = self._validation_from_parts(
+                row, records, calendar_dates, calendar_available=calendar_available,
+                expected_dates=expected_dates,
+            )
             quality_status = (
                 "failed" if compliance.get("failed") else
                 "passed" if compliance.get("verified_through") and pd.Timestamp(
@@ -3172,42 +3188,44 @@ class MarketDataRepository:
         values = values.normalize().unique().sort_values()
         return values[(values >= first) & (values <= last)]
 
-    def validation_state(
-        self, symbol: str, timeframe: str, *, adjustment: str = "none",
-        start=None, end=None,
+    @staticmethod
+    def _calendar_dates(payload) -> pd.DatetimeIndex:
+        if not payload:
+            return pd.DatetimeIndex([])
+        return pd.DatetimeIndex(pd.to_datetime(
+            [row.get("date") for row in payload], errors="coerce"
+        ).dropna()).normalize().unique().sort_values()
+
+    def _calendar_dates_by_market(self) -> dict[str, pd.DatetimeIndex]:
+        output = {}
+        for suffix in ("SH", "SZ"):
+            path = self.package.absolute(auxiliary_relative_path(f"000001.{suffix}", "calendar"))
+            if not path.is_file():
+                continue
+            try:
+                output[suffix] = self._calendar_dates(pd.read_parquet(path).to_dict("records"))
+            except (OSError, ValueError):
+                continue
+        return output
+
+    def _validation_from_parts(
+        self, dataset: dict, records: list[dict], calendar_dates: pd.DatetimeIndex,
+        *, calendar_available: bool | None = None, start=None, end=None,
+        expected_dates: pd.DatetimeIndex | None = None,
     ) -> dict:
-        with self._connect() as db:
-            dataset_row = self._dataset_row(db, symbol, timeframe, adjustment)
-        dataset = dict(dataset_row) if dataset_row else None
-        if not dataset:
-            return {
-                "symbol": symbol, "timeframe": timeframe, "rules_version": VALIDATION_RULES_VERSION,
-                "verified_from": None, "verified_through": None, "validated_days": 0,
-                "failed": [], "pending": [], "calendar_available": False,
-            }
+        symbol, timeframe = dataset["symbol"], dataset["timeframe"]
         first = pd.Timestamp(start or dataset["first_time"]).normalize()
         last = pd.Timestamp(end or dataset["last_time"]).normalize()
-        records = self.day_validations(
-            symbol, timeframe, adjustment=adjustment, start=first, end=last
-        )
         by_day = {pd.Timestamp(row["trade_date"]).normalize(): row for row in records}
-        calendar = self.auxiliary(symbol, "calendar")
-        calendar_available = bool(calendar and calendar.get("payload"))
-        calendar_dates = pd.DatetimeIndex(pd.to_datetime(
-            [row.get("date") for row in (calendar or {}).get("payload", [])],
-            errors="coerce",
-        ).dropna()).normalize().unique().sort_values()
-        # An entirely unvalidated dataset cannot qualify anyway. Inventory
-        # listings must not read every imported daily source just to say that
-        # its ledger is empty.
+        if calendar_available is None:
+            calendar_available = bool(len(calendar_dates))
+        expected = pd.DatetimeIndex([])
+        if expected_dates is not None:
+            expected = expected_dates[(expected_dates >= first) & (expected_dates <= last)]
+        elif calendar_available:
+            expected = calendar_dates[(calendar_dates >= first) & (calendar_dates <= last)]
         if records:
-            expected = self.trading_days(symbol, first, last)
-        else:
-            expected = calendar_dates
-            expected = expected[(expected >= first) & (expected <= last)]
-        if records:
-            # Keep historical failures visible even if an auxiliary calendar
-            # contains only the latest increment.
+            # Keep historical failures visible even with an incremental calendar.
             observed = pd.DatetimeIndex(sorted(by_day)).normalize().sort_values()
             expected = expected.append(observed).unique().sort_values()
         if timeframe in {"1week", "1month"} and records:
@@ -3260,6 +3278,32 @@ class MarketDataRepository:
             "calendar_start": calendar_dates[0].date().isoformat() if len(calendar_dates) else None,
             "calendar_end": calendar_dates[-1].date().isoformat() if len(calendar_dates) else None,
         }
+
+    def validation_state(
+        self, symbol: str, timeframe: str, *, adjustment: str = "none",
+        start=None, end=None,
+    ) -> dict:
+        with self._connect() as db:
+            dataset_row = self._dataset_row(db, symbol, timeframe, adjustment)
+        dataset = dict(dataset_row) if dataset_row else None
+        if not dataset:
+            return {
+                "symbol": symbol, "timeframe": timeframe, "rules_version": VALIDATION_RULES_VERSION,
+                "verified_from": None, "verified_through": None, "validated_days": 0,
+                "failed": [], "pending": [], "calendar_available": False,
+            }
+        first = pd.Timestamp(start or dataset["first_time"]).normalize()
+        last = pd.Timestamp(end or dataset["last_time"]).normalize()
+        records = self.day_validations(
+            symbol, timeframe, adjustment=adjustment, start=first, end=last
+        )
+        calendar = self.auxiliary(symbol, "calendar")
+        payload = calendar.get("payload") if calendar else None
+        return self._validation_from_parts(
+            dataset, records, self._calendar_dates(payload),
+            calendar_available=bool(payload), start=start, end=end,
+            expected_dates=self.trading_days(symbol, first, last) if records else None,
+        )
 
     def archive_status(
         self, symbol: str, timeframe: str, adjustment: str = "none",

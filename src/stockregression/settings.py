@@ -18,6 +18,23 @@ DEFAULT_STOCK_PACKAGE_DIR = DEFAULT_DATASET_DIR / "stock"
 DEFAULT_PACKAGE_DIR = DEFAULT_ETF_PACKAGE_DIR
 
 
+def resolve_project_path(value: str | Path) -> Path:
+    """Resolve configured paths relative to the project root."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def portable_project_path(value: str | Path) -> str:
+    """Keep project paths relative so the checkout can be moved."""
+    resolved = resolve_project_path(value)
+    try:
+        return resolved.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
 class ScheduleSettings(BaseModel):
     enabled: bool = False
     daily_time: str = "18:30"
@@ -267,9 +284,9 @@ def load_settings() -> Settings:
     if os.environ.get("STOCKREGRESSION_PACKAGE_DIR"):
         values["package_dir"] = os.environ["STOCKREGRESSION_PACKAGE_DIR"]
     settings = Settings.model_validate(values)
-    settings.data_dir = str(Path(settings.data_dir).expanduser().resolve())
+    settings.data_dir = str(resolve_project_path(settings.data_dir))
     if settings.package_dir:
-        settings.package_dir = str(Path(settings.package_dir).expanduser().resolve())
+        settings.package_dir = str(resolve_project_path(settings.package_dir))
     return settings
 
 
@@ -299,10 +316,14 @@ def save_settings(values: dict) -> Settings:
                     merged_defaults[group] = patch
             values["workbench_defaults"] = merged_defaults
         settings = Settings.model_validate({**previous, **values})
-        settings.data_dir = str(Path(settings.data_dir).expanduser().resolve())
+        settings.data_dir = str(resolve_project_path(settings.data_dir))
         if settings.package_dir:
-            settings.package_dir = str(Path(settings.package_dir).expanduser().resolve())
+            settings.package_dir = str(resolve_project_path(settings.package_dir))
+        stored = settings.model_copy(update={
+            "data_dir": portable_project_path(settings.data_dir),
+            "package_dir": portable_project_path(settings.package_dir) if settings.package_dir else None,
+        })
         temporary = SETTINGS_FILE.with_suffix(".writing")
-        temporary.write_text(settings.model_dump_json(indent=2), encoding="utf-8")
+        temporary.write_text(stored.model_dump_json(indent=2), encoding="utf-8")
         temporary.replace(SETTINGS_FILE)
     return settings

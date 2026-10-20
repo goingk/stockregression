@@ -323,6 +323,8 @@ def select_at(
         "training_end": generation[-1].date().isoformat(),
         "validation_start": validation_dates[0].date().isoformat(),
         "validation_end": validation_dates[-1].date().isoformat(),
+        "validation_account_mode": "fresh_initial_config",
+        "validation_return_basis": "peak_invested_roi",
         "validation_folds": [
             {"start": start.date().isoformat(), "end": end.date().isoformat(), "days": int(((validation_dates >= start) & (validation_dates <= end)).sum())}
             for start, end in folds

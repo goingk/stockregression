@@ -6,7 +6,9 @@ import pandas as pd
 import pytest
 
 from stockregression import engine
-from stockregression.models import BacktestConfig, DataBundle
+from stockregression.models import BacktestConfig, DataBundle, OptimizationConfig
+from stockregression.research_v4.evaluator import BatchEvaluator
+from stockregression.research_v4.space import ParameterSpace
 from stockregression.providers import normalize_actions
 from stockregression.rules import instrument_terms
 from stockregression.share_engine import (
@@ -167,3 +169,80 @@ def test_batch_python_reference_matches_compiled(monkeypatch):
     assert fast["metrics"] == slow["metrics"]
     assert fast["fold_metrics"] == slow["fold_metrics"]
     np.testing.assert_array_equal(fast["daily_returns"], slow["daily_returns"])
+
+
+@pytest.mark.parametrize("intraday", [False, True])
+@pytest.mark.parametrize("corporate_actions", [False, True])
+def test_v4_fresh_validation_matches_standalone_backtest(intraday, corporate_actions):
+    config, bundle = market(intraday=intraday)
+    config = config.model_copy(update={
+        "schema_version": 3, "grid_mode": "geometric", "reserve_cash": None,
+        "fees": config.fees.model_copy(update={
+            "commission_rate": .0003, "min_commission": 5., "slippage_bps": 5.,
+        }),
+    })
+    if corporate_actions:
+        bundle.actions = normalize_actions(pd.DataFrame([
+            {"record_date": str(bundle.calendar[2].date()),
+             "ex_date": str(bundle.calendar[4].date()),
+             "pay_date": str(bundle.calendar[5].date()),
+             "stock_date": str(bundle.calendar[5].date()),
+             "cash_per_share": .2, "bonus_ratio": .1, "implemented": True},
+            {"record_date": str(bundle.calendar[5].date()),
+             "ex_date": str(bundle.calendar[6].date()),
+             "pay_date": str(bundle.calendar[7].date()),
+             "stock_date": str(bundle.calendar[7].date()),
+             "cash_per_share": .1, "bonus_ratio": .1, "implemented": True},
+        ]))
+    request = OptimizationConfig(
+        base=config, protocol_version=4,
+        ranges={
+            "grid_step": {"low": .03, "high": .031},
+            "sell_shares": {"low": 100, "high": 200},
+            "buy_shares": {"low": 200, "high": 200},
+            "min_shares": {"low": 0, "high": 0},
+            "max_shares": {"low": 2000, "high": 2000},
+        },
+    )
+    space = ParameterSpace(request)
+    train, validation = bundle.calendar[:4], bundle.calendar[4:]
+    evaluator = BatchEvaluator(request, request.base, bundle, space, train, validation)
+    coordinates = list(space.iterate())
+    rows = evaluator.evaluate_validation(coordinates)
+    stressed = evaluator.evaluate_stress(coordinates)
+    trained = evaluator.evaluate_training(coordinates)
+    assert evaluator.validation_base.start_date == validation[0].date()
+    assert len(evaluator.validation_folds) == 4
+    for index, (coordinate, row) in enumerate(zip(coordinates, rows)):
+        candidate = evaluator.validation_base.model_copy(update=space.params(coordinate))
+        backtest = run_share_backtest(candidate, bundle)
+        grid = backtest["strategies"]["grid"]
+        baseline = backtest["strategies"]["buy_hold"]["metrics"]["total_return"]
+        assert row["grid_return"] == grid["metrics"]["total_return"]
+        assert row["baseline_return"] == pytest.approx(baseline, abs=1e-14)
+        assert row["validation_excess_original"] == pytest.approx(
+            grid["metrics"]["total_return"] - baseline, abs=1e-14,
+        )
+        assert row["trade_count"] == grid["metrics"]["trade_count"]
+        np.testing.assert_array_equal(row["_current_validation_returns"],
+            [item["return"] for item in grid["period_returns"]])
+        assert list(row["_current_validation_dates"]) == list(validation)
+        # Every diagnostic fold measures this one ledger; no fold reopens it.
+        assert sum(fold["profit"] for fold in row["folds"]) == pytest.approx(
+            grid["metrics"]["total_profit"], abs=1e-9,
+        )
+        stress_fees = candidate.fees.model_copy(update={
+            name: getattr(candidate.fees, name) * 2
+            for name in ("commission_rate", "min_commission", "slippage_bps")
+        })
+        stress_run = run_share_backtest(candidate.model_copy(update={"fees": stress_fees}), bundle)
+        assert stressed[coordinate]["validation_return_stress"] == stress_run["strategies"]["grid"]["metrics"]["total_return"]
+        training_run = run_share_backtest(evaluator.train_base.model_copy(update=space.params(coordinate)), bundle)
+        assert trained[index]["training_return"] == training_run["strategies"]["grid"]["metrics"]["total_return"]
+    if not intraday and not corporate_actions:
+        # A replay starting in training must not silently become validation's
+        # starting account again. This fixture deliberately changes holdings.
+        old_run = research_batch(request.base, bundle, [space.params(coordinates[0])],
+            [(str(validation[0].date()), str(validation[-1].date()))], parallel=False)
+        fold = old_run["fold_metrics"][0][0]
+        assert fold["profit"] / fold["principal"] != pytest.approx(rows[0]["grid_return"])
