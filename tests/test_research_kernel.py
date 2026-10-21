@@ -1,22 +1,41 @@
-"""Scientific evaluation must share the production ledger, including boundaries."""
-from datetime import date
+"""Scientific evaluation must share the production ledger, including boundaries.
+
+The v5 protocol scores every candidate on one peak-principal ledger:
+``peak_principal_return``, ``max_principal_drawdown`` and the
+``matched_funding_hold`` baseline.  The checks below keep the shared-kernel
+guarantees that survive that contract change: research and production run on
+the same ledger, corporate actions land on that ledger, the account stays
+continuous across parameter changes, the interpreted kernel matches the
+compiled one, and risk is measured on every bar instead of the session close.
+"""
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from stockregression import engine
-from stockregression.models import BacktestConfig, DataBundle, FloorPenaltyConfig, OptimizationConfig
-from stockregression.research_v4.evaluator import BatchEvaluator
-from stockregression.research_v4.space import ParameterSpace
+from stockregression.models import BacktestConfig, DataBundle, FloorPenaltyConfig
 from stockregression.providers import normalize_actions
 from stockregression.rules import instrument_terms
 from stockregression.share_engine import (
-    funding, research_batch, research_passive, run_passive_backtest, run_share_backtest,
+    research_batch, run_passive_backtest, run_share_backtest,
+)
+
+# Research and production must agree on these ledger fields exactly.  The
+# production backtest also reports ``peak_invested``; the batch path keeps the
+# same number in its funding statistics instead of in the metric row.
+LEDGER_FIELDS = (
+    "peak_principal_return", "max_principal_drawdown",
+    "matched_funding_hold_return", "matched_funding_hold_drawdown",
+    "initial_equity", "total_invested", "external_topups", "total_profit",
+    "matched_funding_hold_invested", "trade_count", "buy_count", "sell_count",
+    "total_fees", "turnover", "return_basis", "risk_basis",
 )
 
 
 def market(intraday=False):
+    """A v5 share account: schema_version=3, geometric grid, no cash budget."""
     dates = pd.bdate_range("2024-01-02", periods=9)
     prices = np.array([10., 10., 9., 8.5, 10.5, 9.2, 11., 9.5, 10.])
     if intraday:
@@ -36,9 +55,9 @@ def market(intraday=False):
                     "open": price, "high": price, "low": price, "close": price,
                     "volume": 10000, "frequency": "1m", "tradable": True, "is_synthetic": False})
         bars = pd.DataFrame(records)
-    config = BacktestConfig(schema_version=2, symbol="159611.SZ", start_date=dates[1].date(),
+    config = BacktestConfig(schema_version=3, symbol="159611.SZ", start_date=dates[1].date(),
         end_date=dates[-1].date(), frequency="1m" if intraday else "1d", initial_shares=1000,
-        max_shares=2000, reserve_cash=10000,
+        min_shares=0, max_shares=None, grid_mode="geometric",
         fees={"commission_rate": 0, "min_commission": 0, "slippage_bps": 0})
     bundle = DataBundle(symbol=config.symbol, bars=bars, daily=daily, calendar=dates[1:],
         actions=normalize_actions(pd.DataFrame()), version="research-fixture",
@@ -51,30 +70,75 @@ def folds(bundle):
             (str(bundle.calendar[4].date()), str(bundle.calendar[-1].date()))]
 
 
-def test_research_batch_matches_full_ledger_and_fixed_cash():
+def session_close_indices(bundle):
+    """Bar index of the last bar of every session, in session order."""
+    stamps = pd.DatetimeIndex(bundle.bars["timestamp"])
+    closes: dict[pd.Timestamp, int] = {}
+    for index, stamp in enumerate(stamps):
+        closes[stamp.normalize()] = index
+    return list(closes.values())
+
+
+def legacy_config(config):
+    """The v2 contract kept a fixed cash budget; v3 funds buys on demand."""
+    values = config.model_dump(mode="python")
+    values.update(schema_version=2, reserve_cash=10000)
+    return BacktestConfig.model_validate(values)
+
+
+def test_research_batch_matches_full_ledger_and_peak_principal():
     config, bundle = market()
-    params = [{"buy_step": .03, "max_shares": 2000}, {"buy_step": .06, "max_shares": 4000}]
+    params = [{"buy_step": .03}, {"buy_step": .06}]
     batched = research_batch(config, bundle, params, folds(bundle))
     serial = research_batch(config, bundle, params, folds(bundle), parallel=False)
-    np.testing.assert_array_equal(batched["daily_returns"], serial["daily_returns"])
+    assert "daily_returns" not in batched
     assert batched["metrics"] == serial["metrics"]
     assert batched["fold_metrics"] == serial["fold_metrics"]
     for index, patch in enumerate(params):
         run = run_share_backtest(config.model_copy(update=patch), bundle)
-        assert run["funding"]["reserve_cash"] == 10000
-        assert run["funding"]["initial_equity"] == 20000
-        assert run["strategies"]["grid"]["metrics"] == batched["metrics"][index]
-        np.testing.assert_array_equal(batched["daily_returns"][:, index],
-            [p["return"] for p in run["strategies"]["grid"]["period_returns"]])
+        funding = run["funding"]
+        grid = run["strategies"]["grid"]
+        # v3 owns no cash budget: the account is funded from successful buys.
+        assert funding["funding_mode"] == "top_up_on_fill"
+        assert funding["reserve_cash"] == 0
+        assert funding["initial_equity"] == funding["initial_principal"]
+        assert grid["metrics"]["total_invested"] == (
+            funding["initial_principal"] + funding["topups"])
+        # Research and production must report one and the same ledger.
+        for field in LEDGER_FIELDS:
+            assert batched["metrics"][index][field] == grid["metrics"][field]
+        # ... including the peak-principal curve and the per-bar risk.
+        assert batched["metrics"][index]["peak_principal_return"] == pytest.approx(
+            grid["equity"][-1]["principal_curve"] - 1)
+        assert batched["metrics"][index]["max_principal_drawdown"] == pytest.approx(
+            max(point["principal_drawdown"] for point in grid["equity"]))
 
 
 def test_research_fold_drawdown_includes_intraday_path():
     config, bundle = market(intraday=True)
-    config = config.model_copy(update={"min_shares": 1000, "max_shares": 1000, "reserve_cash": 0})
+    config = config.model_copy(update={"min_shares": 1000, "max_shares": 1000})
     result = research_batch(config, bundle, [{}], folds(bundle))
-    np.testing.assert_array_equal(result["daily_returns"], 0.)
-    np.testing.assert_allclose(result["fold_drawdowns"], 1 / 3)
+    # The intraday path runs 10 -> 12 -> 8 -> 10 on a 1000-share account, so
+    # the profit peaks at +2000 and troughs at -2000 while the peak principal
+    # stays at the 10000 seed: a 4000 profit drawdown on 10000 of principal.
+    np.testing.assert_allclose(result["fold_drawdowns"], .4)
     assert result["fold_metrics"][0][0]["trade_count"] == 0
+
+
+def test_single_fold_measures_the_same_ledger_as_the_account():
+    """A fold is a window on one continuous account, never a second account."""
+    config, bundle = market()
+    window = [(str(bundle.calendar[0].date()), str(bundle.calendar[-1].date()))]
+    result = research_batch(config, bundle, [{}], window)
+    fold = result["fold_metrics"][0][0]
+    metrics = result["metrics"][0]
+    run = run_share_backtest(config, bundle)
+    assert fold["profit"] == pytest.approx(metrics["total_profit"], abs=1e-9)
+    assert fold["principal_drawdown"] == pytest.approx(metrics["max_principal_drawdown"], abs=1e-12)
+    assert fold["principal"] == pytest.approx(run["funding"]["peak_invested"])
+    assert fold["end_assets"] == pytest.approx(
+        run["strategies"]["grid"]["equity"][-1]["equity"], abs=1e-9)
+    assert fold["trade_count"] == metrics["trade_count"]
 
 
 @pytest.mark.parametrize("grid_mode", ["trailing", "arithmetic", "geometric"])
@@ -100,7 +164,10 @@ def test_parameter_change_replaces_pending_size_using_prior_close():
     first = grid["trades"][0]
     assert first["timestamp"][:10] == schedule[0]["effective_date"]
     assert first["quantity"] == 300
-    assert first["cash"] == pytest.approx(10000 - 300 * 8.5)
+    # v3 owns no cash budget: the fill is funded by an external contribution
+    # of exactly the traded value, and the account keeps no residual cash.
+    assert first["external_topup"] == pytest.approx(300 * 8.5)
+    assert first["cash"] == 0
     assert any(row["reason"] == "parameter_update" for row in grid["rejections"])
     assert not any(row["reason"] == "initial_position" for row in grid["trades"])
 
@@ -109,17 +176,32 @@ def test_daily_details_preserve_fills_and_exact_risk():
     config, bundle = market(intraday=True)
     full = run_share_backtest(config, bundle)
     compact = run_share_backtest(config, bundle, daily_details=True)
+    closes = session_close_indices(bundle)
     for name, strategy in full["strategies"].items():
         daily = compact["strategies"][name]
         assert daily["metrics"] == strategy["metrics"]
         assert daily["trades"] == strategy["trades"]
         assert daily["rejections"] == strategy["rejections"]
-        assert daily["period_returns"] == strategy["period_returns"]
         assert len(daily["equity"]) == len(bundle.calendar)
         assert len(strategy["equity"]) == len(bundle.bars)
+        # The daily view is the same ledger, sampled once per session close.
+        for point, index in zip(daily["equity"], closes):
+            full_point = strategy["equity"][index]
+            assert point["equity"] == full_point["equity"]
+            assert point["cash"] == full_point["cash"]
+            assert point["position"] == full_point["position"]
+            assert point["total_invested"] == full_point["total_invested"]
+            assert point["cumulative_profit"] == full_point["cumulative_profit"]
+            assert point["principal_curve"] == full_point["principal_curve"]
+            assert point["principal_drawdown"] == full_point["principal_drawdown"]
+        # Risk is measured on every bar, not only at the session close.
+        assert daily["metrics"]["max_principal_drawdown"] == max(
+            point["principal_drawdown"] for point in strategy["equity"])
+        assert daily["metrics"]["max_principal_drawdown"] > max(
+            point["principal_drawdown"] for point in daily["equity"])
 
 
-def test_passive_uses_same_cash_and_shares_and_carries_dividend_across_change():
+def test_passive_market_reference_carries_dividend_and_bonus_claims():
     config, bundle = market()
     bundle.actions = normalize_actions(pd.DataFrame([{
         "record_date": str(bundle.calendar[1].date()), "ex_date": str(bundle.calendar[2].date()),
@@ -127,12 +209,14 @@ def test_passive_uses_same_cash_and_shares_and_carries_dividend_across_change():
         "cash_per_share": .6, "bonus_ratio": .1, "implemented": True,
     }]))
     passive = run_passive_backtest(config, bundle, daily_details=True)
-    compact = research_passive(config, bundle)
     grid = passive["strategies"]["grid"]
+    metrics = grid["metrics"]
     assert grid["trades"] == []
-    assert grid["equity"][-1]["cash"] == 10600
+    # 1000 shares become 1100 after the 10% bonus and pay 600 in cash.
+    assert grid["equity"][-1]["cash"] == 600
     assert grid["equity"][-1]["position"] == 1100
-    np.testing.assert_array_equal(compact["daily_returns"], [p["return"] for p in grid["period_returns"]])
+    assert metrics["peak_principal_return"] == pytest.approx(
+        (grid["equity"][-1]["equity"] - metrics["total_invested"]) / metrics["peak_invested"])
     # Changing the rule while dividend/bonus rights are outstanding must retain
     # those exact claims rather than initialize a fresh account.
     frozen = config.model_copy(update={"min_shares": 1000, "max_shares": 1000})
@@ -147,10 +231,17 @@ def test_batch_refuses_changed_initial_account_and_cancel():
     config, bundle = market()
     with pytest.raises(ValueError, match="初始持股"):
         research_batch(config, bundle, [{"initial_shares": 2000}], [])
-    with pytest.raises(ValueError, match="现金预算"):
-        research_batch(config, bundle, [{"reserve_cash": 20000}], [])
     with pytest.raises(InterruptedError):
         research_batch(config, bundle, [{}], [], cancelled=lambda: True)
+
+
+def test_legacy_fixed_cash_budget_cannot_change_inside_a_batch():
+    """Only the retired v2 contract owns a cash budget, and it stays fixed."""
+    config, bundle = market()
+    legacy = legacy_config(config)
+    assert legacy.schema_version == 2
+    with pytest.raises(ValueError, match="schema_version=3"):
+        research_batch(legacy, bundle, [{"reserve_cash": 20000}], [])
 
 
 def test_latest_parameters_replay_is_explicitly_retrospective():
@@ -164,8 +255,6 @@ def test_latest_parameters_replay_is_explicitly_retrospective():
 def test_batch_python_reference_matches_compiled(monkeypatch):
     config, bundle = market()
     config = config.model_copy(update={
-        "schema_version": 3, "reserve_cash": None,
-        "grid_mode": "geometric",
         "floor_penalty_config": FloorPenaltyConfig(eta_floor=.5, gamma_min=.4, floor_k_ref=10),
     })
     fast = research_batch(config, bundle, [{}, {"sell_shares": 200}], folds(bundle))
@@ -175,81 +264,3 @@ def test_batch_python_reference_matches_compiled(monkeypatch):
     assert fast["fold_metrics"] == slow["fold_metrics"]
     assert fast["position_stats"] == slow["position_stats"]
     assert all("floor_episode_grids" in row for row in fast["position_stats"])
-    np.testing.assert_array_equal(fast["daily_returns"], slow["daily_returns"])
-
-
-@pytest.mark.parametrize("intraday", [False, True])
-@pytest.mark.parametrize("corporate_actions", [False, True])
-def test_v4_fresh_validation_matches_standalone_backtest(intraday, corporate_actions):
-    config, bundle = market(intraday=intraday)
-    config = config.model_copy(update={
-        "schema_version": 3, "grid_mode": "geometric", "reserve_cash": None,
-        "fees": config.fees.model_copy(update={
-            "commission_rate": .0003, "min_commission": 5., "slippage_bps": 5.,
-        }),
-    })
-    if corporate_actions:
-        bundle.actions = normalize_actions(pd.DataFrame([
-            {"record_date": str(bundle.calendar[2].date()),
-             "ex_date": str(bundle.calendar[4].date()),
-             "pay_date": str(bundle.calendar[5].date()),
-             "stock_date": str(bundle.calendar[5].date()),
-             "cash_per_share": .2, "bonus_ratio": .1, "implemented": True},
-            {"record_date": str(bundle.calendar[5].date()),
-             "ex_date": str(bundle.calendar[6].date()),
-             "pay_date": str(bundle.calendar[7].date()),
-             "stock_date": str(bundle.calendar[7].date()),
-             "cash_per_share": .1, "bonus_ratio": .1, "implemented": True},
-        ]))
-    request = OptimizationConfig(
-        base=config, protocol_version=4,
-        ranges={
-            "grid_step": {"low": .03, "high": .031},
-            "sell_shares": {"low": 100, "high": 200},
-            "buy_shares": {"low": 200, "high": 200},
-            "min_shares": {"low": 0, "high": 0},
-            "max_shares": {"low": 2000, "high": 2000},
-        },
-    )
-    space = ParameterSpace(request)
-    train, validation = bundle.calendar[:4], bundle.calendar[4:]
-    evaluator = BatchEvaluator(request, request.base, bundle, space, train, validation)
-    coordinates = list(space.iterate())
-    rows = evaluator.evaluate_validation(coordinates)
-    stressed = evaluator.evaluate_stress(coordinates)
-    trained = evaluator.evaluate_training(coordinates)
-    assert evaluator.validation_base.start_date == validation[0].date()
-    assert len(evaluator.validation_folds) == 4
-    for index, (coordinate, row) in enumerate(zip(coordinates, rows)):
-        candidate = evaluator.validation_base.model_copy(update=space.params(coordinate))
-        backtest = run_share_backtest(candidate, bundle)
-        grid = backtest["strategies"]["grid"]
-        baseline = backtest["strategies"]["buy_hold"]["metrics"]["total_return"]
-        assert row["grid_return"] == grid["metrics"]["total_return"]
-        assert row["baseline_return"] == pytest.approx(baseline, abs=1e-14)
-        assert row["validation_excess_original"] == pytest.approx(
-            grid["metrics"]["total_return"] - baseline, abs=1e-14,
-        )
-        assert row["trade_count"] == grid["metrics"]["trade_count"]
-        np.testing.assert_array_equal(row["_current_validation_returns"],
-            [item["return"] for item in grid["period_returns"]])
-        assert list(row["_current_validation_dates"]) == list(validation)
-        # Every diagnostic fold measures this one ledger; no fold reopens it.
-        assert sum(fold["profit"] for fold in row["folds"]) == pytest.approx(
-            grid["metrics"]["total_profit"], abs=1e-9,
-        )
-        stress_fees = candidate.fees.model_copy(update={
-            name: getattr(candidate.fees, name) * 2
-            for name in ("commission_rate", "min_commission", "slippage_bps")
-        })
-        stress_run = run_share_backtest(candidate.model_copy(update={"fees": stress_fees}), bundle)
-        assert stressed[coordinate]["validation_return_stress"] == stress_run["strategies"]["grid"]["metrics"]["total_return"]
-        training_run = run_share_backtest(evaluator.train_base.model_copy(update=space.params(coordinate)), bundle)
-        assert trained[index]["training_return"] == training_run["strategies"]["grid"]["metrics"]["total_return"]
-    if not intraday and not corporate_actions:
-        # A replay starting in training must not silently become validation's
-        # starting account again. This fixture deliberately changes holdings.
-        old_run = research_batch(request.base, bundle, [space.params(coordinates[0])],
-            [(str(validation[0].date()), str(validation[-1].date()))], parallel=False)
-        fold = old_run["fold_metrics"][0][0]
-        assert fold["profit"] / fold["principal"] != pytest.approx(rows[0]["grid_return"])

@@ -28,9 +28,11 @@ export function savedGridParameters(value: unknown): ResultParameter[] {
   const result = record(value)
   const config = record(result.config)
   const funding = record(result.funding)
+  const gridMetrics = record(record(record(result.strategies).grid).metrics)
   const unit = resultShareUnit(result.symbol ?? config.symbol)
   const version = config.schema_version ?? result.schema_version
   const shareBased = typeof version === 'number' && version >= 2 || (version !== 1 && ['initial_shares', 'min_shares', 'max_shares', 'buy_shares', 'sell_shares'].some((key) => finite(config[key])))
+  const reserveHidden = typeof version === 'number' && version >= 3
   const modeNames: Record<string, string> = { trailing: '移动网格', arithmetic: '等差网格', geometric: '等比网格' }
   const mode = typeof config.grid_mode === 'string' ? config.grid_mode : ''
   const rows: ResultParameter[] = [{ key: 'grid_mode', label: '网格模式', value: modeNames[mode] ?? (mode || '—') }]
@@ -54,12 +56,15 @@ export function savedGridParameters(value: unknown): ResultParameter[] {
       { key: 'initial_shares', label: '初始持有', value: amountText(config.initial_shares, unit, 0) },
       { key: 'min_shares', label: '最低持有', value: amountText(config.min_shares, unit, 0) },
       { key: 'max_shares', label: '最高持有', value: config.max_shares === null ? '不限' : amountText(config.max_shares, unit, 0) },
-      ...(version !== 3 ? [{ key: 'reserve_cash', label: '网格预留现金', value: amountText(finite(funding.reserve_cash) ? funding.reserve_cash : config.reserve_cash, '元') }] : []),
+      ...(reserveHidden ? [] : [{ key: 'reserve_cash', label: '网格预留现金', value: amountText(finite(funding.reserve_cash) ? funding.reserve_cash : config.reserve_cash, '元') }]),
       { key: 'initial_equity', label: '网格起始资产', value: amountText(funding.initial_equity, '元') },
-      ...(version === 3 ? [
-        { key: 'peak_invested', label: '峰值净投入', value: amountText(funding.peak_invested, '元') },
-        { key: 'topups', label: '累计外部补款', value: amountText(funding.topups, '元') },
-      ] : []),
+      { key: 'peak_invested', label: '峰值本金', value: amountText(funding.peak_invested, '元') },
+      { key: 'topups', label: '累计外部补款', value: amountText(funding.topups, '元') },
+      {
+        key: 'external_topups', label: '外部补款',
+        value: amountText(finite(funding.external_topups) ? funding.external_topups : finite(gridMetrics.external_topups) ? gridMetrics.external_topups : funding.topups, '元'),
+        note: '网格账户口径',
+      },
     )
   } else {
     rows.push(
@@ -77,6 +82,7 @@ export function savedGridParameters(value: unknown): ResultParameter[] {
 export const resultCurveStyles = [
   { key: 'grid', name: '网格策略', color: '#2864dc' },
   { key: 'same_account_passive', name: '同账户被动持有', color: '#13957b' },
+  { key: 'matched_funding_hold', name: '同资金被动持有', color: '#7a4fd1' },
   { key: 'dca', name: '定投', color: '#e29136' },
   { key: 'buy_hold', name: '买入并持有', color: '#8795aa' },
 ] as const
@@ -97,7 +103,8 @@ function pointTime(timestamp: unknown) {
 function investmentAmount(point: EquityPoint, strategy: StrategyResult, result: BacktestResult): number | null {
   if (finite(point.total_invested)) return Math.max(0, point.total_invested)
   if (result.accounting_basis === 'independent_contributions_v1' || strategy.return_basis === 'cost') {
-    return finite(point.normalized_equity) && point.normalized_equity > 0 && finite(point.equity) ? point.equity / point.normalized_equity : null
+    const normalized = point.normalized_equity
+    return finite(normalized) && normalized > 0 && finite(point.equity) ? point.equity / normalized : null
   }
   const base = result.funding?.initial_equity ?? result.config?.initial_cash
   return finite(base) ? base : null
@@ -124,7 +131,7 @@ export function buildResultCurveModel(result: BacktestResult): ResultCurveModel 
       const time = pointTime(point.timestamp)
       if (!Number.isFinite(time)) return
       const row = rows.get(time) ?? { timestamp: point.timestamp, time, values: {}, position: null }
-      const drawdown = drawdowns ? drawdowns[index][1] : point.drawdown
+      const drawdown = drawdowns ? drawdowns[index][1] : finite(point.principal_drawdown) ? point.principal_drawdown : finite(point.drawdown) ? point.drawdown : null
       row.values[key] = {
         returnRate: assetInvestmentReturn(point, strategy, result),
         drawdown: finite(drawdown) ? drawdown : null,

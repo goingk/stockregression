@@ -126,7 +126,7 @@ def test_floor_penalty_does_not_change_the_trading_path():
     right = engine.run_backtest(plain, bundle)["strategies"]["grid"]
     assert left["trades"] == right["trades"]
     assert left["equity"] == right["equity"]
-    for key in ("total_return", "max_drawdown", "trade_count"):
+    for key in ("peak_principal_return", "max_principal_drawdown", "trade_count"):
         assert left["metrics"][key] == right["metrics"][key]
 
 
@@ -154,17 +154,21 @@ def test_dca_initial_holdings_and_external_contributions_share_one_return_basis(
     assert len(trades) == 8
     assert dca["metrics"]["initial_equity"] == 2000
     assert dca["metrics"]["total_invested"] == pytest.approx(2000 + total)
-    assert dca["metrics"]["total_return"] == pytest.approx((1000 * bundle.daily.close.iloc[-1]) / (2000 + total) - 1)
-    assert dca["metrics"]["cagr"] is None and dca["period_returns"] == []
+    assert dca["metrics"]["peak_principal_return"] == pytest.approx((1000 * bundle.daily.close.iloc[-1]) / (2000 + total) - 1)
+    assert "cagr" not in dca["metrics"] and "period_returns" not in dca
     for name in full["strategies"]:
         assert full["strategies"][name]["equity"] == preview["strategies"][name]["equity"]
     assert full["accounting_basis"] == "independent_contributions_v1"
+    dca_principal = dca["metrics"]["total_invested"]
     for point in dca["equity"]:
-        assert point["normalized_equity"] == pytest.approx(point["equity"] / point["total_invested"])
-    for name, starting_value in (("grid", full["funding"]["initial_equity"]), ("buy_hold", 10000)):
+        assert point["principal_curve"] == pytest.approx(
+            1 + (point["equity"] - point["total_invested"]) / dca_principal
+        )
+    for name in ("grid", "buy_hold"):
         for point in full["strategies"][name]["equity"]:
-            assert point["total_invested"] == pytest.approx(starting_value)
-            assert point["normalized_equity"] == pytest.approx(point["equity"] / starting_value)
+            assert point["principal_curve"] == pytest.approx(
+                1 + (point["equity"] - point["total_invested"]) / point["peak_principal"]
+            )
 
 
 def test_initial_shares_defaults_and_fee_defaults():
@@ -197,14 +201,14 @@ def test_buy_hold_and_dca_are_independent_of_grid_funding_fields():
     raw.update(initial_shares=0, min_shares=0, max_shares=0, grid_mode="arithmetic", buy_step=.15, sell_step=.15, reference_price_mode="manual", reference_price=20)
     gridless = engine.run_backtest(BacktestConfig.model_validate(raw), bundle)
     assert gridless["funding"]["initial_equity"] == 0
-    assert gridless["strategies"]["grid"]["metrics"]["total_return"] is None
+    assert gridless["strategies"]["grid"]["metrics"]["peak_principal_return"] is None
     for name in ("dca", "buy_hold"):
         assert gridless["strategies"][name] == baseline["strategies"][name]
     hold = gridless["strategies"]["buy_hold"]
     assert hold["trades"] == []
     assert all(point["position"] == 1000 and point["cash"] == 0 for point in hold["equity"])
     assert hold["metrics"]["initial_equity"] == 10000
-    assert all(point["normalized_equity"] == pytest.approx(point["equity"] / 10000) for point in hold["equity"])
+    assert all(point["principal_curve"] == pytest.approx(point["equity"] / 10000) for point in hold["equity"])
 
 
 def test_compiled_and_interpreted_share_accounting_match(monkeypatch):
@@ -255,43 +259,14 @@ def test_incremental_partitions_reference_price_and_chart_ma(tmp_path):
     assert not store.watches()
 
 
-def test_share_optimization_uses_integer_quantities():
+def test_retired_optimization_modes_and_trial_controls_are_rejected():
     config, bundle = fixture("510300.SH")
     unversioned = config.model_dump(mode="json")
     unversioned.pop("schema_version")
     defaults = OptimizationConfig(base=unversioned)
     assert "buy_shares" in defaults.ranges and "buy_ratio" not in defaults.ranges and "grid_step" not in defaults.ranges
-    settings = OptimizationConfig(base=config, mode="historical", n_trials=2, ranges={"buy_shares": {"low": 100, "high": 200, "step": 100}})
-    result = optimize(settings, bundle)
-    assert result["historical"]["status"] == "completed"
-    assert result["historical"]["best_params"]["buy_shares"] in {100, 200}
-    assert "buy_quantity" not in result["historical"]["best_params"]
-
-
-def test_optimization_segment_seeds_each_account_from_its_own_starting_value():
-    from stockregression.optimization import _slice_bundle
-
-    config, bundle = fixture("510300.SH", days=8)
-    start, end = bundle.calendar[3], bundle.calendar[5]
-    previous = bundle.daily.loc[bundle.daily.date < start].iloc[-1]
-    bundle.metadata["prior_closes"] = {str(previous.date.date()): float(previous.close)}
-    sliced = _slice_bundle(bundle, start, end)
-    config = config.model_copy(update={
-        "start_date": start.date(),
-        "end_date": end.date(),
-        "dca": DcaConfig(frequency="daily", shares=100, initial_shares=200),
-    })
-    result = engine.run_backtest(config, sliced)
-    price = float(previous.close)
-    assert result["funding"]["valuation_price"] == price
-    assert result["funding"]["dca_initial_equity"] == pytest.approx(200 * price)
-    assert result["funding"]["buy_hold_initial_equity"] == pytest.approx(1000 * price)
-    for name, initial in (("grid", result["funding"]["initial_equity"]), ("dca", 200 * price), ("buy_hold", 1000 * price)):
-        strategy = result["strategies"][name]
-        assert strategy["metrics"]["initial_equity"] == pytest.approx(initial)
-        if initial > 0 and strategy["equity"]:
-            point = strategy["equity"][0]
-            assert point["normalized_equity"] == pytest.approx(point["equity"] / point["total_invested"])
+    with pytest.raises(ValueError):
+        OptimizationConfig(base=config, mode="historical", n_trials=2)
 
 
 def test_v2_api_preview_does_not_persist_jobs_or_results(tmp_path, monkeypatch):
@@ -339,7 +314,10 @@ def test_initial_holding_receives_first_day_dividend_without_nav_jump():
     first_dca_trade = result["strategies"]["dca"]["trades"][0]
     first_invested = 2000 + first_dca_trade["quantity"] * first_dca_trade["price"] + first_dca_trade["fees"]
     assert result["strategies"]["dca"]["equity"][0]["total_invested"] == pytest.approx(first_invested)
-    assert result["strategies"]["dca"]["equity"][0]["normalized_equity"] == pytest.approx(2940 / first_invested)
+    dca_principal = result["strategies"]["dca"]["metrics"]["total_invested"]
+    assert result["strategies"]["dca"]["equity"][0]["principal_curve"] == pytest.approx(
+        1 + (2940 - first_invested) / dca_principal
+    )
     assert result["strategies"]["dca"]["equity"][0]["cash"] == 0
     assert result["strategies"]["dca"]["equity"][1]["cash"] == 120
     hold = result["strategies"]["buy_hold"]
@@ -400,8 +378,8 @@ def test_dca_wholly_unavailable_period_has_no_investment_or_return():
     bundle.bars["volume"] = 0
     result = engine.run_backtest(config, bundle)["strategies"]["dca"]
     assert result["metrics"]["total_invested"] == 0
-    assert result["metrics"]["total_return"] is None
-    assert all(row["normalized_equity"] is None for row in result["equity"])
+    assert result["metrics"]["peak_principal_return"] is None
+    assert all(row["principal_curve"] is None for row in result["equity"])
     assert sum(row["reason"] == "dca_period_skipped" for row in result["rejections"]) == 8
 
 
@@ -412,7 +390,7 @@ def test_zero_position_bounds_do_not_create_assets_or_fixed_capital_returns():
     result = engine.run_backtest(config, bundle)
     assert result["funding"]["initial_equity"] == 0
     assert result["strategies"]["grid"]["trades"] == []
-    assert result["strategies"]["grid"]["metrics"]["total_return"] is None
+    assert result["strategies"]["grid"]["metrics"]["peak_principal_return"] is None
     assert result["strategies"]["dca"]["metrics"]["total_invested"] > 0
     assert result["strategies"]["buy_hold"]["metrics"]["initial_equity"] == 10000
     assert result["strategies"]["buy_hold"]["trades"] == []
@@ -521,6 +499,7 @@ def test_all_failed_sync_keeps_report_and_status_api(tmp_path, monkeypatch):
     report = {"status": "failed", "message": "0 completed", "failures": [{"symbol": "510300.SH", "reason": "unavailable"}], "symbols": []}
     monkeypatch.setattr(DataService, "sync", lambda *args, **kwargs: report)
     job = store.new_job("sync", {"symbols": ["510300.SH"]})
+    assert store.claim_job(job, "test-worker")
     execute_job(str(tmp_path), job)
     state = store.job(job)
     assert state["status"] == "failed"

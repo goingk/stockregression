@@ -1,5 +1,7 @@
 # 稳健 J v4 真实日线验收
 
+> 历史资料：本记录对应 `protocol_version=4`，其旧候选存储和结果页面不可由当前引擎接续。现行收益、风险、预算和补算契约见[参数研究 v5](parameter-research-v5.md)。
+
 验收日期：2026-10-20（Asia/Shanghai）  
 标的：`159611.SZ`  
 数据版本：`mkt-2fe613b32b3cb6f36535ca00`  

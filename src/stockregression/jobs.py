@@ -9,6 +9,8 @@ import subprocess
 import threading
 import time
 import traceback
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .data import DataService
@@ -25,6 +27,85 @@ from .resources import ResourceLease, clear_stale_leases
 from .settings import Settings, load_settings
 from .source_health import probe_source
 from .storage import Store
+
+
+class ClaimLostError(RuntimeError):
+    pass
+
+
+TIMEOUT_GRACE_SECONDS = 30
+"""Extra seconds a compute job may use to stop cleanly after its limit."""
+
+
+def _runtime_limit_seconds(job: dict) -> int:
+    """Wall-clock limit of a running compute job (0 means unlimited)."""
+    payload = job.get("payload") or {}
+    if not isinstance(payload, dict):
+        return 0
+    if job.get("kind") == "research_completion":
+        return int(payload.get("max_runtime_seconds", 0) or 0)
+    config = payload.get("config")
+    strategy = config.get("strategy") if isinstance(config, dict) else None
+    if not isinstance(strategy, dict):
+        return 0
+    return int(strategy.get("max_runtime_seconds", 0) or 0)
+
+
+def _elapsed_seconds(job: dict, now: datetime | None = None) -> float:
+    """Seconds since the job was claimed."""
+    try:
+        claimed = datetime.fromisoformat(str(job.get("claimed_at")))
+    except (TypeError, ValueError):
+        return 0.0
+    if claimed.tzinfo is None:
+        claimed = claimed.replace(tzinfo=timezone.utc)
+    return ((now or datetime.now(timezone.utc)) - claimed).total_seconds()
+
+
+def timeout_stage(elapsed: float, limit: int, grace: int = TIMEOUT_GRACE_SECONDS) -> str:
+    """Escalation stage for a job that ran past its runtime limit.
+
+    ``stop`` asks the worker to cancel cleanly so it can checkpoint and
+    publish the evidence it already produced.  ``terminate`` kills the
+    process tree and is only reached once the extra grace window is used up.
+    """
+    if limit <= 0:
+        return "none"
+    if elapsed > limit + max(0, int(grace)):
+        return "terminate"
+    if elapsed > limit:
+        return "stop"
+    return "none"
+
+
+def _request_stop(store: Store, job_id: str, job: dict, limit: int) -> bool:
+    """Ask a running compute job to stop and keep its partial evidence.
+
+    The worker polls ``cancel_requested``; it finishes the current batch,
+    saves what it already evaluated and releases the claim instead of being
+    killed in the middle of a computation.
+    """
+    if job.get("cancel_requested"):
+        return False
+    return bool(store.update_job(
+        job_id, require_claim=True, expected_claim_token=job.get("claim_token"),
+        cancel_requested=1,
+        message="任务超过时间上限，正在安全停止并保存已完成结果",
+        error=f"任务运行时间超过 {limit} 秒，已请求安全停止，已完成结果保留",
+    ))
+
+
+def _with_completion_revision(payload: dict, result: dict) -> dict:
+    """Return the job payload with the produced completion revision attached.
+
+    The revision identifies the immutable artefact the completion produced,
+    so the job can later resolve exactly that revision instead of whatever
+    revision happens to be the newest one.
+    """
+    revision = result.get("completion_revision") if isinstance(result, dict) else None
+    if revision is None:
+        return payload
+    return {**payload, "completion_revision": int(revision)}
 
 
 def _cleanup_uploaded_input(store: Store, job_id: str):
@@ -45,64 +126,31 @@ def _cleanup_uploaded_input(store: Store, job_id: str):
 def _research_protocol_hash(config: OptimizationConfig) -> str:
     payload = config.model_dump(mode="json")
     payload.pop("configuration_revision", None)
-    if config.protocol_version == 4 and config.strategy.strategy_version in (1, 2):
-        legacy_strategy = dict(payload.get("strategy", {}))
-        legacy_strategy.pop("hypercube_edge", None)
-        legacy_strategy.pop("granularity", None)
-        payload["strategy"] = legacy_strategy
-    if config.protocol_version == 3:
-        payload["protocol_thresholds"] = {
-            "positive_neighbor_ratio": 0.8,
-            "neighbor_quantile": 0.25,
-            "cost_multipliers": [1.0, 2.0],
-            "neighbor_perturbations": "single_and_pairwise_one_step",
-            "funding_mode": "top_up_on_fill",
-        }
-    elif config.protocol_version == 4:
-        from .research_v4.space import UNITS
-        strategy_payload = dict(payload.get("strategy", {}))
-        payload["protocol_thresholds"] = {
-            "strategy": strategy_payload,
-            "grid_mode": "geometric",
-            "spacing_unit": UNITS["buy_step"],
-            "units": UNITS,
-            "share_unit": 100,
-            "negative_tolerance": 1e-12,
-            "funding_mode": "top_up_on_fill",
-            "pressure_is_diagnostic_only": True,
-            "validation_account_mode": "fresh_initial_config",
-            "validation_return_basis": "peak_invested_roi",
-        }
-        if config.strategy.strategy_version == 4:
-            payload["protocol_thresholds"].update(
-                geometry="robust_j", connectivity="fixed_edge_cube",
-                fields=["buy_step", "sell_step", "buy_shares", "sell_shares"],
-                objective="alpha*R+(1-alpha)*mu-beta*downside-Cpos",
-                natural_position=True, constraints_role="center_qualification",
-                peak_analysis="complete_one_tick_closed_plateaus",
-            )
-        elif config.strategy.strategy_version == 2:
-            payload["protocol_thresholds"].update(
-                geometry="connected_lattice", connectivity="axis_one_tick",
-                stability_metric="normalized_euclidean_to_inner_boundary",
-                closure="expand_discovered_components_until_closed", constraints_role="diagnostic_only",
-            )
-        elif config.strategy.strategy_version == 3:
-            payload["protocol_thresholds"].update(
-                geometry="hypercube_mean", connectivity="fixed_edge_cube",
-                hypercube_edge=int(config.strategy.hypercube_edge),
-                granularity=dict(config.strategy.granularity),
-                training_window="farthest_same_price_day_250_500_or_500_fallback",
-                training_only=True, constraints_role="diagnostic_only",
-            )
+    from .research_v4.space import UNITS
+    payload["protocol_thresholds"] = {
+        "protocol_version": 5,
+        "result_schema_version": 2,
+        "strategy": dict(payload.get("strategy", {})),
+        "grid_mode": "geometric",
+        "units": UNITS,
+        "share_unit": 100,
+        "negative_tolerance": 1e-12,
+        "funding_mode": "top_up_on_fill",
+        "return_basis": "peak_principal",
+        "risk_basis": "principal_profit_drawdown",
+        "ranking_baseline": "matched_funding_hold",
+        "training_window": config.strategy.training_window_mode,
+        "statistics": "not_applicable",
+        "pressure_is_diagnostic_only": True,
+        "validation_account_mode": "matched_funding_hold",
+    }
     base = dict(payload.get("base", {}))
     for key in ("symbol", "start_date", "end_date"):
         base.pop(key, None)
-    if config.protocol_version == 4:
-        for key in ("grid_step", "buy_step", "sell_step", "buy_shares", "sell_shares", "min_shares", "max_shares"):
-            base.pop(key, None)
+    for key in ("grid_step", "buy_step", "sell_step", "buy_shares", "sell_shares", "min_shares", "max_shares"):
+        base.pop(key, None)
     payload["base"] = base
-    if config.protocol_version == 4 and isinstance(payload.get("research_context"), dict):
+    if isinstance(payload.get("research_context"), dict):
         context = dict(payload["research_context"])
         for key in ("symbol", "start_date", "end_date"):
             context.pop(key, None)
@@ -111,36 +159,12 @@ def _research_protocol_hash(config: OptimizationConfig) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _validation_intervals(result: dict, start: str, end: str | None) -> list[dict]:
-    intervals: list[dict] = [{"start": start, "end": end or start, "kind": "input_evaluation"}]
-
-    def add(item, kind):
-        if not isinstance(item, dict):
-            return
-        left = item.get("start", item.get("start_date"))
-        right = item.get("end", item.get("end_date"))
-        if left is None or right is None:
-            return
-        intervals.append({"start": str(left)[:10], "end": str(right)[:10], "kind": kind})
-
-    def visit(node, path=()):
-        if isinstance(node, dict):
-            if path and path[-1] in {"final_126_day_check", "test_window", "validation_interval"}:
-                add(node, ".".join(path))
-            for key, value in node.items():
-                if key in {"windows", "validation_windows", "evaluation_windows"} and isinstance(value, list):
-                    for item in value:
-                        add(item, ".".join((*path, key)))
-                visit(value, (*path, key))
-        elif isinstance(node, list):
-            for value in node:
-                visit(value, path)
-
-    visit(result.get("evidence", {}), ("evidence",))
-    return intervals
+def _evaluation_intervals(start: str, end: str | None) -> list[dict]:
+    """The v5 study has one real out-of-sample evaluation interval."""
+    return [{"start": start, "end": end or start, "kind": "input_evaluation"}]
 
 
-def _scientific_failed(result: dict) -> bool:
+def _research_failed(result: dict) -> bool:
     if result.get("status") in {"failed", "error"}:
         return True
     branches = [result.get(name, {}) for name in ("fixed", "adaptive") if isinstance(result.get(name), dict)]
@@ -153,6 +177,13 @@ def execute_job(root: str, job_id: str, observer=None):
     job = store.job(job_id)
     if not job:
         return
+    claim_token = str(job.get("claim_token") or "")
+    if job.get("status") != "running" or not claim_token:
+        # A worker may only run a job it has atomically claimed.  A queued or
+        # unclaimed job must be left untouched so the scheduler can still
+        # claim it: an unguarded write would move it to "running" outside the
+        # queue's ordering, cancellation and capacity rules.
+        return
     frozen = (job.get("payload") or {}).get("configuration_snapshot")
     frozen_settings = (frozen or {}).get("settings") if isinstance(frozen, dict) else None
     try:
@@ -163,6 +194,19 @@ def execute_job(root: str, job_id: str, observer=None):
     trace = PerformanceTrace(job_id=job_id)
     lease = ResourceLease(store, job_id, configured.performance)
     cpu_units = lease.acquire()
+    if cpu_units <= 0:
+        # The configured CPU budget is fully committed to the other running
+        # compute jobs.  Activating the performance context would floor the
+        # share at one unit and oversubscribe the machine, so the job is
+        # failed explicitly and both the claim and the lease are released.
+        message = "计算配额已被其它任务占满，未能获得 CPU 份额；请稍后重试或调整计算预算"
+        store.update_job(
+            job_id, require_claim=True, expected_claim_token=claim_token,
+            status="failed", message=message, error=message,
+            claim_token=None, claimed_at=None,
+        )
+        lease.release()
+        return
     performance_tokens = activate_performance(
         cpu_budget=cpu_units,
         workspace_mb=configured.performance.workspace_mb,
@@ -175,10 +219,36 @@ def execute_job(root: str, job_id: str, observer=None):
         workspace_budget_mb=configured.performance.workspace_mb,
         performance_settings=configured.performance.model_dump(mode="json"),
     )
-    store.update_job(
-        job_id, status="running",
-        message=f"正在执行 · {cpu_units} 个计算线程", pid=os.getpid(),
-    )
+    claim_lost = False
+
+    def write_job(**values) -> None:
+        nonlocal claim_lost
+        if values.get("status") in {"completed", "partial", "failed", "cancelled"}:
+            # The terminal write still validates the token above, then releases
+            # ownership so a restarted process cannot continue this task.
+            values.setdefault("claim_token", None)
+            values.setdefault("claimed_at", None)
+        updated = store.update_job(
+            job_id, require_claim=True, expected_claim_token=claim_token, **values,
+        )
+        if not updated:
+            claim_lost = True
+            raise ClaimLostError("任务领取令牌已失效")
+
+    try:
+        write_job(
+            status="running",
+            # A job without a share is never started, so the message always
+            # states the units the worker really got.
+            message=f"正在执行 · {cpu_units} 个计算线程",
+            pid=os.getpid(),
+        )
+    except ClaimLostError:
+        # The claim was lost before the job could start.  Release the lease
+        # and the performance context instead of leaking them.
+        lease.release()
+        reset_performance(performance_tokens)
+        return
     last_progress = 0.0
     last_cancel_check = 0.0
     cancel_state = False
@@ -189,7 +259,11 @@ def execute_job(root: str, job_id: str, observer=None):
         nonlocal last_cancel_check, cancel_state
         tick = time.monotonic()
         if tick - last_cancel_check > cancel_poll_seconds:
-            cancel_state = bool((store.job(job_id) or {}).get("cancel_requested"))
+            current = store.job(job_id) or {}
+            if current.get("claim_token") != claim_token:
+                cancel_state = True
+            else:
+                cancel_state = bool(current.get("cancel_requested"))
             last_cancel_check = tick
         return cancel_state
 
@@ -200,13 +274,25 @@ def execute_job(root: str, job_id: str, observer=None):
             rendered = str(message)
             if job.get("kind") in {"backtest", "optimization", "batch", "batch_backtest"} and 0 < fraction < 1:
                 rendered += f" · {max(1, lease.units)} 线程"
-            store.update_job(job_id, progress=max(0, min(1, float(fraction))), message=rendered)
+            write_job(progress=max(0, min(1, float(fraction))), message=rendered)
             if observer:
                 observer(fraction, rendered)
             last_progress = tick
     try:
         service = DataService(store, settings=configured)
         payload, kind = job["payload"], job["kind"]
+        computation_started = None
+        submission_provenance = None
+        if kind == "optimization":
+            from .reproducibility import computation_provenance, reproducibility_mismatches
+            from .settings import PROJECT_ROOT
+            submission_provenance = payload.get("submission_provenance")
+            computation_started = computation_provenance(
+                PROJECT_ROOT, configuration=payload.get("config"),
+            )
+            mismatches = reproducibility_mismatches(submission_provenance, computation_started)
+            if mismatches:
+                raise RuntimeError("计算来源在任务提交后发生变化，请重新提交：" + "；".join(mismatches))
         if cancelled():
             raise InterruptedError("任务已取消")
         if kind == "backtest":
@@ -216,41 +302,71 @@ def execute_job(root: str, job_id: str, observer=None):
             with trace.measure("data_preparation"):
                 bundle = service.ensure_bundle(config, payload.get("version"), lambda fraction, message: progress(0.02 + 0.30 * fraction, message), cancelled)
             payload["version"] = bundle.version
-            store.update_job(job_id, payload=payload)
+            write_job(payload=payload)
             progress(0.33, "行情准备完成，开始回测")
             with trace.measure("backtest"):
                 result = run_backtest(config, bundle, lambda fraction, message: progress(0.33 + 0.67 * fraction, message), cancelled)
             symbol, title = config.symbol, "现金补足网格 / 定投 / 买入持有" if config.schema_version == 3 else "股数网格 / 定投 / 买入持有" if config.schema_version == 2 else "网格 / 定投 / 初始全仓"
+        elif kind == "research_completion":
+            from .research_completion import complete_research_result
+            result_id = str(payload["result_id"])
+            original = store.result(result_id)
+            if original is None:
+                raise ValueError("原始结果不存在")
+            result = complete_research_result(
+                store, service, result_id,
+                decision=str(payload.get("decision", "current")),
+                decision_index=int(payload.get("decision_index", 0)),
+                reporting_budget=int(payload.get("reporting_budget", 1000)),
+                target=str(payload.get("target", "return_leader")),
+                # A fresh job owns a new checkpoint; a resumed job continues
+                # the checkpoint of the job it resumes.
+                checkpoint_id=str(payload.get("checkpoint_id") or job_id),
+                progress=lambda fraction, message: progress(0.02 + 0.97 * fraction, message),
+                cancelled=cancelled,
+            )
+            result["protocol"] = original.get("protocol")
+            result["data_version"] = original.get("data_version")
+            symbol = original.get("symbol") or ""
+            title = f"研究结果补算 · {payload.get('decision', 'current')} · 修订 {result['completion_revision']}"
+            # Record the produced revision next to the job so the exact
+            # artefact this run created can be resolved later, even after
+            # newer revisions were published for the same result.
+            payload = _with_completion_revision(payload, result)
+            write_job(payload=payload)
         elif kind == "optimization":
             from .optimization import optimize
             config = OptimizationConfig.model_validate(payload["config"])
-            scientific = config.protocol_version in (2, 3, 4)
-            progress(0.01, "检查本地行情并准备研究数据" if not scientific else "准备评估区间及前置训练时段")
+            is_v5_research = config.protocol_version == 5
+            progress(0.01, "检查本地行情并准备研究数据" if not is_v5_research else "准备评估区间及前置训练时段")
             with trace.measure("data_preparation"):
-                if scientific:
+                if is_v5_research:
                     bundle = prepare_research_bundle(
                         service,
                         config.base,
                         payload.get("version"),
                         lambda fraction, message: progress(0.02 + 0.30 * fraction, message),
                         cancelled,
-                        lookback_days=(config.strategy.training_max_days if config.protocol_version == 4 and config.strategy.strategy_version == 4 else 500) if config.protocol_version == 4 else 504,
+                        lookback_days=int(config.strategy.training_max_days),
                     )
                 else:
                     bundle = service.ensure_bundle(config.base, payload.get("version"), lambda fraction, message: progress(0.02 + 0.30 * fraction, message), cancelled)
             payload["version"] = bundle.version
-            store.update_job(job_id, payload=payload)
-            progress(0.33, "行情准备完成，开始科学参数研究" if scientific else "行情准备完成，开始参数搜索")
+            write_job(payload=payload)
+            progress(0.33, "行情准备完成，开始参数研究" if is_v5_research else "行情准备完成，开始参数搜索")
             with trace.measure("research"):
                 result = optimize(
                     config, bundle,
                     lambda fraction, message: progress(0.33 + 0.67 * fraction, message),
-                    cancelled, configured.performance,
+                    cancelled, configured.performance, payload.get("budget_contract"),
                 )
+            if is_v5_research:
+                result["symbol"] = config.base.symbol
+                result["data_version"] = bundle.version
             result["diagnostics"] = bundle.metadata.get("diagnostics", {})
             result["source_events"] = bundle.metadata.get("source_events", [])
             symbol = config.base.symbol
-            if scientific:
+            if is_v5_research:
                 audit = store.register_research(
                     registry_id=job_id,
                     protocol_hash=_research_protocol_hash(config),
@@ -258,15 +374,14 @@ def execute_job(root: str, job_id: str, observer=None):
                     input_start=str(config.base.start_date),
                     input_end=str(config.base.end_date) if config.base.end_date else str(bundle.calendar.max())[:10] if len(bundle.calendar) else None,
                     data_version=bundle.version,
-                    validation_intervals=_validation_intervals(
-                        result,
+                    evaluation_intervals=_evaluation_intervals(
                         str(config.base.start_date),
                         str(config.base.end_date) if config.base.end_date else str(bundle.calendar.max())[:10] if len(bundle.calendar) else None,
                     ),
                 )
                 result["evidence"] = {**(result.get("evidence") if isinstance(result.get("evidence"), dict) else {}), "local_audit": audit}
                 result["protocol_hash"] = audit["protocol_hash"]
-                title = ("等比网格多峰研究" if config.protocol_version == 4 else "科学参数研究") + (" · 固定与自适应" if config.selection_target == "both" else f" · {config.selection_target}")
+                title = "稳健 J v5 峰值研究" + (" · 固定与自适应" if config.selection_target == "both" else f" · {config.selection_target}")
             else:
                 title = "历史搜索 / 样本外验证"
         elif kind == "market_import":
@@ -419,10 +534,10 @@ def execute_job(root: str, job_id: str, observer=None):
             raise InterruptedError("任务已取消")
         was_cancelled = cancelled()
         failed_sync = kind in {"market_sync", "market_source_probe", "market_import", "market_import_batch", "market_import_package", "market_index_package", "market_aggregate", "market_prepare", "market_archive"} and result.get("status") == "failed"
-        failed_research = kind == "optimization" and payload.get("config", {}).get("protocol_version") in (2, 3, 4) and _scientific_failed(result)
+        failed_research = kind == "optimization" and payload.get("config", {}).get("protocol_version") == 5 and _research_failed(result)
         result_cancelled = kind == "optimization" and result.get("status") == "cancelled"
         cancelled_job = was_cancelled or result_cancelled
-        if kind == "optimization" and payload.get("config", {}).get("protocol_version") in (2, 3, 4):
+        if kind == "optimization" and payload.get("config", {}).get("protocol_version") == 5:
             if failed_research:
                 title += " · 失败"
             elif cancelled_job:
@@ -432,13 +547,48 @@ def execute_job(root: str, job_id: str, observer=None):
         if isinstance(result, dict):
             result["performance"] = trace.snapshot()
             result["configuration_snapshot"] = frozen if isinstance(frozen, dict) else None
+            if kind == "optimization":
+                from .reproducibility import computation_provenance, reproducibility_mismatches
+                from .settings import PROJECT_ROOT
+                computation_finished = computation_provenance(
+                    PROJECT_ROOT, configuration=payload.get("config"),
+                )
+                finish_mismatches = reproducibility_mismatches(computation_started, computation_finished)
+                result["computation_provenance"] = {
+                    "submission": submission_provenance,
+                    "started": computation_started,
+                    "finished": computation_finished,
+                    "reproducible": not finish_mismatches,
+                    "mismatches": finish_mismatches,
+                    "completion_allowed": bool(
+                        not finish_mismatches
+                        and computation_finished.get("engine_version")
+                        and computation_finished.get("git_commit")
+                        and computation_finished.get("source_fingerprint")
+                        and computation_finished.get("dependency_lock_hash")
+                        and computation_finished.get("configuration_fingerprint")
+                    ),
+                }
+                if finish_mismatches:
+                    result["status"] = "failed"
+                    result["reproducibility_error"] = (
+                        "任务运行期间计算源码、配置或依赖发生变化，结果不可复现，请重新提交"
+                    )
+                    failed_research = True
+                    title += " · 计算来源变化"
             result["execution"] = {
                 "configuration_revision": (frozen or {}).get("revision") if isinstance(frozen, dict) else None,
                 "data_version": payload.get("version"),
                 "resource_settings": configured.performance.model_dump(mode="json"),
                 "cpu_units": int(cpu_units),
             }
-        result_id = store.save_result(kind, result, symbol, title)
+        if kind == "research_completion":
+            # The revision is stored beside the original immutable result.  A
+            # separate result artifact would look like a second research study
+            # and would not contain the original protocol/configuration.
+            result_id = str(result.get("result_id") or "")
+        else:
+            result_id = store.save_result(kind, result, symbol, title)
         sync_error = None
         if failed_sync:
             failures = result.get("failures", [])
@@ -448,22 +598,43 @@ def execute_job(root: str, job_id: str, observer=None):
         elif failed_sync:
             message = f"同步失败：{sync_error}"
         elif failed_research:
-            message = "科学参数研究失败：" + str(result.get("reason") or result.get("message") or "查看结果中的失败原因")
-        elif kind == "optimization" and payload.get("config", {}).get("protocol_version") in (2, 3, 4) and result.get("status") == "partial":
-            message = "科学参数研究部分完成；已保留已完成的候选与结果"
+            message = "参数研究失败：" + str(result.get("reason") or result.get("message") or "查看结果中的失败原因")
+        elif kind == "optimization" and payload.get("config", {}).get("protocol_version") == 5 and result.get("status") == "partial":
+            message = "参数研究部分完成；已保留已完成的候选与结果"
         else:
             message = result.get("message", "完成")
-        partial = result.get("status") == "partial" and kind != "optimization"
-        store.update_job(job_id, status="cancelled" if cancelled_job else "failed" if failed_sync or failed_research else "partial" if partial else "completed", progress=1, message=message, error=sync_error or (result.get("reason") if failed_research else None), result_id=result_id)
+        partial = result.get("status") == "partial"
+        if kind == "research_completion" and partial:
+            message = "补算部分完成，已保存可追踪修订与检查点"
+        terminal_error = sync_error or (result.get("reason") if failed_research else None)
+        if terminal_error is None and cancelled_job:
+            # Keep the stop reason the dispatcher recorded, so a run that was
+            # stopped because it ran out of time does not look like a plain
+            # user cancellation.
+            terminal_error = (store.job(job_id) or {}).get("error")
+        write_job(status="cancelled" if cancelled_job else "failed" if failed_sync or failed_research else "partial" if partial else "completed", progress=1, message=message, error=terminal_error, result_id=result_id)
+    except ClaimLostError:
+        return
     except InterruptedError as exc:
-        store.update_job(job_id, status="cancelled", message=str(exc))
+        original_result = None
+        if job.get("kind") == "research_completion":
+            original_result = (job.get("payload") or {}).get("result_id")
+        completion_revision = getattr(exc, "completion_revision", None)
+        if original_result and completion_revision is not None:
+            payload = _with_completion_revision(
+                job.get("payload") or {}, {"completion_revision": completion_revision},
+            )
+            write_job(status="cancelled", message=str(exc), result_id=original_result, payload=payload)
+            return
+        write_job(status="cancelled", message=str(exc), **({"result_id": original_result} if original_result else {}))
     except Exception as exc:
         folder = store.root / "logs"
         folder.mkdir(exist_ok=True)
         (folder / f"{job_id}.log").write_text(traceback.format_exc(), encoding="utf-8")
-        store.update_job(job_id, status="failed", message="任务失败，查看原因后可重试", error=str(exc))
+        write_job(status="failed", message="任务失败，查看原因后可重试", error=str(exc))
     finally:
-        _cleanup_uploaded_input(store, job_id)
+        if not claim_lost:
+            _cleanup_uploaded_input(store, job_id)
         lease.release()
         reset_performance(performance_tokens)
 
@@ -473,15 +644,48 @@ class JobManager:
         self.root, self.workers = root, workers
         self.poll_seconds = float(poll_seconds or load_settings().market_data.scheduler_poll_seconds)
         self.stop_event = threading.Event()
+        self.claim_token = uuid.uuid4().hex
         self.active: dict[str, multiprocessing.Process] = {}
+        self.last_recovery = 0.0
         self.thread = threading.Thread(target=self._loop, daemon=True, name="grid-job-dispatcher")
+
+    def _recover_orphans(self, store: Store, startup_grace: float = 30.0) -> None:
+        cursor = None
+        now = datetime.now(timezone.utc)
+        while True:
+            page = store.jobs_by_status("running", after=cursor, limit=200)
+            if not page:
+                break
+            for job in page:
+                if job.get("pid") and _pid_alive(job["pid"]):
+                    continue
+                updated: datetime | None = None
+                try:
+                    updated = datetime.fromisoformat(str(job.get("updated_at")))
+                    if updated.tzinfo is None:
+                        updated = updated.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError):
+                    pass
+                starting = job.get("message") == "正在启动计算进程"
+                if starting and updated is not None and (now - updated).total_seconds() < startup_grace:
+                    continue
+                marked = store.update_job(
+                    job["id"], require_claim=bool(job.get("claim_token")),
+                    expected_claim_token=job.get("claim_token"), status="failed",
+                    claim_token=None, claimed_at=None,
+                    message="启动超时" if starting else "执行中断",
+                    error="应用或计算进程中断；原数据版本保留，请重新运行",
+                )
+                current = store.job(job["id"]) or {}
+                if marked or current.get("status") != "running":
+                    # The dead job must not keep holding its CPU lease.
+                    _release_job_lease(store, job["id"])
+            cursor = (page[-1]["created_at"], page[-1]["id"])
 
     def start(self):
         # Previously interrupted application jobs are reviewable and retryable.
         store = Store(self.root)
-        for job in store.jobs(1000):
-            if job["status"] == "running" and (not job.get("pid") or not _pid_alive(job["pid"])):
-                store.update_job(job["id"], status="failed", error="应用或计算进程中断；原数据版本保留，请重新运行", message="执行中断")
+        self._recover_orphans(store)
         clear_stale_leases(store)
         self.thread.start()
 
@@ -489,32 +693,70 @@ class JobManager:
         context = multiprocessing.get_context("spawn")
         store = Store(self.root)
         while not self.stop_event.wait(self.poll_seconds):
+            if time.monotonic() - self.last_recovery >= 5.0:
+                self._recover_orphans(store)
+                self.last_recovery = time.monotonic()
             for job_id, process in list(self.active.items()):
                 if not process.is_alive():
                     process.join()
                     self.active.pop(job_id)
                     job = store.job(job_id)
                     if job and job["status"] == "running":
-                        store.update_job(job_id, status="failed", error="计算进程异常退出", message="进程中断")
+                        store.update_job(
+                            job_id, require_claim=bool(job.get("claim_token")),
+                            expected_claim_token=job.get("claim_token"), status="failed",
+                            claim_token=None, claimed_at=None,
+                            error="计算进程异常退出", message="进程中断",
+                        )
                     _release_job_lease(store, job_id)
+                    continue
+                job = store.job(job_id) or {}
+                limit = _runtime_limit_seconds(job)
+                if job.get("kind") in {"optimization", "research_completion"} and limit > 0:
+                    elapsed = _elapsed_seconds(job)
+                    stage = timeout_stage(elapsed, limit)
+                    if stage == "stop":
+                        # Ask the worker to stop first: it checkpoints and
+                        # publishes the evidence it already produced.
+                        _request_stop(store, job_id, job, limit)
+                    elif stage == "terminate":
+                        current = store.job(job_id) or {}
+                        if current.get("status") != "running":
+                            # The worker already published its final evidence.
+                            continue
+                        _terminate_process_tree(process.pid)
+                        process.join(timeout=1)
+                        self.active.pop(job_id, None)
+                        store.update_job(
+                            job_id, require_claim=True,
+                            expected_claim_token=current.get("claim_token"),
+                            status="failed", message="任务超过时间上限，计算进程已终止",
+                            error="达到时间预算后 30 秒仍未退出，已终止进程",
+                            claim_token=None, claimed_at=None,
+                        )
+                        _release_job_lease(store, job_id)
             if len(self.active) >= self.workers:
                 continue
-            queued = [job for job in reversed(store.jobs(1000)) if job["status"] == "queued"]
-            for job in queued[:self.workers - len(self.active)]:
-                if job["cancel_requested"]:
-                    store.update_job(job["id"], status="cancelled", message="排队期间已取消")
-                    continue
-                # Claim before spawn so two dispatcher ticks cannot duplicate a job.
-                store.update_job(job["id"], status="running", message="正在启动计算进程")
+            for job_id in store.claim_jobs(self.claim_token, self.workers):
                 # Batch workers spawn their own BaoStock/validation children.
                 # A daemonic parent is forbidden from creating those children.
-                process = context.Process(target=execute_job, args=(self.root, job["id"]), daemon=False)
+                process = context.Process(target=execute_job, args=(self.root, job_id), daemon=False)
                 try:
                     process.start()
-                    store.update_job(job["id"], pid=process.pid)
-                    self.active[job["id"]] = process
+                    if not store.update_job(
+                        job_id, require_claim=True, expected_claim_token=self.claim_token,
+                        pid=process.pid,
+                    ):
+                        _terminate_process_tree(process.pid)
+                        process.join(timeout=1)
+                        continue
+                    self.active[job_id] = process
                 except Exception as exc:
-                    store.update_job(job["id"], status="failed", error="无法启动计算进程：" + str(exc), message="进程启动失败")
+                    store.update_job(
+                        job_id, require_claim=True, expected_claim_token=self.claim_token,
+                        status="failed", error="无法启动计算进程：" + str(exc),
+                        message="进程启动失败", claim_token=None, claimed_at=None,
+                    )
 
     def stop(self):
         self.stop_event.set()
@@ -526,7 +768,13 @@ class JobManager:
             if process.is_alive():
                 _terminate_process_tree(process.pid)
                 process.join(timeout=1)
-                store.update_job(job_id, status="cancelled", message="应用已退出；计算任务已停止")
+                job = store.job(job_id) or {}
+                store.update_job(
+                    job_id, require_claim=bool(job.get("claim_token")),
+                    expected_claim_token=job.get("claim_token"),
+                    status="cancelled", message="应用已退出；计算任务已停止",
+                    claim_token=None, claimed_at=None,
+                )
             _release_job_lease(store, job_id)
 
 

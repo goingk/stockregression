@@ -302,11 +302,11 @@ def tensor_robust_scores(
     return output
 
 
-def eligible(row: Mapping[str, Any] | None, score: RobustScore | None, *, max_drawdown: float, min_trades: int, strategy: ResearchStrategySpec) -> bool:
+def eligible(row: Mapping[str, Any] | None, score: RobustScore | None, *, max_principal_drawdown: float, min_trades: int, strategy: ResearchStrategySpec) -> bool:
     if not completed(row) or score is None or not score.complete or not math.isfinite(score.j_score) or score.j_score <= 0:
         return False
-    drawdown = float(row.get("training_drawdown", math.inf))
-    if not math.isfinite(drawdown) or drawdown > float(max_drawdown):
+    drawdown = float(row.get("max_principal_drawdown", math.inf))
+    if not math.isfinite(drawdown) or drawdown > float(max_principal_drawdown):
         return False
     if int(row.get("trade_count", 0) or 0) < int(min_trades):
         return False

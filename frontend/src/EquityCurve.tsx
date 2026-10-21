@@ -2,7 +2,7 @@ import type { EChartsOption } from 'echarts'
 import ChartView from './ChartView'
 import { money } from './components'
 import { assetInvestmentReturn } from './equityMath'
-import type { BacktestResult, EquityPoint, StrategyResult } from './types'
+import type { BacktestResult, EquityPoint } from './types'
 
 export { assetInvestmentRatio, assetInvestmentReturn, costBasisDrawdowns, costBasisDrawdowns as contributionAdjustedDrawdowns } from './equityMath'
 
@@ -13,14 +13,9 @@ const curves = [
   { key: 'dca', name: '定投', color: '#e29136', width: 1.9 },
 ] as const
 
-function denominator(point: EquityPoint, strategy: StrategyResult, result: BacktestResult) {
+function denominator(point: EquityPoint, result: BacktestResult) {
   if (typeof point.total_invested === 'number' && Number.isFinite(point.total_invested)) return Math.max(0, point.total_invested)
-  if (result.accounting_basis === 'independent_contributions_v1') {
-    if (typeof point.normalized_equity === 'number' && Number.isFinite(point.normalized_equity) && point.normalized_equity > 0) return point.equity / point.normalized_equity
-    return null
-  }
-  if (strategy.return_basis === 'cost' && typeof point.normalized_equity === 'number' && point.normalized_equity > 0) return point.equity / point.normalized_equity
-  if (strategy.return_basis === 'cost') return null
+  if (result.accounting_basis === 'independent_contributions_v1') return null
   return result.funding?.initial_equity ?? result.config.initial_cash ?? null
 }
 
@@ -45,7 +40,7 @@ export default function EquityCurve({ result, height, stretch = false }: { resul
     legend: { top: 2, right: 4 },
     grid: { left: 57, right: 20, top: 42, bottom: 34 },
     xAxis: { type: 'time', axisLabel: { hideOverlap: true } },
-    yAxis: { type: 'value', scale: false, name: '投入收益率', axisLabel: { formatter: (value: number) => `${(value * 100).toFixed(0)}%` }, splitLine: { lineStyle: { color: '#eef1f5' } } },
+    yAxis: { type: 'value', scale: false, name: '峰值本金收益率', axisLabel: { formatter: (value: number) => `${(value * 100).toFixed(0)}%` }, splitLine: { lineStyle: { color: '#eef1f5' } } },
     dataZoom: [{ type: 'inside' }],
     series: curves.filter((curve) => result.strategies[curve.key]).map((curve) => {
       const strategy = result.strategies[curve.key]
@@ -57,7 +52,7 @@ export default function EquityCurve({ result, height, stretch = false }: { resul
         connectNulls: false,
         data: points.map((point) => {
           const returnRate = assetInvestmentReturn(point, strategy, result)
-          const invested = denominator(point, strategy, result)
+          const invested = denominator(point, result)
           return {
             value: [point.timestamp, returnRate],
             asset: point.equity,

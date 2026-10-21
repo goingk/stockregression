@@ -11,6 +11,61 @@ const point = (timestamp, normalized_equity, total_invested, equity = 100) => ({
   normalized_equity,
   total_invested,
 })
+const peakPoint = (timestamp, principal_curve, values = {}) => ({
+  timestamp,
+  equity: 100,
+  total_invested: 100,
+  principal_curve,
+  ...values,
+})
+
+test('the peak-principal curve is the ratio and the return follows it', () => {
+  const value = peakPoint('2024-01-01', 1.25)
+
+  assert.equal(assetInvestmentRatio(value, costStrategy, result), 1.25)
+  assert.ok(Math.abs(assetInvestmentReturn(value, costStrategy, result) - 0.25) < 1e-12)
+})
+
+test('the peak-principal curve wins over the legacy invested-capital fallback', () => {
+  const value = { timestamp: '2024-01-01', equity: 110, total_invested: 100, normalized_equity: 1.1, principal_curve: 1.4 }
+
+  assert.equal(assetInvestmentRatio(value, costStrategy, result), 1.4)
+  // A point without contributions still reports its peak-principal curve.
+  assert.equal(assetInvestmentRatio({ timestamp: '2024-01-02', equity: 0, total_invested: 0, principal_curve: 0.9 }, costStrategy, result), 0.9)
+})
+
+test('a missing peak-principal curve falls back to the legacy fields', () => {
+  assert.equal(assetInvestmentRatio(point('2024-01-01', 1.1, 100, 110), costStrategy, result), 1.1)
+  assert.equal(assetInvestmentRatio({ timestamp: '2024-01-01', equity: 110, total_invested: 100 }, costStrategy, result), 1.1)
+})
+
+test('the reported principal drawdown is used as it is', () => {
+  const values = costBasisDrawdowns([
+    peakPoint('2024-01-01', 1.1, { principal_drawdown: 0 }),
+    peakPoint('2024-01-02', 1.2, { principal_drawdown: 0.03 }),
+    peakPoint('2024-01-03', 1.05, { principal_drawdown: 0.12 }),
+  ], costStrategy, result)
+
+  assert.deepEqual(values.map(([, value]) => value), [0, 0.03, 0.12])
+})
+
+test('a reported principal drawdown survives a point whose ratio is missing', () => {
+  const values = costBasisDrawdowns([{ timestamp: '2024-01-01', equity: 0, total_invested: 0, principal_drawdown: 0.04 }], costStrategy, result)
+
+  assert.deepEqual(values, [['2024-01-01', 0.04]])
+})
+
+test('legacy points without a reported drawdown keep the peak baseline', () => {
+  const values = costBasisDrawdowns([
+    point('2024-01-01', 1.1, 100, 110),
+    point('2024-01-02', 1.2, 200, 240),
+    point('2024-01-03', 1.05, 300, 315),
+  ], costStrategy, result)
+
+  assert.equal(values[0][1], 0)
+  assert.equal(values[1][1], 0)
+  assert.ok(Math.abs(values[2][1] - 0.125) < 1e-12)
+})
 
 test('1.10 invested ratio is a 10% return from break-even', () => {
   const ratio = assetInvestmentRatio(point('2024-01-01', 1.1, 100, 110), costStrategy, result)

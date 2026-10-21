@@ -38,7 +38,7 @@ export function RobustPointSummary({ point, kind, onLoad }: { point: LandscapePo
 export function RobustJRanking({ points, total, count, coverage, onLoad }: { points: LandscapePoint[]; total: number; count: number; coverage?: string | null; onLoad?: LoadPoint }) {
   return <section className='research-j-ranking'>
     <div className='research-peak-regions-head'>
-      <div><h3>四维稳健 J 排名</h3><span>按 J 从高到低推荐前 {count} 组，当前显示 {points.length} / {total.toLocaleString()} 组；约束状态随参数展示。</span></div>
+      <div><h3>四维稳健 J 排名</h3><span>训练候选按 J 从高到低推荐前 {count} 组，当前显示 {points.length} / {total.toLocaleString()} 组；约束状态随参数展示。训练候选不是样本外结果。</span></div>
       <Badge tone='neutral'>{coverage === 'global_exhaustive' ? '全局穷尽' : '预算搜索'}</Badge>
     </div>
     {points.length ? <div className='research-peak-regions'>{points.map((point, index) => <article className='research-peak-region' key={point.candidate_id}>

@@ -283,6 +283,7 @@ def test_etf_package_api_scans_and_submits_parquet_import(tmp_path):
         )
         assert submitted.status_code == 200, submitted.text
         job_id = submitted.json()["job_id"]
+        assert Store(root).claim_job(job_id, "test-worker")
         execute_job(str(root), job_id)
         assert client.get(f"/api/v1/jobs/{job_id}").json()["status"] == "completed"
         assert client.get("/api/v1/data/coverage/510050.SH?timeframe=1min").json()["storage"] == "parquet-source"

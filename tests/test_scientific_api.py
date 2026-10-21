@@ -16,7 +16,7 @@ import pytest
 
 from stockregression.api import create_app, public_result
 from stockregression.jobs import _research_protocol_hash
-from stockregression.models import BacktestConfig, OptimizationConfig
+from stockregression.models import BacktestConfig, OptimizationConfig, ResearchStrategySpec
 from stockregression.settings import ResearchDefaults
 from stockregression.storage import Store, dumps
 
@@ -150,6 +150,13 @@ def test_v5_models_reject_retired_protocol_fields():
             base={"schema_version": 3, "symbol": "600000.SH", "start_date": "2024-01-02"},
             n_trials=8,
         )
+    with pytest.raises(ValidationError):
+        OptimizationConfig(
+            base={"schema_version": 3, "symbol": "600000.SH", "start_date": "2024-01-02"},
+            protocol_version=4,
+        )
+    with pytest.raises(ValidationError):
+        ResearchStrategySpec(strategy_version=4)
 
     serialized = BacktestConfig(
         schema_version=3, symbol="600000.SH", start_date=date(2024, 1, 2),

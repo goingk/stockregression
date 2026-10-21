@@ -215,7 +215,9 @@ def test_api_snapshot_and_compliance_are_exposed_as_task_results(tmp_path):
             "import_mode": mode,
         })
         assert response.status_code == 200
-        execute_job(str(root), response.json()["job_id"])
+        job_id = response.json()["job_id"]
+        assert Store(root).claim_job(job_id, "test-worker")
+        execute_job(str(root), job_id)
 
     bars = client.get("/api/v1/data/bars/600000.SH?frequency=1day").json()
     compliance = client.get("/api/v1/data/compliance/600000.SH").json()

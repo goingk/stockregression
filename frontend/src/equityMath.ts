@@ -3,6 +3,10 @@ export interface EquityMathPoint {
   equity: number
   normalized_equity?: number | null
   total_invested?: number | null
+  /** v5 peak-principal accounting: 1 + cumulative profit / peak principal. */
+  principal_curve?: number | null
+  /** v5 peak-principal accounting: drawdown of the principal profit curve. */
+  principal_drawdown?: number | null
 }
 
 export interface EquityMathStrategy {
@@ -24,6 +28,10 @@ export function assetInvestmentRatio(
   result: EquityMathResult,
   requireInvestmentData = false,
 ): number | null {
+  // v5 states the peak-principal ratio directly; only older results need the derived fallbacks.
+  if (typeof point.principal_curve === 'number' && Number.isFinite(point.principal_curve)) {
+    return point.principal_curve
+  }
   const invested = typeof point.total_invested === 'number' && Number.isFinite(point.total_invested)
     ? point.total_invested
     : null
@@ -66,9 +74,14 @@ export function costBasisDrawdowns(
 ): Array<[string, number | null]> {
   let peakRatio = 1
   return points.map((point): [string, number | null] => {
+    // v5 reports the principal profit drawdown itself; older results keep the peak-based fallback.
+    const reported = typeof point.principal_drawdown === 'number' && Number.isFinite(point.principal_drawdown)
+      ? point.principal_drawdown
+      : null
     const ratio = assetInvestmentRatio(point, strategy, result, true)
-    if (ratio == null || !Number.isFinite(ratio) || ratio < 0) return [point.timestamp, null]
+    if (ratio == null || !Number.isFinite(ratio) || ratio < 0) return [point.timestamp, reported]
     peakRatio = Math.max(peakRatio, ratio)
+    if (reported != null) return [point.timestamp, reported]
     return [point.timestamp, (peakRatio - ratio) / peakRatio]
   })
 }

@@ -1,46 +1,12 @@
 """Deterministic market-shape diagnostics used to seed research searches."""
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from ..models import DataBundle
-
-
-@dataclass(frozen=True)
-class StatisticalEvaluator:
-    """Explicit statistical state for reproducible family-level inference."""
-
-    reps: int = 10_000
-    block_lengths: tuple[int, ...] = (20, 10, 40)
-    alpha: float = .05
-    seed: int = 42
-
-    def __post_init__(self) -> None:
-        if int(self.reps) < 1:
-            raise ValueError("Bootstrap 次数必须为正整数")
-        if not self.block_lengths or any(int(value) < 1 for value in self.block_lengths):
-            raise ValueError("Bootstrap 区块长度必须为正整数")
-        if not 0 < float(self.alpha) < 1:
-            raise ValueError("显著性水平必须位于 0 与 1 之间")
-
-    def paired_bootstrap(
-        self, candidates: np.ndarray, passive: np.ndarray, *, selected_index: int = 0,
-        cancelled=None, progress=None,
-    ) -> dict[str, Any]:
-        from ..research_statistics import paired_stationary_bootstrap
-
-        return paired_stationary_bootstrap(
-            candidates, passive, selected_index=int(selected_index),
-            reps=int(self.reps), block_lengths=tuple(int(value) for value in self.block_lengths),
-            seed=int(self.seed), cancelled=cancelled, progress=progress,
-        )
-
-    def market_profile(self, data: DataBundle, dates: pd.DatetimeIndex) -> dict[str, Any]:
-        return market_statistical_profile(data, dates)
 
 
 def market_statistical_profile(data: DataBundle, dates: pd.DatetimeIndex) -> dict[str, Any]:

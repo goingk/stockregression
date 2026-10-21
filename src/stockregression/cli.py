@@ -434,9 +434,12 @@ def config_migrate_legacy(
 
 
 def _run(kind: str, payload: dict):
+    import uuid
     settings = load_settings()
     store = Store(settings.data_dir)
     job_id = store.new_job(kind, payload)
+    if not store.claim_job(job_id, uuid.uuid4().hex):
+        raise typer.BadParameter("任务已被其他调度器领取")
     typer.echo(f"任务 {job_id}，数据目录 {store.root}")
     execute_job(str(store.root), job_id, lambda fraction, message: typer.echo(f"{fraction:6.1%} · {message}"))
     result = store.job(job_id)

@@ -48,35 +48,364 @@ _V4_ARCHIVE_FIELDS = (
     "candidate_archive", "search_candidate_archive", "trial_archive",
 )
 
-
-def _archive_reference(root: Path, relative: str) -> dict[str, str]:
-    return {"__archive__": relative}
+_CANDIDATE_REFERENCE = "__candidate_archive__"
 
 
-def _write_archive(root: Path, result_id: str, ordinal: int, kind: str, rows: list) -> dict[str, str]:
-    folder = root / "results" / f"{result_id}.artifacts"
+class CompletionRevisionError(Exception):
+    """A completion revision cannot serve the requested decision branch.
+
+    A revision only covers the decision and decision index it was computed
+    for.  Reading any other branch with that revision would silently show the
+    pre-completion archive as if it had been revised, so the caller has to
+    fail loudly instead.
+    """
+
+    def __init__(self, message: str, *, code: str, revision: int,
+                 scope: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.revision = int(revision)
+        self.scope = scope
+
+
+_CANDIDATE_FIELDS = {
+    "ordinal", "candidate_id", "buy_step", "sell_step", "buy_shares",
+    "sell_shares", "j_score", "training_excess_return", "max_principal_drawdown",
+    "validation_excess_original", "validation_return_original",
+    "validation_excess_stress", "validation_return_stress",
+    "neighborhood_mean", "downside_risk_tau", "pos_penalty", "score_complete",
+}
+
+_CANDIDATE_AXIS_FIELDS = {"buy_step", "sell_step", "buy_shares", "sell_shares"}
+
+
+def _checkpoint_points(values: Any) -> set[tuple[int, ...]]:
+    """Read a checkpoint coordinate list into a comparable set."""
+    points: set[tuple[int, ...]] = set()
+    for value in values or []:
+        if isinstance(value, (list, tuple)):
+            try:
+                points.add(tuple(int(item) for item in value))
+            except (TypeError, ValueError):
+                continue
+    return points
+
+
+def _checkpoint_rows(*groups: Any) -> list[dict[str, Any]]:
+    """Merge checkpoint rows, keeping one row per evaluated coordinate."""
+    merged: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for row in group or []:
+            if not isinstance(row, dict):
+                continue
+            params = row.get("params")
+            key = dumps(params) if isinstance(params, dict) else dumps(row)
+            merged[key] = row
+    return list(merged.values())
+
+
+def _merge_completion_checkpoint(existing: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+    """Merge two concurrent checkpoint writes without losing paid work.
+
+    Two workers may write the same checkpoint file.  The merge keeps the
+    highest recorded consumption and the union of the processed points, so a
+    later reader never believes that already paid evaluations are still
+    pending and never spends the same budget twice.
+    """
+    if not isinstance(existing, dict) or not existing:
+        return dict(payload)
+    merged = {**existing, **payload}
+    merged["consumed"] = max(
+        int(existing.get("consumed", 0) or 0), int(payload.get("consumed", 0) or 0),
+    )
+    processed = _checkpoint_points(existing.get("processed")) | _checkpoint_points(payload.get("processed"))
+    merged["processed"] = [list(point) for point in sorted(processed)]
+    # A reservation stays charged until it is either processed or explicitly
+    # released, so the in-flight set is the union minus the processed points.
+    in_flight = _checkpoint_points(existing.get("in_flight")) | _checkpoint_points(payload.get("in_flight"))
+    merged["in_flight"] = [list(point) for point in sorted(in_flight - processed)]
+    merged["new_rows"] = _checkpoint_rows(existing.get("new_rows"), payload.get("new_rows"))
+    merged["targets"] = existing.get("targets") or payload.get("targets")
+    remaining = [
+        int(value) for value in (existing.get("remaining_count"), payload.get("remaining_count"))
+        if isinstance(value, int) and not isinstance(value, bool)
+    ]
+    if remaining:
+        merged["remaining_count"] = min(remaining)
+    terminal = {"completed", "failed", "cancelled", "partial", "budget_exhausted"}
+    if str(existing.get("status") or "") in terminal and str(payload.get("status") or "") == "running":
+        merged["status"] = existing.get("status")
+        merged["stop_reason"] = existing.get("stop_reason")
+    return merged
+
+
+def _write_candidate_archive(root: Path, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    canonical = sorted(
+        rows,
+        key=lambda row: (
+            int(row.get("candidate_id")) if isinstance(row.get("candidate_id"), (int, float)) else 2**63,
+            dumps(row),
+        ),
+    )
+    encoded = dumps(canonical)
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    folder = root / "result_archives"
     folder.mkdir(parents=True, exist_ok=True)
-    name = f"{ordinal:03d}-{kind}.json.gz"
-    target = folder / name
-    with gzip.open(target, "wt", encoding="utf-8") as handle:
-        handle.write(dumps(rows))
-    return _archive_reference(root, target.relative_to(root).as_posix())
+    target = folder / f"{digest}.sqlite"
+    if not target.exists():
+        lock = FileLock(str(target) + ".lock")
+        with lock:
+            if not target.exists():
+                temporary = folder / f".{digest}.{uuid.uuid4().hex}.writing"
+                connection = sqlite3.connect(temporary)
+                try:
+                    connection.executescript(
+                        """
+                        CREATE TABLE candidates(
+                            ordinal INTEGER PRIMARY KEY,
+                            candidate_id INTEGER,
+                            buy_step REAL, sell_step REAL, buy_shares REAL, sell_shares REAL,
+                            j_score REAL, training_excess_return REAL, max_principal_drawdown REAL,
+                            validation_excess_original REAL, validation_return_original REAL,
+                            validation_excess_stress REAL, validation_return_stress REAL,
+                            neighborhood_mean REAL, downside_risk_tau REAL, pos_penalty REAL,
+                            score_complete INTEGER,
+                            row_json TEXT NOT NULL
+                        );
+                        CREATE TABLE candidate_regions(ordinal INTEGER NOT NULL, region_id INTEGER NOT NULL);
+                        CREATE INDEX candidate_order ON candidates(ordinal);
+                        CREATE INDEX candidate_j ON candidates(j_score DESC);
+                        CREATE INDEX candidate_return ON candidates(training_excess_return DESC);
+                        CREATE INDEX candidate_validation_return ON candidates(validation_excess_original DESC);
+                        CREATE INDEX candidate_j_robust ON candidates(
+                            j_score DESC, neighborhood_mean DESC, downside_risk_tau ASC,
+                            pos_penalty ASC, training_excess_return DESC
+                        );
+                        CREATE INDEX candidate_region ON candidate_regions(region_id,ordinal);
+                        """
+                    )
+                    connection.execute("BEGIN")
+                    for ordinal, row in enumerate(canonical):
+                        params = row.get("params") if isinstance(row.get("params"), dict) else {}
+                        connection.execute(
+                            "INSERT INTO candidates VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                ordinal, row.get("candidate_id"),
+                                params.get("buy_step"), params.get("sell_step"),
+                                params.get("buy_shares"), params.get("sell_shares"),
+                                row.get("j_score"), row.get("training_excess_return"),
+                                row.get("max_principal_drawdown"),
+                                row.get("validation_excess_original"), row.get("validation_return_original"),
+                                row.get("validation_excess_stress"), row.get("validation_return_stress"),
+                                row.get("neighborhood_mean"), row.get("downside_risk_tau"),
+                                row.get("pos_penalty"),
+                                None if row.get("score_complete") is None else int(bool(row.get("score_complete"))),
+                                dumps(row),
+                            ),
+                        )
+                        region_ids = row.get("region_ids") or []
+                        if not isinstance(region_ids, list):
+                            region_ids = []
+                        connection.executemany(
+                            "INSERT INTO candidate_regions VALUES(?,?)",
+                            [(ordinal, int(region_id)) for region_id in region_ids if isinstance(region_id, int)],
+                        )
+                    connection.commit()
+                finally:
+                    connection.close()
+                temporary.replace(target)
+    return {_CANDIDATE_REFERENCE: target.relative_to(root).as_posix(), "archive_hash": digest, "row_count": len(canonical)}
 
 
-def _detach_v4_archives(root: Path, result_id: str, result: dict) -> dict:
-    """Keep v4 candidate rows out of the main result JSON."""
+def _merge_candidate_archives(root: Path, base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Create an immutable overlay view without materialising rows in memory."""
+    base_relative = base.get(_CANDIDATE_REFERENCE)
+    overlay_relative = overlay.get(_CANDIDATE_REFERENCE)
+    if not isinstance(base_relative, str) or not isinstance(overlay_relative, str):
+        return overlay
+    identity = dumps({
+        "base": base.get("archive_hash"), "overlay": overlay.get("archive_hash"),
+    })
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    folder = root / "result_archives"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"{digest}.sqlite"
+    reference = {
+        _CANDIDATE_REFERENCE: target.relative_to(root).as_posix(),
+        "archive_hash": digest,
+        "base_archive_hash": base.get("archive_hash"),
+        "overlay_archive_hash": overlay.get("archive_hash"),
+    }
+    if target.exists():
+        return {**reference, "row_count": _archive_row_count(target)}
+    base_path = (root / base_relative).resolve()
+    overlay_path = (root / overlay_relative).resolve()
+    for path in (base_path, overlay_path):
+        if root.resolve() not in path.parents or not path.is_file():
+            raise FileNotFoundError("候选档案不存在")
+    with FileLock(str(target) + ".lock"):
+        if target.exists():
+            return {**reference, "row_count": _archive_row_count(target)}
+        temporary = folder / f".{digest}.{uuid.uuid4().hex}.writing"
+        connection = sqlite3.connect(temporary)
+        try:
+            connection.executescript(
+                """
+                CREATE TABLE candidates(
+                    ordinal INTEGER PRIMARY KEY, candidate_id INTEGER,
+                    buy_step REAL, sell_step REAL, buy_shares REAL, sell_shares REAL,
+                    j_score REAL, training_excess_return REAL, max_principal_drawdown REAL,
+                    validation_excess_original REAL, validation_return_original REAL,
+                    validation_excess_stress REAL, validation_return_stress REAL,
+                    neighborhood_mean REAL, downside_risk_tau REAL, pos_penalty REAL,
+                    score_complete INTEGER, row_json TEXT NOT NULL
+                );
+                CREATE TABLE candidate_regions(ordinal INTEGER NOT NULL, region_id INTEGER NOT NULL);
+                CREATE INDEX candidate_j_robust ON candidates(
+                    j_score DESC, neighborhood_mean DESC, downside_risk_tau ASC,
+                    pos_penalty ASC, training_excess_return DESC
+                );
+                CREATE INDEX candidate_return ON candidates(training_excess_return DESC);
+                CREATE INDEX candidate_validation_return ON candidates(validation_excess_original DESC);
+                CREATE INDEX candidate_region ON candidate_regions(region_id,ordinal);
+                """
+            )
+            # SQLite cannot attach a table alias with the same table name, so
+            # collect the four-axis overlay rows (reporting overlays are
+            # capped) and stream the much larger base archive row by row.
+            overlay_connection = sqlite3.connect(overlay_path)
+            overlay_connection.row_factory = sqlite3.Row
+            overlay_rows: dict[tuple[Any, Any, Any, Any], dict[str, Any]] = {}
+            overlay_order: list[tuple[Any, Any, Any, Any]] = []
+            try:
+                for row in overlay_connection.execute(
+                    "SELECT buy_step,sell_step,buy_shares,sell_shares,row_json FROM candidates ORDER BY ordinal"
+                ):
+                    axis = (row["buy_step"], row["sell_step"], row["buy_shares"], row["sell_shares"])
+                    overlay_rows[axis] = json.loads(row["row_json"])
+                    overlay_order.append(axis)
+            finally:
+                overlay_connection.close()
+            base_connection = sqlite3.connect(base_path)
+            base_connection.row_factory = sqlite3.Row
+            ordinal = 0
+            replaced: set[tuple[Any, Any, Any, Any]] = set()
+            next_candidate_id = 1
+            try:
+                for row in base_connection.execute(
+                    "SELECT buy_step,sell_step,buy_shares,sell_shares,row_json FROM candidates ORDER BY ordinal"
+                ):
+                    axis = (row["buy_step"], row["sell_step"], row["buy_shares"], row["sell_shares"])
+                    base_payload = json.loads(row["row_json"])
+                    candidate_id = base_payload.get("candidate_id")
+                    if isinstance(candidate_id, (int, float)) and not isinstance(candidate_id, bool):
+                        next_candidate_id = max(next_candidate_id, int(candidate_id) + 1)
+                    overlay = overlay_rows.get(axis)
+                    if overlay is None:
+                        _insert_archive_row(connection, ordinal, row)
+                    else:
+                        # The overlay replaces the base row in place and keeps
+                        # the base identity and region membership, so a region
+                        # filter still returns the same members after a merge.
+                        payload = dict(overlay)
+                        regions = list(dict.fromkeys([
+                            *(payload.get("region_ids") or []),
+                            *(base_payload.get("region_ids") or []),
+                        ]))
+                        if regions:
+                            payload["region_ids"] = regions
+                        if payload.get("candidate_id") is None and candidate_id is not None:
+                            payload["candidate_id"] = candidate_id
+                        _insert_archive_payload(connection, ordinal, payload, axis)
+                        replaced.add(axis)
+                    ordinal += 1
+                for axis in overlay_order:
+                    if axis in replaced:
+                        continue
+                    payload = dict(overlay_rows[axis])
+                    if payload.get("candidate_id") is None:
+                        payload["candidate_id"] = next_candidate_id
+                        next_candidate_id += 1
+                    _insert_archive_payload(connection, ordinal, payload, axis)
+                    ordinal += 1
+            finally:
+                base_connection.close()
+            connection.commit()
+        finally:
+            connection.close()
+        temporary.replace(target)
+    return {
+        **reference, "row_count": ordinal,
+    }
+
+
+def _archive_row_count(path: Path) -> int:
+    connection = sqlite3.connect(path)
+    try:
+        return int(connection.execute("SELECT COUNT(*) FROM candidates").fetchone()[0])
+    finally:
+        connection.close()
+
+
+def _insert_archive_payload(connection: sqlite3.Connection, ordinal: int, payload: dict[str, Any],
+                             axis: tuple[Any, Any, Any, Any], row_json: str | None = None) -> None:
+    """Insert one candidate row from its JSON payload and its four-axis values."""
+    connection.execute(
+        "INSERT INTO candidates VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            ordinal, payload.get("candidate_id"),
+            axis[0], axis[1], axis[2], axis[3],
+            payload.get("j_score"),
+            payload.get("training_excess_return"),
+            payload.get("max_principal_drawdown"),
+            payload.get("validation_excess_original"), payload.get("validation_return_original"),
+            payload.get("validation_excess_stress"), payload.get("validation_return_stress"),
+            payload.get("neighborhood_mean"),
+            payload.get("downside_risk_tau"),
+            payload.get("pos_penalty"),
+            None if payload.get("score_complete") is None else int(bool(payload.get("score_complete"))),
+            row_json if row_json is not None else dumps(payload),
+        ),
+    )
+    region_ids = payload.get("region_ids") or []
+    if isinstance(region_ids, list):
+        connection.executemany(
+            "INSERT INTO candidate_regions VALUES(?,?)",
+            [(ordinal, int(region_id)) for region_id in region_ids if isinstance(region_id, int)],
+        )
+
+
+def _insert_archive_row(connection: sqlite3.Connection, ordinal: int, row: sqlite3.Row) -> None:
+    payload = json.loads(row["row_json"])
+    axis = (row["buy_step"], row["sell_step"], row["buy_shares"], row["sell_shares"])
+    _insert_archive_payload(connection, ordinal, payload, axis, row_json=row["row_json"])
+
+
+def _detach_candidate_archives(root: Path, result: dict) -> dict:
     evidence = result.get("evidence")
     if not isinstance(evidence, dict):
         return result
-    ordinal = 0
     for group_name in ("candidate_archives", "trial_archives", "search_candidate_archives"):
         group = evidence.get(group_name)
         if not isinstance(group, dict):
             continue
         for branch_name, value in list(group.items()):
             if isinstance(value, list) and value and all(isinstance(row, dict) for row in value):
-                ordinal += 1
-                group[branch_name] = _write_archive(root, result_id, ordinal, group_name, value)
+                # Adaptive branches contain one decision entry per rebalance,
+                # each with its own candidate/search archives.  Only flat lists
+                # without archive-bearing decision metadata are candidate rows.
+                decision_entries = any(
+                    any(field in row for field in _V4_ARCHIVE_FIELDS)
+                    for row in value
+                )
+                if not decision_entries:
+                    group[branch_name] = _write_candidate_archive(root, value)
+                else:
+                    for item in value:
+                        for field in _V4_ARCHIVE_FIELDS:
+                            rows = item.get(field)
+                            if isinstance(rows, list) and rows and all(isinstance(row, dict) for row in rows):
+                                item[field] = _write_candidate_archive(root, rows)
             elif isinstance(value, list):
                 for item in value:
                     if not isinstance(item, dict):
@@ -84,24 +413,209 @@ def _detach_v4_archives(root: Path, result_id: str, result: dict) -> dict:
                     for field in _V4_ARCHIVE_FIELDS:
                         rows = item.get(field)
                         if isinstance(rows, list) and rows and all(isinstance(row, dict) for row in rows):
-                            ordinal += 1
-                            item[field] = _write_archive(root, result_id, ordinal, field, rows)
+                            item[field] = _write_candidate_archive(root, rows)
     return result
 
 
-def _hydrate_v4_archives(root: Path, result: dict) -> dict:
-    def hydrate(value):
-        if isinstance(value, dict):
-            reference = value.get("__archive__")
-            if isinstance(reference, str):
-                with gzip.open(root / reference, "rt", encoding="utf-8") as handle:
-                    return json.load(handle)
-            return {key: hydrate(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [hydrate(item) for item in value]
-        return value
+def _candidate_rows(root: Path, reference: dict[str, Any], *, offset: int = 0,
+                    limit: int | None = None, sort_by: str = "ordinal",
+                    descending: bool = False, region_id: int | None = None,
+                    filters: dict[str, Any] | None = None,
+                    in_filters: dict[str, list[Any]] | None = None,
+                    ordinals: list[int] | tuple[int, ...] | None = None) -> dict[str, Any]:
+    relative = reference.get(_CANDIDATE_REFERENCE)
+    if not isinstance(relative, str):
+        return {"rows": [], "total": 0, "offset": offset, "limit": limit}
+    path = (root / relative).resolve()
+    if root.resolve() not in path.parents or not path.is_file():
+        raise FileNotFoundError("候选档案不存在")
+    if sort_by not in _CANDIDATE_FIELDS:
+        raise ValueError("不支持的候选排序字段")
+    if ordinals is not None and not [int(value) for value in ordinals]:
+        return {"rows": [], "total": 0, "offset": offset, "limit": limit}
+    connection = sqlite3.connect(path)
+    try:
+        columns = _candidate_columns(connection)
+        clause, arguments = _candidate_where(
+            connection, region_id=region_id, filters=filters,
+            in_filters=in_filters, ordinals=ordinals,
+        )
+        total = int(connection.execute("SELECT COUNT(*) FROM candidates c" + clause, arguments).fetchone()[0])
+        sql = (
+            f"SELECT c.ordinal,c.row_json FROM candidates c{clause} "
+            f"ORDER BY {_candidate_expression(columns, sort_by)} {'DESC' if descending else 'ASC'},c.ordinal"
+        )
+        query_arguments = list(arguments)
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            query_arguments.extend([int(limit), int(offset)])
+        elif offset:
+            sql += " LIMIT -1 OFFSET ?"
+            query_arguments.append(int(offset))
+        rows = []
+        for row in connection.execute(sql, query_arguments):
+            item = json.loads(row[1])
+            item.setdefault("_archive_ordinal", int(row[0]))
+            rows.append(item)
+    finally:
+        connection.close()
+    return {"rows": rows, "total": total, "offset": offset, "limit": limit}
 
-    return hydrate(result)
+
+def _candidate_columns(connection: sqlite3.Connection) -> set[str]:
+    return {row[1] for row in connection.execute("PRAGMA table_info(candidates)")}
+
+
+def _candidate_expression(columns: set[str], name: str) -> str:
+    if name in columns:
+        return f"c.{name}"
+    if name in _CANDIDATE_FIELDS:
+        # Results written before the S4 index extension remain readable; the
+        # expression fallback reads only rows selected by the surrounding
+        # WHERE and LIMIT clauses.
+        return f"json_extract(c.row_json, '$.{name}')"
+    raise ValueError("不支持的候选字段")
+
+
+def _candidate_where(connection: sqlite3.Connection, *, region_id: int | None = None,
+                     filters: dict[str, Any] | None = None,
+                     in_filters: dict[str, list[Any]] | None = None,
+                     ordinals: list[int] | tuple[int, ...] | None = None) -> tuple[str, list[Any]]:
+    """Build the shared WHERE clause used by archive reads and counts."""
+    columns = _candidate_columns(connection)
+    where: list[str] = []
+    arguments: list[Any] = []
+    if region_id is not None:
+        where.append("c.ordinal IN (SELECT ordinal FROM candidate_regions WHERE region_id=?)")
+        arguments.append(int(region_id))
+    if ordinals is not None:
+        values = [int(value) for value in ordinals]
+        if not values:
+            return " WHERE 0", []
+        where.append("c.ordinal IN (" + ",".join("?" for _ in values) + ")")
+        arguments.extend(values)
+    for name, value in (filters or {}).items():
+        if name not in _CANDIDATE_FIELDS:
+            continue
+        where.append(f"{_candidate_expression(columns, name)}=?")
+        arguments.append(value)
+    for name, values in (in_filters or {}).items():
+        if name not in _CANDIDATE_AXIS_FIELDS or not values:
+            continue
+        where.append(f"c.{name} IN (" + ",".join("?" for _ in values) + ")")
+        arguments.extend(values)
+    clause = " WHERE " + " AND ".join(where) if where else ""
+    return clause, arguments
+
+
+def _candidate_total(root: Path, reference: dict[str, Any], *, region_id: int | None = None,
+                     filters: dict[str, Any] | None = None,
+                     in_filters: dict[str, list[Any]] | None = None) -> int:
+    """Count the rows an archive query would return, without materialising them."""
+    relative = reference.get(_CANDIDATE_REFERENCE)
+    if not isinstance(relative, str):
+        return 0
+    path = (root / relative).resolve()
+    if root.resolve() not in path.parents or not path.is_file():
+        raise FileNotFoundError("候选档案不存在")
+    connection = sqlite3.connect(path)
+    try:
+        clause, arguments = _candidate_where(
+            connection, region_id=region_id, filters=filters, in_filters=in_filters,
+        )
+        return int(connection.execute("SELECT COUNT(*) FROM candidates c" + clause, arguments).fetchone()[0])
+    finally:
+        connection.close()
+
+
+def _candidate_axis_values(root: Path, reference: dict[str, Any], names: list[str]) -> dict[str, list[float]]:
+    relative = reference.get(_CANDIDATE_REFERENCE)
+    if not isinstance(relative, str):
+        return {}
+    path = (root / relative).resolve()
+    if root.resolve() not in path.parents or not path.is_file():
+        raise FileNotFoundError("候选档案不存在")
+    allowed = {"buy_step", "sell_step", "buy_shares", "sell_shares"}
+    connection = sqlite3.connect(path)
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(candidates)")}
+        output = {}
+        for name in names:
+            if name not in allowed or name not in columns:
+                continue
+            output[name] = sorted(
+                float(row[0]) for row in connection.execute(
+                    f"SELECT DISTINCT {name} FROM candidates WHERE {name} IS NOT NULL ORDER BY {name}"
+                )
+            )
+        return output
+    finally:
+        connection.close()
+
+
+def _candidate_ordinals(root: Path, reference: dict[str, Any], *,
+                        region_id: int | None = None, sort_by: str = "ordinal",
+                        descending: bool = False) -> list[int]:
+    relative = reference.get(_CANDIDATE_REFERENCE)
+    if not isinstance(relative, str):
+        return []
+    path = (root / relative).resolve()
+    if root.resolve() not in path.parents or not path.is_file():
+        raise FileNotFoundError("候选档案不存在")
+    connection = sqlite3.connect(path)
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(candidates)")}
+        allowed = {
+            "ordinal", "candidate_id", "buy_step", "sell_step", "buy_shares",
+            "sell_shares", "j_score", "training_excess_return", "max_principal_drawdown",
+            "validation_excess_original", "validation_return_original",
+            "validation_excess_stress", "validation_return_stress",
+            "neighborhood_mean", "downside_risk_tau", "pos_penalty", "score_complete",
+        }
+        if sort_by not in allowed:
+            raise ValueError("不支持的候选排序字段")
+        order = f"c.{sort_by}" if sort_by in columns else f"json_extract(c.row_json, '$.{sort_by}')"
+        if region_id is None:
+            rows = connection.execute(
+                f"SELECT ordinal FROM candidates c ORDER BY {order} {'DESC' if descending else 'ASC'},ordinal"
+            )
+        else:
+            rows = connection.execute(
+                f"SELECT ordinal FROM candidates c WHERE ordinal IN "
+                f"(SELECT ordinal FROM candidate_regions WHERE region_id=?) "
+                f"ORDER BY {order} {'DESC' if descending else 'ASC'},ordinal",
+                (int(region_id),),
+            )
+        return [int(row[0]) for row in rows]
+    finally:
+        connection.close()
+
+
+def _candidate_stats(root: Path, reference: dict[str, Any], *,
+                     region_id: int | None = None) -> dict[str, int]:
+    relative = reference.get(_CANDIDATE_REFERENCE)
+    if not isinstance(relative, str):
+        return {"total": 0, "j_complete": 0}
+    path = (root / relative).resolve()
+    if root.resolve() not in path.parents or not path.is_file():
+        raise FileNotFoundError("候选档案不存在")
+    where = ""
+    arguments: list[Any] = []
+    if region_id is not None:
+        where = " WHERE ordinal IN (SELECT ordinal FROM candidate_regions WHERE region_id=?)"
+        arguments.append(int(region_id))
+    connection = sqlite3.connect(path)
+    try:
+        total = int(connection.execute("SELECT COUNT(*) FROM candidates" + where, arguments).fetchone()[0])
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(candidates)")}
+        if "score_complete" in columns:
+            j_where = where + (" AND " if where else " WHERE ") + "score_complete != 0 AND j_score IS NOT NULL"
+        else:
+            j_where = where + (" AND " if where else " WHERE ") + "j_score IS NOT NULL"
+        j_complete = int(connection.execute("SELECT COUNT(*) FROM candidates" + j_where, arguments).fetchone()[0])
+        return {"total": total, "j_complete": j_complete}
+    finally:
+        connection.close()
 
 
 class Store:
@@ -124,14 +638,48 @@ class Store:
                 CREATE TABLE IF NOT EXISTS watchlist(symbol TEXT PRIMARY KEY,created_at TEXT);
                 CREATE TABLE IF NOT EXISTS snapshots(version TEXT PRIMARY KEY,symbol TEXT,created_at TEXT,manifest TEXT);
                 CREATE TABLE IF NOT EXISTS active_snapshots(symbol TEXT PRIMARY KEY,version TEXT);
-                CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,kind TEXT,status TEXT,progress REAL,message TEXT,error TEXT,result_id TEXT,payload TEXT,created_at TEXT,updated_at TEXT,cancel_requested INTEGER DEFAULT 0,pid INTEGER);
-                CREATE TABLE IF NOT EXISTS results(id TEXT PRIMARY KEY,kind TEXT,symbol TEXT,created_at TEXT,title TEXT,path TEXT);
+                CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,kind TEXT,status TEXT,progress REAL,message TEXT,error TEXT,result_id TEXT,payload TEXT,created_at TEXT,updated_at TEXT,cancel_requested INTEGER DEFAULT 0,pid INTEGER,claim_token TEXT,claimed_at TEXT,dedupe_key TEXT);
+                CREATE TABLE IF NOT EXISTS results(id TEXT PRIMARY KEY,kind TEXT,symbol TEXT,created_at TEXT,title TEXT,path TEXT,protocol_version INTEGER,result_schema_version INTEGER,reproducible INTEGER);
                 CREATE TABLE IF NOT EXISTS configs(id TEXT PRIMARY KEY,name TEXT,config TEXT,created_at TEXT);
                 CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT);
                 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status,created_at);
             """)
             if "metadata" not in {row[1] for row in db.execute("PRAGMA table_info(instruments)")}:
                 db.execute("ALTER TABLE instruments ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
+            job_columns = {row[1] for row in db.execute("PRAGMA table_info(jobs)")}
+            for column in ("claim_token", "claimed_at", "dedupe_key"):
+                if column not in job_columns:
+                    db.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedupe ON jobs(dedupe_key) "
+                "WHERE dedupe_key IS NOT NULL AND status IN ('queued','running')"
+            )
+            result_columns = {row[1] for row in db.execute("PRAGMA table_info(results)")}
+            for column, kind in (
+                ("protocol_version", "INTEGER"), ("result_schema_version", "INTEGER"),
+                ("reproducible", "INTEGER"),
+            ):
+                if column not in result_columns:
+                    db.execute(f"ALTER TABLE results ADD COLUMN {column} {kind}")
+            legacy_results = db.execute(
+                "SELECT id,path FROM results WHERE protocol_version IS NULL "
+                "AND result_schema_version IS NULL AND reproducible IS NULL"
+            ).fetchall()
+            for result_id, relative in legacy_results:
+                try:
+                    payload = json.loads((self.root / relative).read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+                provenance = payload.get("computation_provenance") if isinstance(payload, dict) else None
+                reproducible = provenance.get("reproducible") if isinstance(provenance, dict) else None
+                db.execute(
+                    "UPDATE results SET protocol_version=?,result_schema_version=?,reproducible=? WHERE id=?",
+                    (
+                        payload.get("protocol_version") if isinstance(payload, dict) else None,
+                        payload.get("result_schema_version") if isinstance(payload, dict) else None,
+                        None if reproducible is None else int(bool(reproducible)), result_id,
+                    ),
+                )
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS sync_items(run_key TEXT,symbol TEXT,status TEXT,mode TEXT,daily_through TEXT,minute_through TEXT,error TEXT,updated_at TEXT,PRIMARY KEY(run_key,symbol));
                 CREATE INDEX IF NOT EXISTS sync_items_status ON sync_items(run_key,status);
@@ -381,7 +929,7 @@ class Store:
             db.execute("INSERT OR REPLACE INTO active_snapshots VALUES(?,?)", (symbol, version))
         return self.snapshot(symbol, version)
 
-    def snapshot(self, symbol: str, version: str | None = None) -> dict | None:
+    def snapshot(self, symbol: str, version: str | None = None, *, persist: bool = True) -> dict | None:
         symbol = normalize_symbol(symbol)
         with self.db() as db:
             if version:
@@ -396,7 +944,8 @@ class Store:
                 if live and live.get("version") != manifest.get("version"):
                     instrument = self.instrument(symbol) or {"symbol": symbol, "name": symbol}
                     live["metadata"] = {**instrument, "is_demo": False, "warnings": []}
-                    self.put_market_snapshot(live, symbol)
+                    if persist:
+                        self.put_market_snapshot(live, symbol)
                     return live
             return manifest
         if version is None:
@@ -409,24 +958,127 @@ class Store:
                 # the worker process.
                 instrument = self.instrument(symbol) or {"symbol": symbol, "name": symbol}
                 live["metadata"] = {**instrument, "is_demo": False, "warnings": []}
-                self.put_market_snapshot(live, symbol)
+                if persist:
+                    self.put_market_snapshot(live, symbol)
             return live
         return None
 
-    def new_job(self, kind: str, payload: dict) -> str:
+    def new_job(self, kind: str, payload: dict, dedupe_key: str | None = None) -> str:
         job_id = uuid.uuid4().hex
         with self.db() as db:
-            db.execute("INSERT INTO jobs(id,kind,status,progress,message,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", (job_id, kind, "queued", 0, "等待执行", dumps(payload), now_iso(), now_iso()))
+            db.execute("BEGIN IMMEDIATE")
+            if dedupe_key:
+                existing = db.execute(
+                    "SELECT id FROM jobs WHERE dedupe_key=? AND status IN ('queued','running') "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (dedupe_key,),
+                ).fetchone()
+                if existing:
+                    return existing[0]
+            db.execute(
+                "INSERT INTO jobs(id,kind,status,progress,message,payload,created_at,updated_at,dedupe_key) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (job_id, kind, "queued", 0, "等待执行", dumps(payload), now_iso(), now_iso(), dedupe_key),
+            )
         return job_id
 
-    def update_job(self, job_id: str, **values):
-        allowed = {"status", "progress", "message", "error", "result_id", "cancel_requested", "pid", "payload"}
+    def update_job(self, job_id: str, *, require_claim: bool = False,
+                   expected_claim_token: str | None = None, **values) -> bool:
+        allowed = {
+            "status", "progress", "message", "error", "result_id",
+            "cancel_requested", "pid", "payload", "claim_token", "claimed_at",
+            "dedupe_key",
+        }
         values = {k: v for k, v in values.items() if k in allowed}
         if "payload" in values:
             values["payload"] = dumps(values["payload"])
+        if not values:
+            return False
         values["updated_at"] = now_iso()
+        condition = " WHERE id=?"
+        arguments = [*values.values(), job_id]
+        if require_claim:
+            condition += " AND claim_token=? AND status='running'"
+            arguments.append(expected_claim_token)
         with self.db() as db:
-            db.execute(f"UPDATE jobs SET {','.join(k+'=?' for k in values)} WHERE id=?", (*values.values(), job_id))
+            cursor = db.execute(
+                f"UPDATE jobs SET {','.join(k+'=?' for k in values)}{condition}",
+                arguments,
+            )
+            return cursor.rowcount > 0
+
+    def claim_jobs(self, claim_token: str, max_workers: int, limit: int | None = None) -> list[str]:
+        """Atomically cancel queued cancellations and claim oldest queued jobs."""
+        stamp = now_iso()
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "UPDATE jobs SET status='cancelled',message='排队期间已取消',updated_at=? "
+                "WHERE status='queued' AND cancel_requested=1",
+                (stamp,),
+            )
+            running = int(db.execute("SELECT COUNT(*) FROM jobs WHERE status='running'").fetchone()[0])
+            capacity = max(0, int(max_workers) - running)
+            if limit is not None:
+                capacity = min(capacity, max(0, int(limit)))
+            if capacity <= 0:
+                return []
+            rows = db.execute(
+                "SELECT id FROM jobs WHERE status='queued' AND cancel_requested=0 "
+                "ORDER BY created_at,id LIMIT ?",
+                (capacity,),
+            ).fetchall()
+            claimed: list[str] = []
+            for row in rows:
+                job_id = row[0]
+                cursor = db.execute(
+                    "UPDATE jobs SET status='running',claim_token=?,claimed_at=?,updated_at=?,"
+                    "message='正在启动计算进程',error=NULL WHERE id=? AND status='queued'",
+                    (claim_token, stamp, stamp, job_id),
+                )
+                if cursor.rowcount:
+                    claimed.append(job_id)
+            return claimed
+
+    def claim_job(self, job_id: str, claim_token: str) -> bool:
+        """Claim one known queued job for an in-process CLI worker."""
+        stamp = now_iso()
+        with self.db() as db:
+            cursor = db.execute(
+                "UPDATE jobs SET status='running',claim_token=?,claimed_at=?,updated_at=?,"
+                "message='正在启动计算进程',error=NULL "
+                "WHERE id=? AND status='queued' AND cancel_requested=0",
+                (claim_token, stamp, stamp, job_id),
+            )
+            return cursor.rowcount > 0
+
+    def active_job_count(self) -> int:
+        with self.db() as db:
+            return int(db.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')"
+            ).fetchone()[0])
+
+    def jobs_by_status(self, status: str, *, after: tuple[str, str] | None = None,
+                       limit: int = 200) -> list[dict]:
+        """Cursor-paginated status query used by recovery and operations."""
+        condition = "status=?"
+        arguments: list[Any] = [status]
+        if after is not None:
+            condition += " AND (created_at>? OR (created_at=? AND id>?))"
+            arguments.extend([after[0], after[0], after[1]])
+        arguments.append(max(1, int(limit)))
+        with self.db() as db:
+            rows = db.execute(
+                f"SELECT * FROM jobs WHERE {condition} ORDER BY created_at,id LIMIT ?",
+                arguments,
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            item["cancel_requested"] = bool(item["cancel_requested"])
+            values.append(item)
+        return values
 
     def job(self, job_id: str) -> dict | None:
         with self.db() as db:
@@ -438,9 +1090,18 @@ class Store:
         result["cancel_requested"] = bool(result["cancel_requested"])
         return result
 
-    def jobs(self, limit=100):
+    def jobs(self, limit=100, *, status: str | None = None, offset: int = 0):
+        arguments: list[Any] = []
+        where = ""
+        if status:
+            where = " WHERE status=?"
+            arguments.append(status)
+        arguments.extend([max(1, int(limit)), max(0, int(offset))])
         with self.db() as db:
-            ids = [r[0] for r in db.execute("SELECT id FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,))]
+            ids = [r[0] for r in db.execute(
+                f"SELECT id FROM jobs{where} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+                arguments,
+            )]
         return [self.job(job_id) for job_id in ids]
 
     def recent_submitted_symbols(self, limit: int = 10) -> list[dict[str, str]]:
@@ -508,11 +1169,21 @@ class Store:
         folder.mkdir(exist_ok=True)
         target = folder / f"{result_id}.json"
         payload = {**result, "id": result_id}
-        if result.get("protocol_version") == 4:
-            payload = _detach_v4_archives(self.root, result_id, payload)
+        if result.get("protocol_version") == 5:
+            payload = _detach_candidate_archives(self.root, payload)
         target.write_text(dumps(payload), encoding="utf-8")
+        provenance = result.get("computation_provenance") if isinstance(result.get("computation_provenance"), dict) else {}
+        reproducible = provenance.get("reproducible") if provenance else None
         with self.db() as db:
-            db.execute("INSERT INTO results VALUES(?,?,?,?,?,?)", (result_id, kind, symbol, now_iso(), title, str(target.relative_to(self.root))))
+            db.execute(
+                "INSERT INTO results(id,kind,symbol,created_at,title,path,protocol_version,result_schema_version,reproducible) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    result_id, kind, symbol, now_iso(), title, str(target.relative_to(self.root)),
+                    result.get("protocol_version"), result.get("result_schema_version"),
+                    None if reproducible is None else int(bool(reproducible)),
+                ),
+            )
         return result_id
 
     def result(self, result_id: str) -> dict | None:
@@ -521,11 +1192,220 @@ class Store:
         if not row:
             return None
         result = json.loads((self.root / row[0]).read_text(encoding="utf-8"))
-        return _hydrate_v4_archives(self.root, result)
+        return result
 
-    def results(self):
+    def results(self, limit: int = 200, offset: int = 0):
         with self.db() as db:
-            return [dict(r) for r in db.execute("SELECT id,kind,symbol,created_at,title FROM results ORDER BY created_at DESC LIMIT 200")]
+            rows = [dict(r) for r in db.execute(
+                "SELECT id,kind,symbol,created_at,title,protocol_version,result_schema_version,reproducible "
+                "FROM results ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+                (max(1, int(limit)), max(0, int(offset))),
+            )]
+        for row in rows:
+            supported = (
+                row.get("protocol_version") is None
+                or (row.get("protocol_version") == 5 and row.get("result_schema_version") == 2)
+            )
+            row["supported"] = supported
+            row["reproducible"] = None if row.get("reproducible") is None else bool(row["reproducible"])
+            if not supported:
+                row["version_label"] = "不支持的历史版本"
+        return rows
+
+    def candidate_reference(self, result: dict, group: str, decision: str,
+                            decision_index: int = 0, *, revision: int | None = None) -> dict | None:
+        evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
+        branch = (evidence.get(group) or {}).get(decision)
+        if decision == "adaptive":
+            if not isinstance(branch, list) or decision_index >= len(branch):
+                raise LookupError("研究决策不存在")
+            branch = branch[decision_index]
+            if isinstance(branch, dict):
+                field = {
+                    "candidate_archives": "candidate_archive",
+                    "trial_archives": "trial_archive",
+                    "search_candidate_archives": "search_candidate_archive",
+                }[group]
+                branch = branch.get(field)
+        if revision is not None:
+            branch = self._revision_branch(result, decision, decision_index, int(revision))
+        if not isinstance(branch, dict) or _CANDIDATE_REFERENCE not in branch:
+            return None
+        return branch
+
+    def _revision_branch(self, result: dict, decision: str, decision_index: int,
+                         revision: int) -> dict[str, Any]:
+        """Resolve the archive a completion revision covers.
+
+        A revision only covers the decision and decision index it was computed
+        for.  Using it for another branch would show the pre-completion
+        archive as if it had been revised, so the caller has to fail loudly.
+        """
+        metadata = self.completion_revision(result.get("id") or "", revision)
+        if metadata is None:
+            raise CompletionRevisionError(
+                f"补算修订 {revision} 不存在",
+                code="COMPLETION_REVISION_NOT_FOUND", revision=revision,
+            )
+        scope = {
+            "decision": metadata.get("decision"),
+            "decision_index": int(metadata.get("decision_index", 0) or 0),
+        }
+        if scope["decision"] != decision or scope["decision_index"] != int(decision_index):
+            raise CompletionRevisionError(
+                f"补算修订 {revision} 只覆盖决策 {scope['decision']} #{scope['decision_index']}，"
+                f"不能用于 {decision} #{int(decision_index)}",
+                code="COMPLETION_REVISION_OUT_OF_SCOPE", revision=revision, scope=scope,
+            )
+        merged = metadata.get("merged_candidate_archive")
+        if not isinstance(merged, dict) or _CANDIDATE_REFERENCE not in merged:
+            raise CompletionRevisionError(
+                f"补算修订 {revision} 没有可用的候选档案",
+                code="COMPLETION_REVISION_ARCHIVE_MISSING", revision=revision, scope=scope,
+            )
+        return merged
+
+    def candidate_archive(self, result: dict, group: str, decision: str,
+                          decision_index: int = 0, *, revision: int | None = None,
+                          **query) -> dict:
+        branch = self.candidate_reference(result, group, decision, decision_index, revision=revision)
+        if branch is None:
+            return {"rows": [], "total": 0, "offset": int(query.get("offset", 0)), "limit": query.get("limit")}
+        return _candidate_rows(self.root, branch, **query)
+
+    def candidate_total(self, result: dict, group: str, decision: str,
+                        decision_index: int = 0, *, region_id: int | None = None,
+                        filters: dict[str, Any] | None = None,
+                        in_filters: dict[str, list[Any]] | None = None,
+                        revision: int | None = None) -> int:
+        """Count the rows an archive query would return, without materialising them."""
+        reference = self.candidate_reference(result, group, decision, decision_index, revision=revision)
+        if reference is None:
+            return 0
+        return _candidate_total(
+            self.root, reference, region_id=region_id, filters=filters, in_filters=in_filters,
+        )
+
+    def merge_candidate_archives(self, base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+        return _merge_candidate_archives(self.root, base, overlay)
+
+    def candidate_axis_values(self, result: dict, group: str, decision: str,
+                              decision_index: int = 0, *, names: list[str],
+                              revision: int | None = None) -> dict[str, list[float]]:
+        reference = self.candidate_reference(result, group, decision, decision_index, revision=revision)
+        if reference is None:
+            return {}
+        return _candidate_axis_values(self.root, reference, names)
+
+    def candidate_ordinals(self, result: dict, group: str, decision: str,
+                           decision_index: int = 0, *, region_id: int | None = None,
+                           sort_by: str = "ordinal", descending: bool = False,
+                           revision: int | None = None) -> list[int]:
+        reference = self.candidate_reference(result, group, decision, decision_index, revision=revision)
+        if reference is None:
+            return []
+        return _candidate_ordinals(
+            self.root, reference, region_id=region_id,
+            sort_by=sort_by, descending=descending,
+        )
+
+    def candidate_stats(self, result: dict, group: str, decision: str,
+                        decision_index: int = 0, *, region_id: int | None = None,
+                        revision: int | None = None) -> dict[str, int]:
+        reference = self.candidate_reference(result, group, decision, decision_index, revision=revision)
+        if reference is None:
+            return {"total": 0, "j_complete": 0}
+        return _candidate_stats(self.root, reference, region_id=region_id)
+
+    def iter_candidate_archive(self, result: dict, group: str, decision: str,
+                               decision_index: int = 0, *, region_id: int | None = None,
+                               sort_by: str = "ordinal", descending: bool = False,
+                               revision: int | None = None):
+        offset = 0
+        page_size = 1000
+        while True:
+            page = self.candidate_archive(
+                result, group, decision, decision_index,
+                revision=revision,
+                offset=offset, limit=page_size, sort_by=sort_by,
+                descending=descending, region_id=region_id,
+            )
+            rows = page["rows"]
+            if not rows:
+                break
+            yield from rows
+            offset += len(rows)
+            if offset >= page["total"]:
+                break
+
+    def iter_candidate_reference(self, reference: dict[str, Any], page_size: int = 1000):
+        offset = 0
+        while True:
+            page = _candidate_rows(
+                self.root, reference, offset=offset, limit=max(1, int(page_size)), sort_by="ordinal",
+            )
+            rows = page["rows"]
+            if not rows:
+                break
+            yield from rows
+            offset += len(rows)
+            if offset >= page["total"]:
+                break
+
+    def completion_checkpoint(self, key: str) -> dict | None:
+        path = self.root / "results" / ".completion_work" / f"{key}.json"
+        if not path.is_file():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def save_completion_checkpoint(self, key: str, payload: dict) -> None:
+        folder = self.root / "results" / ".completion_work"
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f"{key}.json"
+        # The read-modify-write cycle has to be serialised: two workers may
+        # write the same checkpoint and the later write must not drop the
+        # budget consumption or the processed points of the earlier one.
+        with FileLock(str(target) + ".lock"):
+            existing = self.completion_checkpoint(key) or {}
+            merged = _merge_completion_checkpoint(existing, payload)
+            temporary = folder / f".{key}.{uuid.uuid4().hex}.writing"
+            temporary.write_text(dumps(merged), encoding="utf-8")
+            temporary.replace(target)
+
+    def completion_revisions(self, result_id: str) -> list[dict]:
+        folder = self.root / "results" / f"{result_id}.completions"
+        if not folder.is_dir():
+            return []
+        values = []
+        for path in sorted(folder.glob("*.json")):
+            try:
+                values.append(json.loads(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+        return values
+
+    def completion_revision(self, result_id: str, revision: int) -> dict | None:
+        return next(
+            (item for item in self.completion_revisions(result_id) if int(item.get("revision", 0)) == int(revision)),
+            None,
+        )
+
+    def save_completion_revision(self, result_id: str, payload: dict) -> dict:
+        folder = self.root / "results" / f"{result_id}.completions"
+        folder.mkdir(parents=True, exist_ok=True)
+        lock = FileLock(str(folder / ".revision.lock"))
+        with lock:
+            revisions = [int(item.get("revision", 0)) for item in self.completion_revisions(result_id)]
+            revision = max(revisions, default=0) + 1
+            payload = {**payload, "revision": revision, "result_id": result_id, "created_at": now_iso()}
+            target = folder / f"{revision:04d}.json"
+            temporary = folder / f".{revision}.{uuid.uuid4().hex}.writing"
+            temporary.write_text(dumps(payload), encoding="utf-8")
+            temporary.replace(target)
+        return payload
 
     def register_research(
         self,
@@ -535,19 +1415,17 @@ class Store:
         input_start: str | None,
         input_end: str | None,
         data_version: str | None,
-        validation_intervals: list[dict[str, Any]],
+        evaluation_intervals: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        """Record a v2 study and count previously used validation dates.
+        """Record a v5 study and count previously used evaluation dates.
 
-        The job id is the registry key so a process retry cannot create a second
-        audit event. Interval overlap intentionally ignores protocol hash and
-        snapshot version: reusing the same dates with a changed seed or snapshot
-        is still prior exposure to those dates.
+        The legacy database column is retained for existing user data.  New API
+        payloads expose the same intervals under the protocol-neutral name.
         """
         symbol = normalize_symbol(symbol)
         intervals = []
         seen = set()
-        for item in validation_intervals:
+        for item in evaluation_intervals:
             try:
                 start = str(pd.Timestamp(item["start"]).date())
                 end = str(pd.Timestamp(item["end"]).date())
@@ -577,7 +1455,7 @@ class Store:
                     "input_start": existing["input_start"],
                     "input_end": existing["input_end"],
                     "data_version": existing["data_version"],
-                    "validation_intervals": intervals,
+                    "evaluation_intervals": intervals,
                     "overlapping_prior_studies": overlap_count,
                     "exact_repeat_prior_studies": exact_count,
                     "recorded_overlap_status": "overlap_detected" if overlap_count else "no_recorded_overlap",
@@ -613,7 +1491,7 @@ class Store:
             "input_start": input_start,
             "input_end": input_end,
             "data_version": data_version,
-            "validation_intervals": intervals,
+            "evaluation_intervals": intervals,
             "overlapping_prior_studies": len(overlapping),
             "exact_repeat_prior_studies": len(exact),
             "recorded_overlap_status": "overlap_detected" if overlapping else "no_recorded_overlap",

@@ -11,6 +11,7 @@ export type LandscapePoint = {
   excess_return: number | null
   grid_return: number | null
   baseline_return: number | null
+  /** Peak-principal drawdown of the candidate. */
   drawdown: number | null
   trade_count: number | null
   peak_invested: number | null
@@ -44,7 +45,18 @@ export type LandscapePoint = {
   platform_size?: number | null
   stress?: { status?: string; mean_excess_return?: number | null }
   island_suspect: boolean
-  folds: LandscapeParams[]
+}
+
+/** The decision branch a completion revision covers. */
+export type LandscapeRevisionScope = {
+  revision?: number
+  decision?: string | null
+  decision_index?: number
+}
+
+export type LandscapeCompletion = {
+  status?: 'available' | 'complete' | string
+  endpoint?: string
 }
 
 export type LandscapeResponse = {
@@ -67,7 +79,11 @@ export type LandscapeResponse = {
   training_start?: string | null
   training_end?: string | null
   coverage_status?: string | null
-  focus_completion_error?: string | null
+  /** The completion revision this landscape was read from. */
+  revision?: number | null
+  /** The branch the applied completion revision covers. */
+  revision_scope?: LandscapeRevisionScope | null
+  completion?: LandscapeCompletion | null
 }
 
 export type LandscapeNeighborhood = {
@@ -96,9 +112,8 @@ export type LandscapeSlice = {
 }
 
 export const landscapeLabels: Record<string, string> = {
-  buy_step: '买入间距', sell_step: '卖出间距', grid_step: '旧版网格间距',
-  min_shares: '最低持股', max_shares: '最高持股', buy_shares: '每次买入', sell_shares: '每次卖出',
-  initial_shares: '初始持股',
+  buy_step: '买入间距', sell_step: '卖出间距',
+  buy_shares: '每次买入', sell_shares: '每次卖出',
 }
 
 export function distinctParameterValues(points: LandscapePoint[], name: string) {
@@ -119,9 +134,8 @@ export function chooseLandscapeAxes(
   if (available.includes('buy_step') && available.includes('sell_step')) return ['buy_step', 'sell_step']
   const varying = available.filter(name => distinctParameterValues(points, name).size > 1)
   const preferred = [
-    ['grid_step', 'sell_shares'],
-    ['grid_step', 'buy_shares'],
-    ['min_shares', 'buy_shares'],
+    ['sell_step', 'buy_shares'],
+    ['buy_step', 'buy_shares'],
     ['sell_shares', 'buy_shares'],
   ]
   for (const pair of preferred) {
@@ -140,6 +154,15 @@ export function landscapeSliceKey(x: string, y: string) {
   return [x, y].filter(Boolean).sort().join('|')
 }
 
+/**
+ * A completion revision only covers one decision branch, so a landscape read
+ * may only carry the revision when the selected decision is that branch.
+ */
+export function revisionMatchesScope(scope: LandscapeRevisionScope | null | undefined, decision: string, decisionIndex: number) {
+  if (!scope) return false
+  return scope.decision === decision && Number(scope.decision_index) === Number(decisionIndex)
+}
+
 export function formatLandscapeNumber(value: number, digits = 2) {
   return value.toLocaleString('zh-CN', { maximumFractionDigits: digits })
 }
@@ -148,7 +171,7 @@ export function formatLandscapeParameter(name: string, value: unknown) {
   if (value == null) return '不限'
   const numeric = Number(value)
   if (!Number.isFinite(numeric)) return String(value)
-  if (name === 'grid_step' || name === 'buy_step' || name === 'sell_step') return `${formatLandscapeNumber(numeric * 100, 2)}%`
+  if (name === 'buy_step' || name === 'sell_step') return `${formatLandscapeNumber(numeric * 100, 2)}%`
   return formatLandscapeNumber(numeric, 0)
 }
 

@@ -3,7 +3,7 @@ import test from 'node:test'
 import { buildResultCurveModel, resultCurveRowAt, savedGridParameters } from '../src/resultPresentation.ts'
 
 const parameterMap = (result) => Object.fromEntries(savedGridParameters(result).map((row) => [row.key, row]))
-const strategy = (equity, values = {}) => ({ metrics: {}, equity, trades: [], rejections: [], period_returns: [], ...values })
+const strategy = (equity, values = {}) => ({ metrics: {}, equity, trades: [], rejections: [], ...values })
 
 test('saved trailing grid parameters show only active steps and the actual saved funding', () => {
   const rows = parameterMap({
@@ -67,11 +67,50 @@ test('v3 unlimited holdings hide the removed cash budget and show peak contribut
     symbol: '159611.SZ', schema_version: 3,
     config: { schema_version: 3, grid_mode: 'trailing', buy_step: .03, sell_step: .03, initial_shares: 1000, min_shares: 0, max_shares: null, buy_shares: 100, sell_shares: 100 },
     funding: { reference_price: 1, reference_date: '2024-01-02', initial_equity: 1000, peak_invested: 1300, topups: 300 },
+    strategies: { grid: { metrics: { external_topups: 300 } } },
   })
   assert.equal(rows.max_shares.value, '不限')
   assert.equal(rows.reserve_cash, undefined)
   assert.equal(rows.peak_invested.value, '1,300.00 元')
   assert.equal(rows.topups.value, '300.00 元')
+  assert.equal(rows.external_topups.value, '300.00 元')
+})
+
+test('older results keep their cash reserve and show missing peak fields as dashes', () => {
+  const rows = parameterMap({
+    symbol: '600000.SH', schema_version: 2,
+    config: { schema_version: 2, grid_mode: 'trailing', initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 200 },
+    funding: { initial_equity: 19250, reserve_cash: 9000 },
+  })
+  assert.equal(rows.reserve_cash.value, '9,000.00 元')
+  assert.equal(rows.initial_equity.value, '19,250.00 元')
+  assert.equal(rows.peak_invested.value, '—')
+  assert.equal(rows.topups.value, '—')
+  assert.equal(rows.external_topups.value, '—')
+})
+
+test('peak-principal curves drive the curve model returns and drawdowns', () => {
+  const model = buildResultCurveModel({
+    symbol: '600000.SH', accounting_basis: 'peak_principal_v2', config: {},
+    strategies: {
+      grid: strategy([{ timestamp: '2024-01-02', equity: 110, total_invested: 100, principal_curve: 1.1, principal_drawdown: .02, position: 10 }]),
+      matched_funding_hold: strategy([{ timestamp: '2024-01-02', equity: 105, total_invested: 100, principal_curve: 1.05, principal_drawdown: .01 }]),
+    },
+  })
+  assert.ok(Math.abs(model.rows[0].values.grid.returnRate - .1) < 1e-12)
+  assert.equal(model.rows[0].values.grid.drawdown, .02)
+  assert.ok(Math.abs(model.rows[0].values.matched_funding_hold.returnRate - .05) < 1e-12)
+  assert.equal(model.rows[0].values.matched_funding_hold.drawdown, .01)
+  assert.equal(model.strategies.find((style) => style.key === 'matched_funding_hold').name, '同资金被动持有')
+})
+
+test('legacy results keep their own drawdown when no principal drawdown is reported', () => {
+  const model = buildResultCurveModel({
+    symbol: '600000.SH', config: {},
+    strategies: { grid: strategy([{ timestamp: '2024-01-02', equity: 110, drawdown: .03 }]) },
+  })
+  assert.equal(model.rows[0].values.grid.drawdown, .03)
+  assert.equal(model.rows[0].values.grid.returnRate, null)
 })
 
 test('aligned curves use equityMath returns and cost-basis drawdowns across contributions', () => {

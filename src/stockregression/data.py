@@ -853,7 +853,7 @@ class DataService:
         return "unverified"
 
     def reference_price(self, symbol, start_date, version=None):
-        manifest = self.store.snapshot(normalize_symbol(symbol), version)
+        manifest = self.store.snapshot(normalize_symbol(symbol), version, persist=False)
         if not manifest:
             raise DataQualityError("尚无本地数据，请先同步该标的")
         if manifest.get("market_data"):

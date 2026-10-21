@@ -4,7 +4,9 @@ import { defaultWorkbenchDefaults, normalizeWorkbenchDefaults, validWorkbenchGro
 import type { WorkbenchDefaults, WorkbenchGroup } from './workbenchDefaults'
 import type { components } from './generated/api-schema'
 
-const CACHE_KEY = 'stockregression-configuration-drafts-v4'
+// Bumped for the v5 research protocol: a v4 draft can carry retired research
+// fields that the configuration document no longer accepts.
+const CACHE_KEY = 'stockregression-configuration-drafts-v5'
 const RECOVERY_KEY = 'stockregression-configuration-recovery-v1'
 type Document = Record<string, unknown>
 type Patch = Record<string, unknown>
@@ -70,39 +72,16 @@ function withoutPath(value: Patch, path: string): Patch {
 function workbenchFromDocument(document: Document): WorkbenchDefaults {
   const backtest = record(document.backtest) ?? {}
   const research = record(document.research) ?? {}
-  const statistics = record(document.statistics) ?? {}
   return normalizeWorkbenchDefaults({
     grid: backtest.grid,
     position: backtest.position,
     dca: backtest.dca,
-    research: {
-      ...(record(research.defaults) ?? {}),
-      bootstrap_reps: statistics.bootstrap_reps,
-      bootstrap_block_lengths: statistics.block_lengths,
-      significance_alpha: statistics.alpha,
-      outer_validation_days: statistics.outer_validation_days,
-    },
+    research: record(research.defaults) ?? {},
   })
 }
 
-function researchDefaultsForFile(value: WorkbenchDefaults['research']): Document {
-  const {
-    bootstrap_reps: _bootstrapReps,
-    bootstrap_block_lengths: _bootstrapBlocks,
-    significance_alpha: _significanceAlpha,
-    outer_validation_days: _outerValidationDays,
-    ...defaults
-  } = structuredClone(value)
-  return defaults
-}
-
-function statisticsForResearch(value: WorkbenchDefaults['research']): Document {
-  return {
-    bootstrap_reps: value.bootstrap_reps,
-    block_lengths: [...value.bootstrap_block_lengths],
-    alpha: value.significance_alpha,
-    outer_validation_days: value.outer_validation_days,
-  }
+function researchDefaultsForFile(value: WorkbenchDefaults['research']): WorkbenchDefaults['research'] {
+  return structuredClone(value)
 }
 
 function mergePatch(base: Document, patch: Patch): Document {
@@ -302,12 +281,11 @@ export function rememberWorkbenchGroup<K extends WorkbenchGroup>(group: K, value
   if (group === 'research') {
     const researchValue = value as WorkbenchDefaults['research']
     const baseResearch = record(record(snapshot.serverDocument.research)?.defaults) ?? {}
-    const baseStatistics = record(snapshot.serverDocument.statistics) ?? {}
     const researchPatch = diffLeaves(baseResearch, researchDefaultsForFile(researchValue))
-    const statisticsPatch = diffLeaves(baseStatistics, statisticsForResearch(researchValue))
+    // The configuration document no longer owns a statistics group, so any
+    // leftover statistics path is dropped instead of being written back.
     let next = withoutPath(withoutPath(pending, 'research'), 'statistics')
     if (Object.keys(researchPatch).length) next = deepMerge(next, { research: { defaults: researchPatch } }) as Patch
-    if (Object.keys(statisticsPatch).length) next = deepMerge(next, { statistics: statisticsPatch }) as Patch
     pending = next
     const desired = mergePatch(snapshot.serverDocument, pending)
     publish({ ...snapshot, value: { ...snapshot.value, research: structuredClone(researchValue) }, document: desired, conflict: false })
@@ -366,8 +344,4 @@ export function configurationRecoveryDraft(): { pending: Patch; revision: string
     }
   } catch { /* A damaged recovery draft is ignored. */ }
   return null
-}
-
-export function rememberLegacyResearch(value: WorkbenchDefaults['research']) {
-  rememberConfigurationPatch({ research: { legacy: { research_defaults: researchDefaultsForFile(value) } } })
 }

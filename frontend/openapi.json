@@ -1761,7 +1761,7 @@
                     "$ref": "#/components/schemas/OptimizationConfig"
                   },
                   {
-                    "$ref": "#/components/schemas/ResearchRequestV4"
+                    "$ref": "#/components/schemas/ResearchRequestV5"
                   }
                 ],
                 "title": "Config"
@@ -1805,7 +1805,7 @@
                     "$ref": "#/components/schemas/OptimizationConfig"
                   },
                   {
-                    "$ref": "#/components/schemas/ResearchRequestV4"
+                    "$ref": "#/components/schemas/ResearchRequestV5"
                   }
                 ],
                 "title": "Config"
@@ -1856,12 +1856,63 @@
       "get": {
         "summary": "Jobs",
         "operationId": "jobs_api_v1_jobs_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }
@@ -2016,6 +2067,43 @@
         }
       }
     },
+    "/api/v1/jobs/{job_id}/resume": {
+      "post": {
+        "summary": "Resume Job",
+        "operationId": "resume_job_api_v1_jobs__job_id__resume_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/jobs/{job_id}/items": {
       "get": {
         "summary": "Job Items",
@@ -2090,12 +2178,101 @@
       "get": {
         "summary": "Results",
         "operationId": "results_api_v1_results_get",
+        "parameters": [
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 200,
+              "title": "Limit"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/results/{result_id}/summary": {
+      "get": {
+        "summary": "Result Summary",
+        "operationId": "result_summary_api_v1_results__result_id__summary_get",
+        "parameters": [
+          {
+            "name": "result_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Result Id"
+            }
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
               }
             }
           }
@@ -2124,6 +2301,23 @@
               "type": "boolean",
               "default": false,
               "title": "Full"
+            }
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
             }
           }
         ],
@@ -2192,7 +2386,7 @@
             "schema": {
               "type": "string",
               "pattern": "^(training|validation)$",
-              "default": "validation",
+              "default": "training",
               "title": "Sample"
             }
           },
@@ -2317,10 +2511,74 @@
               "default": "stable",
               "title": "Anchor"
             }
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
           }
         ],
         "responses": {
           "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/results/{result_id}/completion": {
+      "post": {
+        "summary": "Submit Result Completion",
+        "operationId": "submit_result_completion_api_v1_results__result_id__completion_post",
+        "parameters": [
+          {
+            "name": "result_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Result Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResearchCompletionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
             "description": "Successful Response",
             "content": {
               "application/json": {
@@ -2396,6 +2654,23 @@
               "default": "csv",
               "title": "Format"
             }
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
+            }
           }
         ],
         "responses": {
@@ -2442,6 +2717,23 @@
               "type": "string",
               "default": "json",
               "title": "Kind"
+            }
+          },
+          {
+            "name": "revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Revision"
             }
           }
         ],
@@ -3228,10 +3520,11 @@
               1,
               2,
               3,
-              4
+              4,
+              5
             ],
             "title": "Config Schema Version",
-            "default": 4
+            "default": 5
           },
           "config_revision": {
             "anyOf": [
@@ -3255,9 +3548,6 @@
           },
           "research": {
             "$ref": "#/components/schemas/ResearchSection"
-          },
-          "statistics": {
-            "$ref": "#/components/schemas/StatisticsSettings"
           },
           "market_data": {
             "$ref": "#/components/schemas/MarketDataSettings"
@@ -4379,14 +4669,9 @@
           },
           "protocol_version": {
             "type": "integer",
-            "enum": [
-              1,
-              2,
-              3,
-              4
-            ],
+            "const": 5,
             "title": "Protocol Version",
-            "default": 1
+            "default": 5
           },
           "selection_target": {
             "type": "string",
@@ -4404,57 +4689,6 @@
             "title": "Rebalance Days",
             "default": 63
           },
-          "bootstrap_reps": {
-            "type": "integer",
-            "minimum": 1.0,
-            "title": "Bootstrap Reps",
-            "default": 10000
-          },
-          "bootstrap_block_lengths": {
-            "items": {
-              "type": "integer"
-            },
-            "type": "array",
-            "title": "Bootstrap Block Lengths"
-          },
-          "significance_alpha": {
-            "type": "number",
-            "exclusiveMaximum": 1.0,
-            "exclusiveMinimum": 0.0,
-            "title": "Significance Alpha",
-            "default": 0.05
-          },
-          "outer_validation_days": {
-            "type": "integer",
-            "maximum": 1000.0,
-            "minimum": 20.0,
-            "title": "Outer Validation Days",
-            "default": 126
-          },
-          "mode": {
-            "type": "string",
-            "enum": [
-              "historical",
-              "robust",
-              "both"
-            ],
-            "title": "Mode",
-            "default": "both"
-          },
-          "n_trials": {
-            "type": "integer",
-            "maximum": 5000.0,
-            "minimum": 1.0,
-            "title": "N Trials",
-            "default": 200
-          },
-          "local_search_budget": {
-            "type": "integer",
-            "maximum": 5000.0,
-            "minimum": 1.0,
-            "title": "Local Search Budget",
-            "default": 3000
-          },
           "seed": {
             "type": "integer",
             "title": "Seed",
@@ -4467,11 +4701,11 @@
             "title": "Top Candidates",
             "default": 20
           },
-          "max_drawdown": {
+          "max_principal_drawdown": {
             "type": "number",
             "maximum": 1.0,
             "exclusiveMinimum": 0.0,
-            "title": "Max Drawdown",
+            "title": "Max Principal Drawdown",
             "default": 0.2
           },
           "min_trades": {
@@ -4484,7 +4718,7 @@
             "type": "integer",
             "minimum": 20.0,
             "title": "Min History Days",
-            "default": 504
+            "default": 250
           },
           "min_minute_ratio": {
             "type": "number",
@@ -4525,6 +4759,7 @@
             "title": "Configuration Revision"
           }
         },
+        "additionalProperties": false,
         "type": "object",
         "required": [
           "base"
@@ -4731,6 +4966,41 @@
         "type": "object",
         "title": "QuantityConfig"
       },
+      "ResearchCompletionRequest": {
+        "properties": {
+          "decision": {
+            "type": "string",
+            "enum": [
+              "current",
+              "fixed",
+              "adaptive"
+            ],
+            "title": "Decision",
+            "default": "current"
+          },
+          "decision_index": {
+            "type": "integer",
+            "minimum": 0.0,
+            "title": "Decision Index",
+            "default": 0
+          },
+          "reporting_budget": {
+            "type": "integer",
+            "maximum": 100000.0,
+            "minimum": 0.0,
+            "title": "Reporting Budget",
+            "default": 1000
+          },
+          "target": {
+            "type": "string",
+            "const": "return_leader",
+            "title": "Target",
+            "default": "return_leader"
+          }
+        },
+        "type": "object",
+        "title": "ResearchCompletionRequest"
+      },
       "ResearchContext": {
         "properties": {
           "symbol": {
@@ -4839,29 +5109,21 @@
           "start_date"
         ],
         "title": "ResearchContext",
-        "description": "Public v4 research input independent of backtest search values."
+        "description": "Public v5 research input independent of backtest search values."
       },
       "ResearchDefaults": {
         "properties": {
           "strategy_id": {
             "type": "string",
-            "enum": [
-              "geometric_excess_neighborhood",
-              "geometric_robust_j"
-            ],
+            "const": "geometric_robust_j",
             "title": "Strategy Id",
             "default": "geometric_robust_j"
           },
           "protocol_version": {
             "type": "integer",
-            "enum": [
-              1,
-              2,
-              3,
-              4
-            ],
+            "const": 5,
             "title": "Protocol Version",
-            "default": 4
+            "default": 5
           },
           "selection_target": {
             "type": "string",
@@ -4879,57 +5141,6 @@
             "title": "Rebalance Days",
             "default": 63
           },
-          "bootstrap_reps": {
-            "type": "integer",
-            "minimum": 1.0,
-            "title": "Bootstrap Reps",
-            "default": 10000
-          },
-          "bootstrap_block_lengths": {
-            "items": {
-              "type": "integer"
-            },
-            "type": "array",
-            "title": "Bootstrap Block Lengths"
-          },
-          "significance_alpha": {
-            "type": "number",
-            "exclusiveMaximum": 1.0,
-            "exclusiveMinimum": 0.0,
-            "title": "Significance Alpha",
-            "default": 0.05
-          },
-          "outer_validation_days": {
-            "type": "integer",
-            "maximum": 1000.0,
-            "minimum": 20.0,
-            "title": "Outer Validation Days",
-            "default": 126
-          },
-          "mode": {
-            "type": "string",
-            "enum": [
-              "historical",
-              "robust",
-              "both"
-            ],
-            "title": "Mode",
-            "default": "both"
-          },
-          "n_trials": {
-            "type": "integer",
-            "maximum": 5000.0,
-            "minimum": 1.0,
-            "title": "N Trials",
-            "default": 1000
-          },
-          "local_search_budget": {
-            "type": "integer",
-            "maximum": 5000.0,
-            "minimum": 1.0,
-            "title": "Local Search Budget",
-            "default": 3000
-          },
           "seed": {
             "type": "integer",
             "title": "Seed",
@@ -4942,11 +5153,11 @@
             "title": "Top Candidates",
             "default": 20
           },
-          "max_drawdown": {
+          "max_principal_drawdown": {
             "type": "number",
             "maximum": 1.0,
             "exclusiveMinimum": 0.0,
-            "title": "Max Drawdown",
+            "title": "Max Principal Drawdown",
             "default": 0.2
           },
           "min_trades": {
@@ -4970,23 +5181,15 @@
           },
           "ranking_mode": {
             "type": "string",
-            "enum": [
-              "max_volume",
-              "fixed_mean"
-            ],
+            "const": "robust_j",
             "title": "Ranking Mode",
-            "default": "fixed_mean"
+            "default": "robust_j"
           },
           "strategy_version": {
             "type": "integer",
-            "enum": [
-              1,
-              2,
-              3,
-              4
-            ],
+            "const": 5,
             "title": "Strategy Version",
-            "default": 4
+            "default": 5
           },
           "hypercube_edge": {
             "type": "integer",
@@ -5026,6 +5229,33 @@
             "title": "Validation Budget",
             "default": 100000
           },
+          "reporting_budget": {
+            "type": "integer",
+            "maximum": 2000000.0,
+            "minimum": 0.0,
+            "title": "Reporting Budget",
+            "default": 1000
+          },
+          "total_evaluation_budget": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 10000000.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Evaluation Budget"
+          },
+          "max_runtime_seconds": {
+            "type": "integer",
+            "maximum": 86400.0,
+            "minimum": 1.0,
+            "title": "Max Runtime Seconds",
+            "default": 3600
+          },
           "recommendation_count": {
             "type": "integer",
             "maximum": 100.0,
@@ -5035,12 +5265,9 @@
           },
           "max_shares_mode": {
             "type": "string",
-            "enum": [
-              "search",
-              "unlimited"
-            ],
+            "const": "unlimited",
             "title": "Max Shares Mode",
-            "default": "search"
+            "default": "unlimited"
           },
           "slippage_mode": {
             "type": "string",
@@ -5058,9 +5285,7 @@
                 "buy_step",
                 "sell_step",
                 "sell_shares",
-                "buy_shares",
-                "min_shares",
-                "max_shares"
+                "buy_shares"
               ]
             },
             "type": "array",
@@ -5170,6 +5395,15 @@
             "minimum": 20.0,
             "title": "Training Max Days",
             "default": 500
+          },
+          "training_window_mode": {
+            "type": "string",
+            "enum": [
+              "same_price",
+              "fixed"
+            ],
+            "title": "Training Window Mode",
+            "default": "same_price"
           },
           "peak_tolerance": {
             "type": "number",
@@ -5291,7 +5525,7 @@
         ],
         "title": "ResearchRangeDefaults"
       },
-      "ResearchRequestV4": {
+      "ResearchRequestV5": {
         "properties": {
           "research_context": {
             "$ref": "#/components/schemas/ResearchContext"
@@ -5322,33 +5556,6 @@
             "title": "Rebalance Days",
             "default": 63
           },
-          "bootstrap_reps": {
-            "type": "integer",
-            "minimum": 1.0,
-            "title": "Bootstrap Reps",
-            "default": 10000
-          },
-          "bootstrap_block_lengths": {
-            "items": {
-              "type": "integer"
-            },
-            "type": "array",
-            "title": "Bootstrap Block Lengths"
-          },
-          "significance_alpha": {
-            "type": "number",
-            "exclusiveMaximum": 1.0,
-            "exclusiveMinimum": 0.0,
-            "title": "Significance Alpha",
-            "default": 0.05
-          },
-          "outer_validation_days": {
-            "type": "integer",
-            "maximum": 1000.0,
-            "minimum": 20.0,
-            "title": "Outer Validation Days",
-            "default": 126
-          },
           "seed": {
             "type": "integer",
             "title": "Seed",
@@ -5361,11 +5568,11 @@
             "title": "Top Candidates",
             "default": 20
           },
-          "max_drawdown": {
+          "max_principal_drawdown": {
             "type": "number",
             "maximum": 1.0,
             "exclusiveMinimum": 0.0,
-            "title": "Max Drawdown",
+            "title": "Max Principal Drawdown",
             "default": 0.2
           },
           "min_trades": {
@@ -5405,7 +5612,7 @@
           "research_context",
           "ranges"
         ],
-        "title": "ResearchRequestV4",
+        "title": "ResearchRequestV5",
         "description": "Standalone public request that does not carry backtest search defaults."
       },
       "ResearchSection": {
@@ -5427,23 +5634,15 @@
         "properties": {
           "strategy_id": {
             "type": "string",
-            "enum": [
-              "geometric_excess_neighborhood",
-              "geometric_robust_j"
-            ],
+            "const": "geometric_robust_j",
             "title": "Strategy Id",
             "default": "geometric_robust_j"
           },
           "strategy_version": {
             "type": "integer",
-            "enum": [
-              1,
-              2,
-              3,
-              4
-            ],
+            "const": 5,
             "title": "Strategy Version",
-            "default": 4
+            "default": 5
           },
           "search_method": {
             "type": "string",
@@ -5457,12 +5656,9 @@
           },
           "ranking_mode": {
             "type": "string",
-            "enum": [
-              "max_volume",
-              "fixed_mean"
-            ],
+            "const": "robust_j",
             "title": "Ranking Mode",
-            "default": "fixed_mean"
+            "default": "robust_j"
           },
           "hypercube_edge": {
             "type": "integer",
@@ -5492,6 +5688,33 @@
             "title": "Validation Budget",
             "default": 100000
           },
+          "reporting_budget": {
+            "type": "integer",
+            "maximum": 2000000.0,
+            "minimum": 0.0,
+            "title": "Reporting Budget",
+            "default": 1000
+          },
+          "total_evaluation_budget": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 10000000.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Evaluation Budget"
+          },
+          "max_runtime_seconds": {
+            "type": "integer",
+            "maximum": 86400.0,
+            "minimum": 1.0,
+            "title": "Max Runtime Seconds",
+            "default": 3600
+          },
           "recommendation_count": {
             "type": "integer",
             "maximum": 100.0,
@@ -5501,12 +5724,9 @@
           },
           "max_shares_mode": {
             "type": "string",
-            "enum": [
-              "search",
-              "unlimited"
-            ],
+            "const": "unlimited",
             "title": "Max Shares Mode",
-            "default": "search"
+            "default": "unlimited"
           },
           "slippage_mode": {
             "type": "string",
@@ -5524,9 +5744,7 @@
                 "buy_step",
                 "sell_step",
                 "sell_shares",
-                "buy_shares",
-                "min_shares",
-                "max_shares"
+                "buy_shares"
               ]
             },
             "type": "array",
@@ -5629,6 +5847,15 @@
             "minimum": 20.0,
             "title": "Training Max Days",
             "default": 500
+          },
+          "training_window_mode": {
+            "type": "string",
+            "enum": [
+              "same_price",
+              "fixed"
+            ],
+            "title": "Training Window Mode",
+            "default": "same_price"
           },
           "peak_tolerance": {
             "type": "number",
@@ -5801,41 +6028,6 @@
           "high"
         ],
         "title": "SearchRange"
-      },
-      "StatisticsSettings": {
-        "properties": {
-          "bootstrap_reps": {
-            "type": "integer",
-            "maximum": 1000000.0,
-            "minimum": 100.0,
-            "title": "Bootstrap Reps",
-            "default": 10000
-          },
-          "block_lengths": {
-            "items": {
-              "type": "integer"
-            },
-            "type": "array",
-            "title": "Block Lengths"
-          },
-          "alpha": {
-            "type": "number",
-            "exclusiveMaximum": 1.0,
-            "exclusiveMinimum": 0.0,
-            "title": "Alpha",
-            "default": 0.05
-          },
-          "outer_validation_days": {
-            "type": "integer",
-            "maximum": 1000.0,
-            "minimum": 20.0,
-            "title": "Outer Validation Days",
-            "default": 126
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "title": "StatisticsSettings"
       },
       "UiSettings": {
         "properties": {

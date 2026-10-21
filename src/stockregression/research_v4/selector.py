@@ -58,7 +58,9 @@ def estimate_search(config: OptimizationConfig, data: DataBundle) -> dict[str, A
 
 def strategy_descriptions() -> dict[str, Any]:
     strategy = ResearchStrategySpec()
-    protocol = research_protocol_description(strategy, "both")
+    protocol = research_protocol_description(
+        strategy, "both", max_principal_drawdown=.2, min_trades=10,
+    )
     return {
         "strategies": [{
             "label": "等比网格四维稳健 J 峰值研究",

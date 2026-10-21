@@ -125,14 +125,11 @@ def reset_market_storage(
         raise MarketDataError("另一个行情重建任务正在执行")
     try:
         store = Store(root_path)
-        active = [
-            job for job in store.jobs(1000)
-            if job["status"] in {"queued", "running"}
-        ]
-        if active and not force_jobs:
+        active_count = store.active_job_count()
+        if active_count and not force_jobs:
             raise MarketDataError(
                 "仍有活动任务，停止计算和行情导入后再执行清空："
-                + ", ".join(job["id"] for job in active[:8])
+                + f"共 {active_count} 个任务"
             )
         preview = preview_reset(root_path)
         for target in preview["targets"]:

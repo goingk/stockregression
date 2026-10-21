@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
@@ -23,15 +24,62 @@ from ..numerics.robust import (
     robust_score,
     tensor_robust_scores,
 )
-from ..performance import record_count, record_seconds
+from ..performance import (
+    current_process_rss_bytes, current_workspace_bytes, record_count, record_seconds,
+)
 from ..research_v4.evaluator import BatchEvaluator
 from ..research_v4.search import coarse_coordinates
 from ..research_v4.space import ROBUST_FIELDS, ParameterSpace
-from .window import TrainingWindowPolicy
+from .window import TrainingWindow, TrainingWindowPolicy
 from .statistics import market_statistical_profile
 
 Progress = Callable[[float, str], None]
 Cancelled = Callable[[], bool]
+
+
+@dataclass
+class EvaluationBudget:
+    """Task-scoped numeric budget shared by selection and replay phases."""
+
+    total: int
+    max_runtime_seconds: int
+    started: float = field(default_factory=time.monotonic)
+    consumed: int = 0
+    stopped: bool = False
+    reason: str | None = None
+    workspace_bytes: int = field(default_factory=current_workspace_bytes)
+
+    @property
+    def remaining(self) -> int:
+        return max(0, int(self.total) - int(self.consumed))
+
+    @property
+    def timed_out(self) -> bool:
+        return time.monotonic() - self.started >= max(1, int(self.max_runtime_seconds))
+
+    def stop(self, reason: str) -> None:
+        self.stopped = True
+        self.reason = reason
+
+    def reserve(self, count: int, purpose: str) -> bool:
+        count = max(0, int(count))
+        if self.stopped:
+            return False
+        if self.timed_out:
+            self.stop("任务达到时间上限")
+            return False
+        if count > self.remaining:
+            self.stop(f"任务总评价上限不足以启动{purpose}批次")
+            return False
+        resident = current_process_rss_bytes()
+        if resident and self.workspace_bytes and resident > int(self.workspace_bytes):
+            self.stop(
+                f"任务内存占用 {resident / 1048576:.0f} MB 超过工作区上限 "
+                f"{int(self.workspace_bytes) / 1048576:.0f} MB"
+            )
+            return False
+        self.consumed += count
+        return True
 
 
 def _emit(progress: Progress | None, fraction: float, message: str) -> None:
@@ -40,9 +88,19 @@ def _emit(progress: Progress | None, fraction: float, message: str) -> None:
 
 
 def _stable_seed(config: OptimizationConfig, asof: str, purpose: str) -> int:
+    strategy = config.strategy.model_dump(mode="json")
+    # Sampling must remain stable when the chosen window or an operational
+    # budget changes.  Those settings alter how much of the same deterministic
+    # sequence is consumed, rather than which candidate sequence is drawn.
+    for name in (
+        "training_window_mode", "training_budget", "validation_budget",
+        "reporting_budget", "total_evaluation_budget", "max_runtime_seconds",
+        "stress_cost_multiplier", "stress_region_count",
+    ):
+        strategy.pop(name, None)
     payload = {
         "seed": int(config.seed), "asof": asof, "purpose": purpose,
-        "strategy": config.strategy.model_dump(mode="json"),
+        "strategy": strategy,
         "ranges": {name: value.model_dump(mode="json") for name, value in config.ranges.items() if name in ROBUST_FIELDS},
         "initial_shares": int(config.base.initial_shares),
     }
@@ -150,32 +208,142 @@ def _initial_coordinates(space: ParameterSpace, config: OptimizationConfig, asof
 
 
 class EvaluationSession:
-    def __init__(self, evaluator: BatchEvaluator, space: ParameterSpace, config: OptimizationConfig, cancelled: Cancelled | None):
+    def __init__(self, evaluator: BatchEvaluator, space: ParameterSpace, config: OptimizationConfig,
+                 cancelled: Cancelled | None, budget: EvaluationBudget | None = None):
         self.evaluator = evaluator
         self.space = space
         self.config = config
         self.cancelled = cancelled
+        self.task_budget = budget
         self.rows: dict[tuple[int, ...], dict[str, Any]] = {}
         self.attempts = 0
         self.requested = 0
         self.failures = 0
+        # Points that were requested but never admitted: truncated batches,
+        # exhausted budgets and timeouts.  They are neither cache hits nor
+        # charged evaluations.
+        self.skipped = 0
         self.spent = {"training": 0, "validation": 0, "reporting": 0}
+        self.stress_spent = 0
+        self.budget_stopped = False
+        self.budget_reason: str | None = None
+        self.reporting_stopped = False
+        self.reporting_reason: str | None = None
+        self.started = time.monotonic()
         self.scores: dict[tuple[int, ...], RobustScore | None] = {}
+
+    @property
+    def total_cap(self) -> int:
+        if self.task_budget is not None:
+            return int(self.task_budget.total)
+        configured = self.config.strategy.total_evaluation_budget
+        if configured is not None:
+            return int(configured)
+        strategy = self.config.strategy
+        return int(
+            strategy.training_budget + strategy.validation_budget + strategy.reporting_budget
+            + strategy.stress_region_count * max(1, strategy.hypercube_edge ** 4)
+        )
+
+    def _budget_remaining(self) -> int:
+        if self.task_budget is not None:
+            return self.task_budget.remaining
+        return max(0, self.total_cap - sum(self.spent.values()) - self.stress_spent)
+
+    @property
+    def ledger_evaluations(self) -> int:
+        # Every numeric candidate evaluates the strategy and its matched-funding
+        # hold account as one paired ledger evaluation.
+        if self.task_budget is not None:
+            return 2 * int(self.task_budget.consumed)
+        return 2 * (sum(self.spent.values()) + self.stress_spent)
+
+    @property
+    def cache_hits(self) -> int:
+        """Requested points that were already evaluated and cost nothing."""
+        return max(0, int(self.requested) - int(self.attempts) - int(self.skipped))
+
+    def _stop_for_budget(self, reason: str) -> None:
+        """Stop the session and the task budget together.
+
+        The task budget must never keep spending once the session stopped, so
+        the reason text no longer decides whether the task budget is stopped.
+        """
+        self.budget_stopped = True
+        self.budget_reason = reason
+        if self.task_budget is not None:
+            self.task_budget.stop(reason)
+
+    def _stop_for_phase_cap(self, phase: str) -> None:
+        reason = f"{phase} 阶段达到评价预算上限"
+        if phase == "reporting":
+            self.reporting_stopped = True
+            self.reporting_reason = "展示补算达到 reporting_budget"
+        else:
+            # A phase cap truncates only this phase.  The task budget keeps the
+            # remaining phases alive, so it must not be stopped here.
+            self.budget_stopped = True
+            self.budget_reason = reason
 
     def ensure(self, coordinates: Iterable[tuple[int, ...]], phase: str, cap: int) -> int:
         requested = list(dict.fromkeys(coordinates))
         self.requested += len(requested)
         missing = [coordinate for coordinate in requested if coordinate not in self.rows]
-        allowed = max(0, int(cap) - int(self.spent[phase]))
-        missing = missing[:allowed]
-        if not missing:
+        original_missing = len(missing)
+        timed_out = (
+            self.task_budget.timed_out if self.task_budget is not None
+            else time.monotonic() - self.started >= int(self.config.strategy.max_runtime_seconds)
+        )
+        if timed_out:
+            self.skipped += original_missing
+            self._stop_for_budget("任务达到时间上限")
             return 0
+        phase_available = max(0, int(cap) - int(self.spent[phase]))
+        task_available = self._budget_remaining()
+        allowed = min(phase_available, task_available)
+        task_limited = task_available <= phase_available and original_missing > task_available
+        missing = missing[:allowed]
+        truncated = original_missing - len(missing)
+        if truncated > 0:
+            # Requested but not admitted: skipped, never a cache hit.
+            self.skipped += truncated
+        if not missing:
+            # Cache hits are free and must not be reported as an exhausted
+            # phase budget.  Only an actually requested, uncached point that
+            # cannot be admitted stops the phase.
+            if original_missing > 0 and allowed <= 0:
+                if task_available <= phase_available:
+                    reason = "任务总评价上限已用尽"
+                    if self.task_budget is not None:
+                        self.task_budget.stop(reason)
+                    self._stop_for_budget(reason)
+                else:
+                    self._stop_for_phase_cap(phase)
+            return 0
+        if len(missing) < original_missing:
+            if not task_limited:
+                self._stop_for_phase_cap(phase)
         if self.cancelled and self.cancelled():
             raise InterruptedError("研究已取消")
-        self.spent[phase] += len(missing)
-        self.attempts += len(missing)
+        attempted = 0
         for begin in range(0, len(missing), self.evaluator.chunk_size):
+            timed_out = (
+                self.task_budget.timed_out if self.task_budget is not None
+                else time.monotonic() - self.started >= int(self.config.strategy.max_runtime_seconds)
+            )
+            if timed_out:
+                self._stop_for_budget("任务达到时间上限")
+                break
             chunk = missing[begin:begin + self.evaluator.chunk_size]
+            if self.task_budget is not None and not self.task_budget.reserve(len(chunk), phase):
+                self._stop_for_budget(self.task_budget.reason or f"{phase} 阶段达到任务总评价上限")
+                break
+            # Numerical work is reserved before the native batch starts.  A
+            # failed or cancelled batch stays charged, while work that never
+            # started remains available for a checkpointed retry.
+            self.spent[phase] += len(chunk)
+            self.attempts += len(chunk)
+            attempted += len(chunk)
             try:
                 evaluated = self.evaluator.evaluate_training(chunk)
                 self.rows.update({tuple(row["key"]): row for row in evaluated})
@@ -189,9 +357,20 @@ class EvaluationSession:
                     self.rows[coordinate] = {
                         "params": self.space.params(coordinate), "key": coordinate,
                         "coordinate": list(coordinate), "evaluation_status": "failed",
-                        "training_excess_return": math.nan, "training_drawdown": math.inf,
+                        "training_excess_return": math.nan, "max_principal_drawdown": math.inf,
                         "failure_reason": f"{type(exc).__name__}: {exc}",
                     }
+        admitted_but_not_run = len(missing) - attempted
+        if admitted_but_not_run > 0:
+            self.skipped += admitted_but_not_run
+        if task_limited:
+            reason = f"任务总评价上限不足以启动{phase}阶段完整批次"
+            if self.task_budget is not None:
+                self.task_budget.stop(reason)
+            self._stop_for_budget(reason)
+        if phase == "reporting" and self.spent["reporting"] >= int(cap):
+            self.reporting_stopped = True
+            self.reporting_reason = "展示补算达到 reporting_budget"
         return len(missing)
 
     def score(self, center: tuple[int, ...], phase: str = "validation", cap: int | None = None) -> RobustScore:
@@ -214,81 +393,39 @@ def _score_sort(score: RobustScore, coordinate: tuple[int, ...]) -> tuple:
     )
 
 
-def _complete_return_leader(session: EvaluationSession) -> set[tuple[int, ...]]:
-    attempted: set[tuple[int, ...]] = set()
-    while True:
-        available = (coordinate for coordinate, row in session.rows.items() if completed(row))
-        leader = min(available, key=lambda coordinate: (-float(session.rows[coordinate]["training_excess_return"]), coordinate), default=None)
-        if leader is None or leader in attempted:
-            return attempted
-        session.score(leader, phase="reporting", cap=session.space.size())
-        attempted.add(leader)
-
-
 def _complete_reporting_scores(session: EvaluationSession) -> None:
-    """Complete the final return leader and enough centres for the J ranking.
+    """Complete a reporting target set frozen before reporting starts.
 
-    Reporting support is charged separately from search/peak verification. A
-    newly evaluated neighbour can become the return leader, so repeat until
-    the leader's real support is present. Failed evaluations remain missing.
+    Newly evaluated neighbours may change the ranking, but they never expand
+    the target list or receive an automatic follow-up neighbourhood.  Failed
+    points remain missing and are reported as incomplete.
     """
     target = int(session.config.strategy.recommendation_count)
-    cap = session.space.size()
-    attempted = _complete_return_leader(session)
-    while True:
-        available = sorted(
-            (coordinate for coordinate, row in session.rows.items() if completed(row)),
-            key=lambda coordinate: (-float(session.rows[coordinate]["training_excess_return"]), coordinate),
-        )
-        if not available:
+    frozen = sorted(
+        (coordinate for coordinate, row in session.rows.items() if completed(row)),
+        key=lambda coordinate: (-float(session.rows[coordinate]["training_excess_return"]), coordinate),
+    )
+    if not frozen:
+        return
+    # The return leader is always the first frozen target; later targets are
+    # only the candidates visible at the start of this phase.
+    reporting_cap = int(session.config.strategy.reporting_budget)
+    for coordinate in frozen[: max(1, target)]:
+        if session.budget_stopped or session.reporting_stopped or session.spent["reporting"] >= reporting_cap:
+            if session.spent["reporting"] >= reporting_cap:
+                session.reporting_stopped = True
+                session.reporting_reason = "展示补算达到 reporting_budget"
             break
-        leader = available[0]
-        if leader not in attempted:
-            session.score(leader, phase="reporting", cap=cap)
-            attempted.add(leader)
-            continue
-        for coordinate in session.rows:
-            score = session.scores.get(coordinate)
+        session.score(coordinate, phase="reporting", cap=reporting_cap)
+        for point in NeighborhoodOperator(session.space, int(session.config.strategy.hypercube_edge) // 2).points(coordinate):
+            if session.budget_stopped or session.reporting_stopped or session.spent["reporting"] >= reporting_cap:
+                if session.spent["reporting"] >= reporting_cap:
+                    session.reporting_stopped = True
+                    session.reporting_reason = "展示补算达到 reporting_budget"
+                break
+            score = session.scores.get(point)
             if score is None or not score.complete:
-                session.scores[coordinate] = robust_score(coordinate, session.rows, session.space, session.config.strategy)
-        count = sum(score is not None and score.complete for score in session.scores.values())
-        if count >= min(target, len(available)):
-            break
-        next_center = next((coordinate for coordinate in available if coordinate not in attempted
-                            and not session.scores[coordinate].complete), None)
-        if next_center is None:
-            break
-        session.score(next_center, phase="reporting", cap=cap)
-        attempted.add(next_center)
-
-
-def complete_archived_focus(config: OptimizationConfig, data: DataBundle, archive: list[dict], dates: pd.DatetimeIndex) -> list[dict]:
-    """Return a small overlay for older immutable results missing focus support."""
-    base = _base_natural(config, config.base)
-    config = config.model_copy(update={"base": base})
-    space = ParameterSpace(config, field_order=ROBUST_FIELDS)
-    evaluator = BatchEvaluator(config, base, data, space, dates, dates, validation_folds=[], allow_odd_lot_exit=True)
-    evaluator.retain_daily_returns = False
-    session = EvaluationSession(evaluator, space, config, None)
-    session.rows = {space.coordinate(row["params"]): row for row in archive}
-    original = set(session.rows)
-    complete_count = sum(row.get("score_complete") is True and row.get("j_score") is not None for row in archive)
-    if complete_count >= int(config.strategy.recommendation_count):
-        scored = _complete_return_leader(session)
-    else:
-        _complete_reporting_scores(session)
-        scored = set(session.scores)
-    next_id = max((int(row.get("candidate_id") or 0) for row in archive), default=0)
-    overlay = []
-    for coordinate in sorted((set(session.rows) - original) | scored):
-        row = _public_row(session.rows[coordinate], session.scores.get(coordinate))
-        if coordinate not in original:
-            next_id += 1
-            row["candidate_id"] = next_id
-        overlay.append(row)
-    return overlay
-
-
+                session.scores[point] = robust_score(point, session.rows, session.space, session.config.strategy)
 def _normalized_distance(space: ParameterSpace, left: tuple[int, ...], right: tuple[int, ...]) -> float:
     total = 0.0
     for name in space.active:
@@ -435,7 +572,11 @@ def _score_of(session: EvaluationSession, center: tuple[int, ...]):
 
 def _eligible_of(session: EvaluationSession, center: tuple[int, ...]) -> bool:
     score = session.scores.get(center)
-    return eligible(session.rows.get(center), score, max_drawdown=session.config.max_drawdown, min_trades=session.config.min_trades, strategy=session.config.strategy)
+    return eligible(
+        session.rows.get(center), score,
+        max_principal_drawdown=session.config.max_principal_drawdown,
+        min_trades=session.config.min_trades, strategy=session.config.strategy,
+    )
 
 
 def _verify_peak(
@@ -563,34 +704,49 @@ def select_robust_at(
     progress_start: float = 0.0,
     progress_width: float = 1.0,
     runtime=None,
+    budget: EvaluationBudget | None = None,
 ) -> dict[str, Any]:
     del seed_offset
-    if config.strategy.strategy_version != 4:
-        raise ValueError("稳健 J 选择器需要 strategy_version=4")
+    if config.strategy.strategy_version != 5:
+        raise ValueError("稳健 J 选择器需要 strategy_version=5")
     if config.base.initial_shares <= 0:
         raise ValueError("稳健 J 研究要求初始持仓大于零")
     natural = _base_natural(config, base)
     config = config.model_copy(update={"base": natural})
     strategy = config.strategy
-    policy = TrainingWindowPolicy(int(strategy.training_min_days), int(strategy.training_max_days))
+    policy = TrainingWindowPolicy(
+        int(strategy.training_min_days), int(strategy.training_max_days),
+        mode=str(strategy.training_window_mode),
+    )
     window = policy.window(data, asof)
     as_of = window.end
     space = ParameterSpace(config, field_order=ROBUST_FIELDS)
     active = tuple(name for name in ROBUST_FIELDS if name in space.active)
+    if window.data_issue:
+        # A corporate-action or price problem is not a short history and must
+        # never be reported as one.
+        return _empty_result(
+            config, space, as_of, [window.data_issue], window.dates,
+            status="data_issue", window=window,
+        )
     if not active:
             return _empty_result(
                 config, space, as_of, ["四个搜索轴全部固定，无法形成稳健 J 峰值"],
-                window.dates, status="insufficient_range",
+                window.dates, status="insufficient_range", window=window,
             )
     if window.days < int(strategy.training_min_days):
-        return _empty_result(config, space, as_of, [window.reason, f"训练时段只有 {window.days} 个交易日，少于最低 {strategy.training_min_days} 日"], window.dates)
+        return _empty_result(
+            config, space, as_of,
+            [window.reason, f"训练时段只有 {window.days} 个交易日，少于最低 {strategy.training_min_days} 日"],
+            window.dates, window=window,
+        )
     edge = int(strategy.hypercube_edge)
     impossible = [name for name in space.active if space.dimensions[name].count < edge]
     if impossible:
         return _empty_result(
             config, space, as_of,
             ["超正方体边长超出这些参数的有效范围：" + "、".join(impossible)],
-            window.dates, status="insufficient_range",
+            window.dates, status="insufficient_range", window=window,
         )
     total = space.size()
     method = _method(config, total, space)
@@ -611,12 +767,11 @@ def select_robust_at(
         raise ValueError("邻域评价预算不足以计算一个完整稳健 J 分数")
     _emit(progress, progress_start + .02 * progress_width, f"训练时段 {window.start} 至 {window.end}（{window.days} 日）")
     evaluator = BatchEvaluator(
-        config, natural, data, space, window.dates, window.dates,
-        validation_folds=[], cancelled=cancelled, allow_odd_lot_exit=True,
+        config, natural, data, space, window.dates,
+        cancelled=cancelled, allow_odd_lot_exit=True,
         chunk_size=getattr(runtime, "evaluation_chunk_size", None),
     )
-    evaluator.retain_daily_returns = False
-    session = EvaluationSession(evaluator, space, config, cancelled)
+    session = EvaluationSession(evaluator, space, config, cancelled, budget=budget)
     started_seconds = time.perf_counter()
     try:
         if method == "exhaustive":
@@ -650,7 +805,11 @@ def select_robust_at(
         analyzer = PeakAnalyzer(space, float(strategy.peak_tolerance))
         candidates = [
             coordinate for coordinate, score in session.scores.items()
-            if score is not None and eligible(session.rows.get(coordinate), score, max_drawdown=config.max_drawdown, min_trades=config.min_trades, strategy=strategy)
+            if score is not None and eligible(
+                session.rows.get(coordinate), score,
+                max_principal_drawdown=config.max_principal_drawdown,
+                min_trades=config.min_trades, strategy=strategy,
+            )
         ]
         candidates.sort(key=lambda coordinate: _score_sort(session.scores[coordinate], coordinate))
         verify_started = session.spent["validation"]
@@ -679,27 +838,54 @@ def select_robust_at(
             row = session.rows[representative]
             region = _region(space, representative, row, score, analysis, session, region_id)
             region["global_exhaustive"] = method == "exhaustive" and len(session.rows) == total
+            for point in region["region_points"]:
+                candidate = session.rows[tuple(point)]
+                candidate["region_ids"] = list(dict.fromkeys([
+                    *(candidate.get("region_ids") or []), int(region_id),
+                ]))
+            row["is_stable_point"] = True
+            row["is_peak_point"] = True
             regions.append(region)
         _emit(progress, progress_start + .78 * progress_width, "补齐最高超额收益点邻域与 J 排名")
         _complete_reporting_scores(session)
         if int(strategy.stress_region_count) > 0 and regions and not (cancelled and cancelled()):
             stress_regions = regions[:int(strategy.stress_region_count)]
             stress_points = sorted({tuple(point) for region in stress_regions for point in region["region_points"]})
-            try:
-                evidence = evaluator.evaluate_training_stress(stress_points, cost_multiplier=float(strategy.stress_cost_multiplier))
+            stress_blocked = False
+            if len(stress_points) > session._budget_remaining():
+                # The stress batch does not fit in the remaining task budget.
+                # The task budget is stopped explicitly here, so the later
+                # current-decision and out-of-sample phases cannot keep
+                # spending after the stress phase was refused.
+                if session.task_budget is not None:
+                    session.task_budget.stop("费用压力评价超出总预算")
+                session._stop_for_budget("费用压力评价超出总预算")
+                stress_blocked = True
+            elif session.task_budget is not None and not session.task_budget.reserve(len(stress_points), "费用压力"):
+                session._stop_for_budget(session.task_budget.reason or "费用压力评价超出总预算")
+                stress_blocked = True
+            if stress_blocked:
+                if session.task_budget is not None and session.task_budget.reason:
+                    session.budget_reason = session.task_budget.reason
                 for region in stress_regions:
-                    values = [float(evidence[tuple(point)]["training_excess_stress"]) for point in region["region_points"] if tuple(point) in evidence and math.isfinite(float(evidence[tuple(point)].get("training_excess_stress", math.nan)))]
-                    region["stress"] = {
-                        "status": "completed" if len(values) == region["combination_count"] else "partial",
-                        "cost_multiplier": float(strategy.stress_cost_multiplier),
-                        "mean_excess_return": math.fsum(values) / len(values) if values else None,
-                        "min_excess_return": min(values) if values else None,
-                    }
-            except InterruptedError:
-                raise
-            except Exception as exc:
-                for region in stress_regions:
-                    region["stress"] = {"status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
+                    region["stress"] = {"status": "budget_exhausted", "cost_multiplier": float(strategy.stress_cost_multiplier)}
+            else:
+                try:
+                    session.stress_spent += len(stress_points)
+                    evidence = evaluator.evaluate_training_stress(stress_points, cost_multiplier=float(strategy.stress_cost_multiplier))
+                    for region in stress_regions:
+                        values = [float(evidence[tuple(point)]["training_excess_stress"]) for point in region["region_points"] if tuple(point) in evidence and math.isfinite(float(evidence[tuple(point)].get("training_excess_stress", math.nan)))]
+                        region["stress"] = {
+                            "status": "completed" if len(values) == region["combination_count"] else "partial",
+                            "cost_multiplier": float(strategy.stress_cost_multiplier),
+                            "mean_excess_return": math.fsum(values) / len(values) if values else None,
+                            "min_excess_return": min(values) if values else None,
+                        }
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    for region in stress_regions:
+                        region["stress"] = {"status": "failed", "reason": f"{type(exc).__name__}: {exc}"}
         fallback_coordinate = space.full_coordinate(tuple(space.dimensions[name].low for name in space.active))
         diagnostic = candidates[0] if candidates else next(iter(session.rows), fallback_coordinate)
         top = regions[0] if regions else None
@@ -722,8 +908,8 @@ def select_robust_at(
         if not regions:
             reasons.append("没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值")
         diagnostics = {
-            "status": "completed", "protocol_version": 4, "strategy_id": "geometric_robust_j",
-            "strategy_version": 4, "geometry": "robust_j", "connectivity": "fixed_edge_cube",
+            "status": "completed", "protocol_version": 5, "strategy_id": "geometric_robust_j",
+            "strategy_version": 5, "geometry": "robust_j", "connectivity": "fixed_edge_cube",
             "search_method": method, "ranking_mode": "robust_j",
             "fields": list(ROBUST_FIELDS), "active_fields": list(active),
             "legal_combination_count": int(total), "neighborhood_edge": edge,
@@ -731,6 +917,13 @@ def select_robust_at(
             "training_budget": int(strategy.training_budget), "neighborhood_budget": int(strategy.validation_budget),
             "training_unique_count": session.spent["training"], "neighborhood_unique_count": session.spent["validation"],
             "reporting_unique_count": session.spent["reporting"],
+            "stress_unique_count": session.stress_spent,
+            "ledger_evaluation_count": session.ledger_evaluations,
+            "total_evaluation_cap": session.total_cap,
+            "budget_stopped": session.budget_stopped,
+            "budget_reason": session.budget_reason,
+            "reporting_stopped": session.reporting_stopped,
+            "reporting_reason": session.reporting_reason,
             "training_attempt_count": session.attempts, "failed_count": session.failures,
             "candidate_count": len(session.rows),
             "generation_evaluation_count": session.spent["training"],
@@ -748,7 +941,16 @@ def select_robust_at(
             "coverage_status": "global_exhaustive" if method == "exhaustive" else "budgeted_local_peaks",
             "training_window": window.diagnostic(), "training_start": window.start.date().isoformat() if window.start is not None else None,
             "training_end": window.end.date().isoformat() if window.end is not None else None,
-            "selection_history_days": window.days, "validation_folds": [],
+            "selection_history_days": window.days,
+            "selection_history_start": window.start.date().isoformat() if window.start is not None else None,
+            "selection_history_end": window.end.date().isoformat() if window.end is not None else None,
+            "training_only": True, "internal_validation_folds": 0,
+            "return_basis": "peak_principal", "ranking_baseline": "matched_funding_hold",
+            "risk_basis": "principal_profit_drawdown",
+            "statistics_applicability": {
+                "status": "not_applicable",
+                "reason": "本版本未提供峰值本金超额收益的显著性检验",
+            },
             "platforms": [{
                 "platform_id": index, "center": list(analysis.center), "representative": list(analysis.representative or ()),
                 "state": analysis.state, "complete": analysis.complete, "flat_region": analysis.flat_region,
@@ -758,18 +960,26 @@ def select_robust_at(
                 "training_evaluations": session.spent["training"], "neighborhood_evaluations": session.spent["validation"],
                 "reporting_evaluations": session.spent["reporting"],
                 "stress_evaluations": sum(int(region.get("combination_count", 0)) for region in regions[:int(strategy.stress_region_count)]),
-                "cache_hits": max(0, session.requested - session.attempts),
+                "stress_evaluations_charged": session.stress_spent,
+                "ledger_evaluations": session.ledger_evaluations,
+                "total_evaluation_cap": session.total_cap,
+                "budget_stopped": session.budget_stopped,
+                "budget_reason": session.budget_reason,
+                "reporting_stopped": session.reporting_stopped,
+                "reporting_reason": session.reporting_reason,
+                "cache_hits": session.cache_hits,
+                "skipped_count": int(session.skipped),
             },
             "selected_constraint_reasons": [],
             "method_parameters": strategy.model_dump(mode="json"),
         }
-        neighborhoods = {tuple(region["center_coordinate"]): [tuple(point) for point in region["region_points"]] for region in regions}
         record_seconds("robust_j_selection", time.perf_counter() - started_seconds)
         record_count("robust_j_training_points", session.spent["training"])
         record_count("robust_j_neighborhood_points", session.spent["validation"])
         record_count("robust_j_reporting_points", session.spent["reporting"])
         return {
-            "status": "completed", "recommendation_status": "qualified" if regions else "no_qualified",
+            "status": "partial" if session.budget_stopped or session.reporting_stopped else "completed",
+            "recommendation_status": "qualified" if regions else "no_qualified",
             "params": selected,
             "recommended_params": deepcopy(regions[0]["center_params"]) if regions else None,
             "as_of": as_of.date().isoformat() if as_of is not None else None,
@@ -782,13 +992,10 @@ def select_robust_at(
             "trial_archive": public_rows,
             "recommendation_regions": regions,
             "diagnostics": diagnostics,
-            "_ranked_rows": public_ranked, "_family_rows": public_rows,
-            "_neighborhoods": neighborhoods, "_search_rows": public_rows,
-            "_fold_ranges": [], "_selection_data": data, "_selection_dates": window.dates,
         }
     except InterruptedError:
         _emit(progress, .95, "稳健 J 研究已取消")
-        raise
+        return _cancelled_selection(config, space, session, window, as_of)
 
 
 def _empty_result(
@@ -799,8 +1006,14 @@ def _empty_result(
     history: pd.DatetimeIndex,
     *,
     status: str = "insufficient_history",
+    window: TrainingWindow | None = None,
 ) -> dict[str, Any]:
     fallback = space.params(space.full_coordinate(tuple(space.dimensions[name].low for name in space.active)))
+    diagnostic = window.diagnostic() if window is not None else {
+        "start": history[0].date().isoformat() if len(history) else None,
+        "end": history[-1].date().isoformat() if len(history) else None,
+        "days": len(history),
+    }
     return {
         "status": status, "recommendation_status": "no_qualified",
         "params": fallback, "recommended_params": None,
@@ -809,24 +1022,74 @@ def _empty_result(
         "reasons": list(dict.fromkeys(reasons)), "candidates": [], "candidate_archive": [],
         "search_candidate_archive": [], "trial_archive": [], "recommendation_regions": [],
         "diagnostics": {
-            "status": status, "protocol_version": 4, "strategy_id": "geometric_robust_j",
-            "strategy_version": 4, "geometry": "robust_j", "training_only": True,
+            "status": status, "protocol_version": 5, "strategy_id": "geometric_robust_j",
+            "strategy_version": 5, "geometry": "robust_j",
             "selection_history_days": len(history), "candidate_count": 0, "eligible_count": 0,
-            "validation_folds": [], "search_method": config.strategy.search_method,
-            "ranking_mode": "robust_j", "training_window": {
-                "start": history[0].date().isoformat() if len(history) else None,
-                "end": history[-1].date().isoformat() if len(history) else None,
-                "days": len(history),
+            "training_only": True, "internal_validation_folds": 0,
+            "search_method": config.strategy.search_method,
+            "ranking_mode": "robust_j", "training_window": diagnostic,
+            "data_issue": diagnostic.get("data_issue"),
+        },
+    }
+
+
+def _cancelled_selection(
+    config: OptimizationConfig, space: ParameterSpace, session: EvaluationSession,
+    window: TrainingWindow, as_of: pd.Timestamp | None,
+) -> dict[str, Any]:
+    public_rows = [_public_row(row, session.scores.get(tuple(row["key"]))) for row in session.rows.values()]
+    public_rows.sort(
+        key=lambda row: (
+            -(float(row.get("j_score")) if row.get("j_score") is not None else -math.inf),
+            tuple(row.get("key", ())),
+        )
+    )
+    for index, row in enumerate(public_rows, 1):
+        row["candidate_id"] = index
+    fallback = space.params(space.full_coordinate(tuple(space.dimensions[name].low for name in space.active)))
+    diagnostic = next(iter(session.rows.values()), {})
+    params = deepcopy(diagnostic.get("params", fallback))
+    return {
+        "status": "cancelled", "recommendation_status": "no_qualified",
+        "params": params, "recommended_params": None,
+        "as_of": as_of.date().isoformat() if as_of is not None else None,
+        "score": None, "raw_score": None, "eligible": False,
+        "reasons": ["用户取消，已保留完成的训练候选"],
+        "candidates": [], "candidate_archive": public_rows,
+        "search_candidate_archive": public_rows, "trial_archive": public_rows,
+        "recommendation_regions": [],
+        "diagnostics": {
+            "status": "cancelled", "protocol_version": 5,
+            "strategy_id": "geometric_robust_j", "strategy_version": 5,
+            "training_window": window.diagnostic(),
+            "training_start": window.start.date().isoformat() if window.start is not None else None,
+            "training_end": window.end.date().isoformat() if window.end is not None else None,
+            "selection_history_days": window.days,
+            "training_only": True, "internal_validation_folds": 0,
+            "candidate_count": len(session.rows),
+            "training_unique_count": session.spent["training"],
+            "neighborhood_unique_count": session.spent["validation"],
+            "reporting_unique_count": session.spent["reporting"],
+            "ledger_evaluation_count": session.ledger_evaluations,
+            "budget_stopped": session.budget_stopped,
+            "budget_reason": session.budget_reason,
+            "reporting_stopped": session.reporting_stopped,
+            "reporting_reason": session.reporting_reason,
+            "score_complete": False, "local_peak_verified": False,
+            "global_exhaustive": False, "coverage_status": "cancelled",
+            "return_basis": "peak_principal", "ranking_baseline": "matched_funding_hold",
+            "risk_basis": "principal_profit_drawdown",
+            "statistics_applicability": {
+                "status": "not_applicable",
+                "reason": "本版本未提供峰值本金超额收益的显著性检验",
             },
         },
-        "_ranked_rows": [], "_family_rows": [], "_neighborhoods": {}, "_search_rows": [],
-        "_fold_ranges": [], "_selection_data": None, "_selection_dates": history,
     }
 
 
 def estimate_robust_search(config: OptimizationConfig, data: DataBundle) -> dict[str, Any]:
-    if config.protocol_version != 4 or config.strategy.strategy_version != 4:
-        raise ValueError("稳健 J 预检需要 protocol_version=4 和 strategy_version=4")
+    if config.protocol_version != 5 or config.strategy.strategy_version != 5:
+        raise ValueError("稳健 J 预检需要 protocol_version=5 和 strategy_version=5")
     natural = _base_natural(config, config.base)
     normalized = config.model_copy(update={"base": natural})
     space = ParameterSpace(normalized, field_order=ROBUST_FIELDS)
@@ -837,7 +1100,10 @@ def estimate_robust_search(config: OptimizationConfig, data: DataBundle) -> dict
     if len(closer):
         asof = closer[-1]
     strategy = config.strategy
-    policy = TrainingWindowPolicy(int(strategy.training_min_days), int(strategy.training_max_days))
+    policy = TrainingWindowPolicy(
+        int(strategy.training_min_days), int(strategy.training_max_days),
+        mode=str(strategy.training_window_mode),
+    )
     window = policy.window(data, asof)
     total = space.size()
     method = _method(normalized, total, space)
@@ -848,9 +1114,43 @@ def estimate_robust_search(config: OptimizationConfig, data: DataBundle) -> dict
     reasons: list[str] = []
     impossible = [name for name in active if space.dimensions[name].count < edge]
     bytes_per_point = int(strategy.estimated_bytes_per_point)
+    stress_points = int(strategy.stress_region_count) * peak_support
+    candidate_upper = min(
+        total,
+        int(strategy.training_budget) + int(strategy.validation_budget)
+        + int(strategy.reporting_budget) + stress_points,
+    )
     memory_mb = total * bytes_per_point / (1024 * 1024)
-    sampled_memory_mb = min(total, int(strategy.training_budget) + int(strategy.validation_budget)) * bytes_per_point / (1024 * 1024)
-    if window.days < int(strategy.training_min_days):
+    sampled_memory_mb = candidate_upper * bytes_per_point / (1024 * 1024)
+    frame_bytes = 0
+    for frame in (data.bars, data.daily, data.actions, pd.DataFrame({"date": data.calendar})):
+        if isinstance(frame, pd.DataFrame) and not frame.empty:
+            frame_bytes += int(frame.memory_usage(index=True, deep=True).sum())
+    # One native batch holds its daily x candidate result plus the paired
+    # account state.  Candidate cache and JSON archives are retained alongside.
+    evaluation_days_estimate = max(1, int(len(dates[dates <= asof])))
+    batch_candidates = min(512, candidate_upper)
+    ledger_buffer_mb = batch_candidates * evaluation_days_estimate * 8 * 4 / (1024 * 1024)
+    tensor_mb = min(total, int(strategy.training_budget)) * 6 * 8 / (1024 * 1024) if active else 0.0
+    memory_estimate_mb = (
+        frame_bytes / (1024 * 1024) + sampled_memory_mb
+        + ledger_buffer_mb + tensor_mb
+    )
+    workspace_mb = current_workspace_bytes() / (1024 * 1024)
+    per_decision_upper = (
+        int(strategy.training_budget) + int(strategy.validation_budget)
+        + int(strategy.reporting_budget) + stress_points
+    )
+    evaluation_days = int(len(dates[dates >= eval_start]))
+    fixed_count = 1 if config.selection_target in ("fixed", "both") else 0
+    adaptive_count = math.ceil(evaluation_days / max(1, int(config.rebalance_days))) if config.selection_target in ("adaptive", "both") else 0
+    replay_runs = fixed_count + (1 if adaptive_count else 0)
+    task_upper = per_decision_upper * (fixed_count + adaptive_count + 1) + replay_runs
+    effective_total = task_upper if strategy.total_evaluation_budget is None else min(task_upper, int(strategy.total_evaluation_budget))
+    if window.data_issue:
+        status = "data_issue"
+        reasons.append(window.data_issue)
+    elif window.days < int(strategy.training_min_days):
         status = "insufficient_history"
         reasons.append(f"训练时段只有 {window.days} 个交易日，少于最低 {strategy.training_min_days} 日")
     elif impossible:
@@ -868,22 +1168,33 @@ def estimate_robust_search(config: OptimizationConfig, data: DataBundle) -> dict
             f"完整枚举预计需要 {memory_mb:.1f} MB，超过内存上限 "
             f"{strategy.exhaustive_memory_limit_mb} MB"
         )
+    elif memory_estimate_mb > workspace_mb:
+        status = "budget_exceeded"
+        reasons.append(
+            f"任务预计占用 {memory_estimate_mb:.1f} MB，超过工作区上限 {workspace_mb:.1f} MB"
+        )
     else:
         status = "ready"
-    evaluation_days = int(len(dates[dates >= eval_start]))
-    fixed_count = 1 if config.selection_target in ("fixed", "both") else 0
-    adaptive_count = math.ceil(evaluation_days / max(1, int(config.rebalance_days))) if config.selection_target in ("adaptive", "both") else 0
     return {
-        "status": status, "protocol_version": 4, "strategy_id": "geometric_robust_j",
-        "strategy_version": 4, "geometry": "robust_j", "grid_mode": "geometric",
+        "status": status, "protocol_version": 5, "strategy_id": "geometric_robust_j",
+        "strategy_version": 5, "geometry": "robust_j", "grid_mode": "geometric",
+        "protocol": config.protocol_description(),
         "fields": list(ROBUST_FIELDS), "active_fields": list(active),
         "granularity": {name: space.granularity[name] for name in ROBUST_FIELDS},
         "legal_combination_count": int(total), "search_method": method,
         "hypercube_edge": edge, "hypercube_volume": volume, "peak_support_volume": peak_support,
         "training_budget": int(strategy.training_budget), "neighborhood_budget": int(strategy.validation_budget),
+        "reporting_budget": int(strategy.reporting_budget),
         "estimated_memory_mb": memory_mb, "exhaustive_memory_limit_mb": int(strategy.exhaustive_memory_limit_mb),
         "estimated_bytes_per_point": bytes_per_point, "estimated_sampled_memory_mb": sampled_memory_mb,
+        "estimated_task_memory_mb": memory_estimate_mb,
+        "workspace_budget_mb": workspace_mb,
         "estimated_peak_support_points": peak_support,
+        "per_decision_evaluation_upper_bound": per_decision_upper,
+        "replay_evaluation_upper_bound": replay_runs,
+        "task_evaluation_upper_bound": task_upper,
+        "effective_total_evaluation_budget": effective_total,
+        "max_runtime_seconds": int(strategy.max_runtime_seconds),
         "decision_count_estimate": int(fixed_count + adaptive_count + 1),
         "history_days": window.days, "training_days": window.days, "validation_days": 0,
         "full_training_window": window.days >= int(strategy.training_min_days),

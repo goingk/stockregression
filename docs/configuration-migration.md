@@ -12,7 +12,7 @@
 2. 当前配置目标是项目主文件；
 3. 旧 `.local/settings.json` 存在且可解析。
 
-迁移会把旧研究所用的完整默认值和回测默认值归档到 `research.legacy`，然后让新研究使用稳健 J 默认值。兼容且合法的用户值继续继承。旧隐藏文件保留作为人工备份，不再读取。
+迁移会把旧研究默认值、旧统计设置和回测默认值归档到 `research.legacy.history`，再把有效研究升级到 `protocol_version=5`、`strategy_version=5` 和 `ranking_mode=robust_j`。行情路径、费用、初始资金／持股、执行频率、窗口参数、搜索范围、训练与邻域预算以及其他仍有效的搜索参数继续保留；只有已退役的 `mode`、`n_trials`、bootstrap、旧验证窗和 `max_drawdown` 控件被清除。新增的 `reporting_budget`、总评价上限和任务时限使用 v5 默认值。旧隐藏文件保留作为人工备份，不再读取。
 
 如果主文件存在，启动不会自动导入旧文件。需要显式执行：
 
@@ -35,13 +35,13 @@
 
 任务在入队时冻结完整配置文档、有效设置、数据目录、实际数据版本和决策区间。后续配置修改不会改变排队或运行中的任务。结果保留 `configuration_snapshot` 和 `execution` 记录，用于解释当时的费用、滑点、资源与研究参数。
 
-历史研究结果进入任务自己的快照视图，不会改写当前研究默认值。历史版本仍按原 `protocol_version`、`strategy_version` 和原始配置读取；新版默认切换到策略 v4 不会重写旧结果标识。
+历史研究结果的文件、行情快照和数据库记录不会被迁移或物理删除。v1–v4 研究结果只在历史列表显示“不支持的历史版本”；详情、参数分布、补算和导出返回明确的版本错误。旧优化任务不能由当前引擎接续，重新运行研究会生成 `protocol_version=5`、`result_schema_version=2` 的新结果。
 
 ## 生效方式
 
 - `application.host`、`application.port`、`paths.data_dir`、`paths.package_dir`：重启进程。
 - `application.max_workers`：新调度器启动后。
-- `backtest.*`、`research.*`、`statistics.*`：下一次任务提交或下一次统计。
+- `backtest.*`、`research.*`：下一次任务提交；已提交任务继续使用自己的配置、数据版本、源码和依赖指纹。
 - `market_data.*`、`runtime.*`：下一次服务、请求或任务构造；排队任务继续使用自己的快照。
 - `ui.*`：界面下一次读取或下一次轮询。
 - `schedule.*`：保存后需要按数据中心现有安装／移除流程更新系统计划任务。

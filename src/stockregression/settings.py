@@ -18,7 +18,7 @@ from .models import GRANULARITY_DEFAULTS, GRANULARITY_MINIMUMS, LEGACY_GRANULARI
 PROJECT_ROOT = Path(os.environ.get("STOCKREGRESSION_HOME", Path(__file__).resolve().parents[2])).resolve()
 PROJECT_CONFIG_FILE = PROJECT_ROOT / "config" / "application.json"
 LEGACY_SETTINGS_FILE = PROJECT_ROOT / ".local" / "settings.json"
-CONFIG_SCHEMA_VERSION = 4
+CONFIG_SCHEMA_VERSION = 5
 # ``SETTINGS_FILE`` remains the single test/CLI override point.  Its default is
 # now the project configuration file rather than the legacy hidden settings.
 SETTINGS_FILE = PROJECT_CONFIG_FILE
@@ -140,44 +140,40 @@ _RESEARCH_RANGE_DEFAULTS = {
 
 
 class ResearchDefaults(_WorkbenchPreference):
-    strategy_id: Literal["geometric_excess_neighborhood", "geometric_robust_j"] = "geometric_robust_j"
-    protocol_version: Literal[1, 2, 3, 4] = 4
+    strategy_id: Literal["geometric_robust_j"] = "geometric_robust_j"
+    protocol_version: Literal[5] = 5
     selection_target: Literal["fixed", "adaptive", "both"] = "both"
     rebalance_days: int = Field(default=63, ge=1)
-    bootstrap_reps: int = Field(default=10_000, ge=1)
-    bootstrap_block_lengths: list[int] = Field(default_factory=lambda: [20, 10, 40])
-    significance_alpha: float = Field(default=.05, gt=0, lt=1)
-    outer_validation_days: int = Field(default=126, ge=20, le=1000)
-    mode: Literal["historical", "robust", "both"] = "both"
-    n_trials: int = Field(default=1000, ge=1, le=5000)
-    local_search_budget: int = Field(default=3000, ge=1, le=5000)
     seed: int = 42
     top_candidates: int = Field(default=20, ge=1, le=100)
-    max_drawdown: float = Field(default=0.2, gt=0, le=1)
+    max_principal_drawdown: float = Field(default=0.2, gt=0, le=1)
     min_trades: int = Field(default=10, ge=0)
     min_history_days: int = Field(default=250, ge=20)
     min_minute_ratio: float = Field(default=0.95, ge=0, le=1)
-    ranking_mode: Literal["max_volume", "fixed_mean"] = "fixed_mean"
-    strategy_version: Literal[1, 2, 3, 4] = 4
+    ranking_mode: Literal["robust_j"] = "robust_j"
+    strategy_version: Literal[5] = 5
     hypercube_edge: int = Field(default=3, ge=1, le=99)
     granularity: dict[str, float] = Field(default_factory=lambda: dict(GRANULARITY_DEFAULTS))
     search_method: Literal["auto", "hierarchical", "exhaustive"] = "auto"
     training_budget: int = Field(default=20_000, ge=1, le=1_000_000)
     validation_budget: int = Field(default=100_000, ge=1, le=2_000_000)
+    reporting_budget: int = Field(default=1_000, ge=0, le=2_000_000)
+    total_evaluation_budget: int | None = Field(default=None, ge=1, le=10_000_000)
+    max_runtime_seconds: int = Field(default=3600, ge=1, le=86400)
     recommendation_count: int = Field(default=10, ge=1, le=100)
-    max_shares_mode: Literal["search", "unlimited"] = "search"
+    max_shares_mode: Literal["unlimited"] = "unlimited"
     slippage_mode: Literal["configured", "zero"] = "configured"
     neighborhood_fields: list[Literal[
-        "buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares"
+        "buy_step", "sell_step", "sell_shares", "buy_shares"
     ]] = Field(default_factory=lambda: [
         "buy_step", "sell_step", "buy_shares", "sell_shares",
     ])
     fixed_half_widths: dict[str, float] = Field(default_factory=lambda: {
         "buy_step": 0.001, "sell_step": 0.001, "sell_shares": 100, "buy_shares": 100,
-        "min_shares": 500, "max_shares": 500,
     })
     ranges: dict[str, ResearchRangeDefaults] = Field(default_factory=lambda: {
-        key: ResearchRangeDefaults.model_validate(value) for key, value in _RESEARCH_RANGE_DEFAULTS.items()
+        key: ResearchRangeDefaults.model_validate({**value, "step": None})
+        for key, value in ROBUST_RANGE_DEFAULTS.items()
     })
     sigma: float = Field(default=1.0, gt=0, le=100)
     alpha: float = Field(default=.30, ge=0, le=1)
@@ -191,6 +187,7 @@ class ResearchDefaults(_WorkbenchPreference):
     floor_k_ref: float = Field(default=10.0, gt=0, le=1_000_000)
     training_min_days: int = Field(default=250, ge=20, le=5000)
     training_max_days: int = Field(default=500, ge=20, le=5000)
+    training_window_mode: Literal["same_price", "fixed"] = "same_price"
     peak_tolerance: float = Field(default=1e-12, gt=0, le=.1)
     start_min: int = Field(default=20, ge=1, le=1000)
     start_max: int = Field(default=64, ge=1, le=1000)
@@ -207,140 +204,96 @@ class ResearchDefaults(_WorkbenchPreference):
     @model_validator(mode="before")
     @classmethod
     def migrate_protocol(cls, values):
-        if isinstance(values, dict):
-            values = dict(values)
-            if "strategy_version" not in values:
-                if "ranking_mode" in values:
-                    values["strategy_version"] = 1 if values.get("ranking_mode") == "fixed_mean" else 3
-                elif int(values.get("protocol_version", 4)) < 4:
-                    values["strategy_version"] = 3
-                else:
-                    values["strategy_version"] = 4
-            elif int(values.get("strategy_version")) == 2 and values.get("ranking_mode") == "max_volume":
-                # The connected-component selector is no longer offered for new
-                # studies.  Remembered v4 settings move to the hypercube mode.
-                values["strategy_version"] = 3
-            if int(values.get("strategy_version", 4)) in (3, 4):
-                values["ranking_mode"] = "fixed_mean"
-            elif int(values.get("strategy_version")) == 2:
-                values["ranking_mode"] = "max_volume"
-            values["strategy_id"] = (
-                "geometric_robust_j" if int(values.get("strategy_version", 4)) == 4
-                else "geometric_excess_neighborhood"
-            )
-            robust = int(values.get("strategy_version", 4)) == 4
-            if "max_shares_mode" not in values:
-                values["max_shares_mode"] = "unlimited" if robust else "search"
-            granularity_defaults = GRANULARITY_DEFAULTS if robust else LEGACY_GRANULARITY_DEFAULTS
-            if not isinstance(values.get("granularity"), dict):
-                values["granularity"] = dict(granularity_defaults)
-            else:
-                saved_granularity = values["granularity"]
-                unknown = set(saved_granularity) - set(LEGACY_GRANULARITY_DEFAULTS)
-                if unknown:
-                    raise ValueError("研究细粒度包含未知参数：" + "、".join(sorted(unknown)))
-                granularity = {
-                    name: saved_granularity.get(name, default)
-                    for name, default in granularity_defaults.items()
+        if not isinstance(values, dict):
+            return values
+        values = dict(values)
+        if "max_principal_drawdown" not in values:
+            # The former unit-NAV threshold has a different denominator and is
+            # deliberately not promoted as an equivalent capital drawdown.
+            values["max_principal_drawdown"] = 0.2
+        # Only whole legacy research objects are migrated.  A current API
+        # patch that submits a retired control must fail validation instead of
+        # being silently accepted and discarded.
+        previous_protocol = values.get("protocol_version")
+        migrating_legacy = (
+            previous_protocol is not None
+            and str(previous_protocol).isdigit()
+            and int(previous_protocol) < 5
+        )
+        if migrating_legacy:
+            for key in (
+                "bootstrap_reps", "bootstrap_block_lengths", "significance_alpha",
+                "outer_validation_days", "mode", "n_trials", "local_search_budget",
+                "max_drawdown",
+            ):
+                values.pop(key, None)
+        versioned_defaults = {
+            "strategy_id": "geometric_robust_j", "protocol_version": 5,
+            "strategy_version": 5, "ranking_mode": "robust_j",
+            "max_shares_mode": "unlimited",
+            "neighborhood_fields": ["buy_step", "sell_step", "buy_shares", "sell_shares"],
+        }
+        if migrating_legacy:
+            values.update(versioned_defaults)
+        else:
+            for name, default in versioned_defaults.items():
+                values.setdefault(name, default)
+        saved_granularity = values.get("granularity")
+        if migrating_legacy:
+            values["granularity"] = {
+                name: (saved_granularity.get(name, default) if isinstance(saved_granularity, dict) else default)
+                for name, default in GRANULARITY_DEFAULTS.items()
+            }
+        saved_ranges = values.get("ranges")
+        if migrating_legacy:
+            values["ranges"] = {
+                name: {
+                    **(dict(saved_ranges.get(name) or default) if isinstance(saved_ranges, dict) else default),
+                    "step": None,
                 }
-                for name, value in list(granularity.items()):
-                    minimum = float(GRANULARITY_MINIMUMS[name])
-                    steps = float(value) / minimum
-                    if float(value) <= 0 or abs(steps - round(steps)) > 1e-7:
-                        raise ValueError(
-                            f"研究细粒度 {name} 必须是参数最小单位 "
-                            f"{'0.0001' if minimum == 0.0001 else int(minimum)} 的正整数倍"
-                        )
-                values["granularity"] = granularity
-            if isinstance(values.get("ranges"), dict):
-                ranges = dict(values["ranges"])
-                legacy = ranges.pop("grid_step", None)
-                if legacy is not None:
-                    ranges["buy_step"] = legacy
-                    ranges["sell_step"] = legacy
-                if robust:
-                    unknown = set(ranges) - set(ROBUST_RANGE_DEFAULTS)
-                    if unknown:
-                        raise ValueError("稳健 J 研究范围包含非搜索轴：" + "、".join(sorted(unknown)))
-                    if any(
-                        isinstance(value, dict) and value.get("step") is not None
-                        for value in ranges.values()
-                    ):
-                        raise ValueError("稳健 J 研究的步长只能配置在 granularity 中")
-                    ranges = {
-                        name: {**dict(ranges.get(name) or ROBUST_RANGE_DEFAULTS[name]), "step": None}
-                        for name in ROBUST_RANGE_DEFAULTS
-                    }
-                values["ranges"] = ranges
-            elif robust:
-                values["ranges"] = {
-                    name: {**value, "step": None}
-                    for name, value in ROBUST_RANGE_DEFAULTS.items()
-                }
-            if isinstance(values.get("neighborhood_fields"), list):
-                fields = values["neighborhood_fields"]
-                if "grid_step" in fields:
-                    migrated_fields = []
-                    for name in fields:
-                        for mapped in (("buy_step", "sell_step") if name == "grid_step" else (name,)):
-                            if mapped not in migrated_fields:
-                                migrated_fields.append(mapped)
-                    values["neighborhood_fields"] = migrated_fields
-            if isinstance(values.get("fixed_half_widths"), dict):
-                saved_widths = dict(values["fixed_half_widths"])
-                legacy = saved_widths.pop("grid_step", None)
-                merged_widths = {
-                    "buy_step": .001, "sell_step": .001, "sell_shares": 100, "buy_shares": 100,
-                    "min_shares": 500, "max_shares": 500,
-                    **saved_widths,
-                }
-                if legacy is not None:
-                    merged_widths["buy_step"] = legacy
-                    merged_widths["sell_step"] = legacy
-                values["fixed_half_widths"] = merged_widths
-            if isinstance(values.get("fixed_half_widths"), dict):
-                for name in ("min_shares", "max_shares"):
-                    raw = values["fixed_half_widths"].get(name, 500)
-                    if isinstance(raw, (int, float)) and raw > 0:
-                        values["fixed_half_widths"][name] = max(500, math.ceil(raw / 500) * 500)
-            if values.get("protocol_version") in (1, 2, 3):
-                values["protocol_version"] = 4
+                for name, default in ROBUST_RANGE_DEFAULTS.items()
+            }
+        saved_widths = values.get("fixed_half_widths")
+        if migrating_legacy:
+            values["fixed_half_widths"] = {
+                name: (saved_widths.get(name, default) if isinstance(saved_widths, dict) else default)
+                for name, default in {
+                    "buy_step": .001, "sell_step": .001,
+                    "sell_shares": 100, "buy_shares": 100,
+                }.items()
+            }
+        values.setdefault("reporting_budget", 1_000)
+        values.setdefault("total_evaluation_budget", None)
+        values.setdefault("max_runtime_seconds", 3_600)
+        values.setdefault("training_window_mode", "same_price")
         return values
 
     @model_validator(mode="after")
     def valid_ranges(self):
-        robust = self.strategy_version == 4
-        expected = set(ROBUST_RANGE_DEFAULTS) if robust else set(_RESEARCH_RANGE_DEFAULTS)
-        if set(self.ranges) != expected:
-            raise ValueError("稳健 J 搜索范围必须包含四个搜索轴" if robust else "搜索范围必须包含全部七个支持参数")
+        if set(self.ranges) != set(ROBUST_RANGE_DEFAULTS):
+            raise ValueError("稳健 J 搜索范围必须包含四个搜索轴")
         for name, value in self.ranges.items():
             if name.endswith("_shares"):
-                minimum = 100 if name in {"buy_shares", "sell_shares"} else 0
-                numbers = (value.low, value.high) + (() if value.step is None else (value.step,))
-                if value.low < minimum or any(number % 100 for number in numbers):
+                if value.low < 100 or value.high % 100 or value.low % 100:
                     raise ValueError(f"股数搜索范围 {name} 必须以 100 为单位，交易量至少 100")
             else:
                 if value.low <= 0 or value.high > 1:
                     raise ValueError(f"网格间距搜索范围 {name} 必须位于 (0, 1]")
-            if robust and value.step is not None:
+            if value.step is not None:
                 raise ValueError("稳健 J 研究的步长只能配置在 granularity 中")
-            if not robust and value.step is None:
-                raise ValueError("历史研究范围必须包含步长")
-        if not self.bootstrap_block_lengths or any(int(value) < 1 for value in self.bootstrap_block_lengths):
-            raise ValueError("Bootstrap 区块长度必须为正整数")
         return self
 
     @model_validator(mode="after")
     def valid_fixed_half_widths(self):
-        allowed = {"buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares"}
+        allowed = {"buy_step", "sell_step", "sell_shares", "buy_shares"}
         if set(self.fixed_half_widths) != allowed:
-            raise ValueError("固定邻域半宽必须包含六个 v4 参数")
+            raise ValueError("固定邻域半宽必须包含四个稳健 J 搜索轴")
         if any(float(value) <= 0 for value in self.fixed_half_widths.values()):
             raise ValueError("固定邻域半宽必须为正数")
         if any(abs(float(self.fixed_half_widths[name]) / 0.001 - round(float(self.fixed_half_widths[name]) / 0.001)) > 1e-7 for name in ("buy_step", "sell_step")):
             raise ValueError("买卖间距半宽必须对齐 0.001")
-        if any(abs(float(self.fixed_half_widths[name]) / (500 if name in {"min_shares", "max_shares"} else 100) - round(float(self.fixed_half_widths[name]) / (500 if name in {"min_shares", "max_shares"} else 100))) > 1e-7 for name in ("sell_shares", "buy_shares", "min_shares", "max_shares")):
-            raise ValueError("交易数量半宽必须对齐 100，持股边界半宽必须对齐 500")
+        if any(abs(float(self.fixed_half_widths[name]) / 100 - round(float(self.fixed_half_widths[name]) / 100)) > 1e-7 for name in ("sell_shares", "buy_shares")):
+            raise ValueError("交易数量半宽必须对齐 100")
         return self
 
     @model_validator(mode="after")
@@ -355,7 +308,7 @@ class ResearchDefaults(_WorkbenchPreference):
     def valid_hypercube(self):
         if self.hypercube_edge < 1 or self.hypercube_edge % 2 != 1:
             raise ValueError("超正方体边长必须为正奇数")
-        expected_granularity = set(GRANULARITY_DEFAULTS if self.strategy_version == 4 else LEGACY_GRANULARITY_DEFAULTS)
+        expected_granularity = set(GRANULARITY_DEFAULTS)
         if set(self.granularity) != expected_granularity:
             raise ValueError("研究细粒度包含的参数与策略版本不匹配")
         for name, value in self.granularity.items():
@@ -369,13 +322,12 @@ class ResearchDefaults(_WorkbenchPreference):
             raise ValueError("局部搜索起点数下限不能大于上限")
         if not self.initial_strides or any(int(value) < 1 for value in self.initial_strides):
             raise ValueError("局部搜索初始步长必须为正整数")
-        if self.strategy_version == 4:
-            if self.eta_floor > self.eta_limit:
-                raise ValueError("底仓保护阈值不能高于持仓免罚阈值")
-            if self.eta_hard_cap is not None and self.eta_hard_cap < self.eta_limit:
-                raise ValueError("最大持仓淘汰阈值不能低于持仓免罚阈值")
-            if not math.isfinite(self.floor_k_ref) or self.floor_k_ref <= 0:
-                raise ValueError("底仓参考格数必须为正数")
+        if self.eta_floor > self.eta_limit:
+            raise ValueError("底仓保护阈值不能高于持仓免罚阈值")
+        if self.eta_hard_cap is not None and self.eta_hard_cap < self.eta_limit:
+            raise ValueError("最大持仓淘汰阈值不能低于持仓免罚阈值")
+        if not math.isfinite(self.floor_k_ref) or self.floor_k_ref <= 0:
+            raise ValueError("底仓参考格数必须为正数")
         return self
 
 
@@ -428,20 +380,6 @@ class UiSettings(BaseModel):
         return self
 
 
-class StatisticsSettings(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    bootstrap_reps: int = Field(default=10_000, ge=100, le=1_000_000)
-    block_lengths: list[int] = Field(default_factory=lambda: [20, 10, 40])
-    alpha: float = Field(default=.05, gt=0, lt=1)
-    outer_validation_days: int = Field(default=126, ge=20, le=1000)
-
-    @model_validator(mode="after")
-    def valid_blocks(self):
-        if not self.block_lengths or any(value < 1 for value in self.block_lengths):
-            raise ValueError("Bootstrap 区块长度必须为正整数")
-        return self
-
-
 class MarketDataSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     cache_mb: int = Field(default=256, ge=0, le=16384)
@@ -475,7 +413,6 @@ class Settings(BaseModel):
     recent_minute_source: Literal["sina", "tdx"] = "sina"
     etf_daily_source: Literal["baostock", "eastmoney"] = "baostock"
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
-    statistics: StatisticsSettings = Field(default_factory=StatisticsSettings)
     ui: UiSettings = Field(default_factory=UiSettings)
     research_legacy: dict = Field(default_factory=dict)
 
@@ -511,13 +448,12 @@ class ConfigurationDocument(BaseModel):
     """The complete validated project configuration file."""
 
     model_config = ConfigDict(extra="forbid")
-    config_schema_version: Literal[1, 2, 3, 4] = CONFIG_SCHEMA_VERSION
+    config_schema_version: Literal[1, 2, 3, 4, 5] = CONFIG_SCHEMA_VERSION
     config_revision: str | None = None
     application: ApplicationSection = Field(default_factory=ApplicationSection)
     paths: PathsSection = Field(default_factory=lambda: PathsSection(data_dir=str(DEFAULT_DATA_DIR)))
     backtest: BacktestSection = Field(default_factory=BacktestSection)
     research: ResearchSection = Field(default_factory=ResearchSection)
-    statistics: StatisticsSettings = Field(default_factory=StatisticsSettings)
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
     runtime: PerformanceSettings = Field(default_factory=PerformanceSettings)
     ui: UiSettings = Field(default_factory=UiSettings)
@@ -539,12 +475,9 @@ def configuration_document(value: Settings, *, portable: bool = True) -> dict:
             "fees": value.fee_defaults.model_dump(mode="json"),
         },
         "research": {
-            "defaults": value.workbench_defaults.research.model_dump(
-                mode="json", exclude={"bootstrap_reps", "bootstrap_block_lengths", "significance_alpha", "outer_validation_days"},
-            ),
+            "defaults": value.workbench_defaults.research.model_dump(mode="json"),
             "legacy": deepcopy(value.research_legacy),
         },
-        "statistics": value.statistics.model_dump(mode="json"),
         "market_data": {
             **value.market_data.model_dump(mode="json"),
             "cache_mb": value.market_cache_mb,
@@ -586,7 +519,6 @@ def settings_from_document(document: dict) -> Settings:
         recent_minute_source=validated.market_data.recent_minute_source,
         etf_daily_source=validated.market_data.etf_daily_source,
         market_data=validated.market_data,
-        statistics=validated.statistics,
         ui=validated.ui,
         research_legacy=deepcopy(validated.research.legacy),
     )
@@ -600,15 +532,22 @@ def _flat_configuration_document(raw: dict) -> dict:
     # source schema here so the migration pipeline can still archive the
     # original research/backtest defaults before activating robust-J defaults.
     document["config_schema_version"] = int(raw.get("config_schema_version", 1))
+    research_defaults = ((raw.get("workbench_defaults") or {}).get("research"))
+    if isinstance(research_defaults, dict):
+        # Settings validation normalises away fields from retired protocols.
+        # Restore the exact source document here so the v5 migration archive is
+        # an audit record of what the user actually had configured.
+        document.setdefault("research", {})["defaults"] = deepcopy(research_defaults)
     return document
 
 
 def migrate_configuration_document(raw: dict) -> dict:
     """Apply deterministic configuration migrations in memory.
 
-    Schema 2 archives the complete former research defaults and activates the
-    robust-J research defaults.  Historical results remain bound to their own
-    task snapshots; this migration only affects new studies.
+    Schema 5 starts a new research protocol.  Earlier research defaults and
+    statistics controls are archived under ``research.legacy`` so existing
+    historical records can still be identified without pretending that their
+    former unit-NAV metrics are equivalent to peak-principal metrics.
     """
     if not isinstance(raw, dict):
         raise ValueError("配置文件根节点必须是对象")
@@ -625,74 +564,33 @@ def migrate_configuration_document(raw: dict) -> dict:
     document = deepcopy(raw) if grouped else _flat_configuration_document(raw)
     if version > CONFIG_SCHEMA_VERSION:
         raise ValueError(f"配置架构 {version} 高于当前程序支持的 {CONFIG_SCHEMA_VERSION}")
-    if version < 2:
+    if version < CONFIG_SCHEMA_VERSION:
         research = document.setdefault("research", {})
-        defaults = deepcopy(research.get("defaults") or {})
-        legacy = deepcopy(research.get("legacy") or {})
-        if not legacy:
-            legacy = {
-                "source": "migration_v1",
-                "research_defaults": deepcopy(defaults),
-                "backtest_defaults": deepcopy(document.get("backtest") or {}),
-            }
-        # New studies use the natural-position robust-J family.  Compatible
-        # user values (budgets, ranges, weights, fees) remain intact; the old
-        # exact values are available in research.legacy for legacy tasks.
-        defaults["strategy_id"] = "geometric_robust_j"
-        defaults["strategy_version"] = 4
-        defaults["max_shares_mode"] = "unlimited"
-        defaults["neighborhood_fields"] = ["buy_step", "sell_step", "buy_shares", "sell_shares"]
-        research["defaults"] = defaults
-        research["legacy"] = legacy
+        previous_defaults = deepcopy(research.get("defaults") or {})
+        previous_legacy = deepcopy(research.get("legacy") or {})
+        previous_statistics = deepcopy(document.pop("statistics", None))
+
+        # Keep every earlier archive.  Existing installations already carry a
+        # v1 archive in ``legacy``; moving that object into ``history`` avoids
+        # silently replacing it with the immediately preceding v4 defaults.
+        if previous_legacy:
+            history = list(previous_legacy.get("history") or [])
+            history.append({key: value for key, value in previous_legacy.items() if key != "history"})
+            previous_legacy = {**previous_legacy, "history": history}
+        previous_legacy["source"] = f"migration_v{version}"
+        previous_legacy["research_defaults"] = previous_defaults
+        if previous_statistics is not None:
+            previous_legacy["statistics"] = previous_statistics
+        research["legacy"] = previous_legacy
+
+        # ResearchDefaults owns the protocol upgrade.  It deliberately resets
+        # the old unit-NAV drawdown limit and carries forward budgets, ranges,
+        # weights and other still-valid search settings.
+        research["defaults"] = ResearchDefaults.model_validate(previous_defaults).model_dump(mode="python")
         document["research"] = research
-        if "statistics" not in document:
-            document["statistics"] = {
-                "bootstrap_reps": defaults.get("bootstrap_reps", 10_000),
-                "block_lengths": defaults.get("bootstrap_block_lengths", [20, 10, 40]),
-                "alpha": defaults.get("significance_alpha", .05),
-                "outer_validation_days": defaults.get("outer_validation_days", 126),
-            }
-        document["config_schema_version"] = CONFIG_SCHEMA_VERSION
-    if version < 3:
-        research = document.setdefault("research", {})
-        defaults = dict(research.get("defaults") or {})
-        statistics = dict(document.get("statistics") or {})
-        for key, target, fallback in (
-            ("bootstrap_reps", "bootstrap_reps", 10_000),
-            ("bootstrap_block_lengths", "block_lengths", [20, 10, 40]),
-            ("significance_alpha", "alpha", .05),
-            ("outer_validation_days", "outer_validation_days", 126),
-        ):
-            value = defaults.pop(key, None)
-            statistics.setdefault(target, fallback if value is None else value)
-        if int(defaults.get("strategy_version", 4)) == 4:
-            ranges = defaults.get("ranges") or {}
-            defaults["ranges"] = {
-                name: {
-                    "low": (ranges.get(name) or ROBUST_RANGE_DEFAULTS[name]).get("low", ROBUST_RANGE_DEFAULTS[name]["low"]),
-                    "high": (ranges.get(name) or ROBUST_RANGE_DEFAULTS[name]).get("high", ROBUST_RANGE_DEFAULTS[name]["high"]),
-                    "step": None,
-                }
-                for name in ROBUST_RANGE_DEFAULTS
-            }
-            granularity = defaults.get("granularity") or {}
-            defaults["granularity"] = {
-                name: granularity.get(name, value)
-                for name, value in GRANULARITY_DEFAULTS.items()
-            }
-        research["defaults"] = defaults
-        document["statistics"] = statistics
-        document["config_schema_version"] = CONFIG_SCHEMA_VERSION
-    if version < 4:
         document["config_schema_version"] = CONFIG_SCHEMA_VERSION
     document.pop("config_revision", None)
     validated = ConfigurationDocument.model_validate(document).model_dump(mode="python", exclude_none=False)
-    # These fields are versioned under the top-level ``statistics`` section.
-    # Keep the migration output in exactly the same canonical shape as
-    # ``configuration_document``; otherwise every read adds hidden defaults and
-    # therefore reports a different content hash from the one written to disk.
-    for key in ("bootstrap_reps", "bootstrap_block_lengths", "significance_alpha", "outer_validation_days"):
-        validated["research"]["defaults"].pop(key, None)
     return validated
 
 
@@ -789,7 +687,7 @@ def save_settings(values: dict, *, base_revision: str | None = None) -> Settings
         else:
             previous = Settings().model_dump()
         values = dict(values)
-        for key in ("schedule", "fee_defaults", "performance", "market_data", "statistics", "ui"):
+        for key in ("schedule", "fee_defaults", "performance", "market_data", "ui"):
             if key in values and isinstance(values[key], dict):
                 values[key] = {**previous[key], **values[key]}
         # Older clients submit source and cache choices as flat settings

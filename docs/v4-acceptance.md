@@ -1,6 +1,6 @@
 # 参数研究 v4 验收记录
 
-> 本文件记录旧版 v4（策略 v1/v2/v3）的历史验收，不包含四维稳健 J。当前策略 v4 的固定真实数据验收见 [robust-j-acceptance.md](robust-j-acceptance.md)，数学与搜索说明见 [parameter-research-v4.md](parameter-research-v4.md)。
+> 历史资料：本文件记录已移除的 v4 协议及其真实数据验收。当前 protocol/strategy v5 契约、预算、补算和验收命令见[参数研究 v5](parameter-research-v5.md)。
 
 验收日期：2026-10-19（北京时间）  
 标的：`159611.SZ`  
@@ -27,6 +27,6 @@
 
 - Python：`252 passed, 52 skipped`。新增测试覆盖基础参数隔离、0.1 个百分点／100 股固定刻度、联合邻点峰、平台、完整正邻域、最大体积与完整半径枚举对照、固定平均收益排名、最深联合负点、零滑点、最高持股不限、策略目录和候选归档读取。
 - 前端：`npm run build` 通过，`45` 项前端测试通过。
-- 真实数据脚本：[validate_research_v4.py](../scripts/validate_research_v4.py)。日线和一分钟完整输出分别保存在 `v4-acceptance-daily.json` 与 `v4-acceptance-minute.json`。
+- 历史真实数据脚本已随旧协议删除；本页只保留验收记录，当前契约与命令见[参数研究 v5](parameter-research-v5.md)。
 
 真实数据是否盈利不是验收通过条件；冻结候选、完整邻域、原成本资格和压力诊断分离是本次验收重点。

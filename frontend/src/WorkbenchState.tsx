@@ -2,8 +2,8 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import type { ReactNode } from 'react'
 import { defaultConfig, validFeeDefaults } from './components'
 import type { FeeDefaults } from './components'
-import { flushConfiguration, rememberConfigurationPatch, rememberLegacyResearch, rememberWorkbenchGroup, saveConfigurationPatch, useWorkbenchDefaults } from './useWorkbenchDefaults'
-import { normalizeRememberedResearchDefaults, strategyDefaults, workbenchConfig } from './workbenchDefaults'
+import { flushConfiguration, rememberConfigurationPatch, rememberWorkbenchGroup, saveConfigurationPatch, useWorkbenchDefaults } from './useWorkbenchDefaults'
+import { strategyDefaults, workbenchConfig } from './workbenchDefaults'
 import type { ResearchDefaults, StrategyDefaultsGroup } from './workbenchDefaults'
 import type { BacktestConfig } from './types'
 
@@ -52,31 +52,12 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
   }, [preferences.loading, preferences.document, preferences.value])
   const updateBacktest = useCallback((next: ConfigUpdate) => setBacktest(current => current ? typeof next === 'function' ? next(current) : next : current), [])
   const updateResearch = useCallback((next: ConfigUpdate) => setResearch(current => current ? typeof next === 'function' ? next(current) : next : current), [])
+  // Protocol v5 owns a single research shape, so every edit is stored as the
+  // active ``research.defaults`` document instead of a legacy archive copy.
   const updateResearchSettings = useCallback((next: ResearchDefaults) => {
-    const current = researchSettings
-    if (next.strategy_version === 4) {
-      const active = preferences.value.research
-      const restored = current && current.strategy_version !== 4 && next.strategy_version === 4
-        ? normalizeRememberedResearchDefaults(active)
-        : next
-      setResearchSettings(restored)
-      rememberWorkbenchGroup('research', restored)
-      return
-    }
-    let value = next
-    if (current?.strategy_version === 4) {
-      const research = (preferences.document.research ?? {}) as Record<string, unknown>
-      const legacy = (research.legacy ?? {}) as Record<string, unknown>
-      const archived = legacy.research_defaults ?? legacy.defaults
-      if (archived && typeof archived === 'object') value = normalizeRememberedResearchDefaults({
-        ...next, ...(archived as Record<string, unknown>),
-        strategy_version: next.strategy_version,
-        strategy_id: 'geometric_excess_neighborhood',
-      })
-    }
-    setResearchSettings(value)
-    rememberLegacyResearch(value)
-  }, [preferences.document, preferences.value.research, researchSettings])
+    setResearchSettings(next)
+    rememberWorkbenchGroup('research', next)
+  }, [])
   const rememberStrategy = useCallback((group: StrategyDefaultsGroup, next: BacktestConfig) => { rememberWorkbenchGroup(group, strategyDefaults(next)[group]) }, [])
   const restore = (page: 'backtest' | 'research') => {
     const initial = workbenchConfig(defaultConfig(feeDefaults.current), preferences.value)

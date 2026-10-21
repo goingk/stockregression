@@ -1,14 +1,16 @@
-"""Training-window selection for the hypercube mean research protocol.
+"""Decision-date training-window selection shared by v5 research and completion.
 
-The training sample is one contiguous block.  It is not split into a training
-and an internal-validation segment.  Its start is the farthest day in the
-250..500 trading-day lookback whose daily low is below, and whose daily high is
-above, the close immediately before the evaluation date.  When no such day
-exists, the 500-day fallback is used.
+The training sample is one contiguous block.  Its start is the farthest
+decision-date-adjusted day in the configured lookback whose daily low is below,
+and whose daily high is above, the close immediately before the evaluation
+date.  When no such day exists, the configured maximum lookback is used.  Fixed
+mode requires the complete maximum lookback and reports insufficient history
+instead of shortening it.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import math
 from typing import Any
 
@@ -35,6 +37,10 @@ class TrainingWindow:
     search_end: pd.Timestamp | None
     match_rule: str
     reason: str
+    mode: str = "same_price"
+    price_basis: str = "decision_date_adjusted"
+    actions_applied: list[dict[str, Any]] | None = None
+    data_issue: str | None = None
     min_offset: int = MIN_TRAINING_OFFSET
     max_offset: int = MAX_TRAINING_OFFSET
 
@@ -44,6 +50,8 @@ class TrainingWindow:
 
     @property
     def start_reason(self) -> str:
+        if self.mode == "fixed":
+            return "fixed_training_max_days"
         return "same_price_farthest" if self.matched else "five_hundred_day_fallback"
 
     def diagnostic(self) -> dict[str, Any]:
@@ -63,6 +71,19 @@ class TrainingWindow:
             "max_offset_trading_days": self.max_offset,
             "match_rule": self.match_rule,
             "reason": self.reason,
+            "mode": self.mode,
+            "price_basis": self.price_basis,
+            "actions_applied": list(self.actions_applied or []),
+            "action_factor_fingerprint": (
+                hashlib.sha256(
+                    repr([
+                        (item.get("ex_date"), item.get("factor"), item.get("source"))
+                        for item in self.actions_applied or []
+                    ]).encode("utf-8")
+                ).hexdigest()
+                if self.actions_applied else None
+            ),
+            "data_issue": self.data_issue,
         }
 
 
@@ -100,7 +121,7 @@ def _daily_prices(data: DataBundle) -> pd.DataFrame:
                 day = _normalise(raw_date)
                 if day is None:
                     continue
-                for field in ("close", "high", "low"):
+                for field in ("close", "high", "low", "preclose"):
                     if field in frame.columns:
                         record(day, field, frame[field].iloc[position])
 
@@ -131,10 +152,139 @@ def _daily_prices(data: DataBundle) -> pd.DataFrame:
     if not records:
         return pd.DataFrame(columns=["close", "high", "low"])
     frame = pd.DataFrame.from_dict(records, orient="index")
-    for column in ("close", "high", "low"):
+    for column in ("close", "high", "low", "preclose"):
         if column not in frame:
             frame[column] = math.nan
-    return frame[["close", "high", "low"]].sort_index()
+    return frame[["close", "high", "low", "preclose"]].sort_index()
+
+
+def _price_tick(data: DataBundle) -> float:
+    """Exchange price tick used to verify ex-rights reference prices."""
+    try:
+        from ..rules import instrument_terms
+        metadata = data.metadata if isinstance(data.metadata, dict) else {}
+        tick = float(instrument_terms(data.symbol, metadata).get("price_tick") or 0.0)
+    except Exception:
+        tick = 0.0
+    return tick if tick > 0 else 0.01
+
+
+def _explicitly_not_implemented(value: Any) -> bool:
+    """True only when an action is explicitly marked as not implemented.
+
+    A missing or unreadable flag stays optimistically implemented, matching the
+    ledger's ``bool(implemented)`` handling in ``engine._prepare_actions``;
+    only an explicit ``false`` marks the action as unverified.
+    """
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"0", "false", "no", "n", "否"}
+    try:
+        if bool(pd.isna(value)):
+            return False
+    except (TypeError, ValueError):
+        return False
+    return not bool(value)
+
+
+def _adjusted_daily_prices(
+    data: DataBundle, anchor: pd.Timestamp, prices: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[dict[str, Any]], str | None]:
+    """Express historical high/low values in the decision-date share basis.
+
+    Only implemented corporate actions with an ex-date on or before the anchor
+    are applied.  An action that is explicitly marked as not implemented is a
+    data issue, never a silently skipped adjustment.  The exchange ex-rights
+    reference price is only trusted when it agrees with the reference implied
+    by the action itself; a stale or unrelated preclose falls back to the
+    cash-and-bonus factor and is recorded as a mismatch.
+    """
+    adjusted = prices.copy()
+    actions = data.actions if isinstance(data.actions, pd.DataFrame) else pd.DataFrame()
+    if actions.empty or not {"ex_date"}.issubset(actions.columns):
+        return adjusted, [], None
+    applied: list[dict[str, Any]] = []
+    tick = _price_tick(data)
+    tolerance = tick * 1.1
+    rows = actions.copy()
+    for column in ("ex_date", "cash_per_share", "bonus_ratio", "implemented", "unsupported_reason"):
+        if column not in rows:
+            rows[column] = True if column == "implemented" else ("" if column == "unsupported_reason" else 0.0)
+    rows["ex_date"] = pd.to_datetime(rows["ex_date"], errors="coerce").dt.normalize()
+    rows = rows[rows["ex_date"].notna() & (rows["ex_date"] <= anchor)].copy()
+
+    for ex_date, same_day in rows.groupby("ex_date", sort=True):
+        action_rows = list(same_day.itertuples(index=False))
+        unverified = [
+            row for row in action_rows
+            if _explicitly_not_implemented(getattr(row, "implemented", True))
+        ]
+        if unverified:
+            return adjusted, applied, (
+                f"选窗遇到未确认已实施的公司行动（{ex_date:%Y-%m-%d}）："
+                "除权事实无法核实，训练窗口不可用"
+            )
+        implemented_rows = action_rows
+        reasons = [
+            str(getattr(row, "unsupported_reason", "") or "").strip()
+            for row in implemented_rows if str(getattr(row, "unsupported_reason", "") or "").strip()
+        ]
+        if reasons:
+            return adjusted, applied, f"选窗遇到未支持的公司行动（{ex_date:%Y-%m-%d}）：{reasons[0]}"
+        ex_date = pd.Timestamp(ex_date).normalize()
+        before = adjusted.index[adjusted.index < ex_date]
+        if not len(before):
+            continue
+        prior_close = float(adjusted.loc[before[-1], "close"])
+        reference = adjusted.loc[ex_date, "preclose"] if ex_date in adjusted.index else math.nan
+        try:
+            reference = float(reference)
+            cash = math.fsum(float(getattr(row, "cash_per_share", 0.0) or 0.0) for row in implemented_rows)
+            bonus = math.fsum(float(getattr(row, "bonus_ratio", 0.0) or 0.0) for row in implemented_rows)
+        except (TypeError, ValueError):
+            return adjusted, applied, f"选窗公司行动 {ex_date.date()} 缺少有效分红或送转数据"
+        if not math.isfinite(prior_close) or prior_close <= 0:
+            return adjusted, applied, (
+                f"选窗公司行动 {ex_date.date()} 的除权因子无效：除权日前一交易日缺少有效收盘价"
+            )
+        if 1.0 + bonus <= 0:
+            return adjusted, applied, f"选窗公司行动 {ex_date.date()} 的除权因子无效：送转比例不可用"
+        implied_reference = (prior_close - cash) / (1.0 + bonus)
+        if not math.isfinite(implied_reference) or implied_reference <= 0:
+            return adjusted, applied, f"选窗公司行动 {ex_date.date()} 的除权因子无效：除权参考价不可用"
+        mismatch: dict[str, Any] | None = None
+        if math.isfinite(reference) and reference > 0:
+            difference = abs(reference - implied_reference)
+            if difference <= tolerance:
+                factor = reference / prior_close
+                source = "verified_preclose"
+            else:
+                # The preclose disagrees with the action itself, so it is not a
+                # verified ex-rights reference price.  Use the factor implied by
+                # the action and report the mismatch explicitly.
+                factor = implied_reference / prior_close
+                source = "cash_and_bonus"
+                mismatch = {
+                    "observed_reference": reference,
+                    "implied_reference": float(implied_reference),
+                    "difference": float(difference),
+                    "tolerance": float(tolerance),
+                }
+        else:
+            factor = implied_reference / prior_close
+            source = "cash_and_bonus"
+        if not math.isfinite(factor) or factor <= 0:
+            return adjusted, applied, f"选窗公司行动 {ex_date.date()} 的除权因子无效"
+        adjusted.loc[before, ["high", "low"]] = adjusted.loc[before, ["high", "low"]] * factor
+        applied.append({
+            "ex_date": ex_date.date().isoformat(), "factor": float(factor), "source": source,
+            "cash_per_share": cash, "bonus_ratio": bonus, "action_count": len(implemented_rows),
+            "preclose": reference if math.isfinite(reference) else None,
+            "implied_reference": float(implied_reference),
+            "preclose_mismatch": mismatch,
+        })
+    return adjusted, applied, None
 
 
 def training_window(
@@ -143,6 +293,7 @@ def training_window(
     *,
     min_offset: int = MIN_TRAINING_OFFSET,
     max_offset: int = MAX_TRAINING_OFFSET,
+    mode: str = "same_price",
 ) -> TrainingWindow:
     """Return the new single-block training window ending at ``asof``."""
     min_offset = max(1, int(min_offset))
@@ -150,6 +301,7 @@ def training_window(
     empty = TrainingWindow(
         pd.DatetimeIndex([]), None, None, None, None, None, False, True,
         None, None, "daily_low_lt_anchor_close_lt_daily_high", "没有可用的决策日收盘价",
+        mode=mode,
     )
     anchor_limit = _normalise(asof)
     if anchor_limit is None:
@@ -168,6 +320,32 @@ def training_window(
         return empty
     anchor = pd.Timestamp(available.index[-1]).normalize()
     anchor_price = float(available.iloc[-1]["close"])
+    if mode == "fixed":
+        evaluation_index = int(calendar.get_indexer([anchor])[0]) + 1
+        start_index = max(0, evaluation_index - max_offset)
+        dates = pd.DatetimeIndex(calendar[start_index:evaluation_index])
+        full = len(dates) >= max_offset
+        issue = None if full else f"固定训练窗口需要 {max_offset} 个交易日，仅有 {len(dates)} 个交易日"
+        if not full:
+            dates = pd.DatetimeIndex([])
+        return TrainingWindow(
+            dates=dates, start=pd.Timestamp(dates[0]).normalize() if len(dates) else None,
+            end=pd.Timestamp(dates[-1]).normalize() if len(dates) else None,
+            anchor_date=anchor, anchor_price=anchor_price, matched_date=None, matched=False,
+            fallback=not full, search_start=dates[0] if len(dates) else None,
+            search_end=anchor, match_rule="fixed_training_max_days",
+            reason=(f"固定训练窗口取评估日前 {max_offset} 个交易日" if full else issue or "固定训练窗口不完整"),
+            min_offset=min_offset, max_offset=max_offset, mode="fixed",
+            data_issue=issue,
+        )
+    adjusted, actions_applied, data_issue = _adjusted_daily_prices(data, anchor, prices)
+    if data_issue:
+        return TrainingWindow(
+            pd.DatetimeIndex([]), None, None, anchor, anchor_price, None, False, False,
+            None, anchor, "decision_date_adjusted_same_price", data_issue,
+            min_offset=min_offset, max_offset=max_offset, mode="same_price",
+            actions_applied=actions_applied, data_issue=data_issue,
+        )
     positions = pd.DatetimeIndex(calendar).get_indexer([anchor])
     if len(positions) == 0 or positions[0] < 0:
         return empty
@@ -180,9 +358,9 @@ def training_window(
     search_end = pd.Timestamp(calendar[latest_index]).normalize()
 
     def same_price(day: pd.Timestamp) -> bool:
-        if day not in prices.index:
+        if day not in adjusted.index:
             return False
-        row = prices.loc[day]
+        row = adjusted.loc[day]
         try:
             low, high = float(row["low"]), float(row["high"])
         except (TypeError, ValueError):
@@ -225,6 +403,8 @@ def training_window(
         reason=reason,
         min_offset=min_offset,
         max_offset=max_offset,
+        mode="same_price",
+        actions_applied=actions_applied,
     )
 
 
@@ -234,17 +414,20 @@ class TrainingWindowPolicy:
 
     min_offset: int = MIN_TRAINING_OFFSET
     max_offset: int = MAX_TRAINING_OFFSET
+    mode: str = "same_price"
 
     def __post_init__(self) -> None:
         if int(self.min_offset) < 1:
             raise ValueError("训练窗口最短回看日数必须为正整数")
         if int(self.max_offset) < int(self.min_offset):
             raise ValueError("训练窗口最长回看日数不能小于最短回看日数")
+        if self.mode not in {"same_price", "fixed"}:
+            raise ValueError("训练窗口模式必须为 same_price 或 fixed")
 
     def window(self, data: DataBundle, asof: pd.Timestamp | None) -> TrainingWindow:
         return training_window(
-            data, asof, min_offset=int(self.min_offset), max_offset=int(self.max_offset),
+            data, asof, min_offset=int(self.min_offset), max_offset=int(self.max_offset), mode=self.mode,
         )
 
     def diagnostic(self) -> dict[str, int]:
-        return {"min_offset_trading_days": int(self.min_offset), "max_offset_trading_days": int(self.max_offset)}
+        return {"min_offset_trading_days": int(self.min_offset), "max_offset_trading_days": int(self.max_offset), "mode": self.mode}

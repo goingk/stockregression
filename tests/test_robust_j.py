@@ -1,3 +1,16 @@
+"""稳健 J 数值与搜索契约回归测试（protocol_version=5 / strategy_version=5）。
+
+契约要点：
+
+* 四个搜索轴固定为 buy_step、sell_step、buy_shares、sell_shares，
+  公开坐标顺序就是这四轴；
+* J 分数建立在峰值本金超额收益上，配对基准是 matched_funding_hold，
+  风险口径是 ``max_principal_drawdown``；
+* 邻域缺失或评价失败永远不构成完整样本；
+* 训练、邻域与展示三个阶段分别计费，展示阶段只补算冻结的目标集合，
+  不会因为新 leader 出现而扩大目标；
+* 枚举小空间会产生唯一平台峰值，评价失败时保留失败证据。
+"""
 from __future__ import annotations
 
 from itertools import product
@@ -33,13 +46,13 @@ def make_config(*, buy_high: float = .005, share_high: int = 500, strategy: dict
         grid_mode="geometric", buy_step=.03, sell_step=.03,
     )
     parameters = {
-        "strategy_version": 4, "search_method": "exhaustive", "ranking_mode": "fixed_mean",
+        "strategy_version": 5, "search_method": "exhaustive", "ranking_mode": "robust_j",
         "granularity": {"buy_step": .001, "sell_step": .001, "buy_shares": 100, "sell_shares": 100},
         "hypercube_edge": 3, "sigma": 1.0, "alpha": .3, "beta": 1.2, "tau": .01,
         "max_shares_mode": "unlimited", **dict(strategy or {}),
     }
     return OptimizationConfig(
-        base=base, protocol_version=4, strategy=ResearchStrategySpec.model_validate(parameters),
+        base=base, protocol_version=5, strategy=ResearchStrategySpec.model_validate(parameters),
         ranges={
             "buy_step": {"low": .001, "high": buy_high},
             "sell_step": {"low": .001, "high": .001},
@@ -54,10 +67,17 @@ def field(space: ParameterSpace):
 
 
 def row(space: ParameterSpace, coordinate, value: float, *, drawdown=.05, trades=20, max_pos=1.0, min_pos=0.0):
+    """一条 v5 训练候选行。
+
+    ``training_excess_return`` 是相对 matched_funding_hold 配对基准的
+    峰值本金超额收益，``max_principal_drawdown`` 是本金利润回撤。
+    """
     return {
         "key": coordinate, "coordinate": list(coordinate), "params": space.params(coordinate),
         "evaluation_status": "completed", "training_excess_return": float(value),
-        "training_drawdown": float(drawdown), "trade_count": int(trades),
+        "training_return": float(value), "training_baseline_return": 0.0,
+        "training_baseline_kind": "matched_funding_hold",
+        "max_principal_drawdown": float(drawdown), "trade_count": int(trades),
         "buy_count": max(1, int(trades) // 2), "sell_count": max(1, int(trades) // 2),
         "actual_max_pos_ratio": float(max_pos), "actual_min_pos_ratio": float(min_pos),
         "floor_episode_count": 0, "floor_episode_grids": [], "floor_penalty": 0.0,
@@ -143,8 +163,8 @@ def test_j_peak_is_not_the_raw_return_peak_and_ineligible_high_return_is_rejecte
     assert rows[raw_peak]["training_excess_return"] > rows[j_peak]["training_excess_return"]
     assert raw_score.neighborhood_mean < raw_score.center_return
     assert steady_score.j_score > raw_score.j_score
-    assert not eligible(rows[raw_peak], raw_score, max_drawdown=.2, min_trades=10, strategy=config.strategy)
-    assert eligible(rows[j_peak], steady_score, max_drawdown=.2, min_trades=10, strategy=config.strategy)
+    assert not eligible(rows[raw_peak], raw_score, max_principal_drawdown=.2, min_trades=10, strategy=config.strategy)
+    assert eligible(rows[j_peak], steady_score, max_principal_drawdown=.2, min_trades=10, strategy=config.strategy)
 
 
 def test_missing_or_failed_neighbour_never_becomes_a_complete_zero_sample():
@@ -210,7 +230,7 @@ def test_peak_analyzer_closes_a_flat_plateau_and_detects_a_higher_exit():
 
     def eligible_of(coordinate):
         return eligible(
-            rows.get(coordinate), score_of(coordinate), max_drawdown=.2,
+            rows.get(coordinate), score_of(coordinate), max_principal_drawdown=.2,
             min_trades=10, strategy=config.strategy,
         )
 
@@ -240,7 +260,7 @@ def test_boundary_complete_peak_does_not_mark_outside_lattice_as_missing():
     corner = space.full_coordinate((1, 1))
     analysis = PeakAnalyzer(space, 1e-12).inspect(
         corner, score_of,
-        lambda coordinate: eligible(rows.get(coordinate), score_of(coordinate), max_drawdown=.2, min_trades=10, strategy=config.strategy),
+        lambda coordinate: eligible(rows.get(coordinate), score_of(coordinate), max_principal_drawdown=.2, min_trades=10, strategy=config.strategy),
     )
     assert analysis.state == "peak" and analysis.complete
     assert not analysis.missing
@@ -294,8 +314,17 @@ def test_neighborhood_budget_exhaustion_returns_incomplete_score():
     assert score.missing_count > 0
 
 
-def test_reporting_completes_the_final_return_leader_after_search_budget_is_spent():
-    config = make_config(buy_high=.011, share_high=100, strategy={"recommendation_count": 4})
+def test_reporting_completes_the_frozen_return_leader_without_charging_the_search_budgets():
+    """展示补算只补齐冻结目标，不追逐补算中出现的新 leader。
+
+    v5 的展示阶段有自己的预算，并且目标集合在阶段开始时冻结：
+    补算邻域时出现收益更高的点，也不会成为新的展示目标，
+    更不会因此动用训练或邻域阶段的预算。
+    """
+    config = make_config(
+        buy_high=.011, share_high=100,
+        strategy={"recommendation_count": 4, "reporting_budget": 4},
+    )
     space = ParameterSpace(config)
 
     class RisingEvaluator(FakeEvaluator):
@@ -305,21 +334,30 @@ def test_reporting_completes_the_final_return_leader_after_search_budget_is_spen
     session = EvaluationSession(RisingEvaluator(space), space, config, None)
     start = space.full_coordinate((3,))
     session.ensure([start], "training", 1)
-    # Leave a stale partial score, as can happen before peak verification adds
-    # more raw observations to the shared session.
-    session.score(start, cap=1)
     spent_before = dict(session.spent)
     _complete_reporting_scores(session)
-    leader = max(session.rows, key=lambda coordinate: session.rows[coordinate]["training_excess_return"])
-    assert leader[0] == space.dimensions["buy_step"].high
+
+    # 阶段开始时只有一个已完成候选，它就是被冻结的展示目标。
+    leader = start
     score = session.scores[leader]
     assert score.complete and score.missing_count == 0
     assert score.neighborhood_mean == pytest.approx(robust_score(leader, session.rows, space, config.strategy).neighborhood_mean)
-    assert sum(score.complete for score in session.scores.values()) >= 4
+
+    # 补算邻域时出现的更高收益点不会成为新的展示目标，
+    # 因此它自己的邻域不会被补算，分数保持不完整。
+    new_leader = max(session.rows, key=lambda coordinate: session.rows[coordinate]["training_excess_return"])
+    assert new_leader != leader
+    assert session.scores[new_leader].complete is False
+    assert space.full_coordinate((space.dimensions["buy_step"].high,)) not in session.rows
+
+    # 展示阶段的花费独立记账，不得借用训练或邻域阶段的预算。
     assert session.spent["training"] == spent_before["training"]
     assert session.spent["validation"] == spent_before["validation"]
     assert session.spent["reporting"] > 0
-    assert not eligible(session.rows[leader], score, max_drawdown=config.max_drawdown, min_trades=config.min_trades, strategy=config.strategy)
+    assert session.spent["reporting"] <= config.strategy.reporting_budget
+    assert session.budget_stopped is False
+    assert session.reporting_stopped is False
+    assert not eligible(session.rows[leader], score, max_principal_drawdown=config.max_principal_drawdown, min_trades=config.min_trades, strategy=config.strategy)
 
 
 def test_reporting_preserves_failed_neighbours_and_does_not_retry_them_forever():
@@ -350,7 +388,7 @@ def _long_history_data() -> tuple[DataBundle, pd.Timestamp]:
 class SearchFakeEvaluator:
     chunk_size = 4
 
-    def __init__(self, config, base, data, space, train_dates, validation_dates, **kwargs):
+    def __init__(self, config, base, data, space, train_dates, *args, **kwargs):
         self.space = space
 
     def evaluate_training(self, coordinates):
@@ -359,7 +397,7 @@ class SearchFakeEvaluator:
     def evaluate_training_stress(self, coordinates, cost_multiplier=2.0):
         return {
             coordinate: {
-                "training_excess_stress": .01, "max_drawdown": .05,
+                "training_excess_stress": .01, "max_principal_drawdown": .05,
                 "trade_count": 20, "actual_min_pos_ratio": 0.0,
                 "actual_max_pos_ratio": 1.0,
                 "floor_episode_count": 0, "floor_episode_grids": [], "floor_penalty": 0.0,
@@ -390,17 +428,34 @@ def test_robust_selector_exhausts_small_space_and_emits_one_flat_peak(monkeypatc
     result = select_robust_at(config, base, data, data.calendar[269])
     diagnostics = result["diagnostics"]
     region = result["recommendation_regions"][0]
+    assert diagnostics["protocol_version"] == 5
+    assert diagnostics["strategy_version"] == 5
+    assert diagnostics["ranking_mode"] == "robust_j"
+    assert diagnostics["return_basis"] == "peak_principal"
+    assert diagnostics["ranking_baseline"] == "matched_funding_hold"
+    assert diagnostics["risk_basis"] == "principal_profit_drawdown"
+    assert diagnostics["training_only"] is True
+    assert diagnostics["internal_validation_folds"] == 0
+    assert diagnostics["statistics_applicability"]["status"] == "not_applicable"
     assert diagnostics["search_method"] == "exhaustive"
     assert diagnostics["global_exhaustive"] is True
     assert diagnostics["score_complete"] is True
     assert diagnostics["local_peak_verified"] is True
     assert diagnostics["coverage_status"] == "global_exhaustive"
     assert diagnostics["fields"] == ["buy_step", "sell_step", "buy_shares", "sell_shares"]
+    assert region["geometry"] == "robust_j"
+    assert region["scoring_basis"] == "robust_j_neighborhood"
     assert region["platform_type"] == "flat"
     assert region["platform_size"] == diagnostics["legal_combination_count"]
     assert result["recommended_params"] == region["center_params"]
     assert result["recommended_params"]["min_shares"] == 0
     assert result["recommended_params"]["max_shares"] is None
+    center = next(
+        item for item in result["candidate_archive"]
+        if tuple(item["key"]) == tuple(region["center_coordinate"])
+    )
+    assert region["region_id"] in center["region_ids"]
+    assert center["is_stable_point"] is True
 
 
 def test_explicit_exhaustive_over_budget_fails_in_preflight(monkeypatch):

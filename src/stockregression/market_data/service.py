@@ -255,7 +255,6 @@ class MarketDataService:
             "price_anomaly_count": price_anomaly_count,
             "price_validation_version": PRICE_VALIDATION_VERSION,
         }
-        self.store.state(cache_key, result)
         return result
 
     def ensure_timeframe(
@@ -344,9 +343,10 @@ class MarketDataService:
             self.repository.mark_derived_target_stale(symbol, timeframe)
         return self.repository.dataset(symbol, timeframe) or result
 
-    def bars(self, symbol: str, timeframe: str, *, start=None, end=None, version=None, limit=None) -> dict:
+    def bars(self, symbol: str, timeframe: str, *, start=None, end=None, version=None, limit=None,
+             materialize: bool = True) -> dict:
         symbol, timeframe = normalize_symbol(symbol), normalize_timeframe(timeframe)
-        if version is None and timeframe in DERIVED_SOURCES:
+        if version is None and timeframe in DERIVED_SOURCES and materialize:
             self.ensure_timeframe(symbol, timeframe, start=start, end=end)
         dataset = self.repository.dataset(symbol, timeframe)
         if not dataset:
@@ -368,9 +368,9 @@ class MarketDataService:
         }
 
     def market_bars(self, symbol: str, timeframe: str, *, start=None, end=None, before=None,
-                    limit=600, ma_periods=(5, 10, 20, 60)) -> dict:
+                    limit=600, ma_periods=(5, 10, 20, 60), materialize: bool = True) -> dict:
         symbol, timeframe = normalize_symbol(symbol), normalize_timeframe(timeframe)
-        if timeframe in DERIVED_SOURCES:
+        if timeframe in DERIVED_SOURCES and materialize:
             self.ensure_timeframe(symbol, timeframe, start=start, end=end or before)
         dataset = self.repository.dataset(symbol, timeframe)
         if not dataset:

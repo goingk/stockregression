@@ -2,23 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
 import io
 import json
 import logging
 import math
 import shutil
 import uuid
-from collections import OrderedDict
 from contextlib import asynccontextmanager
 from itertools import combinations, product
 from pathlib import Path, PurePosixPath
-from threading import Lock
 
 import pandas as pd
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from typing import Any, Literal
@@ -37,7 +36,7 @@ from .data import DataService
 from .data_diagnostics import derive_source_spans, project_data_diagnostics
 from .quality import QUALITY_RULES_VERSION, _closing_auction_placeholders, minute_slots
 from .jobs import JobManager
-from .models import BacktestConfig, OptimizationConfig, ResearchRequestV4, normalize_symbol
+from .models import BacktestConfig, OptimizationConfig, ResearchRequestV5, normalize_symbol
 from .market_data import MarketDataService
 from .market_data.aggregation import AggregationService
 from .market_data.models import DataVersionNotFound, MarketDataError
@@ -52,7 +51,7 @@ from .research_preparation import preparation_config
 from .schedule import configure_schedule
 from .settings import ConfigurationDocument, PROJECT_ROOT, Settings, load_settings, resolve_project_path, save_settings
 from .source_health import configured_sources, validate_source_settings
-from .storage import Store, dumps, json_safe, now_iso
+from .storage import CompletionRevisionError, Store, dumps, json_safe, now_iso
 from .watchlist_sync import import_watchlist_snapshot
 
 
@@ -223,18 +222,25 @@ class BatchRequest(BaseModel):
     configs: list[BacktestConfig] = Field(min_length=1, max_length=100)
 
 
-_V2_ARCHIVE_FIELDS = {
+class ResearchCompletionRequest(BaseModel):
+    decision: Literal["current", "fixed", "adaptive"] = "current"
+    decision_index: int = Field(default=0, ge=0)
+    reporting_budget: int = Field(default=1000, ge=0, le=100_000)
+    target: Literal["return_leader"] = "return_leader"
+
+
+_RESULT_ARCHIVE_FIELDS = {
     "candidate_archive", "trial_archive", "candidate_archives", "trial_archives",
     "search_candidate_archive", "search_candidate_archives",
 }
 
 
-def _compact_v2_result(value, top_candidates: int, parent_key: str | None = None):
+def _compact_research_result(value, top_candidates: int, parent_key: str | None = None):
     """Remove research-only matrices/archives while retaining UI summaries."""
     if isinstance(value, dict):
         compact = {}
         for key, item in value.items():
-            if key in _V2_ARCHIVE_FIELDS:
+            if key in _RESULT_ARCHIVE_FIELDS:
                 continue
             if key == "candidate_ids":
                 continue
@@ -244,14 +250,14 @@ def _compact_v2_result(value, top_candidates: int, parent_key: str | None = None
                 # candidate/evaluation counts needed to interpret the result.
                 continue
             if key == "candidates" and isinstance(item, list):
-                compact[key] = [_compact_v2_result(row, top_candidates) for row in item[:top_candidates]]
+                compact[key] = [_compact_research_result(row, top_candidates) for row in item[:top_candidates]]
             else:
-                compact[key] = _compact_v2_result(item, top_candidates, key)
+                compact[key] = _compact_research_result(item, top_candidates, key)
         return compact
     if isinstance(value, list):
-        return [_compact_v2_result(item, top_candidates, parent_key) for item in value]
+        return [_compact_research_result(item, top_candidates, parent_key) for item in value]
     if isinstance(value, tuple):
-        return [_compact_v2_result(item, top_candidates, parent_key) for item in value]
+        return [_compact_research_result(item, top_candidates, parent_key) for item in value]
     return value
 
 
@@ -288,9 +294,9 @@ def _landscape_point(row: dict, sample: str, cost: str, fold: int | None, fallba
         "status": status or "unknown",
         "excess_return": _landscape_metric(row, sample, cost, fold),
         "grid_return": grid_value, "baseline_return": baseline_value,
-        "drawdown": row.get("max_drawdown") if sample == "validation" else row.get("training_drawdown"),
+        "drawdown": row.get("max_principal_drawdown") if sample == "validation" else row.get("max_principal_drawdown"),
         "trade_count": row.get("trade_count") if sample == "validation" else row.get("training_trade_count", row.get("trade_count")),
-        "peak_invested": row.get("peak_invested"), "folds": folds,
+        "peak_invested": row.get("peak_invested"),
         "neighbor_candidate_ids": row.get("neighbor_candidate_ids", []),
         "neighbor_of_candidate_ids": row.get("neighbor_of_candidate_ids", []),
         "robustness_status": row.get("robustness_status"),
@@ -358,7 +364,7 @@ def _robust_landscape_ranking(archive: list[dict], config: dict, selection: dict
         reasons = []
         if finite(row, "j_score") <= 0:
             reasons.append("J 未大于 0")
-        if finite(row, "training_drawdown", math.inf) > config.get("max_drawdown", .3):
+        if finite(row, "max_principal_drawdown", math.inf) > config.get("max_principal_drawdown", .3):
             reasons.append("回撤超过约束")
         if finite(row, "trade_count") < config.get("min_trades", 10):
             reasons.append("成交笔数不足")
@@ -426,12 +432,15 @@ def _landscape_same(left, right) -> bool:
 def _landscape_slices(
     archive: list[dict], focus_params: dict, names: list[str],
     sample: str, cost: str, fold: int | None, limit: int = 2500,
+    totals: dict[str, int] | None = None,
 ) -> dict[str, dict]:
     """Return complete two-dimensional planes through the relative-best point.
 
     A neighborhood slice is complete: every legal candidate in that plane is
     available in the result archive, so blank heatmap cells should only mean an
-    unevaluated or invalid combination.
+    unevaluated or invalid combination.  The plane size comes from the archive
+    query's SQL count, not from the number of rows that were materialised for
+    the response, and a truncated plane is reported as sampled.
     """
     output = {}
     for x_name, y_name in combinations(names, 2):
@@ -457,9 +466,11 @@ def _landscape_slices(
             point = _landscape_point(rows[index], sample, cost, fold, index + 1)
             point["is_focus"] = index == focus_index
             points.append(point)
-        output["|".join(sorted((x_name, y_name)))] = {
+        key = "|".join(sorted((x_name, y_name)))
+        total = int((totals or {}).get(key, len(rows)))
+        output[key] = {
             "x": x_name, "y": y_name, "points": points,
-            "total": len(rows), "sampled": sampled,
+            "total": total, "sampled": bool(sampled or total > len(points)),
         }
     return output
 
@@ -473,6 +484,18 @@ def _landscape_param_key(params: dict, names: list[str]) -> tuple:
         else:
             values.append(value)
     return tuple(values)
+
+
+def _research_decision_context(result: dict, decision: str, index: int = 0) -> dict:
+    """Resolve one v5 selection without consulting or recomputing market data."""
+    if decision == "current":
+        return ((result.get("fixed") or {}).get("current") or {})
+    if decision == "fixed":
+        return result.get("fixed") or {}
+    decisions = ((result.get("evidence") or {}).get("decisions") or [])
+    if index >= len(decisions):
+        raise LookupError("研究决策不存在")
+    return decisions[index]
 
 
 def _landscape_neighborhood(
@@ -540,6 +563,169 @@ def _landscape_neighborhood(
         "min_excess": min(values) if values else None,
         "max_excess": max(values) if values else None,
         "all_positive": bool(values) and len(values) == expected and all(value > 1e-12 for value in values),
+    }
+
+
+def _robust_training_landscape(
+    store: Store, result: dict, result_id: str, *, decision: str,
+    decision_index: int, region_id: int | None, offset: int, limit: int,
+    revision: int | None,
+) -> dict[str, Any]:
+    """Read a training landscape through storage-layer queries only."""
+    group = "search_candidate_archives"
+    stats = store.candidate_stats(
+        result, group, decision, decision_index, region_id=region_id, revision=revision,
+    )
+    total = int(stats.get("total", 0))
+    if not total:
+        return {
+            "result_id": result_id, "decision": decision, "decision_index": decision_index,
+            "revision": revision, "sample": "training", "cost": "original", "fold": None,
+            "region_id": region_id, "offset": offset, "limit": limit, "total": 0,
+            "points": [], "bounds": None, "focus": None, "focus_neighborhood": None,
+            "top_candidates": [], "slices": {}, "sampled": False, "center_count": 0,
+        }
+
+    def query(**kwargs):
+        return store.candidate_archive(
+            result, group, decision, decision_index, revision=revision, **kwargs,
+        )["rows"]
+
+    focus_rows = query(
+        region_id=region_id, sort_by="training_excess_return", descending=True, limit=1,
+    )
+    if not focus_rows:
+        raise LookupError("候选档案为空")
+    focus_row = focus_rows[0]
+    ordinals = store.candidate_ordinals(
+        result, group, decision, decision_index, region_id=region_id, revision=revision,
+    )
+    focus_ordinal = int(focus_row.get("_archive_ordinal", ordinals[0]))
+    focus_position = ordinals.index(focus_ordinal) if focus_ordinal in ordinals else 0
+    if offset > 0:
+        selected_ordinals = ordinals[offset:min(total, offset + limit)]
+        sampled = False
+    else:
+        positions = _landscape_sample_indices(total, limit, focus_position)
+        selected_ordinals = [ordinals[position] for position in positions]
+        sampled = len(positions) < total
+
+    subset: dict[int, dict] = {}
+
+    def remember(rows: list[dict]) -> None:
+        for row in rows:
+            subset[int(row.get("_archive_ordinal", -1))] = row
+
+    selected_rows = query(
+        region_id=region_id, ordinals=selected_ordinals,
+        sort_by="ordinal", limit=max(1, len(selected_ordinals)),
+    )
+    remember(selected_rows)
+    remember([focus_row])
+    names = ["buy_step", "sell_step", "buy_shares", "sell_shares"]
+    focus_params = focus_row.get("params", {})
+
+    # Fetch only each two-dimensional plane through the focus.  The storage
+    # query performs the fixed-axis filter; rows outside these planes are never
+    # decoded for this response.
+    plane_totals: dict[str, int] = {}
+    for x_name, y_name in combinations(names, 2):
+        fixed = {
+            name: focus_params[name]
+            for name in names if name not in (x_name, y_name)
+            and isinstance(focus_params.get(name), (int, float))
+        }
+        remember(query(
+            region_id=region_id, filters=fixed, sort_by="ordinal", limit=2501,
+        ))
+        # The plane size is counted by SQLite; the materialised rows above are
+        # truncated and must not be reported as the complete plane.
+        plane_totals["|".join(sorted((x_name, y_name)))] = store.candidate_total(
+            result, group, decision, decision_index, region_id=region_id,
+            filters=fixed, revision=revision,
+        )
+
+    axis_values = store.candidate_axis_values(
+        result, group, decision, decision_index, names=names, revision=revision,
+    )
+    neighborhood_choices = {}
+    for name in names:
+        values = axis_values.get(name, [])
+        center = focus_params.get(name)
+        if len(values) < 2 or not isinstance(center, (int, float)):
+            continue
+        index = min(range(len(values)), key=lambda item: abs(values[item] - float(center)))
+        neighborhood_choices[name] = values[max(0, index - 1):index + 2]
+    if neighborhood_choices:
+        remember(query(
+            region_id=region_id, in_filters=neighborhood_choices,
+            sort_by="ordinal", limit=256,
+        ))
+
+    top_candidates = []
+    for rank, row in enumerate(query(
+        region_id=region_id, sort_by="training_excess_return", descending=True, limit=10,
+    ), 1):
+        point = _landscape_point(row, "training", "original", None)
+        point["is_focus"] = int(row.get("_archive_ordinal", -1)) == focus_ordinal
+        point["rank"] = rank
+        top_candidates.append(point)
+        remember([row])
+
+    config = result.get("config", {})
+    strategy = config.get("strategy") if isinstance(config, dict) else {}
+    recommendation_count = max(1, min(100, int((strategy or {}).get("recommendation_count", 10))))
+    ranking_rows = query(
+        region_id=region_id, filters={"score_complete": 1},
+        sort_by="j_score", descending=True,
+        limit=min(1000, max(32, recommendation_count * 8)),
+    )
+    remember(ranking_rows)
+    selection = _research_decision_context(result, decision, decision_index)
+    ranking = _robust_landscape_ranking(ranking_rows, config, selection)
+    ranking["j_candidate_count"] = int(stats.get("j_complete", 0))
+
+    rows = list(subset.values())
+    points = []
+    for row in selected_rows:
+        point = _landscape_point(row, "training", "original", None)
+        point["is_focus"] = int(row.get("_archive_ordinal", -1)) == focus_ordinal
+        points.append(point)
+    focus = next((point for point in points if point["is_focus"]), None)
+    if focus is None:
+        focus = _landscape_point(focus_row, "training", "original", None)
+        focus["is_focus"] = True
+        points.append(focus)
+    slices = _landscape_slices(
+        rows, focus_params, names, "training", "original", None, totals=plane_totals,
+    )
+    neighborhood_fields = [
+        str(name) for name in ((strategy or {}).get("neighborhood_fields") or names)
+        if name in names
+    ] or None
+    focus_neighborhood = _landscape_neighborhood(
+        rows, focus_params, names, "training", "original", None, fields=neighborhood_fields,
+    )
+    finite = [
+        float(point["excess_return"]) for point in points
+        if isinstance(point.get("excess_return"), (int, float))
+        and np.isfinite(float(point["excess_return"]))
+    ]
+    return {
+        "result_id": result_id, "decision": decision, "decision_index": decision_index,
+        "revision": revision, "sample": "training", "cost": "original", "fold": None,
+        "region_id": region_id, "offset": offset, "limit": limit, "total": total,
+        "parameters": names, "points": points,
+        "bounds": {"min": min(finite), "max": max(finite)} if finite else None,
+        "center_count": sum(bool(point["is_center"]) for point in points),
+        "focus": focus, "focus_neighborhood": focus_neighborhood,
+        "top_candidates": top_candidates, "slices": slices,
+        "sampled": sampled, "sample_strategy": "even" if sampled else "page",
+        **ranking,
+        "completion": {
+            "status": "available" if int(stats.get("j_complete", 0)) < total else "complete",
+            "endpoint": f"/api/v1/results/{result_id}/completion",
+        },
     }
 
 
@@ -620,7 +806,6 @@ def _result_data_metadata(store: Store, result: dict) -> dict | None:
                 if count:
                     auction_by_day[str(day.date())] = count
         cached = {"spans": spans, "auction_placeholders_by_day": auction_by_day}
-        store.state(key, cached)
     metadata = dict(manifest.get("metadata") or {})
     metadata["diagnostics"] = {**metadata.get("diagnostics", {}), "source_spans": cached["spans"]}
     metadata["_snapshot_profiles"] = manifest.get("profiles", {})
@@ -677,13 +862,17 @@ def public_result(result: dict, full: bool = False, data_metadata: dict | None =
         return result
     result = dict(result)
     config = result.get("config") if isinstance(result.get("config"), dict) else {}
-    is_v2 = result.get("protocol_version") in (2, 3, 4) or config.get("protocol_version") in (2, 3, 4)
-    if is_v2:
+    is_v5_research = (
+        result.get("protocol_version") == 5
+        and result.get("result_schema_version") == 2
+        and config.get("protocol_version") == 5
+    )
+    if is_v5_research:
         try:
             top_candidates = max(1, min(100, int(config.get("top_candidates", 20))))
         except (TypeError, ValueError):
             top_candidates = 20
-        result = _compact_v2_result(result, top_candidates)
+        result = _compact_research_result(result, top_candidates)
     result = _project_result_quality(result, data_metadata)
     if "strategies" in result:
         result["equity_frequency"] = "1d"
@@ -697,13 +886,45 @@ def public_result(result: dict, full: bool = False, data_metadata: dict | None =
             strategy["equity_frequency"] = "1d"
             strategies[name] = strategy
         result["strategies"] = strategies
-    for mode, key in [("historical", "best_result"), ("robust", "test_result")]:
-        if result.get(mode) and result[mode].get(key):
-            result[mode] = {**result[mode], key: public_result(result[mode][key], data_metadata=data_metadata)}
     for mode in ("fixed", "adaptive"):
         if result.get(mode) and result[mode].get("test_result"):
             result[mode] = {**result[mode], "test_result": public_result(result[mode]["test_result"], data_metadata=data_metadata)}
     return result
+
+
+def _stream_json_value(value: Any, store: Store):
+    """Serialize a result while streaming candidate archives from SQLite."""
+    if isinstance(value, dict) and isinstance(value.get("__candidate_archive__"), str):
+        yield "["
+        first = True
+        for row in store.iter_candidate_reference(value):
+            if not first:
+                yield ","
+            yield dumps(row)
+            first = False
+        yield "]"
+        return
+    if isinstance(value, dict):
+        yield "{"
+        first = True
+        for key, item in value.items():
+            if not first:
+                yield ","
+            yield json.dumps(str(key), ensure_ascii=False)
+            yield ":"
+            yield from _stream_json_value(item, store)
+            first = False
+        yield "}"
+        return
+    if isinstance(value, (list, tuple)):
+        yield "["
+        for index, item in enumerate(value):
+            if index:
+                yield ","
+            yield from _stream_json_value(item, store)
+        yield "]"
+        return
+    yield dumps(value)
 
 
 def _with_data_availability(store: Store, result: dict) -> dict:
@@ -713,11 +934,139 @@ def _with_data_availability(store: Store, result: dict) -> dict:
     version = result.get("data_version")
     if not symbol or not version:
         return result
-    available = store.snapshot(symbol, version) is not None
+    available = store.snapshot(symbol, version, persist=False) is not None
     return {
         **result, "data_version_available": available,
         "data_version_warning": None if available else "原数据版本已清理，可查看历史结果，但不能按原版本重算",
     }
+
+
+def _require_supported_result(result: dict) -> None:
+    protocol = result.get("protocol_version")
+    if protocol is None:
+        return
+    if protocol == 5 and result.get("result_schema_version") == 2:
+        return
+    raise HTTPException(410, {
+        "code": "UNSUPPORTED_RESULT_VERSION",
+        "message": "该历史研究结果产生于已移除的协议版本，不支持查看或导出",
+    })
+
+
+def _revision_scope(revision: dict | None) -> dict | None:
+    """Describe which decision branch a completion revision covers."""
+    if not isinstance(revision, dict):
+        return None
+    return {
+        "revision": int(revision.get("revision", 0) or 0),
+        "decision": revision.get("decision"),
+        "decision_index": int(revision.get("decision_index", 0) or 0),
+    }
+
+
+def _completion_state(result_id: str, result: dict, revisions: list[dict],
+                      selected_revision: dict | None) -> dict:
+    """Describe the revision selected for one result read."""
+    if selected_revision is not None:
+        revision_status = selected_revision.get("status")
+        completion_status = (
+            "complete" if revision_status == "completed"
+            and int(selected_revision.get("remaining_count", 0) or 0) == 0
+            else "available" if revision_status in {"partial", "budget_exhausted", "cancelled"}
+            else str(revision_status or "available")
+        )
+    elif result.get("protocol_version") == 5:
+        completion_status = str(result.get("completion_status") or "available")
+    else:
+        completion_status = "not_applicable"
+    return {
+        "latest_revision": revisions[-1] if revisions else None,
+        "revision": selected_revision,
+        "selected_revision": selected_revision.get("revision") if selected_revision else None,
+        "revision_scope": _revision_scope(selected_revision),
+        "status": completion_status,
+        "endpoint": f"/api/v1/results/{result_id}/completion",
+    }
+
+
+def _csv_value(value: Any) -> Any:
+    """Render one ledger value for CSV output."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and not math.isfinite(value):
+        return ""
+    return value
+
+
+def _revision_conflict(exc: CompletionRevisionError) -> HTTPException:
+    """Turn an unusable completion revision into a clear client error."""
+    return HTTPException(409, {
+        "code": exc.code,
+        "message": str(exc),
+        "revision": exc.revision,
+        "scope": exc.scope,
+    })
+
+
+def _revision_substituted_result(result: dict, revision: dict | None) -> dict:
+    """Resolve the branch covered by a completion revision to its merged archive.
+
+    The three archive groups of a decision hold the same candidate rows, so a
+    revision is applied to every one of them for the covered decision only.
+    The other branches keep their original archive and the export states which
+    branch was revised.
+    """
+    scope = _revision_scope(revision)
+    merged = revision.get("merged_candidate_archive") if isinstance(revision, dict) else None
+    evidence = result.get("evidence")
+    if scope is None:
+        return result
+    if not isinstance(merged, dict) or not isinstance(evidence, dict):
+        raise CompletionRevisionError(
+            f"补算修订 {scope['revision']} 没有可用的候选档案",
+            code="COMPLETION_REVISION_ARCHIVE_MISSING", revision=scope["revision"], scope=scope,
+        )
+    updated = {**result, "evidence": {**evidence}}
+    applied = False
+    for group_name, field in (
+        ("candidate_archives", "candidate_archive"),
+        ("trial_archives", "trial_archive"),
+        ("search_candidate_archives", "search_candidate_archive"),
+    ):
+        group = evidence.get(group_name)
+        if not isinstance(group, dict):
+            continue
+        new_group = dict(group)
+        if scope["decision"] == "adaptive":
+            entries = group.get("adaptive")
+            if isinstance(entries, list) and scope["decision_index"] < len(entries):
+                entry = entries[scope["decision_index"]]
+                if isinstance(entry, dict):
+                    new_entry = dict(entry)
+                    if isinstance(new_entry.get(field), dict):
+                        new_entry[field] = merged
+                        applied = True
+                    new_group["adaptive"] = [
+                        *entries[:scope["decision_index"]], new_entry, *entries[scope["decision_index"] + 1:],
+                    ]
+        else:
+            branch = group.get(scope["decision"])
+            if isinstance(branch, dict) and "__candidate_archive__" in branch:
+                new_group[scope["decision"]] = merged
+                applied = True
+        updated["evidence"][group_name] = new_group
+    if not applied:
+        raise CompletionRevisionError(
+            f"补算修订 {scope['revision']} 覆盖的决策 {scope['decision']} "
+            f"#{scope['decision_index']} 没有候选档案",
+            code="COMPLETION_REVISION_OUT_OF_SCOPE", revision=scope["revision"], scope=scope,
+        )
+    updated["export_revision"] = {
+        **scope,
+        "archive": "merged_candidate_archive",
+        "applied_branches": [f"{scope['decision']}#{scope['decision_index']}"],
+    }
+    return updated
 
 
 def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_only: bool = False):
@@ -734,7 +1083,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             except (OSError, ValueError) as exc:
                 logging.getLogger(__name__).warning("自选快照导入失败，保留本地列表：%s", exc)
 
-    refresh_watchlist_snapshot()
+    if store is not None:
+        refresh_watchlist_snapshot()
     initial_package = (
         str(resolve_project_path(configured.package_dir))
         if data_dir is None and configured.package_dir else None
@@ -746,8 +1096,6 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         package_dir = str(initial_market.repository.package_dir)
     manager = JobManager(root, configured.max_workers, configured.market_data.scheduler_poll_seconds)
     previews = PreviewManager(store)
-    landscape_focus_cache: OrderedDict[tuple, list[dict]] = OrderedDict()
-    landscape_focus_lock = Lock()
     instance_id = uuid.uuid4().hex
 
     @asynccontextmanager
@@ -767,7 +1115,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     app.state.restart_callback = None
     app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
 
-    def submit(kind, payload):
+    def submit(kind, payload, dedupe_key=None):
         frozen = dict(payload)
         snapshot = task_configuration_snapshot(
             active_data_dir=root,
@@ -776,20 +1124,26 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             active_port=configured.port,
         )
         requested_revision = str(frozen.get("configuration_revision") or "")
-        if requested_revision and requested_revision != snapshot.get("revision"):
+        # A resumed task replays the frozen configuration snapshot of the
+        # original submission, so a later configuration save must not block it.
+        if (
+            requested_revision
+            and not frozen.get("resume_from_job")
+            and requested_revision != snapshot.get("revision")
+        ):
             raise HTTPException(409, detail={
                 "code": "CONFIG_REVISION_CONFLICT",
                 "message": "研究提交所使用的配置版本已过期，请等待配置保存后重试",
             })
         frozen.setdefault("configuration_revision", snapshot.get("revision"))
         frozen.setdefault("configuration_snapshot", snapshot)
-        return {"job_id": store.new_job(kind, frozen)}
-
-    def snapshot_version(config):
-        # Preserve a submission-time immutable input when the active snapshot
-        # already covers this request. Missing or stale coverage is prepared by
-        # the worker, so the API never blocks on a source download.
-        return DataService(store).current_version_if_ready(config)
+        if kind == "optimization" and "submission_provenance" not in frozen:
+            from .reproducibility import computation_provenance
+            from .settings import PROJECT_ROOT
+            frozen["submission_provenance"] = computation_provenance(
+                PROJECT_ROOT, configuration=frozen.get("config"),
+            )
+        return {"job_id": store.new_job(kind, frozen, dedupe_key=dedupe_key)}
 
     def require_ready(config):
         manifest = store.snapshot(config.symbol)
@@ -826,10 +1180,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
                 "code": "RESTART_UNAVAILABLE",
                 "message": "当前进程不是由项目启动脚本托管，无法自动重启。请关闭后重新运行 start.cmd。",
             })
-        active_jobs = sum(
-            job.get("status") in {"queued", "running"}
-            for job in store.jobs(1000)
-        )
+        active_jobs = store.active_job_count()
         if active_jobs and not payload.force:
             raise HTTPException(409, detail={
                 "code": "RESTART_JOBS_ACTIVE",
@@ -1240,7 +1591,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     def bars(symbol: str, start_date: str | None = None, end_date: str | None = None, frequency: str = "1m", limit: int = Query(1500, ge=1, le=10000), version: str | None = None):
         normalized = normalize_timeframe(frequency)
         market = MarketDataService(store)
-        manifest = store.snapshot(symbol, version)
+        manifest = store.snapshot(symbol, version, persist=False)
         if version and manifest is None:
             raise HTTPException(404, {
                 "code": "DATA_VERSION_NOT_FOUND",
@@ -1267,6 +1618,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
                     end=pd.Timestamp(end_date) if end_date else None,
                     version=market_version,
                     limit=limit,
+                    materialize=False,
                 )
                 return json_safe(payload["rows"])
             except DataVersionNotFound as exc:
@@ -1297,6 +1649,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             return json_safe(market.market_bars(
                 symbol, timeframe, start=start_date, end=end_date, before=before,
                 limit=limit, ma_periods=[int(value) for value in ma.split(",") if value.strip()],
+                materialize=False,
             ))
         except MarketDataError as exc:
             return {"symbol": normalize_symbol(symbol), "frequency": normalize_timeframe(frequency),
@@ -1361,33 +1714,21 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         return {"job_ids": [submit("backtest", {"config": config.model_dump(mode="json"), "version": version})["job_id"] for config, version in zip(payload.configs, versions)]}
 
     @app.post("/api/v1/optimizations")
-    def optimization(config: OptimizationConfig | ResearchRequestV4):
-        if isinstance(config, ResearchRequestV4):
+    def optimization(config: OptimizationConfig | ResearchRequestV5):
+        if isinstance(config, ResearchRequestV5):
             config = config.to_optimization()
-        prepared = preparation_config(
-            store, config.base,
-            lookback_days=(config.strategy.training_max_days if config.protocol_version == 4 and config.strategy.strategy_version == 4 else 500) if config.protocol_version == 4 else 504,
-        )
+        prepared = preparation_config(store, config.base, lookback_days=int(config.strategy.training_max_days))
         version = require_ready(prepared)
         bundle = DataService(store).load_bundle(prepared, version)
-        if config.protocol_version == 4:
-            from .research_v4 import estimate_search
+        if config.protocol_version == 5:
+            from .research.robust import estimate_robust_search
             try:
-                preview = estimate_search(config, bundle)
+                preview = estimate_robust_search(config, bundle)
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from exc
-        elif config.protocol_version == 3:
-            from .scientific import estimate_v3_search
-            preview = estimate_v3_search(config, bundle)
-            if preview.get("status") == "budget_exceeded":
-                raise HTTPException(422, {
-                    "code": "SEARCH_BUDGET_EXCEEDED",
-                    "message": f"局部网格预计 {preview['expected']} 组，超过预算 {preview['budget']}；请调整范围或预算",
-                    **preview,
-                })
         else:
-            raise HTTPException(422, "新研究请先通过配置转换并使用 protocol_version=3 或 4")
-        if config.protocol_version == 4 and preview.get("status") == "budget_exceeded":
+            raise HTTPException(422, "旧研究协议已移除；请使用 protocol_version=5")
+        if preview.get("status") == "budget_exceeded":
             reason = next((value for value in preview.get("reasons", []) if "超正方体" in str(value) or "预算" in str(value)), None)
             raise HTTPException(422, {
                 "code": "SEARCH_BUDGET_EXCEEDED",
@@ -1397,29 +1738,31 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         submitted = submit("optimization", {
             "config": config.model_dump(mode="json"), "version": version,
             "configuration_revision": config.configuration_revision,
+            "budget_contract": {
+                "data_version": version,
+                "effective_total_evaluation_budget": preview["effective_total_evaluation_budget"],
+                "task_evaluation_upper_bound": preview["task_evaluation_upper_bound"],
+                "max_runtime_seconds": preview["max_runtime_seconds"],
+                "estimated_task_memory_mb": preview["estimated_task_memory_mb"],
+                "workspace_budget_mb": preview["workspace_budget_mb"],
+            },
         })
         return {**submitted, "search_preview": preview}
 
     @app.post("/api/v1/optimizations/preview")
-    def optimization_preview(config: OptimizationConfig | ResearchRequestV4):
-        if isinstance(config, ResearchRequestV4):
+    def optimization_preview(config: OptimizationConfig | ResearchRequestV5):
+        if isinstance(config, ResearchRequestV5):
             config = config.to_optimization()
-        prepared = preparation_config(
-            store, config.base,
-            lookback_days=(config.strategy.training_max_days if config.protocol_version == 4 and config.strategy.strategy_version == 4 else 500) if config.protocol_version == 4 else 504,
-        )
+        prepared = preparation_config(store, config.base, lookback_days=int(config.strategy.training_max_days))
         version = require_ready(prepared)
         bundle = DataService(store).load_bundle(prepared, version)
-        if config.protocol_version == 4:
-            from .research_v4 import estimate_search
+        if config.protocol_version == 5:
+            from .research.robust import estimate_robust_search
             try:
-                return json_safe(estimate_search(config, bundle))
+                return json_safe(estimate_robust_search(config, bundle))
             except ValueError as exc:
                 raise HTTPException(422, str(exc)) from exc
-        if config.protocol_version == 3:
-            from .scientific import estimate_v3_search
-            return json_safe(estimate_v3_search(config, bundle))
-        raise HTTPException(422, "搜索预检仅适用于 protocol_version=3 或 4")
+        raise HTTPException(422, "旧研究协议已移除；请使用 protocol_version=5")
 
     @app.get("/api/v1/research/strategies")
     def research_strategies():
@@ -1427,8 +1770,12 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         return strategy_descriptions()
 
     @app.get("/api/v1/jobs")
-    def jobs():
-        return store.jobs()
+    def jobs(
+        status: str | None = Query(None),
+        offset: int = Query(0, ge=0),
+        limit: int = Query(100, ge=1, le=1000),
+    ):
+        return store.jobs(limit=limit, status=status, offset=offset)
 
     @app.get("/api/v1/jobs/{job_id}")
     def get_job(job_id: str):
@@ -1465,10 +1812,51 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         job = get_job(job_id)
         if not job.get("result_id"):
             raise HTTPException(409, "任务尚无结果")
-        result = store.result(job["result_id"])
-        return _with_data_availability(
-            store, public_result(result, data_metadata=_result_data_metadata(store, result))
+        result_id = str(job["result_id"])
+        result = store.result(result_id)
+        if result is None:
+            raise HTTPException(404, "结果不存在")
+        _require_supported_result(result)
+        revisions = store.completion_revisions(result_id)
+        payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        requested_revision = payload.get("completion_revision")
+        if requested_revision is not None:
+            try:
+                revision_number = int(requested_revision)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(409, {
+                    "code": "COMPLETION_REVISION_INVALID",
+                    "message": "任务保存的补算修订号无效",
+                }) from exc
+            selected_revision = store.completion_revision(result_id, revision_number)
+            if selected_revision is None:
+                raise HTTPException(409, {
+                    "code": "COMPLETION_REVISION_NOT_FOUND",
+                    "message": f"任务对应的补算修订 {revision_number} 不存在",
+                    "revision": revision_number,
+                })
+        else:
+            selected_revision = revisions[-1] if revisions else None
+        public = public_result(result, data_metadata=None)
+        public["completion"] = _completion_state(
+            result_id, result, revisions, selected_revision,
         )
+        return _with_data_availability(store, public)
+
+    @app.post("/api/v1/jobs/{job_id}/resume", status_code=202)
+    def resume_job(job_id: str):
+        job = get_job(job_id)
+        if job.get("kind") != "research_completion":
+            raise HTTPException(422, "只有可恢复的研究补算任务支持继续")
+        if job.get("status") not in {"failed", "cancelled", "partial"}:
+            raise HTTPException(409, "任务当前不需要恢复")
+        payload = dict(job.get("payload") or {})
+        payload.pop("submission_provenance", None)
+        payload["resume_from_job"] = job_id
+        # Only a resume continues the original checkpoint; a fresh submission
+        # always starts a new one.
+        payload["checkpoint_id"] = job_id
+        return {**submit("research_completion", payload), "resumed_from": job_id}
 
     @app.get("/api/v1/jobs/{job_id}/items")
     def job_items(job_id: str, section: str = "all", offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000)):
@@ -1490,17 +1878,33 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         return {"items": groups[offset:offset + limit], "total": total, "offset": offset, "limit": limit}
 
     @app.get("/api/v1/results")
-    def results():
-        return store.results()
+    def results(
+        offset: int = Query(0, ge=0),
+        limit: int = Query(200, ge=1, le=1000),
+    ):
+        return store.results(limit=limit, offset=offset)
+
+    @app.get("/api/v1/results/{result_id}/summary")
+    def result_summary(result_id: str, revision: int | None = Query(None, ge=1)):
+        return get_result(result_id, full=False, revision=revision)
 
     @app.get("/api/v1/results/{result_id}")
-    def get_result(result_id: str, full: bool = False):
+    def get_result(result_id: str, full: bool = False, revision: int | None = Query(None, ge=1)):
         result = store.result(result_id)
         if result is None:
             raise HTTPException(404, "结果不存在")
+        _require_supported_result(result)
         public = public_result(
-            result, full=full,
-            data_metadata=None if full else _result_data_metadata(store, result),
+            result, full=full, data_metadata=None,
+        )
+        revisions = store.completion_revisions(result_id)
+        selected_revision = revisions[-1] if revisions else None
+        if revision is not None:
+            selected_revision = store.completion_revision(result_id, revision)
+            if selected_revision is None:
+                raise HTTPException(404, "补算修订不存在")
+        public["completion"] = _completion_state(
+            result_id, result, revisions, selected_revision,
         )
         return public if full else _with_data_availability(store, public)
 
@@ -1509,7 +1913,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         result_id: str,
         decision: str = Query("current", pattern="^(current|fixed|adaptive)$"),
         decision_index: int = Query(0, ge=0),
-        sample: str = Query("validation", pattern="^(training|validation)$"),
+        sample: str = Query("training", pattern="^(training|validation)$"),
         cost: str = Query("original", pattern="^(original|stress)$"),
         fold: int | None = Query(None, ge=0),
         region_id: int | None = Query(None, ge=1),
@@ -1519,229 +1923,279 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         x: str | None = None,
         y: str | None = None,
         anchor: str = Query("stable", pattern="^(stable|peak)$"),
+        revision: int | None = Query(None, ge=1),
     ):
         result = store.result(result_id)
         if result is None:
             raise HTTPException(404, "结果不存在")
-        if result.get("protocol_version") not in (3, 4):
-            raise HTTPException(422, "参数收益分布仅适用于 protocol_version=3 或 4")
-        strategy = result.get("config", {}).get("strategy", {})
-        if sample == "validation" and strategy.get("strategy_version") == 2:
-            from .research_v4.region_api import connected_landscape
-            try:
-                return connected_landscape(
-                    result, decision=decision, decision_index=decision_index, region_id=region_id,
-                    view=view, x=x, y=y, anchor=anchor, offset=offset, limit=limit,
-                    sample=sample, cost=cost, fold=fold, point_factory=_landscape_point,
-                )
-            except LookupError as exc:
-                raise HTTPException(404, str(exc)) from exc
-            except ValueError as exc:
-                raise HTTPException(422, str(exc)) from exc
-        evidence = result.get("evidence", {})
-        if sample == "training":
-            archive = evidence.get("search_candidate_archives", {}).get(decision, [])
-            if decision == "adaptive":
-                if not archive or decision_index >= len(archive):
-                    raise HTTPException(404, "研究决策不存在")
-                archive = archive[decision_index].get("search_candidate_archive", [])
-        else:
-            archive = evidence.get("candidate_archives", {}).get(decision, [])
-            if decision == "adaptive":
-                if not archive or decision_index >= len(archive):
-                    raise HTTPException(404, "研究决策不存在")
-                archive = archive[decision_index].get("candidate_archive", [])
-        archive = [row for row in archive if isinstance(row, dict) and isinstance(row.get("params"), dict)]
+        _require_supported_result(result)
         config = result.get("config", {})
-        robust_j = config.get("strategy", {}).get("strategy_version") == 4 and sample == "training"
-        selection = {}
-        focus_completion_error = None
-        if robust_j and archive:
-            from .research_v4.region_api import decision_context
-            selection = decision_context(result, decision, decision_index)
-            leader = min(archive, key=_robust_return_key)
-            if leader.get("score_complete") is not True and result.get("data_version"):
-                cache_key = (result_id, result["data_version"], decision, decision_index)
-                try:
-                    with landscape_focus_lock:
-                        overlay = landscape_focus_cache.get(cache_key)
-                        if overlay is None:
-                            from .research.robust import complete_archived_focus
-                            parsed = OptimizationConfig.model_validate(config)
-                            diagnostics = selection.get("diagnostics", {})
-                            start = diagnostics.get("training_start")
-                            end = diagnostics.get("training_end")
-                            if not start or not end:
-                                raise ValueError("历史结果缺少原训练时段，无法补算邻域")
-                            prepared = preparation_config(store, parsed.base, result["data_version"], parsed.strategy.training_max_days)
-                            bundle = DataService(store).load_bundle(prepared, result["data_version"])
-                            dates = pd.DatetimeIndex(bundle.calendar)
-                            dates = dates[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))]
-                            if not len(dates):
-                                raise ValueError("原数据版本缺少训练时段行情")
-                            overlay = json_safe(complete_archived_focus(parsed, bundle, archive, dates))
-                            landscape_focus_cache[cache_key] = overlay
-                            if len(landscape_focus_cache) > 8:
-                                landscape_focus_cache.popitem(last=False)
-                        landscape_focus_cache.move_to_end(cache_key)
-                    fields = ["buy_step", "sell_step", "buy_shares", "sell_shares"]
-                    merged = {_landscape_param_key(row["params"], fields): row for row in archive}
-                    merged.update({_landscape_param_key(row["params"], fields): row for row in overlay})
-                    archive = list(merged.values())
-                except Exception as exc:
-                    focus_completion_error = f"最高超额收益点邻域补算失败：{exc}"
-                    logging.getLogger(__name__).warning("%s (%s)", focus_completion_error, result_id)
-        if region_id is not None:
-            archive = [row for row in archive if region_id in (row.get("region_ids") or [])]
-        total_points = len(archive)
-        if not archive:
-            return {"result_id": result_id, "decision": decision, "sample": sample,
-                    "cost": cost, "fold": fold, "region_id": region_id, "offset": offset,
-                    "limit": limit, "total": total_points, "points": [], "bounds": None,
-                    "focus": None, "focus_neighborhood": None, "top_candidates": [], "slices": {},
-                    "sampled": False, "center_count": 0}
-        focus_index = min(range(total_points), key=lambda index: _robust_return_key(archive[index])) if robust_j else max(
-            range(total_points),
-            key=lambda index: _landscape_rank_key(archive[index], sample, cost, fold, index),
-        )
-        if offset > 0:
-            selected_indices = list(range(offset, min(total_points, offset + limit)))
-            sampled = False
-        else:
-            selected_indices = _landscape_sample_indices(total_points, limit, focus_index)
-            sampled = len(selected_indices) < total_points
-        ordered_names = [
-            "buy_step", "sell_step", "sell_shares", "buy_shares",
-            "min_shares", "max_shares", "grid_step",
-        ]
-        names = [
-            name for name in ordered_names
-            if any(row.get("params", {}).get(name) is not None for row in archive)
-            and (not robust_j or name in {"buy_step", "sell_step", "buy_shares", "sell_shares"})
-        ]
-        points = []
-        for index in selected_indices:
-            point = _landscape_point(archive[index], sample, cost, fold, index + 1)
-            point["is_focus"] = index == focus_index
-            points.append(point)
+        strategy_version = (config.get("strategy") or {}).get("strategy_version")
+        if strategy_version != 5:
+            raise HTTPException(410, {
+                "code": "UNSUPPORTED_RESULT_VERSION",
+                "message": "该研究结果缺少 v5 协议事实，不支持参数分布读取",
+            })
+        if sample != "training":
+            raise HTTPException(422, {
+                "code": "NO_INTERNAL_VALIDATION_LANDSCAPE",
+                "message": "v5 只有单段训练和真实连续样本外账本，没有内部验证候选分布",
+            })
+        try:
+            payload = _robust_training_landscape(
+                store, result, result_id, decision=decision,
+                decision_index=decision_index, region_id=region_id,
+                offset=offset, limit=limit, revision=revision,
+            )
+            if revision is not None:
+                payload["revision_scope"] = _revision_scope(
+                    store.completion_revision(result_id, revision)
+                )
+            return payload
+        except CompletionRevisionError as exc:
+            # A revision only covers one decision branch.  Showing the
+            # pre-completion archive as if it had been revised is worse than
+            # refusing the request.
+            raise _revision_conflict(exc) from exc
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
 
-        ranked_indices = sorted(
-            range(total_points),
-            key=lambda index: _landscape_rank_key(archive[index], sample, cost, fold, index),
-            reverse=True,
-        )
-        top_candidates = []
-        for rank, index in enumerate(ranked_indices[:min(10, total_points)], start=1):
-            point = _landscape_point(archive[index], sample, cost, fold, index + 1)
-            point["is_focus"] = index == focus_index
-            point["rank"] = rank
-            top_candidates.append(point)
-        focus = next((point for point in points if point["is_focus"]), None)
-        if focus is None:
-            focus = _landscape_point(archive[focus_index], sample, cost, fold, focus_index + 1)
-            focus["is_focus"] = True
-        slices = _landscape_slices(
-            archive, archive[focus_index].get("params", {}), names, sample, cost, fold,
-        )
-        neighborhood_fields = None
-        strategy = config.get("strategy") if isinstance(config, dict) else None
-        stored_fields = strategy.get("neighborhood_fields") if isinstance(strategy, dict) else None
-        if isinstance(stored_fields, list):
-            mapped_fields = []
-            for name in stored_fields:
-                legacy_grid = name == "grid_step" and "grid_step" in names and not {"buy_step", "sell_step"}.issubset(names)
-                for mapped in ((str(name),) if legacy_grid else (("buy_step", "sell_step") if name == "grid_step" else (str(name),))):
-                    if mapped not in mapped_fields:
-                        mapped_fields.append(mapped)
-            neighborhood_fields = [name for name in mapped_fields if name in names] or None
-        focus_neighborhood = _landscape_neighborhood(
-            archive, archive[focus_index].get("params", {}), names, sample, cost, fold,
-            fields=neighborhood_fields,
-        )
-        ranking = {}
-        if robust_j:
-            ranking = _robust_landscape_ranking(archive, config, selection)
-        finite = [float(point["excess_return"]) for point in points if isinstance(point.get("excess_return"), (int, float)) and np.isfinite(float(point["excess_return"]))]
+    @app.post("/api/v1/results/{result_id}/completion", status_code=202)
+    def submit_result_completion(result_id: str, request: ResearchCompletionRequest):
+        result = store.result(result_id)
+        if result is None:
+            raise HTTPException(404, "结果不存在")
+        _require_supported_result(result)
+        if result.get("protocol_version") != 5 or result.get("result_schema_version") != 2:
+            raise HTTPException(410, {
+                "code": "UNSUPPORTED_RESULT_VERSION",
+                "message": "该历史版本不支持补算",
+            })
+        provenance = result.get("computation_provenance") or {}
+        if provenance.get("reproducible") is False or not provenance.get("completion_allowed"):
+            raise HTTPException(409, {
+                "code": "COMPLETION_PROVENANCE_MISMATCH",
+                "message": "原结果缺少完整计算来源，或运行期间代码与依赖发生变化，不能补算",
+                "mismatches": provenance.get("mismatches", []),
+            })
+        finished = provenance.get("finished") or {}
+        from .reproducibility import computation_provenance, reproducibility_mismatches
+        from .settings import PROJECT_ROOT
+        current = computation_provenance(PROJECT_ROOT, configuration=result.get("config"))
+        mismatches = reproducibility_mismatches(finished, current)
+        if mismatches:
+            raise HTTPException(409, {
+                "code": "COMPLETION_PROVENANCE_MISMATCH",
+                "message": "当前代码、配置或依赖环境与原结果不一致，拒绝补算",
+                "mismatches": mismatches,
+            })
+        symbol = result.get("symbol") or (result.get("config") or {}).get("base", {}).get("symbol")
+        data_version = result.get("data_version")
+        if not symbol or not data_version or store.snapshot(symbol, data_version, persist=False) is None:
+            raise HTTPException(409, {
+                "code": "COMPLETION_DATA_UNAVAILABLE",
+                "message": "原行情数据版本不可用，不能补算",
+            })
+        payload = {
+            "result_id": result_id, **request.model_dump(mode="json"),
+            "data_version": data_version,
+            "max_runtime_seconds": int(
+                (result.get("config") or {}).get("strategy", {}).get("max_runtime_seconds", 3600)
+            ),
+        }
+        identity = {
+            "result_id": result_id, "decision": request.decision,
+            "decision_index": request.decision_index, "target": request.target,
+            "reporting_budget": int(request.reporting_budget),
+            "data_version": data_version,
+            "source_fingerprint": current.get("source_fingerprint"),
+            "dependency_lock_hash": current.get("dependency_lock_hash"),
+            "configuration_fingerprint": current.get("configuration_fingerprint"),
+        }
+        dedupe_key = "completion:" + hashlib.sha256(
+            dumps(identity).encode("utf-8")
+        ).hexdigest()
+        submitted = submit("research_completion", payload, dedupe_key=dedupe_key)
+        # The checkpoint belongs to this job: a fresh submission starts a new
+        # checkpoint, and only an explicit resume reuses the original one.
+        store.update_job(submitted["job_id"], payload={
+            **payload, "checkpoint_id": submitted["job_id"],
+        })
+        job = store.job(submitted["job_id"]) or {}
         return {
-            "result_id": result_id, "decision": decision, "decision_index": decision_index,
-            "sample": sample, "cost": cost, "fold": fold, "region_id": region_id,
-            "offset": offset, "limit": limit, "total": total_points, "parameters": names,
-            "points": points,
-            "bounds": {"min": min(finite), "max": max(finite)} if finite else None,
-            "center_count": sum(bool(point["is_center"]) for point in points),
-            "focus": focus, "focus_neighborhood": focus_neighborhood,
-            "top_candidates": top_candidates,
-            "slices": slices,
-            "sampled": sampled, "sample_strategy": "even" if sampled else "page",
-            **ranking,
-            "focus_completion_error": focus_completion_error,
+            **submitted, "status": job.get("status"),
+            "deduplicated": job.get("dedupe_key") == dedupe_key and job.get("status") in {"queued", "running"},
         }
 
     @app.get("/api/v1/results/{result_id}/regions/{region_id}/export")
     def export_region(result_id: str, region_id: int,
                       decision: str = Query("current", pattern="^(current|fixed|adaptive)$"),
                       decision_index: int = Query(0, ge=0),
-                      format: str = Query("csv", pattern="^(csv|json)$")):
-        from .research_v4.region_api import decision_archive, decision_context
+                      format: str = Query("csv", pattern="^(csv|json)$"),
+                      revision: int | None = Query(None, ge=1)):
         result = store.result(result_id)
         if result is None:
             raise HTTPException(404, "结果不存在")
+        _require_supported_result(result)
         try:
-            context = decision_context(result, decision, decision_index)
+            context = _research_decision_context(result, decision, decision_index)
             region = next((r for r in context.get("recommendation_regions", []) if r.get("region_id") == region_id), None)
-            if not region or region.get("geometry") not in {"connected_lattice", "hypercube_mean"}:
+            if not region or region.get("geometry") != "robust_j":
                 raise LookupError("推荐参数域不存在")
-            rows = [r for r in decision_archive(result, decision, decision_index) if region_id in r.get("region_ids", [])]
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
-        rows.sort(key=lambda row: row["candidate_id"])
+        if revision is not None:
+            try:
+                # The revision scope is checked before the response starts:
+                # a revision that covers another branch must not silently
+                # export the pre-completion rows.
+                store.candidate_reference(
+                    result, "candidate_archives", decision, decision_index, revision=revision,
+                )
+            except CompletionRevisionError as exc:
+                raise _revision_conflict(exc) from exc
+            except LookupError as exc:
+                raise HTTPException(404, str(exc)) from exc
         filename = f"{result_id}-{decision}-{decision_index}-region-{region_id}.{format}"
         headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
         if format == "json":
-            return Response(dumps({"region": region, "members": [_landscape_point(r, "validation", "original", None) for r in rows]}),
-                            media_type="application/json", headers=headers)
+            def json_rows():
+                yield '{"region":' + dumps(region) + ',"members":['
+                first = True
+                for row in store.iter_candidate_archive(
+                    result, "candidate_archives", decision, decision_index,
+                    region_id=region_id, sort_by="candidate_id", revision=revision,
+                ):
+                    if not first:
+                        yield ","
+                    yield dumps(_landscape_point(row, "training", "original", None))
+                    first = False
+                yield "]}"
+            return StreamingResponse(json_rows(), media_type="application/json", headers=headers)
 
         def csv_rows():
-            from .research_v4.space import FIELDS
+            from .research_v4.space import ROBUST_FIELDS
             output = io.StringIO(newline="")
             writer = csv.writer(output)
-            writer.writerow(["candidate_id", *FIELDS, "excess_return", "stability_margin", "is_stable_point", "is_peak_point", "constraint_eligible", "constraint_reasons"])
+            writer.writerow(["candidate_id", *ROBUST_FIELDS, "excess_return", "max_principal_drawdown", "score_complete", "constraint_eligible", "constraint_reasons"])
             yield "\ufeff" + output.getvalue()
-            for row in rows:
+            for row in store.iter_candidate_archive(
+                result, "candidate_archives", decision, decision_index,
+                region_id=region_id, sort_by="candidate_id", revision=revision,
+            ):
                 output.seek(0)
                 output.truncate(0)
-                writer.writerow([row["candidate_id"], *(row["params"].get(name) for name in FIELDS),
-                                 row.get("validation_excess_original"), row.get("stability_margin"),
-                                 bool(row.get("is_stable_point")), bool(row.get("is_peak_point")),
+                writer.writerow([row["candidate_id"], *(row["params"].get(name) for name in ROBUST_FIELDS),
+                                 row.get("training_excess_return"), row.get("max_principal_drawdown"),
+                                 bool(row.get("score_complete")),
                                  row.get("constraint_eligible"), "；".join(row.get("constraint_reasons", []))])
                 yield output.getvalue()
         return StreamingResponse(csv_rows(), media_type="text/csv; charset=utf-8", headers=headers)
 
     @app.get("/api/v1/results/{result_id}/export")
-    def export(result_id: str, kind: str = "json"):
-        result = get_result(result_id, full=True)
+    def export(result_id: str, kind: str = "json", revision: int | None = Query(None, ge=1)):
+        result = get_result(result_id, full=True, revision=revision)
         if kind == "json":
-            content, extension, media = dumps(result).encode("utf-8"), "json", "application/json"
+            revision_record = store.completion_revision(result_id, revision) if revision is not None else None
+            try:
+                payload = _revision_substituted_result(result, revision_record)
+            except CompletionRevisionError as exc:
+                raise _revision_conflict(exc) from exc
+            return StreamingResponse(
+                _stream_json_value(payload, store), media_type="application/json",
+                headers={"Content-Disposition": f'attachment; filename="{result_id}-{kind}.json"'},
+            )
         elif kind in ("equity", "trades"):
-            records = []
-            if result.get("protocol_version") in (2, 3, 4):
-                runs = []
-                for name in ("fixed", "adaptive"):
-                    branch = result.get(name)
-                    if isinstance(branch, dict):
-                        runs.append((name, branch.get("test_result") or {}))
+            def ledger_records():
+                """Yield the equity or trade ledger rows one at a time."""
+                if result.get("protocol_version") == 5:
+                    runs = []
+                    for name in ("fixed", "adaptive"):
+                        branch = result.get(name)
+                        if isinstance(branch, dict):
+                            runs.append((name, branch.get("test_result") or {}))
+                else:
+                    runs = [(None, result if "strategies" in result else {})]
                 for selection, run in runs:
-                    for strategy, values in run.get("strategies", {}).items():
-                        records.extend({"selection": selection, "strategy": strategy, **row} for row in values.get(kind, []))
-            else:
-                run = result if "strategies" in result else (result.get("historical", {}).get("best_result") or result.get("robust", {}).get("test_result") or {})
-                for strategy, values in run.get("strategies", {}).items():
-                    records.extend({"strategy": strategy, **row} for row in values.get(kind, []))
-            content = pd.DataFrame(records).to_csv(index=False).encode("utf-8-sig")
-            extension, media = "csv", "text/csv"
+                    for strategy, values in (run.get("strategies") or {}).items():
+                        for row in values.get(kind, []) or []:
+                            record = {"strategy": strategy, **row}
+                            if selection is not None:
+                                record = {"selection": selection, **record}
+                            yield record
+
+            def ledger_rows():
+                """Stream the equity or trade ledger without building a frame in memory."""
+                columns: list[str] = []
+                seen: set[str] = set()
+                for record in ledger_records():
+                    for key in record:
+                        if key not in seen:
+                            seen.add(key)
+                            columns.append(key)
+                if not columns:
+                    yield "\ufeff\n"
+                    return
+                output = io.StringIO(newline="")
+                writer = csv.writer(output, lineterminator="\n")
+                writer.writerow(columns)
+                yield "\ufeff" + output.getvalue()
+                for record in ledger_records():
+                    output.seek(0)
+                    output.truncate(0)
+                    writer.writerow([_csv_value(record.get(name)) for name in columns])
+                    yield output.getvalue()
+            return StreamingResponse(
+                ledger_rows(), media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": f'attachment; filename="{result_id}-{kind}.csv"'},
+            )
+        elif kind == "candidates":
+            revision_record = store.completion_revision(result_id, revision) if revision is not None else None
+            scope = _revision_scope(revision_record)
+
+            def applies(selection: str, index: int) -> bool:
+                return bool(
+                    scope is not None
+                    and scope["decision"] == selection
+                    and scope["decision_index"] == int(index)
+                )
+
+            def csv_rows():
+                output = io.StringIO(newline="")
+                writer = csv.writer(output)
+                writer.writerow([
+                    "selection", "decision_index", "candidate_id", "buy_step", "sell_step",
+                    "buy_shares", "sell_shares", "j_score", "training_excess_return",
+                    "max_principal_drawdown", "score_complete", "revision", "archive_source",
+                ])
+                yield "\ufeff" + output.getvalue()
+                evidence = result.get("evidence") if isinstance(result.get("evidence"), dict) else {}
+                selections = [("fixed", 0), ("current", 0)]
+                adaptive = (evidence.get("candidate_archives") or {}).get("adaptive") or []
+                selections.extend(("adaptive", index) for index in range(len(adaptive)))
+                for selection, index in selections:
+                    revised = applies(selection, index)
+                    for row in store.iter_candidate_archive(
+                        result, "candidate_archives", selection, index,
+                        revision=revision if revised else None,
+                    ):
+                        params = row.get("params") if isinstance(row.get("params"), dict) else {}
+                        output.seek(0)
+                        output.truncate(0)
+                        writer.writerow([
+                            selection, index, row.get("candidate_id"), params.get("buy_step"),
+                            params.get("sell_step"), params.get("buy_shares"), params.get("sell_shares"),
+                            row.get("j_score"), row.get("training_excess_return"),
+                            row.get("max_principal_drawdown"), row.get("score_complete"),
+                            revision if revised else "", "revised" if revised else "base",
+                        ])
+                        yield output.getvalue()
+            return StreamingResponse(
+                csv_rows(), media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": f'attachment; filename="{result_id}-{kind}.csv"'},
+            )
         else:
-            raise HTTPException(422, "导出类型应为 json/equity/trades")
-        return Response(content=content, media_type=media, headers={"Content-Disposition": f'attachment; filename="{result_id}-{kind}.{extension}"'})
+            raise HTTPException(422, "导出类型应为 json/equity/trades/candidates")
 
     @app.get("/api/v1/configs")
     def configs():

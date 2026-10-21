@@ -8,11 +8,11 @@ import ResultsCurves from '../ResultsCurves'
 import { resultShareUnit, savedGridParameters } from '../resultPresentation'
 import { Badge, Button, Card, Empty, ErrorBox, Loading, PageHeader, SelectInput, money, percent, useErrorMessage } from '../components'
 import { chartValue } from '../marketValues'
-import type { BacktestResult, EquityPoint, ResultSummary, StrategyResult, Trade } from '../types'
+import type { BacktestResult, ResultSummary, StrategyResult, Trade } from '../types'
 
 type Props = { requestedResult: string | null; clearRequestedResult: () => void }
-const names: Record<string, string> = { grid: '网格策略', dca: '定期定额', buy_hold: '买入并持有', same_account_passive: '同账户被动持有' }
-const colors: Record<string, string> = { grid: '#2864dc', dca: '#e29136', buy_hold: '#8795aa', same_account_passive: '#13957b' }
+const names: Record<string, string> = { grid: '网格策略', dca: '定期定额', buy_hold: '买入并持有', same_account_passive: '同账户被动持有', matched_funding_hold: '同资金被动持有' }
+const colors: Record<string, string> = { grid: '#2864dc', dca: '#e29136', buy_hold: '#8795aa', same_account_passive: '#13957b', matched_funding_hold: '#7a4fd1' }
 const reasonNames: Record<string, string> = {
   initial_position: '初始建仓', dca: '定期购买', buy_hold: '初始全仓', grid_buy: '网格买入', grid_sell: '网格卖出',
   dca_period_skipped: '该期无可成交时点，未投入资金', non_tradable_bar: '不可交易行情', suspended_day: '当日停牌', invalid_open: '开盘价无效', zero_volume: '无成交量',
@@ -22,9 +22,15 @@ const reasonNames: Record<string, string> = {
 }
 const reasonText = (value: unknown) => reasonNames[String(value)] ?? String(value ?? '—')
 const sideText = (value: unknown) => value === 'buy' ? '买入' : value === 'sell' ? '卖出' : String(value ?? '—')
-const metricLabels: Record<string, string> = { total_return: '总收益率', cagr: '年化收益', max_drawdown: '最大回撤', sharpe: '夏普比率', calmar: '卡玛比率', trade_count: '成交笔数', total_fees: '总手续费', turnover: '换手率', buy_count: '买入次数', sell_count: '卖出次数' }
+const metricLabels: Record<string, string> = { peak_principal_return: '峰值本金收益', max_principal_drawdown: '最大本金回撤', matched_funding_hold_return: '同资金被动持有', trade_count: '成交笔数', total_fees: '总手续费', buy_count: '买入次数', sell_count: '卖出次数', turnover: '换手率' }
+const percentMetrics = ['peak_principal_return', 'max_principal_drawdown', 'matched_funding_hold_return']
+const countMetrics = ['trade_count', 'buy_count', 'sell_count']
 type Strategy = { key: string; name: string; value: StrategyResult }
-const tone = (key: string, value: number) => ['total_return', 'cagr'].includes(key) ? value >= 0 ? 'gain' : 'loss' : key === 'max_drawdown' ? 'loss' : ''
+const tone = (key: string, value: number | null | undefined) => {
+  if (value == null || !Number.isFinite(value)) return ''
+  if (key === 'max_principal_drawdown') return 'loss'
+  return percentMetrics.includes(key) ? value >= 0 ? 'gain' : 'loss' : ''
+}
 const timestampMs = (value: unknown) => {
   const text = String(value ?? '').trim().replace(' ', 'T')
   const parsed = Date.parse(text)
@@ -50,35 +56,22 @@ function bucketIndex(timestamp: unknown, bucketTimes: number[], bucketLabels: st
   return Math.min(low, bucketTimes.length - 1)
 }
 
+/** v5 results no longer ship period returns, so they are rebuilt from the peak-principal equity curve. */
 function periodRows(strategies: Strategy[], period: 'year' | 'month') {
-  const all: Record<string, Record<string, number>> = {}
+  const all: Record<string, Record<string, number | null>> = {}
   for (const strategy of strategies) {
-    if (strategy.value.return_basis === 'cost') continue
     const groups: Record<string, number[]> = {}
-    for (const point of strategy.value.period_returns ?? []) {
-      const timestamp = String(point.timestamp ?? '')
-      if (!timestamp) continue
-      const day = timestamp.slice(0, 10)
+    for (const point of strategy.value.equity ?? []) {
+      const curve = point.principal_curve
+      if (curve == null || !Number.isFinite(curve)) continue
+      const day = String(point.timestamp ?? '').slice(0, 10)
+      if (!day) continue
       const key = period === 'year' ? day.slice(0, 4) : day.slice(0, 7)
-      const dailyReturn = Number(point.return)
-      if (Number.isFinite(dailyReturn)) (groups[key] ??= []).push(dailyReturn)
+      ;(groups[key] ??= []).push(curve)
     }
-    if (Object.keys(groups).length) {
-      for (const [key, returns] of Object.entries(groups)) {
-        ;(all[key] ??= {})[strategy.key] = returns.reduce((growth, value) => growth * (1 + value), 1) - 1
-      }
-    } else {
-      const fallback: Record<string, EquityPoint[]> = {}
-      for (const point of strategy.value.equity ?? []) {
-        const day = String(point.timestamp).slice(0, 10)
-        const key = period === 'year' ? day.slice(0, 4) : day.slice(0, 7)
-        ;(fallback[key] ??= []).push(point)
-      }
-      for (const [key, points] of Object.entries(fallback)) {
-        const first = points[0]?.equity ?? 0
-        const last = points[points.length - 1]?.equity ?? 0
-        ;(all[key] ??= {})[strategy.key] = first ? last / first - 1 : 0
-      }
+    for (const [key, curves] of Object.entries(groups)) {
+      if (curves.length < 2) continue
+      ;(all[key] ??= {})[strategy.key] = curves[curves.length - 1] - curves[0]
     }
   }
   return Object.entries(all).sort(([a], [b]) => b.localeCompare(a))
@@ -103,6 +96,10 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
   const curvePeriod = equityFrequency === '1d' ? '每日收盘' : '回测时间点'
   const shareUnit = resultShareUnit(result?.symbol)
   const parameters = useMemo(() => savedGridParameters(result), [result])
+  const peakPrincipalBasis = result?.accounting_basis === 'peak_principal_v2' || (result?.accounting_basis == null && (result?.result_schema_version === 2 || result?.schema_version === 3))
+  const externalTopups = result?.funding?.external_topups ?? result?.strategies?.grid?.metrics?.external_topups ?? result?.funding?.topups
+  const matchedHoldInvested = result?.funding?.matched_funding_hold_invested ?? result?.strategies?.grid?.metrics?.matched_funding_hold_invested ?? result?.strategies?.matched_funding_hold?.metrics?.total_invested
+  const periodData = useMemo(() => periodRows(strategies, unit), [strategies, unit])
 
   useEffect(() => {
     let active = true
@@ -165,7 +162,7 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
   }, [bars, reference, result?.config?.frequency])
 
   return <div className='results-page'>
-    <PageHeader eyebrow='PERFORMANCE REVIEW' title='结果分析' description='比较策略收益、回撤和网格持仓，按同一日期核对表现。' action={<div className='button-row export-row'><Button variant='secondary' busy={busy === 'json'} disabled={!result} onClick={() => void exportFile('json')}><Download size={14} />JSON</Button><Button variant='secondary' busy={busy === 'equity'} disabled={!result} onClick={() => void exportFile('equity')}>净值 CSV</Button><Button variant='secondary' busy={busy === 'trades'} disabled={!result} onClick={() => void exportFile('trades')}>成交 CSV</Button></div>} />
+    <PageHeader eyebrow='PERFORMANCE REVIEW' title='结果分析' description='比较各策略的峰值本金收益、回撤和网格持仓，按同一日期核对表现。' action={<div className='button-row export-row'><Button variant='secondary' busy={busy === 'json'} disabled={!result} onClick={() => void exportFile('json')}><Download size={14} />JSON</Button><Button variant='secondary' busy={busy === 'equity'} disabled={!result} onClick={() => void exportFile('equity')}>净值 CSV</Button><Button variant='secondary' busy={busy === 'trades'} disabled={!result} onClick={() => void exportFile('trades')}>成交 CSV</Button></div>} />
     {error && <ErrorBox message={error} onClose={() => setError('')} />}
     <div className='results-primary'>
       <Card title='回测结果' className='results-overview' action={<div className='result-select'><SelectInput aria-label='选择回测结果' value={selectedId} onChange={(event) => setSelectedId(event.target.value)}><option value=''>选择结果</option>{results.map((item) => <option key={item.id} value={item.id}>{item.symbol} · {item.title} · {new Date(item.created_at).toLocaleString('zh-CN', { hour12: false })}</option>)}</SelectInput><Button variant='quiet' aria-label='刷新回测结果' onClick={() => {
@@ -182,14 +179,24 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
           {isDemoResult && <div className='demo-callout'>此结果基于本机生成的演示行情，不代表真实历史数据或投资结论。</div>}
           <div className='strategy-metrics results-metrics'>{strategies.map((strategy) => {
             const metrics = strategy.value.metrics
-            const totalReturn = metrics?.total_return
+            const peakReturn = metrics?.peak_principal_return
+            const matchedHoldReturn = metrics?.matched_funding_hold_return
+            const excess = peakReturn != null && matchedHoldReturn != null && Number.isFinite(peakReturn) && Number.isFinite(matchedHoldReturn) ? peakReturn - matchedHoldReturn : null
             return <div className={'strategy-card ' + strategy.key} key={strategy.key}>
-              <div className='strategy-top'><div><span className='strategy-swatch' style={{ background: colors[strategy.key] ?? '#69758b' }} /><strong>{strategy.name}</strong></div><Badge tone={totalReturn == null || !Number.isFinite(totalReturn) ? 'neutral' : totalReturn >= 0 ? 'red' : 'green'}>{percent(totalReturn)}</Badge></div>
-              <div className='strategy-detail-grid'>{strategy.value.return_basis === 'cost' ? <>
-                <div><small>累计投入</small><strong>{money(metrics?.total_invested)} 元</strong></div><div><small>总手续费</small><strong>{money(metrics?.total_fees)} 元</strong></div><div><small>跳过期数</small><strong>{metrics?.skipped_periods ?? '—'}</strong></div><div><small>成交笔数</small><strong>{metrics?.trade_count ?? '—'}</strong></div>
-              </> : <>
-                <div><small>{result.schema_version === 3 ? '时间加权年化' : '年化收益'}</small><strong>{percent(metrics?.cagr)}</strong></div><div><small>{result.schema_version === 3 ? '资金流调整回撤' : '最大回撤'}</small><strong className='loss'>{percent(metrics?.max_drawdown)}</strong></div><div><small>夏普比率</small><strong>{metrics?.sharpe == null || !Number.isFinite(metrics.sharpe) ? '—' : metrics.sharpe.toFixed(2)}</strong></div><div><small>成交笔数</small><strong>{metrics?.trade_count ?? '—'}</strong></div>
-              </>}</div>
+              <div className='strategy-top'><div><span className='strategy-swatch' style={{ background: colors[strategy.key] ?? '#69758b' }} /><strong>{strategy.name}</strong></div><Badge tone={peakReturn == null || !Number.isFinite(peakReturn) ? 'neutral' : peakReturn >= 0 ? 'red' : 'green'}>{percent(peakReturn)}</Badge></div>
+              <div className='strategy-detail-grid'>
+                <div><small>最大本金回撤</small><strong className='loss'>{percent(metrics?.max_principal_drawdown)}</strong></div>
+                <div><small>成交笔数</small><strong>{metrics?.trade_count ?? '—'}</strong></div>
+                <div><small>总手续费</small><strong>{money(metrics?.total_fees)} 元</strong></div>
+                {strategy.key === 'grid' && <>
+                  <div><small>同资金被动持有</small><strong>{percent(matchedHoldReturn)}</strong></div>
+                  <div><small>超额（同资金被动持有）</small><strong className={excess == null ? '' : excess >= 0 ? 'gain' : 'loss'}>{excess == null ? '—' : percent(excess)}</strong></div>
+                </>}
+                {strategy.key === 'dca' && <>
+                  <div><small>累计投入</small><strong>{money(metrics?.total_invested)} 元</strong></div>
+                  <div><small>跳过期数</small><strong>{metrics?.skipped_periods ?? '—'}</strong></div>
+                </>}
+              </div>
               {strategy.value.floor_penalty_basis && <p className='field-hint'>底仓惩罚 {percent(strategy.value.floor_penalty, 4)} · {strategy.value.floor_episode_count ?? 0} 段 · 各段上涨格数 {strategy.value.floor_episode_grids?.length ? strategy.value.floor_episode_grids.join(' / ') : '无'}</p>}
             </div>
           })}</div>
@@ -199,17 +206,17 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
         <Card title='本次网格参数' className='result-parameters' subtitle='来自此结果保存的配置与资金口径'>
           <dl className='result-parameter-list'>{parameters.map((parameter) => <div className='result-parameter' key={parameter.key}><dt>{parameter.label}</dt><dd>{parameter.value}</dd>{parameter.note && <small className='result-parameter-note'>{parameter.note}</small>}</div>)}</dl>
         </Card>
-        <Card title='收益、回撤与网格持仓' className='results-curves-card' subtitle={(result.schema_version === 3 ? '收益率 = 累计盈利 ÷ 周期峰值净投入 · 风险指标使用资金流调整后的单位净值 · ' : '收益率 = 资产总值 ÷ 累计实际投入 − 1 · ') + curvePeriod + ' · 三图共享日期、缩放和悬浮值'} action={<Badge tone={result.accounting_basis ? 'blue' : 'amber'}>{result.schema_version === 3 ? '峰值本金' : result.accounting_basis ? '独立投入' : '历史口径'}</Badge>}>
+        <Card title='收益、回撤与网格持仓' className='results-curves-card' subtitle={(peakPrincipalBasis ? '收益率 = (资产总值 − 累计投入) ÷ 峰值本金 · 回撤 = 本金利润曲线回撤 · ' : result.accounting_basis ? '收益率 = 资产总值 ÷ 累计实际投入 − 1 · ' : '收益率 = 资产总值 ÷ 初始资产 − 1 · ') + curvePeriod + ' · 三图共享日期、缩放和悬浮值'} action={<Badge tone={result.accounting_basis ? 'blue' : 'amber'}>{peakPrincipalBasis ? '峰值本金' : result.accounting_basis ? '独立投入' : '历史口径'}</Badge>}>
           <ResultsCurves result={result} />
         </Card>
       </>}
     </div>
     {result && <div className='result-disclosures'>
-      <Disclosure id='results-funding' title='资金口径与完整配置' summary={result.funding ? '估值、初始资产、定投与费用参数' : '查看此结果保存的参数'}>
+      <Disclosure id='results-funding' title='资金口径与完整配置' summary={result.funding ? '峰值本金、外部补款与费用参数' : '查看此结果保存的参数'}>
         <div className='result-details-grid'>
           <Card title={result.funding ? '股数回测口径' : '历史回测口径'}>
             {result.funding ? <>
-              <p>估值日 {result.funding.reference_date ?? '—'} · 网格起始资产 {money(result.funding.initial_equity)} 元 · {result.schema_version === 3 ? `峰值净投入 ${money(result.funding.peak_invested ?? result.funding.initial_equity)} 元 · 累计补款 ${money(result.funding.topups)} 元` : `网格预留现金 ${money(result.funding.reserve_cash)} 元`} · 实际截至 {result.effective_end_date ?? '—'}</p>
+              <p>估值日 {result.funding.reference_date ?? '—'} · 峰值本金 {money(result.funding.peak_invested)} 元 · 外部补款 {money(externalTopups)} 元 · 同资金被动持有投入 {money(matchedHoldInvested)} 元 · 实际截至 {result.effective_end_date ?? '—'}</p>
               <p>期初持有：网格 {result.config?.initial_shares ?? '—'} {shareUnit} · 全仓 {result.funding.buy_hold_initial_shares ?? '—'} {shareUnit} · 定投 {result.config?.dca?.initial_shares ?? '—'} {shareUnit}。初始资产：全仓 {money(result.funding.buy_hold_initial_equity)} 元 · 定投 {money(result.funding.dca_initial_equity)} 元；定投累计实际投入 {money(result.strategies?.dca?.metrics?.total_invested)} 元，各策略使用独立资产账户。</p>
               <pre className='json-preview'>{JSON.stringify(result.funding, null, 2)}</pre>
             </> : <p>本结果按保存记录中的历史资金口径展示。缺失的参数与投入数据以“—”表示。</p>}
@@ -221,15 +228,15 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
         <div className='table-wrap'><table><thead><tr><th>指标</th>{strategies.map((strategy) => <th key={strategy.key}>{strategy.name}</th>)}</tr></thead><tbody>
           {Object.entries(metricLabels).map(([key, label]) => <tr key={key}><td>{label}</td>{strategies.map((strategy) => {
             const value = strategy.value.metrics?.[key]
-            const shown = ['total_return', 'cagr', 'max_drawdown'].includes(key) ? percent(value) : key.includes('count') ? value ?? '—' : key === 'total_fees' ? money(value) : value == null || !Number.isFinite(value) ? '—' : value.toFixed(2)
-            return <td key={strategy.key} className={tone(key, Number(value))}>{shown}</td>
+            const shown = percentMetrics.includes(key) ? percent(value) : countMetrics.includes(key) ? value == null || !Number.isFinite(value) ? '—' : String(value) : key === 'total_fees' ? money(value) : value == null || !Number.isFinite(value) ? '—' : value.toFixed(2)
+            return <td key={strategy.key} className={tone(key, value)}>{shown}</td>
           })}</tr>)}
-          {((result.schema_version === 2 ? ['buy_hold'] : ['dca', 'buy_hold']) as Array<'dca' | 'buy_hold'>).map((baseline) => <tr key={baseline}><td>{baseline === 'dca' ? '相对定投超额' : '相对全仓超额'}（百分点）</td>{strategies.map((strategy) => {
-            const strategyReturn = strategy.value.metrics?.total_return
-            const baselineReturn = result.strategies?.[baseline]?.metrics?.total_return
-            const excess = strategyReturn != null && baselineReturn != null && Number.isFinite(strategyReturn) && Number.isFinite(baselineReturn) ? strategyReturn - baselineReturn : null
-            return <td key={strategy.key} className={excess == null ? '' : excess >= 0 ? 'gain' : 'loss'}>{strategy.value.return_basis === 'cost' || excess == null ? '—' : (excess * 100).toFixed(2)}</td>
-          })}</tr>)}
+          <tr><td>相对同资金被动持有超额（百分点）</td>{strategies.map((strategy) => {
+            const strategyReturn = strategy.value.metrics?.peak_principal_return
+            const baselineReturn = result.strategies?.matched_funding_hold?.metrics?.peak_principal_return
+            const excess = strategy.key === 'matched_funding_hold' || strategyReturn == null || baselineReturn == null || !Number.isFinite(strategyReturn) || !Number.isFinite(baselineReturn) ? null : strategyReturn - baselineReturn
+            return <td key={strategy.key} className={excess == null ? '' : excess >= 0 ? 'gain' : 'loss'}>{excess == null ? '—' : (excess * 100).toFixed(2)}</td>
+          })}</tr>
         </tbody></table></div>
       </Disclosure>
       <Disclosure id='results-candles' title='K 线与成交标记' summary={(result.config?.frequency ?? '频率未知') + ' · ' + (reference?.name ?? '策略')}>
@@ -238,8 +245,8 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
         </Card>
       </Disclosure>
       <Disclosure id='results-period-returns' title='年 / 月收益' summary={unit === 'year' ? '年度分解' : '月度分解'}>
-        <Card subtitle={result.schema_version === 2 ? '网格和持有按每日收益连乘；定投采用累计成本收益，不列月年收益。' : '由每日收益连乘计算，包含区间首日收益。'} action={<div className='segmented'><button className={unit === 'year' ? 'selected' : ''} onClick={() => setUnit('year')}>年度</button><button className={unit === 'month' ? 'selected' : ''} onClick={() => setUnit('month')}>月度</button></div>}>
-          <div className='table-wrap'><table><thead><tr><th>区间</th>{strategies.map((strategy) => <th key={strategy.key}>{strategy.name}</th>)}</tr></thead><tbody>{periodRows(strategies, unit).map(([period, values]) => <tr key={period}><td>{period}</td>{strategies.map((strategy) => <td key={strategy.key} className={Number(values[strategy.key]) >= 0 ? 'gain' : 'loss'}>{percent(values[strategy.key])}</td>)}</tr>)}</tbody></table></div>
+        <Card subtitle={periodData.length ? '区间收益 = 期末峰值本金净值 − 期初峰值本金净值，按峰值本金口径分段累计。' : '当前结果没有峰值本金净值，无法计算区间收益。'} action={<div className='segmented'><button className={unit === 'year' ? 'selected' : ''} onClick={() => setUnit('year')}>年度</button><button className={unit === 'month' ? 'selected' : ''} onClick={() => setUnit('month')}>月度</button></div>}>
+          {periodData.length ? <div className='table-wrap'><table><thead><tr><th>区间</th>{strategies.map((strategy) => <th key={strategy.key}>{strategy.name}</th>)}</tr></thead><tbody>{periodData.map(([period, values]) => <tr key={period}><td>{period}</td>{strategies.map((strategy) => { const value = values[strategy.key]; return <td key={strategy.key} className={value == null ? '' : value >= 0 ? 'gain' : 'loss'}>{percent(value)}</td> })}</tr>)}</tbody></table></div> : <Empty title='后端未提供区间收益' detail='此结果的净值点没有峰值本金口径数据，无法计算年 / 月收益。' />}
         </Card>
       </Disclosure>
       <Disclosure id='results-trades' title='成交记录' summary={(reference?.value.trades?.length ?? 0) + ' 笔 · ' + (reference?.name ?? '策略')}>

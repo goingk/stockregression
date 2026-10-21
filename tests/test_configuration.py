@@ -71,8 +71,18 @@ def test_flat_migration_materialises_one_file_and_archives_exact_legacy_defaults
     assert archived["protocol_version"] == 4
     assert len(archived["ranges"]) == 7
     assert archived["ranges"]["max_shares"] == {"low": 20000.0, "high": 22000.0, "step": 2000.0}
-    assert document["research"]["defaults"]["strategy_version"] == 4
-    assert loaded.workbench_defaults.research.strategy_version == 4
+    defaults = document["research"]["defaults"]
+    assert defaults["protocol_version"] == 5
+    assert defaults["strategy_version"] == 5
+    assert defaults["ranking_mode"] == "robust_j"
+    assert defaults["max_principal_drawdown"] == 0.2
+    assert defaults["training_window_mode"] == "same_price"
+    assert defaults["training_budget"] == 20_000
+    assert defaults["validation_budget"] == 100_000
+    assert defaults["reporting_budget"] == 1_000
+    assert loaded.workbench_defaults.research.strategy_version == 5
+    for retired in ("mode", "n_trials", "max_drawdown", "bootstrap_reps", "outer_validation_days"):
+        assert retired not in defaults
     assert document["market_data"]["network_timeout_seconds"] == 15
 
 

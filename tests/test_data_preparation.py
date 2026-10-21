@@ -147,6 +147,7 @@ def test_market_scope_update_does_not_refresh_the_catalog(tmp_path, monkeypatch)
         "symbols": [], "timeframe": "1day", "mode": "incremental", "scope": "market",
         "initialize": False, "workers": 1,
     })
+    assert app.state.store.claim_job(job_id, "test-worker")
     execute_job(str(root), job_id)
     job = app.state.store.job(job_id)
     assert job["status"] == "completed", job.get("error")

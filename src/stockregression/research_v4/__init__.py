@@ -1,4 +1,4 @@
-"""Protocol v4 geometric-grid parameter research."""
+"""Shared parameter-space, ledger-evaluation and v5 catalog helpers."""
 
 from .selector import estimate_search, select_at, strategy_descriptions
 

@@ -181,7 +181,7 @@ class SearchRange(BaseModel):
         return self
 
 
-NeighborhoodField = Literal["buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares"]
+NeighborhoodField = Literal["buy_step", "sell_step", "sell_shares", "buy_shares"]
 
 # The true exchange/config minimum for each research dimension.  Granularity
 # controls how densely the research samples this space; it never changes the
@@ -220,27 +220,28 @@ class ResearchStrategySpec(BaseModel):
     """Versioned research algorithm configuration."""
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
-    strategy_id: Literal["geometric_excess_neighborhood", "geometric_robust_j"] = "geometric_robust_j"
-    strategy_version: Literal[1, 2, 3, 4] = 4
+    strategy_id: Literal["geometric_robust_j"] = "geometric_robust_j"
+    strategy_version: Literal[5] = 5
     search_method: Literal["auto", "hierarchical", "exhaustive"] = "auto"
-    ranking_mode: Literal["max_volume", "fixed_mean"] = "fixed_mean"
+    ranking_mode: Literal["robust_j"] = "robust_j"
     hypercube_edge: int = Field(default=3, ge=1, le=99)
     granularity: dict[str, float] = Field(default_factory=lambda: dict(GRANULARITY_DEFAULTS))
     training_budget: int = Field(default=20_000, ge=1, le=1_000_000)
     validation_budget: int = Field(default=100_000, ge=1, le=2_000_000)
+    reporting_budget: int = Field(default=1_000, ge=0, le=2_000_000)
+    total_evaluation_budget: int | None = Field(default=None, ge=1, le=10_000_000)
+    max_runtime_seconds: int = Field(default=3600, ge=1, le=86400)
     recommendation_count: int = Field(default=10, ge=1, le=100)
-    max_shares_mode: Literal["search", "unlimited"] = "search"
+    max_shares_mode: Literal["unlimited"] = "unlimited"
     slippage_mode: Literal["configured", "zero"] = "configured"
     neighborhood_fields: list[NeighborhoodField] = Field(default_factory=lambda: [
-        "buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares",
+        "buy_step", "sell_step", "sell_shares", "buy_shares",
     ])
     fixed_half_widths: dict[str, float] = Field(default_factory=lambda: {
         "buy_step": 0.001,
         "sell_step": 0.001,
         "sell_shares": 100,
         "buy_shares": 100,
-        "min_shares": 500,
-        "max_shares": 500,
     })
     # Robust-J research parameters.  They are inert for the historical
     # strategy versions, but live in the versioned strategy so a task snapshot
@@ -257,6 +258,7 @@ class ResearchStrategySpec(BaseModel):
     floor_k_ref: float = Field(default=10.0, gt=0, le=1_000_000)
     training_min_days: int = Field(default=250, ge=20, le=5000)
     training_max_days: int = Field(default=500, ge=20, le=5000)
+    training_window_mode: Literal["same_price", "fixed"] = "same_price"
     peak_tolerance: float = Field(default=1e-12, gt=0, le=.1)
     start_min: int = Field(default=20, ge=1, le=1000)
     start_max: int = Field(default=64, ge=1, le=1000)
@@ -276,25 +278,17 @@ class ResearchStrategySpec(BaseModel):
         if not isinstance(value, dict):
             return value
         value = dict(value)
-        if "strategy_version" not in value:
-            # Explicit legacy ranking modes keep their historical semantics.
-            # A request that omits both fields is a new study and gets v3.
-            if "ranking_mode" in value:
-                value["strategy_version"] = 1 if value.get("ranking_mode") == "fixed_mean" else 2
-            else:
-                value["strategy_version"] = 4
-        if "ranking_mode" not in value:
-            value["ranking_mode"] = "fixed_mean" if int(value.get("strategy_version", 4)) in (1, 3, 4) else "max_volume"
-        value["strategy_id"] = (
-            "geometric_robust_j" if int(value.get("strategy_version", 4)) == 4
-            else "geometric_excess_neighborhood"
-        )
-        robust = int(value.get("strategy_version", 4)) == 4
-        if "max_shares_mode" not in value:
-            value["max_shares_mode"] = "unlimited" if robust else "search"
-        if int(value.get("strategy_version", 4)) == 4 and "neighborhood_fields" not in value:
+        if "strategy_version" in value and value.get("strategy_version") != 5:
+            raise ValueError("旧研究策略版本已移除；请使用 strategy_version=5")
+        if "ranking_mode" in value and value.get("ranking_mode") != "robust_j":
+            raise ValueError("旧研究排序模式已移除；请使用 ranking_mode=robust_j")
+        if "strategy_id" in value and value.get("strategy_id") != "geometric_robust_j":
+            raise ValueError("旧研究策略已移除；请使用 strategy_id=geometric_robust_j")
+        if "max_shares_mode" in value and value.get("max_shares_mode") != "unlimited":
+            raise ValueError("旧研究股数模式已移除；请使用 max_shares_mode=unlimited")
+        if "neighborhood_fields" not in value:
             value["neighborhood_fields"] = ["buy_step", "sell_step", "buy_shares", "sell_shares"]
-        granularity_defaults = GRANULARITY_DEFAULTS if robust else LEGACY_GRANULARITY_DEFAULTS
+        granularity_defaults = GRANULARITY_DEFAULTS
         saved_granularity = value.get("granularity")
         if not isinstance(saved_granularity, dict):
             value["granularity"] = dict(granularity_defaults)
@@ -327,19 +321,14 @@ class ResearchStrategySpec(BaseModel):
 
     @model_validator(mode="after")
     def valid_half_widths(self):
-        if self.strategy_version == 2 and self.ranking_mode != "max_volume":
-            raise ValueError("连通域策略 v2 仅支持最大正收益连通域；固定邻域请使用策略 v1")
-        if self.strategy_version in (3, 4) and self.ranking_mode != "fixed_mean":
-            raise ValueError("超正方体平均超额收益策略 v3 只使用 fixed_mean 评分")
         robust_fields = {"buy_step", "sell_step", "buy_shares", "sell_shares"}
-        if self.strategy_version == 4 and set(self.neighborhood_fields) != robust_fields:
-            raise ValueError("稳健 J 策略 v4 的搜索轴必须为 buy_step、sell_step、buy_shares、sell_shares")
+        if set(self.neighborhood_fields) != robust_fields:
+            raise ValueError("稳健 J 策略 v5 的搜索轴必须为 buy_step、sell_step、buy_shares、sell_shares")
         if self.hypercube_edge < 1 or self.hypercube_edge % 2 != 1:
             raise ValueError("超正方体边长必须为正奇数，使中心落在整数研究刻度上")
-        allowed_granularity = set(GRANULARITY_DEFAULTS if self.strategy_version == 4 else LEGACY_GRANULARITY_DEFAULTS)
+        allowed_granularity = set(GRANULARITY_DEFAULTS)
         if set(self.granularity) != allowed_granularity:
-            expected = "四个稳健 J 搜索轴" if self.strategy_version == 4 else "全部六个研究参数"
-            raise ValueError(f"研究细粒度必须包含{expected}")
+            raise ValueError("研究细粒度必须包含四个稳健 J 搜索轴")
         for name, value in self.granularity.items():
             minimum = float(GRANULARITY_MINIMUMS[name])
             sampled = float(value) / minimum
@@ -356,18 +345,17 @@ class ResearchStrategySpec(BaseModel):
             raise ValueError("局部搜索起点数下限不能大于上限")
         if not self.initial_strides or any(int(value) < 1 for value in self.initial_strides):
             raise ValueError("局部搜索初始步长必须为正整数")
-        if self.strategy_version == 4:
-            if self.eta_floor > self.eta_limit:
-                raise ValueError("底仓保护阈值不能高于持仓免罚阈值")
-            if not math.isfinite(self.floor_k_ref) or self.floor_k_ref <= 0:
-                raise ValueError("底仓参考格数必须为正数")
-            if self.eta_hard_cap is not None and self.eta_hard_cap < self.eta_limit:
-                raise ValueError("最大持仓淘汰阈值不能低于持仓免罚阈值")
-            if len(self.initial_strides) > 8:
-                raise ValueError("局部搜索初始步长最多设置八项")
-        allowed = {"buy_step", "sell_step", "sell_shares", "buy_shares", "min_shares", "max_shares"}
-        if set(self.fixed_half_widths) - allowed:
-            raise ValueError("固定邻域半宽包含不支持的参数")
+        if self.eta_floor > self.eta_limit:
+            raise ValueError("底仓保护阈值不能高于持仓免罚阈值")
+        if not math.isfinite(self.floor_k_ref) or self.floor_k_ref <= 0:
+            raise ValueError("底仓参考格数必须为正数")
+        if self.eta_hard_cap is not None and self.eta_hard_cap < self.eta_limit:
+            raise ValueError("最大持仓淘汰阈值不能低于持仓免罚阈值")
+        if len(self.initial_strides) > 8:
+            raise ValueError("局部搜索初始步长最多设置八项")
+        allowed = {"buy_step", "sell_step", "sell_shares", "buy_shares"}
+        if set(self.fixed_half_widths) != allowed:
+            raise ValueError("固定邻域半宽必须包含四个稳健 J 搜索轴")
         for name, value in self.fixed_half_widths.items():
             if float(value) <= 0:
                 raise ValueError("固定邻域半宽必须为正数")
@@ -376,14 +364,14 @@ class ResearchStrategySpec(BaseModel):
                 if abs(float(value) / 0.0001 - scaled) > 1e-7:
                     raise ValueError("买卖间距半宽必须对齐 0.0001")
             else:
-                unit = 500 if name in {"min_shares", "max_shares"} else 100
+                unit = 100
                 if abs(float(value) / unit - round(float(value) / unit)) > 1e-7:
                     raise ValueError(f"{name} 邻域半宽必须对齐 {unit}")
         return self
 
 
 class ResearchContext(BaseModel):
-    """Public v4 research input independent of backtest search values."""
+    """Public v5 research input independent of backtest search values."""
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     symbol: str
@@ -437,7 +425,7 @@ class RecommendationRegion(BaseModel):
     stress: dict[str, Any] = Field(default_factory=dict)
 
 
-class ResearchRequestV4(BaseModel):
+class ResearchRequestV5(BaseModel):
     """Standalone public request that does not carry backtest search defaults."""
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
@@ -446,23 +434,14 @@ class ResearchRequestV4(BaseModel):
     strategy: ResearchStrategySpec = Field(default_factory=ResearchStrategySpec)
     selection_target: Literal["fixed", "adaptive", "both"] = "both"
     rebalance_days: int = Field(default=63, ge=1)
-    bootstrap_reps: int = Field(default=10_000, ge=1)
-    bootstrap_block_lengths: list[int] = Field(default_factory=lambda: [20, 10, 40])
-    significance_alpha: float = Field(default=.05, gt=0, lt=1)
-    outer_validation_days: int = Field(default=126, ge=20, le=1000)
     seed: int = 42
     top_candidates: int = Field(default=20, ge=1, le=100)
-    max_drawdown: float = Field(default=0.2, gt=0, le=1)
+    max_principal_drawdown: float = Field(default=0.2, gt=0, le=1)
     min_trades: int = Field(default=10, ge=0)
     min_history_days: int = Field(default=250, ge=20)
     min_minute_ratio: float = Field(default=0.95, ge=0, le=1)
     configuration_revision: str | None = None
 
-    @model_validator(mode="after")
-    def valid_blocks(self):
-        if not self.bootstrap_block_lengths or any(int(value) < 1 for value in self.bootstrap_block_lengths):
-            raise ValueError("Bootstrap 区块长度必须为正整数")
-        return self
 
     def to_optimization(self) -> OptimizationConfig:
         context = self.research_context
@@ -470,7 +449,7 @@ class ResearchRequestV4(BaseModel):
             schema_version=3, symbol=context.symbol, start_date=context.start_date,
             end_date=context.end_date, frequency=context.frequency,
             initial_shares=context.initial_shares, min_shares=0,
-            max_shares=None if self.strategy.strategy_version == 4 or self.strategy.max_shares_mode == "unlimited" else max(2000, context.initial_shares),
+            max_shares=None,
             buy_shares=100, sell_shares=100, grid_mode="geometric",
             buy_step=.03, sell_step=.03,
             fees=context.fees, reference_price_mode=context.reference_price_mode,
@@ -478,11 +457,9 @@ class ResearchRequestV4(BaseModel):
             upper_price=context.upper_price, dca=context.dca,
         )
         return OptimizationConfig(
-            base=base, protocol_version=4, selection_target=self.selection_target,
-            rebalance_days=self.rebalance_days, bootstrap_reps=self.bootstrap_reps,
-            bootstrap_block_lengths=list(self.bootstrap_block_lengths), significance_alpha=self.significance_alpha,
-            outer_validation_days=self.outer_validation_days,
-            seed=self.seed, top_candidates=self.top_candidates, max_drawdown=self.max_drawdown,
+            base=base, protocol_version=5, selection_target=self.selection_target,
+            rebalance_days=self.rebalance_days,
+            seed=self.seed, top_candidates=self.top_candidates, max_principal_drawdown=self.max_principal_drawdown,
             min_trades=self.min_trades, min_history_days=self.min_history_days,
             min_minute_ratio=self.min_minute_ratio, strategy=self.strategy,
             research_context=self.research_context, ranges=self.ranges,
@@ -491,22 +468,17 @@ class ResearchRequestV4(BaseModel):
 
 
 class OptimizationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
     base: BacktestConfig
-    protocol_version: Literal[1, 2, 3, 4] = 1
+    protocol_version: Literal[5] = 5
     selection_target: Literal["fixed", "adaptive", "both"] = "both"
     rebalance_days: int = Field(default=63, ge=1)
-    bootstrap_reps: int = Field(default=10_000, ge=1)
-    bootstrap_block_lengths: list[int] = Field(default_factory=lambda: [20, 10, 40])
-    significance_alpha: float = Field(default=.05, gt=0, lt=1)
-    outer_validation_days: int = Field(default=126, ge=20, le=1000)
-    mode: Literal["historical", "robust", "both"] = "both"
-    n_trials: int = Field(default=200, ge=1, le=5000)
-    local_search_budget: int = Field(default=3000, ge=1, le=5000)
     seed: int = 42
     top_candidates: int = Field(default=20, ge=1, le=100)
-    max_drawdown: float = Field(default=0.2, gt=0, le=1)
+    max_principal_drawdown: float = Field(default=0.2, gt=0, le=1)
     min_trades: int = Field(default=10, ge=0)
-    min_history_days: int = Field(default=504, ge=20)
+    min_history_days: int = Field(default=250, ge=20)
     min_minute_ratio: float = Field(default=0.95, ge=0, le=1)
     strategy: ResearchStrategySpec = Field(default_factory=ResearchStrategySpec)
     research_context: ResearchContext | None = None
@@ -523,15 +495,19 @@ class OptimizationConfig(BaseModel):
     # identifier or enter any numerical calculation.
     configuration_revision: str | None = None
 
-    @model_validator(mode="after")
-    def valid_statistics(self):
-        if not self.bootstrap_block_lengths or any(int(value) < 1 for value in self.bootstrap_block_lengths):
-            raise ValueError("Bootstrap 区块长度必须为正整数")
-        return self
+
+
+    def protocol_description(self) -> dict[str, Any]:
+        """Single source of protocol facts for preflight, results and exports."""
+        return research_protocol_description(
+            self.strategy, self.selection_target,
+            max_principal_drawdown=self.max_principal_drawdown,
+            min_trades=self.min_trades,
+        )
 
     @model_validator(mode="after")
     def valid_v4_ranges(self):
-        if self.protocol_version == 4 and self.strategy.strategy_version == 4:
+        if self.protocol_version == 5 and self.strategy.strategy_version == 5:
             expected = {"buy_step", "sell_step", "buy_shares", "sell_shares"}
             if set(self.ranges) != expected:
                 raise ValueError("稳健 J 研究范围必须且只能包含四个搜索轴")
@@ -545,65 +521,49 @@ class OptimizationConfig(BaseModel):
         if not isinstance(values, dict) or "base" not in values:
             return values
         values = dict(values)
-        if values.get("protocol_version", 1) == 2:
-            if "n_trials" not in values:
-                values["n_trials"] = 1000
-        if values.get("protocol_version", 1) == 3 and "local_search_budget" not in values:
-            values["local_search_budget"] = 3000
-        if values.get("protocol_version", 1) == 4:
-            context = values.get("research_context")
-            raw_base = values["base"]
-            base_values = raw_base if isinstance(raw_base, dict) else raw_base.model_dump(mode="python")
-            base_values = dict(base_values)
-            if context is not None:
-                context = context if isinstance(context, ResearchContext) else ResearchContext.model_validate(context)
-                context_values = context.model_dump(mode="python")
-                fees = context_values.pop("fees")
-                base_values.update(context_values)
-                base_values["fees"] = fees
-            base_values["schema_version"] = 3
-            base_values["grid_mode"] = "geometric"
-            strategy_raw = values.get("strategy") or {}
-            strategy = strategy_raw if isinstance(strategy_raw, ResearchStrategySpec) else ResearchStrategySpec.model_validate(strategy_raw)
-            if strategy.strategy_version == 4:
-                base_values["min_shares"] = 0
-                base_values["max_shares"] = None
-                base_values["floor_penalty_config"] = {
-                    "eta_floor": strategy.eta_floor,
-                    "gamma_min": strategy.gamma_min,
-                    "floor_k_ref": strategy.floor_k_ref,
-                }
-            elif strategy.max_shares_mode == "unlimited":
-                base_values["max_shares"] = None
-            elif base_values.get("max_shares") is None:
-                raw_ranges = values.get("ranges") or {}
-                maximum = raw_ranges.get("max_shares") if isinstance(raw_ranges, dict) else None
-                high = maximum.get("high") if isinstance(maximum, dict) else getattr(maximum, "high", None)
-                base_values["max_shares"] = int(high) if high is not None else int(base_values.get("initial_shares", 1000))
-            if strategy.slippage_mode == "zero":
-                fees = dict(base_values.get("fees") or {})
-                fees["slippage_bps"] = 0
-                base_values["fees"] = fees
-            if values.get("research_context") is None:
-                values["research_context"] = {
-                    "symbol": base_values["symbol"], "start_date": base_values["start_date"],
-                    "end_date": base_values.get("end_date"), "frequency": base_values.get("frequency", "1m"),
-                    "initial_shares": base_values.get("initial_shares", 1000), "grid_mode": "geometric",
-                    "fees": base_values.get("fees") or {},
-                    "reference_price_mode": base_values.get("reference_price_mode", "auto"),
-                    "reference_price": base_values.get("reference_price"),
-                    "lower_price": base_values.get("lower_price"), "upper_price": base_values.get("upper_price"),
-                    "dca": base_values.get("dca") or {},
-                }
-            values["base"] = base_values
+        if "protocol_version" in values and values.get("protocol_version") != 5:
+            raise ValueError("旧研究协议已移除；请使用 protocol_version=5")
+        context = values.get("research_context")
+        raw_base = values["base"]
+        base_values = raw_base if isinstance(raw_base, dict) else raw_base.model_dump(mode="python")
+        base_values = dict(base_values)
+        if context is not None:
+            context = context if isinstance(context, ResearchContext) else ResearchContext.model_validate(context)
+            context_values = context.model_dump(mode="python")
+            fees = context_values.pop("fees")
+            base_values.update(context_values)
+            base_values["fees"] = fees
+        base_values["schema_version"] = 3
+        base_values["grid_mode"] = "geometric"
+        strategy_raw = values.get("strategy") or {}
+        strategy = strategy_raw if isinstance(strategy_raw, ResearchStrategySpec) else ResearchStrategySpec.model_validate(strategy_raw)
+        base_values["min_shares"] = 0
+        base_values["max_shares"] = None
+        base_values["floor_penalty_config"] = {
+            "eta_floor": strategy.eta_floor,
+            "gamma_min": strategy.gamma_min,
+            "floor_k_ref": strategy.floor_k_ref,
+        }
+        if strategy.slippage_mode == "zero":
+            fees = dict(base_values.get("fees") or {})
+            fees["slippage_bps"] = 0
+            base_values["fees"] = fees
+        if values.get("research_context") is None:
+            values["research_context"] = {
+                "symbol": base_values["symbol"], "start_date": base_values["start_date"],
+                "end_date": base_values.get("end_date"), "frequency": base_values.get("frequency", "1m"),
+                "initial_shares": base_values.get("initial_shares", 1000), "grid_mode": "geometric",
+                "fees": base_values.get("fees") or {},
+                "reference_price_mode": base_values.get("reference_price_mode", "auto"),
+                "reference_price": base_values.get("reference_price"),
+                "lower_price": base_values.get("lower_price"), "upper_price": base_values.get("upper_price"),
+                "dca": base_values.get("dca") or {},
+            }
+        values["base"] = base_values
         base = values["base"]
         base = base if isinstance(base, BacktestConfig) else BacktestConfig.model_validate(base)
-        if values.get("protocol_version", 1) == 2 and base.schema_version != 2:
-            raise ValueError("protocol_version=2 需要 base.schema_version=2")
-        if values.get("protocol_version", 1) in (3, 4) and base.schema_version != 3:
-            raise ValueError("protocol_version=3/4 需要 base.schema_version=3")
-        if base.schema_version not in (2, 3):
-            return values
+        if base.schema_version != 3:
+            raise ValueError("研究 protocol_version=5 需要 schema_version=3")
         raw_ranges = values.get("ranges")
         if isinstance(raw_ranges, dict) and "grid_step" in raw_ranges:
             ranges = dict(raw_ranges)
@@ -613,38 +573,99 @@ class OptimizationConfig(BaseModel):
             values["ranges"] = ranges
         if "ranges" not in values:
             values = {**values, "ranges": {
-                "buy_step": {"low": .005, "high": .1, "step": .005},
-                "sell_step": {"low": .005, "high": .1, "step": .005},
-                "buy_shares": {"low": 100, "high": 1000, "step": 100},
-                "sell_shares": {"low": 100, "high": 1000, "step": 100},
-                "min_shares": {"low": 0, "high": 1000, "step": 100},
-                "max_shares": {"low": 1000, "high": 5000, "step": 100},
+                "buy_step": {"low": .005, "high": .1},
+                "sell_step": {"low": .005, "high": .1},
+                "buy_shares": {"low": 100, "high": 1000},
+                "sell_shares": {"low": 100, "high": 1000},
             }}
-        if values.get("protocol_version") == 4:
-            inactive = {"buy_ratio", "sell_ratio", "initial_position", "min_position", "max_position", "initial_shares"}
-            strategy_for_ranges = values.get("strategy") or {}
-            strategy_for_ranges = strategy_for_ranges if isinstance(strategy_for_ranges, ResearchStrategySpec) else ResearchStrategySpec.model_validate(strategy_for_ranges)
-            if strategy_for_ranges.strategy_version == 4:
-                inactive |= {"min_shares", "max_shares", "grid_step"}
-        else:
-            inactive: set[str] = set()
+        inactive = {"buy_ratio", "sell_ratio", "initial_position", "min_position", "max_position", "initial_shares", "min_shares", "max_shares", "grid_step"}
         if isinstance(values["ranges"], dict):
             values = {**values, "ranges": {key: value for key, value in values["ranges"].items() if key not in inactive}}
-            if values.get("protocol_version") == 4:
-                strategy = values.get("strategy")
-                strategy = strategy if isinstance(strategy, ResearchStrategySpec) else ResearchStrategySpec.model_validate(strategy or {})
-                if strategy.strategy_version == 4:
-                    canonical_ranges = {}
-                    for name, raw in values["ranges"].items():
-                        if name in strategy.granularity:
-                            parsed = raw if isinstance(raw, SearchRange) else SearchRange.model_validate(raw)
-                            # v4 keeps one authoritative spacing value in
-                            # strategy.granularity; ranges contains bounds only.
-                            canonical_ranges[name] = SearchRange(low=parsed.low, high=parsed.high, step=None)
-                        else:
-                            canonical_ranges[name] = raw
-                    values["ranges"] = canonical_ranges
+            strategy = values.get("strategy")
+            strategy = strategy if isinstance(strategy, ResearchStrategySpec) else ResearchStrategySpec.model_validate(strategy or {})
+            canonical_ranges = {}
+            for name, raw in values["ranges"].items():
+                parsed = raw if isinstance(raw, SearchRange) else SearchRange.model_validate(raw)
+                canonical_ranges[name] = SearchRange(low=parsed.low, high=parsed.high, step=None)
+            values["ranges"] = canonical_ranges
         return values
+
+
+
+def research_protocol_description(
+    strategy: ResearchStrategySpec, selection_target: str = "both", *,
+    max_principal_drawdown: float | None = None, min_trades: int | None = None,
+) -> dict[str, Any]:
+    """Return the single protocol fact source used by every public surface."""
+    if selection_target not in {"fixed", "adaptive", "both"}:
+        raise ValueError("研究方案必须为 fixed、adaptive 或 both")
+    training = {
+        "mode": strategy.training_window_mode,
+        "single_block": True,
+        "max_days": int(strategy.training_max_days),
+        "internal_validation_folds": 0,
+    }
+    if strategy.training_window_mode == "fixed":
+        training.update({
+            "match_rule": "fixed_training_max_days",
+            "price_basis": "unadjusted_training_ledger",
+            "fallback": None,
+            "insufficient_history": "data_issue",
+        })
+    else:
+        training.update({
+            "min_days": int(strategy.training_min_days),
+            "same_price_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "price_basis": "decision_date_adjusted",
+            "fallback": "farthest_window_no_later_than_max_days",
+        })
+    return {
+        "protocol_version": 5,
+        "result_schema_version": 2,
+        "strategy_id": "geometric_robust_j",
+        "strategy_version": 5,
+        "ranking_mode": "robust_j",
+        "training": training,
+        "out_of_sample": {
+            "fixed": selection_target in ("fixed", "both"),
+            "adaptive": selection_target in ("adaptive", "both"),
+            "continuous_ledger": True,
+        },
+        "return_definition": "(final_equity-total_external_principal)/peak_external_principal",
+        "risk_definition": "profit_drawdown/peak_external_principal",
+        "ranking_baseline": "matched_funding_hold",
+        "ranking_basis": "peak_principal_return_difference",
+        "j_formula": "alpha*center_excess+(1-alpha)*neighborhood_mean-beta*downside-Cpos",
+        "j_inputs": {
+            "center_excess": "peak_principal_return_grid-matched_funding_hold_return_grid",
+            "neighborhood_weights": "exp(-distance^2/(2*sigma^2))",
+            "downside": "sqrt(weighted_mean(min(0, excess-tau)^2))",
+        },
+        "eligibility": {
+            "min_j_score": 0.0,
+            "j_score_is_exclusive": True,
+            "max_principal_drawdown": (
+                float(max_principal_drawdown) if max_principal_drawdown is not None else None
+            ),
+            "min_trades": int(min_trades) if min_trades is not None else None,
+            "require_two_way_trades": True,
+            "eta_hard_cap": strategy.eta_hard_cap,
+        },
+        "cost_stress": {
+            "role": "diagnostic", "multiplier": float(strategy.stress_cost_multiplier),
+        },
+        "statistics": {
+            "status": "not_applicable",
+            "reason": "本版本未提供峰值本金超额收益的显著性检验",
+        },
+        "budgets": {
+            "training_points": int(strategy.training_budget),
+            "neighborhood_points": int(strategy.validation_budget),
+            "reporting_points": int(strategy.reporting_budget),
+            "total_evaluations": strategy.total_evaluation_budget,
+            "max_runtime_seconds": int(strategy.max_runtime_seconds),
+        },
+    }
 
 
 @dataclass

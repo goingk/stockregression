@@ -1,0 +1,267 @@
+{
+  "symbol": "159611.SZ",
+  "data_version": "mkt-55b86ebb66f6e417d7ce3623",
+  "evaluation_start": "2024-02-02",
+  "evaluation_end": "2026-10-21",
+  "seed": 42,
+  "budgets": {
+    "training": 100,
+    "neighborhood": 100,
+    "reporting": 20,
+    "total": 1000
+  },
+  "windows": {
+    "same_price": {
+      "status": "partial",
+      "fixed_status": "partial",
+      "fixed": null,
+      "current": {
+        "decision_date": "2026-10-21",
+        "status": "partial",
+        "selected_params": null,
+        "diagnostic_params": {
+          "buy_step": 0.005,
+          "sell_step": 0.005,
+          "buy_shares": 2500,
+          "sell_shares": 2500,
+          "initial_shares": 1000,
+          "min_shares": 0,
+          "max_shares": null
+        },
+        "score": null,
+        "candidate_count": 160,
+        "eligible_count": 0,
+        "selected_eligible": false,
+        "reasons": [
+          "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 450 个交易日内距离评估日最远的一天作为训练时段起点",
+          "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+          "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值"
+        ],
+        "recommendation_regions": []
+      },
+      "training_window": {
+        "start": "2022-06-07",
+        "end": "2024-02-01",
+        "days": 408,
+        "anchor_date": "2024-02-01",
+        "anchor_price": 0.88,
+        "matched_date": "2022-06-07",
+        "matched": true,
+        "fallback": false,
+        "start_reason": "same_price_farthest",
+        "search_start": "2022-03-31",
+        "search_end": "2023-01-31",
+        "min_offset_trading_days": 250,
+        "max_offset_trading_days": 450,
+        "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+        "reason": "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 450 个交易日内距离评估日最远的一天作为训练时段起点",
+        "mode": "same_price",
+        "price_basis": "decision_date_adjusted",
+        "actions_applied": [],
+        "action_factor_fingerprint": null,
+        "data_issue": null
+      },
+      "protocol": {
+        "protocol_version": 5,
+        "result_schema_version": 2,
+        "strategy_id": "geometric_robust_j",
+        "strategy_version": 5,
+        "ranking_mode": "robust_j",
+        "training": {
+          "mode": "same_price",
+          "single_block": true,
+          "max_days": 450,
+          "internal_validation_folds": 0,
+          "min_days": 250,
+          "same_price_rule": "daily_low_lt_anchor_close_lt_daily_high",
+          "price_basis": "decision_date_adjusted",
+          "fallback": "farthest_window_no_later_than_max_days"
+        },
+        "out_of_sample": {
+          "fixed": true,
+          "adaptive": false,
+          "continuous_ledger": true
+        },
+        "return_definition": "(final_equity-total_external_principal)/peak_external_principal",
+        "risk_definition": "profit_drawdown/peak_external_principal",
+        "ranking_baseline": "matched_funding_hold",
+        "ranking_basis": "peak_principal_return_difference",
+        "j_formula": "alpha*center_excess+(1-alpha)*neighborhood_mean-beta*downside-Cpos",
+        "j_inputs": {
+          "center_excess": "peak_principal_return_grid-matched_funding_hold_return_grid",
+          "neighborhood_weights": "exp(-distance^2/(2*sigma^2))",
+          "downside": "sqrt(weighted_mean(min(0, excess-tau)^2))"
+        },
+        "eligibility": {
+          "min_j_score": 0.0,
+          "j_score_is_exclusive": true,
+          "max_principal_drawdown": 0.2,
+          "min_trades": 10,
+          "require_two_way_trades": true,
+          "eta_hard_cap": 3.5
+        },
+        "cost_stress": {
+          "role": "diagnostic",
+          "multiplier": 2.0
+        },
+        "statistics": {
+          "status": "not_applicable",
+          "reason": "本版本未提供峰值本金超额收益的显著性检验"
+        },
+        "budgets": {
+          "training_points": 100,
+          "neighborhood_points": 100,
+          "reporting_points": 20,
+          "total_evaluations": 1000,
+          "max_runtime_seconds": 180
+        }
+      },
+      "computation": {
+        "decision_count": 2,
+        "candidate_evaluations": 320,
+        "ledger_evaluations": 640,
+        "training_budget": 100,
+        "neighborhood_budget": 100,
+        "reporting_budget": 20,
+        "total_evaluation_budget": 1000,
+        "max_runtime_seconds": 180,
+        "evaluation_upper_bound": 4191,
+        "budget_contract_frozen": false,
+        "frozen_evaluation_budget": 1000,
+        "frozen_data_version": null,
+        "evaluation_budget_used": 320,
+        "evaluation_budget_remaining": 680,
+        "budget_stopped": false,
+        "budget_reason": null,
+        "estimated_task_memory_mb": 9.517213821411133,
+        "workspace_budget_mb": 8192.0
+      }
+    },
+    "fixed": {
+      "status": "partial",
+      "fixed_status": "partial",
+      "fixed": null,
+      "current": {
+        "decision_date": "2026-10-21",
+        "status": "partial",
+        "selected_params": null,
+        "diagnostic_params": {
+          "buy_step": 0.005,
+          "sell_step": 0.005,
+          "buy_shares": 2500,
+          "sell_shares": 2500,
+          "initial_shares": 1000,
+          "min_shares": 0,
+          "max_shares": null
+        },
+        "score": null,
+        "candidate_count": 160,
+        "eligible_count": 0,
+        "selected_eligible": false,
+        "reasons": [
+          "固定训练窗口取评估日前 450 个交易日",
+          "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+          "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值"
+        ],
+        "recommendation_regions": []
+      },
+      "training_window": {
+        "start": "2022-03-31",
+        "end": "2024-02-01",
+        "days": 450,
+        "anchor_date": "2024-02-01",
+        "anchor_price": 0.88,
+        "matched_date": null,
+        "matched": false,
+        "fallback": false,
+        "start_reason": "fixed_training_max_days",
+        "search_start": "2022-03-31",
+        "search_end": "2024-02-01",
+        "min_offset_trading_days": 250,
+        "max_offset_trading_days": 450,
+        "match_rule": "fixed_training_max_days",
+        "reason": "固定训练窗口取评估日前 450 个交易日",
+        "mode": "fixed",
+        "price_basis": "decision_date_adjusted",
+        "actions_applied": [],
+        "action_factor_fingerprint": null,
+        "data_issue": null
+      },
+      "protocol": {
+        "protocol_version": 5,
+        "result_schema_version": 2,
+        "strategy_id": "geometric_robust_j",
+        "strategy_version": 5,
+        "ranking_mode": "robust_j",
+        "training": {
+          "mode": "fixed",
+          "single_block": true,
+          "max_days": 450,
+          "internal_validation_folds": 0,
+          "match_rule": "fixed_training_max_days",
+          "price_basis": "unadjusted_training_ledger",
+          "fallback": null,
+          "insufficient_history": "data_issue"
+        },
+        "out_of_sample": {
+          "fixed": true,
+          "adaptive": false,
+          "continuous_ledger": true
+        },
+        "return_definition": "(final_equity-total_external_principal)/peak_external_principal",
+        "risk_definition": "profit_drawdown/peak_external_principal",
+        "ranking_baseline": "matched_funding_hold",
+        "ranking_basis": "peak_principal_return_difference",
+        "j_formula": "alpha*center_excess+(1-alpha)*neighborhood_mean-beta*downside-Cpos",
+        "j_inputs": {
+          "center_excess": "peak_principal_return_grid-matched_funding_hold_return_grid",
+          "neighborhood_weights": "exp(-distance^2/(2*sigma^2))",
+          "downside": "sqrt(weighted_mean(min(0, excess-tau)^2))"
+        },
+        "eligibility": {
+          "min_j_score": 0.0,
+          "j_score_is_exclusive": true,
+          "max_principal_drawdown": 0.2,
+          "min_trades": 10,
+          "require_two_way_trades": true,
+          "eta_hard_cap": 3.5
+        },
+        "cost_stress": {
+          "role": "diagnostic",
+          "multiplier": 2.0
+        },
+        "statistics": {
+          "status": "not_applicable",
+          "reason": "本版本未提供峰值本金超额收益的显著性检验"
+        },
+        "budgets": {
+          "training_points": 100,
+          "neighborhood_points": 100,
+          "reporting_points": 20,
+          "total_evaluations": 1000,
+          "max_runtime_seconds": 180
+        }
+      },
+      "computation": {
+        "decision_count": 2,
+        "candidate_evaluations": 320,
+        "ledger_evaluations": 640,
+        "training_budget": 100,
+        "neighborhood_budget": 100,
+        "reporting_budget": 20,
+        "total_evaluation_budget": 1000,
+        "max_runtime_seconds": 180,
+        "evaluation_upper_bound": 4191,
+        "budget_contract_frozen": false,
+        "frozen_evaluation_budget": 1000,
+        "frozen_data_version": null,
+        "evaluation_budget_used": 320,
+        "evaluation_budget_remaining": 680,
+        "budget_stopped": false,
+        "budget_reason": null,
+        "estimated_task_memory_mb": 9.517213821411133,
+        "workspace_budget_mb": 8192.0
+      }
+    }
+  }
+}

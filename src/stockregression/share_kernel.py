@@ -125,11 +125,20 @@ def _nb_attempt(
         normalized_request = _nb_buy_lot(min(max(0, requested), 2147483647), board_code)
         max_by_position = max(0.0, max_shares - position_shares)
         position_quantity = _nb_buy_lot(max_by_position, board_code) if math.isfinite(max_shares) else normalized_request
-        effective_transfer_rate = transfer_rate * face_value / price if transfer_is_face_value else transfer_rate
-        max_by_cash = max(0.0, cash - min_commission - transfer_minimum) / (
-            price * (1.0 + commission_rate + effective_transfer_rate)
-        )
-        affordable_quantity = normalized_request if top_up_on_fill else _nb_buy_lot(max_by_cash, board_code)
+        affordable_quantity = normalized_request
+        if not top_up_on_fill:
+            affordable_quantity = 0
+            candidate_quantity = _nb_buy_lot(min(normalized_request, max_by_position), board_code)
+            while candidate_quantity > 0:
+                notional = _nb_round_money(candidate_quantity * price)
+                commission = _nb_round_money(max(min_commission, notional * commission_rate))
+                transfer_basis = candidate_quantity * face_value if transfer_is_face_value else notional
+                transfer = _nb_round_money(max(transfer_minimum, transfer_basis * transfer_rate))
+                total = _nb_round_money(notional + commission + transfer)
+                if total <= cash + 0.005:
+                    affordable_quantity = candidate_quantity
+                    break
+                candidate_quantity -= 100
         quantity = min(normalized_request, position_quantity, affordable_quantity)
         if quantity <= 0:
             if normalized_request <= 0:
@@ -229,40 +238,44 @@ def simulate(
 ) -> tuple:
     keep_details = output_mode >= 2
     top_up_mode = funding_mode == 1
-    account_count = 1 if grid_only else 3
+    # The matched-funding account mirrors the grid's external contributions in
+    # the same bar.  It is kept in the native ledger so research batches and
+    # ordinary backtests use exactly the same execution and corporate-action
+    # rules.
+    account_count = 1 if grid_only else 4
     n = len(opens)
     day_count = 0
     for flag in last_bar_day:
         if flag:
             day_count += 1
-    initial_equities = np.array([grid_initial_equity, dca_initial_equity, buy_hold_initial_equity], dtype=np.float64)
+    initial_equities = np.array([grid_initial_equity, dca_initial_equity, buy_hold_initial_equity, grid_initial_equity], dtype=np.float64)
     cash = initial_equities.copy()
-    shares = np.zeros(3, dtype=np.int64)
-    sellable = np.zeros(3, dtype=np.int64)
-    cash_receivable = np.zeros(3, dtype=np.float64)
-    share_receivable = np.zeros(3, dtype=np.float64)
-    started = np.zeros(3, dtype=np.bool_)
-    reference = np.zeros(3, dtype=np.float64)
-    fixed_anchor = np.zeros(3, dtype=np.float64)
-    active_cell = np.zeros(3, dtype=np.int64)
-    has_active_cell = np.zeros(3, dtype=np.bool_)
-    pending_side = np.zeros(3, dtype=np.int64)
-    pending_quantity = np.zeros(3, dtype=np.int64)
-    pending_reason = np.zeros(3, dtype=np.int64)
+    shares = np.zeros(4, dtype=np.int64)
+    sellable = np.zeros(4, dtype=np.int64)
+    cash_receivable = np.zeros(4, dtype=np.float64)
+    share_receivable = np.zeros(4, dtype=np.float64)
+    started = np.zeros(4, dtype=np.bool_)
+    reference = np.zeros(4, dtype=np.float64)
+    fixed_anchor = np.zeros(4, dtype=np.float64)
+    active_cell = np.zeros(4, dtype=np.int64)
+    has_active_cell = np.zeros(4, dtype=np.bool_)
+    pending_side = np.zeros(4, dtype=np.int64)
+    pending_quantity = np.zeros(4, dtype=np.int64)
+    pending_reason = np.zeros(4, dtype=np.int64)
     dca_due = False
     dca_last_day = -1
     action_count = len(action_record_day)
-    entitlement_cash = np.zeros((3, action_count), dtype=np.float64)
-    entitlement_bonus = np.zeros((3, action_count), dtype=np.float64)
-    accrued_cash = np.zeros((3, action_count), dtype=np.float64)
-    accrued_bonus = np.zeros((3, action_count), dtype=np.float64)
-    accrued_exists = np.zeros((3, action_count), dtype=np.bool_)
-    action_paid = np.zeros((3, action_count), dtype=np.bool_)
-    action_stock_issued = np.zeros((3, action_count), dtype=np.bool_)
+    entitlement_cash = np.zeros((4, action_count), dtype=np.float64)
+    entitlement_bonus = np.zeros((4, action_count), dtype=np.float64)
+    accrued_cash = np.zeros((4, action_count), dtype=np.float64)
+    accrued_bonus = np.zeros((4, action_count), dtype=np.float64)
+    accrued_exists = np.zeros((4, action_count), dtype=np.bool_)
+    action_paid = np.zeros((4, action_count), dtype=np.bool_)
+    action_stock_issued = np.zeros((4, action_count), dtype=np.bool_)
     prior_close = 0.0
-    trade_count = np.zeros(3, dtype=np.int64)
-    buy_count = np.zeros(3, dtype=np.int64)
-    sell_count = np.zeros(3, dtype=np.int64)
+    trade_count = np.zeros(4, dtype=np.int64)
+    buy_count = np.zeros(4, dtype=np.int64)
+    sell_count = np.zeros(4, dtype=np.int64)
     actual_min_position = 0.0
     actual_max_position = 0.0
     floor_enabled = floor_eta_floor >= 0 and floor_k_ref > 0
@@ -278,23 +291,15 @@ def simulate(
     stockout_signal_active = False
     tplus1_block_count = 0.0
     tplus1_signal_active = False
-    total_fees = np.zeros(3, dtype=np.float64)
-    gross_turnover = np.zeros(3, dtype=np.float64)
-    peak_equity = initial_equities.copy()
-    max_drawdown = np.zeros(3, dtype=np.float64)
+    total_fees = np.zeros(4, dtype=np.float64)
+    gross_turnover = np.zeros(4, dtype=np.float64)
+    interval_peak_principal = initial_equities.copy()
+    max_drawdown_raw = np.zeros(4, dtype=np.float64)
     last_equity = initial_equities.copy()
-    unit_count = initial_equities.copy()
-    unit_initialized = initial_equities > 0
-    peak_nav = np.ones(3, dtype=np.float64)
-    prior_day_nav = np.ones(3, dtype=np.float64)
-    daily_return_sum = np.zeros(3, dtype=np.float64)
-    daily_return_sumsq = np.zeros(3, dtype=np.float64)
-    prior_day_equity = initial_equities.copy()
-    daily_return_count = 0
-    first_timestamp = 0
-    last_timestamp = 0
     fold_stats = np.zeros((fold_count, 9), dtype=np.float64)
     fold_peaks = np.zeros(fold_count, dtype=np.float64)
+    fold_drawdown_raw = np.zeros(fold_count, dtype=np.float64)
+    fold_peak_principal = np.zeros(fold_count, dtype=np.float64)
     fold_initials = np.zeros(fold_count, dtype=np.float64)
     fold_snapshots = np.zeros((fold_count, 5), dtype=np.float64)
     fold_start_assets = np.zeros(fold_count, dtype=np.float64)
@@ -303,29 +308,27 @@ def simulate(
     grid_topups = 0.0
     grid_peak_invested = float(grid_initial_equity)
     grid_peak_day = -1
+    matched_invested = float(grid_initial_equity)
+    matched_peak_invested = float(grid_initial_equity)
+    matched_pending_cash = 0.0
+    peak_profit = np.zeros(4, dtype=np.float64)
     day_external_flow = 0.0
     parameter_index = 0
     params_paused = False
     last_grid_price = reference_price
     prior_signal_allowed = False
-    for index in range(n):
-        if tradable_mask[index]:
-            if first_timestamp == 0:
-                first_timestamp = timestamps_ns[index]
-            last_timestamp = timestamps_ns[index]
-
     if keep_details:
-        period_values = np.zeros((3, day_count), dtype=np.float64)
-        trade_bar = np.zeros(3 * n, dtype=np.int64)
-        trade_strategy = np.zeros(3 * n, dtype=np.int8)
-        trade_side = np.zeros(3 * n, dtype=np.int8)
-        trade_quantity = np.zeros(3 * n, dtype=np.int64)
-        trade_price = np.zeros(3 * n, dtype=np.float64)
-        trade_fees = np.zeros(3 * n, dtype=np.float64)
-        trade_cash = np.zeros(3 * n, dtype=np.float64)
-        trade_shares = np.zeros(3 * n, dtype=np.int64)
-        trade_reason = np.zeros(3 * n, dtype=np.int8)
-        trade_topup = np.zeros(3 * n, dtype=np.float64)
+        period_values = np.zeros((0, 0), dtype=np.float64)
+        trade_bar = np.zeros(5 * n, dtype=np.int64)
+        trade_strategy = np.zeros(5 * n, dtype=np.int8)
+        trade_side = np.zeros(5 * n, dtype=np.int8)
+        trade_quantity = np.zeros(5 * n, dtype=np.int64)
+        trade_price = np.zeros(5 * n, dtype=np.float64)
+        trade_fees = np.zeros(5 * n, dtype=np.float64)
+        trade_cash = np.zeros(5 * n, dtype=np.float64)
+        trade_shares = np.zeros(5 * n, dtype=np.int64)
+        trade_reason = np.zeros(5 * n, dtype=np.int8)
+        trade_topup = np.zeros(5 * n, dtype=np.float64)
         trade_n = 0
         rejection_bar = np.zeros(5 * n, dtype=np.int64)
         rejection_ts = np.zeros(5 * n, dtype=np.int64)
@@ -335,9 +338,7 @@ def simulate(
         rejection_quantity = np.zeros(5 * n, dtype=np.int64)
         rejection_n = 0
     else:
-        # Only a few hundred/thousand session returns are required to preserve
-        # the exact Sharpe calculation in summary-only optimization runs.
-        period_values = np.zeros((3, day_count), dtype=np.float64)
+        period_values = np.zeros((0, 0), dtype=np.float64)
         trade_bar = np.zeros(0, dtype=np.int64)
         trade_strategy = np.zeros(0, dtype=np.int8)
         trade_side = np.zeros(0, dtype=np.int8)
@@ -371,9 +372,13 @@ def simulate(
     shares[2] = buy_hold_initial_shares
     sellable[2] = buy_hold_initial_shares
     started[2] = True
+    cash[3] = reserve_cash
+    shares[3] = seed_shares
+    sellable[3] = seed_shares
+    started[3] = True
     dca_invested = dca_initial_equity
     prior_close = valuation_price
-    initial_holdings = (seed_shares, dca_initial_shares, buy_hold_initial_shares)
+    initial_holdings = (seed_shares, dca_initial_shares, buy_hold_initial_shares, seed_shares)
     actual_min_position = float(seed_shares)
     actual_max_position = float(seed_shares)
     for action in range(action_count):
@@ -382,11 +387,11 @@ def simulate(
                 entitlement_cash[account, action] = initial_holdings[account] * action_cash_per_share[action]
                 entitlement_bonus[account, action] = initial_holdings[account] * action_bonus_ratio[action]
     output_count = n if output_mode == 2 else (day_count if output_mode in (1, 3) else 0)
-    equity_values = np.zeros((3, output_count), dtype=np.float64)
-    equity_cash = np.zeros((3, output_count), dtype=np.float64)
-    equity_shares = np.zeros((3, output_count), dtype=np.float64)
-    equity_drawdown = np.zeros((3, output_count), dtype=np.float64)
-    invested_values = np.zeros((2, output_count), dtype=np.float64)
+    equity_values = np.zeros((4, output_count), dtype=np.float64)
+    equity_cash = np.zeros((4, output_count), dtype=np.float64)
+    equity_shares = np.zeros((4, output_count), dtype=np.float64)
+    equity_drawdown = np.zeros((4, output_count), dtype=np.float64)
+    invested_values = np.zeros((4, output_count), dtype=np.float64)
     current_day_id = -1
     dca_day_index = 0
     for i in range(n):
@@ -397,9 +402,13 @@ def simulate(
             day_external_flow = 0.0
             fold_id = fold_ids[day_id]
             if fold_id >= 0 and fold_initials[fold_id] == 0.0:
-                fold_initials[fold_id] = prior_day_equity[0]
-                fold_peaks[fold_id] = prior_day_nav[0] if top_up_mode else prior_day_equity[0]
-                fold_start_assets[fold_id] = prior_day_equity[0]
+                # Fold profit starts at the principal already committed when
+                # the evaluation interval begins.  Equity may contain retained
+                # profits; treating that equity as principal would dilute the
+                # fold's peak-principal return and drawdown.
+                fold_initials[fold_id] = grid_invested
+                fold_start_assets[fold_id] = grid_invested
+                fold_peak_principal[fold_id] = grid_invested
                 fold_snapshots[fold_id, 0] = trade_count[0]
                 fold_snapshots[fold_id, 1] = buy_count[0]
                 fold_snapshots[fold_id, 2] = sell_count[0]
@@ -540,7 +549,6 @@ def simulate(
                 quantity = pending_quantity[account]
                 reason_code = pending_reason[account]
                 pending_side[account] = 0
-                preflow_equity = cash[account] + cash_receivable[account] + (shares[account] + share_receivable[account]) * opening
                 result = _nb_attempt(
                     side, quantity, opening, volume, limit_ups[i], limit_downs[i],
                     stamp_rates[i], transfer_rates[i], transfer_is_face_value[i],
@@ -576,16 +584,16 @@ def simulate(
                                 floor_active, floor_anchor, floor_high, floor_sell_step = True, result[5], result[5], sell_step
                     if account == 0 and result[10] > 0:
                         top_up = float(result[10])
-                        if unit_initialized[0]:
-                            if preflow_equity > 0:
-                                unit_count[0] += top_up * unit_count[0] / preflow_equity
-                        else:
-                            unit_count[0] = top_up
-                            unit_initialized[0] = True
                         grid_invested = _nb_round_money(grid_invested + top_up)
                         grid_topups = _nb_round_money(grid_topups + top_up)
                         grid_peak_invested = grid_invested
                         grid_peak_day = day_id
+                        if account_count > 3:
+                            # Mirror the real contribution in the same fill event.
+                            cash[3] = _nb_round_money(cash[3] + top_up)
+                            matched_invested = _nb_round_money(matched_invested + top_up)
+                            matched_peak_invested = max(matched_peak_invested, matched_invested)
+                            matched_pending_cash = _nb_round_money(matched_pending_cash + top_up)
                         day_external_flow = _nb_round_money(day_external_flow + top_up)
                         if fold_id >= 0:
                             fold_topups[fold_id] = _nb_round_money(fold_topups[fold_id] + top_up)
@@ -618,6 +626,51 @@ def simulate(
                                 reference[account] = fixed_anchor[account]
                             active_cell[account] = _nb_cell(result[5], fixed_anchor[account], grid_mode, buy_step, sell_step)
                             has_active_cell[account] = True
+
+            if account_count > 3 and account == 0 and matched_pending_cash > 0 and opening > 0:
+                available_pool = min(matched_pending_cash, cash[3])
+                matched_quantity = _nb_buy_lot(available_pool / opening, board_code)
+                if matched_quantity > 0:
+                    matched = _nb_attempt(
+                        1, matched_quantity, opening, volume, limit_ups[i], limit_downs[i],
+                        stamp_rates[i], transfer_rates[i], transfer_is_face_value[i],
+                        transfer_minimums[i], stamp_bilateral[i], day_id, available_pool,
+                        cash_receivable[3], share_receivable[3], shares[3], sellable[3],
+                        2147483647.0, 0.0, commission_rate, min_commission, slippage,
+                        board_code, face_value, tick, t0, False, False,
+                    )
+                    if matched[0]:
+                        # Dividends and other retained account cash are not part
+                        # of the contribution pool.  Only the mirrored top-up
+                        # and its uninvested lot remainder may fund this buy.
+                        matched_cost = _nb_round_money(matched[7] + matched[6])
+                        cash[3] = max(0.0, _nb_round_money(cash[3] - matched_cost))
+                        shares[3], sellable[3] = matched[2], matched[3]
+                        matched_pending_cash = max(0.0, _nb_round_money(matched_pending_cash - matched_cost))
+                        trade_count[3] += 1
+                        buy_count[3] += 1
+                        total_fees[3] += matched[6]
+                        gross_turnover[3] += matched[7]
+                        if keep_details:
+                            trade_bar[trade_n] = i
+                            trade_strategy[trade_n] = 3
+                            trade_side[trade_n] = 1
+                            trade_quantity[trade_n] = matched[4]
+                            trade_price[trade_n] = matched[5]
+                            trade_fees[trade_n] = matched[6]
+                            trade_cash[trade_n] = cash[3]
+                            trade_shares[trade_n] = shares[3]
+                            trade_reason[trade_n] = 3
+                            trade_topup[trade_n] = 0.0
+                            trade_n += 1
+                    elif keep_details:
+                        rejection_bar[rejection_n] = i
+                        rejection_ts[rejection_n] = open_timestamps_ns[i]
+                        rejection_strategy[rejection_n] = 3
+                        rejection_side[rejection_n] = 1
+                        rejection_reason[rejection_n] = matched[9]
+                        rejection_quantity[rejection_n] = matched[8]
+                        rejection_n += 1
 
             if not traded and account == 1 and dca_due and dca_last_day != day_id:
                 dca_last_day = day_id
@@ -750,39 +803,45 @@ def simulate(
                 actual_min_position = min(actual_min_position, current_position)
                 actual_max_position = max(actual_max_position, current_position)
             last_equity[account] = equity
-            nav = equity / unit_count[account] if top_up_mode and account == 0 and unit_count[account] > 0 else equity
-            if equity > peak_equity[account]:
-                peak_equity[account] = equity
-            if top_up_mode and account == 0:
-                peak_nav[account] = max(peak_nav[account], nav)
-                drawdown = (peak_nav[account] - nav) / peak_nav[account] if peak_nav[account] > 0 else 0.0
-            else:
-                drawdown = (peak_equity[account] - equity) / peak_equity[account] if peak_equity[account] > 0 else 0.0
-            if drawdown > max_drawdown[account]:
-                max_drawdown[account] = drawdown
+            principal = initial_equities[account]
+            if account == 0:
+                principal = grid_invested
+            elif account == 1:
+                principal = dca_invested
+            elif account == 3:
+                principal = matched_invested
+            profit = equity - principal
+            peak_profit[account] = max(peak_profit[account], profit)
+            interval_peak_principal[account] = max(interval_peak_principal[account], principal)
+            drawdown_raw = max(0.0, peak_profit[account] - profit)
+            if drawdown_raw > max_drawdown_raw[account]:
+                max_drawdown_raw[account] = drawdown_raw
             if output_mode == 2 or (output_mode in (1, 3) and last_bar_day[i]):
                 out = i if output_mode == 2 else dca_day_index
                 equity_values[account, out] = equity
                 equity_cash[account, out] = cash[account]
                 equity_shares[account, out] = shares[account] + share_receivable[account]
-                equity_drawdown[account, out] = drawdown
-                invested_values[0, out] = grid_invested if top_up_mode else initial_equities[0]
-                invested_values[1, out] = dca_invested
+                equity_drawdown[account, out] = drawdown_raw
+
+        if output_mode == 2 or (output_mode in (1, 3) and last_bar_day[i]):
+            out = i if output_mode == 2 else dca_day_index
+            invested_values[0, out] = grid_invested if top_up_mode else initial_equities[0]
+            invested_values[1, out] = dca_invested
+            invested_values[2, out] = initial_equities[2]
+            invested_values[3, out] = matched_invested if account_count > 3 else initial_equities[3]
 
         if floor_active:
             floor_high = max(floor_high, close)
 
         fold_id = fold_ids[day_id]
         if fold_id >= 0:
-            if top_up_mode and unit_count[0] > 0:
-                fold_nav = last_equity[0] / unit_count[0]
-                fold_peaks[fold_id] = max(fold_peaks[fold_id], fold_nav)
-                if fold_peaks[fold_id] > 0:
-                    fold_stats[fold_id, 0] = max(fold_stats[fold_id, 0], 1.0 - fold_nav / fold_peaks[fold_id])
-            else:
-                fold_peaks[fold_id] = max(fold_peaks[fold_id], last_equity[0])
-                if fold_peaks[fold_id] > 0:
-                    fold_stats[fold_id, 0] = max(fold_stats[fold_id, 0], 1.0 - last_equity[0] / fold_peaks[fold_id])
+            fold_principal = fold_start_assets[fold_id] + fold_topups[fold_id]
+            fold_peak_principal[fold_id] = max(fold_peak_principal[fold_id], fold_principal)
+            fold_profit = last_equity[0] - fold_principal
+            fold_peaks[fold_id] = max(fold_peaks[fold_id], fold_profit)
+            fold_drawdown_raw[fold_id] = max(
+                fold_drawdown_raw[fold_id], fold_peaks[fold_id] - fold_profit,
+            )
             fold_stats[fold_id, 1] = trade_count[0] - fold_snapshots[fold_id, 0]
             fold_stats[fold_id, 2] = buy_count[0] - fold_snapshots[fold_id, 1]
             fold_stats[fold_id, 3] = sell_count[0] - fold_snapshots[fold_id, 2]
@@ -793,20 +852,6 @@ def simulate(
             fold_stats[fold_id, 8] = last_equity[0]
 
         if last_bar_day[i]:
-            daily_return_count += 1
-            for account in range(account_count):
-                # ``prior_day_equity`` starts at independent initial principal and
-                # then uses the previous session's closing mark.
-                if top_up_mode and account == 0 and unit_count[0] > 0:
-                    nav = last_equity[0] / unit_count[0]
-                    daily_return = nav / prior_day_nav[0] - 1.0 if prior_day_nav[0] > 0 else 0.0
-                    prior_day_nav[0] = nav
-                else:
-                    daily_return = last_equity[account] / prior_day_equity[account] - 1.0 if prior_day_equity[account] > 0 else 0.0
-                prior_day_equity[account] = last_equity[account]
-                daily_return_sum[account] += daily_return
-                daily_return_sumsq[account] += daily_return * daily_return
-                period_values[account, dca_day_index] = daily_return
             dca_day_index += 1
             for action in range(action_count):
                 if action_record_day[action] == day_id:
@@ -816,37 +861,23 @@ def simulate(
         prior_close = close
         prior_signal_allowed = volumes[i] > 0
 
-    metrics = np.zeros((3, 11), dtype=np.float64)
-    elapsed = (last_timestamp - first_timestamp) / 1_000_000_000.0 / (365.25 * 24.0 * 3600.0) if n else 0.0
-    elapsed = max(elapsed, 1.0 / 252.0)
+    metrics = np.zeros((4, 11), dtype=np.float64)
     for account in range(account_count):
-        total_return = last_equity[account] / initial_equities[account] - 1.0 if initial_equities[account] > 0 else 0.0
-        cagr = 0.0
-        growth_base = initial_equities[account]
-        final_equity = last_equity[account]
-        if top_up_mode and account == 0 and unit_count[0] > 0:
-            growth_base = 1.0
-            final_equity = last_equity[0] / unit_count[0]
-        if final_equity > 0 and growth_base > 0:
-            log_growth = math.log(final_equity / growth_base) / elapsed
-            cagr = math.expm1(min(700.0, max(-700.0, log_growth)))
-        sharpe = 0.0
-        if daily_return_count > 1:
-            mean = daily_return_sum[account] / daily_return_count
-            squared_deviation = 0.0
-            for session in range(daily_return_count):
-                delta = period_values[account, session] - mean
-                squared_deviation += delta * delta
-            variance = squared_deviation / (daily_return_count - 1)
-            deviation = math.sqrt(max(0.0, variance))
-            if deviation > 0:
-                sharpe = mean / deviation * math.sqrt(252.0)
-        calmar = cagr / max_drawdown[account] if max_drawdown[account] > 0 else 0.0
+        principal = initial_equities[account]
+        peak_principal = initial_equities[account]
+        if account == 0:
+            principal = grid_invested
+            peak_principal = grid_peak_invested
+        elif account == 1:
+            principal = dca_invested
+            peak_principal = max(dca_initial_equity, dca_invested)
+        elif account == 3:
+            principal = matched_invested
+            peak_principal = matched_peak_invested
+        peak_principal = interval_peak_principal[account]
+        total_return = (last_equity[account] - principal) / peak_principal if peak_principal > 0 else np.nan
         metrics[account, 0] = total_return
-        metrics[account, 1] = cagr
-        metrics[account, 2] = max_drawdown[account]
-        metrics[account, 3] = sharpe
-        metrics[account, 4] = calmar
+        metrics[account, 2] = max_drawdown_raw[account] / peak_principal if peak_principal > 0 else np.nan
         metrics[account, 5] = buy_count[account] + sell_count[account]
         metrics[account, 6] = total_fees[account]
         turnover_base = grid_peak_invested if top_up_mode and account == 0 else initial_equities[account]
@@ -854,15 +885,22 @@ def simulate(
         metrics[account, 8] = buy_count[account]
         metrics[account, 9] = sell_count[account]
 
-    metrics[1, 0] = last_equity[1] / dca_invested - 1.0 if dca_invested > 0 else np.nan
     metrics[1, 10] = dca_invested
-    for index in (1, 2, 3, 4, 7):
+    for index in (1, 3, 4, 7):
         metrics[1, index] = np.nan
     floor_active, floor_anchor, floor_high, floor_episode_grids, floor_episode_count, floor_grid_squares = _nb_close_floor(
         floor_active, floor_anchor, floor_high, floor_sell_step,
         floor_episode_grids, floor_episode_count, floor_grid_squares,
     )
-    funding_stats = np.zeros((3, 16), dtype=np.float64)
+    for account in range(account_count):
+        if interval_peak_principal[account] > 0:
+            equity_drawdown[account, :] = equity_drawdown[account, :] / interval_peak_principal[account]
+    for fold_id in range(fold_count):
+        if fold_peak_principal[fold_id] > 0:
+            fold_stats[fold_id, 0] = fold_drawdown_raw[fold_id] / fold_peak_principal[fold_id]
+        else:
+            fold_stats[fold_id, 0] = np.nan
+    funding_stats = np.zeros((4, 24), dtype=np.float64)
     funding_stats[0, 0] = initial_equities[0]
     funding_stats[0, 1] = grid_topups
     funding_stats[0, 2] = grid_peak_invested
@@ -870,7 +908,7 @@ def simulate(
     funding_stats[0, 4] = grid_invested
     funding_stats[0, 5] = last_equity[0]
     funding_stats[0, 6] = last_equity[0] - grid_invested
-    funding_stats[0, 7] = (last_equity[0] / unit_count[0] - 1.0) if unit_count[0] > 0 and unit_initialized[0] else np.nan
+    funding_stats[0, 7] = np.nan
     funding_stats[0, 8] = 1.0 if top_up_mode else 0.0
     baseline_position = max(1.0, float(seed_shares))
     funding_stats[0, 9] = actual_min_position / baseline_position
@@ -880,8 +918,16 @@ def simulate(
     funding_stats[0, 13] = floor_episode_count
     funding_stats[0, 14] = floor_gamma_min * floor_grid_squares / (floor_k_ref * floor_k_ref) if floor_enabled else np.nan
     funding_stats[0, 15] = floor_grid_squares
-    if top_up_mode and grid_peak_invested > 0:
+    if grid_peak_invested > 0:
         metrics[0, 0] = (last_equity[0] - grid_invested) / grid_peak_invested
+    funding_stats[0, 16] = metrics[3, 0]
+    funding_stats[0, 17] = metrics[3, 2]
+    funding_stats[0, 18] = metrics[0, 0]
+    funding_stats[0, 19] = metrics[0, 2]
+    funding_stats[0, 20] = initial_equities[3]
+    funding_stats[0, 21] = matched_invested
+    funding_stats[0, 22] = matched_peak_invested - initial_equities[3]
+    funding_stats[0, 23] = matched_peak_invested
     return (
         metrics, equity_values, equity_cash, equity_shares, equity_drawdown,
         period_values, trade_bar[:trade_n], trade_strategy[:trade_n],
@@ -899,11 +945,11 @@ def simulate(
 def simulate_research_batch(arrays, options, parameters, fold_ids, fold_count):
     """Parallel independent ledgers; each ledger's time axis stays serial."""
     count = len(parameters)
-    day_count = int(arrays[10].sum())
-    returns = np.zeros((day_count, count), dtype=np.float64)
+    # Scoring consumes peak-principal summaries only; no day-by-candidate
+    # return tensor is allocated.
     metrics = np.zeros((count, 11), dtype=np.float64)
     folds = np.zeros((count, fold_count, 9), dtype=np.float64)
-    funding = np.zeros((count, 16), dtype=np.float64)
+    funding = np.zeros((count, 24), dtype=np.float64)
     episodes = [np.empty(0, dtype=np.int64) for _ in range(count)]
     empty_days = np.zeros(0, dtype=np.int64)
     empty_values = np.zeros((0, 7), dtype=np.float64)
@@ -915,12 +961,11 @@ def simulate_research_batch(arrays, options, parameters, fold_ids, fold_count):
             options[20], options[21], options[22], options[23], options[24], options[25],
             options[26], options[27], options[28], options[29], options[30], options[31], options[32],
             empty_days, empty_values,
-            fold_ids, fold_count, True, False)
+            fold_ids, fold_count, False, False)
         output = simulate(*(arrays + individual))
-        returns[:, index] = output[5][0]
         metrics[index] = output[0][0]
         folds[index] = output[-3]
         episodes[index] = output[-2]
         funding[index] = output[-1][0]
-    return returns, metrics, folds, episodes, funding
+    return metrics, folds, episodes, funding
 

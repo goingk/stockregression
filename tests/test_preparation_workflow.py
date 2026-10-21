@@ -125,6 +125,7 @@ def test_empty_store_backtest_reports_local_gap_without_network(tmp_path, monkey
     worker_store = Store(worker_root)
     config = config_for(calendar)
     job_id = worker_store.new_job("backtest", {"config": config.model_dump(mode="json"), "version": None})
+    assert worker_store.claim_job(job_id, "test-worker")
     execute_job(str(worker_root), job_id)
     worker_job = worker_store.job(job_id)
     assert worker_job["status"] == "failed"

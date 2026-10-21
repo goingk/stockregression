@@ -12,7 +12,6 @@ from .settings import (
     CONFIG_SCHEMA_VERSION,
     ConfigurationDocument,
     Settings,
-    StatisticsSettings,
     UiSettings,
     configuration_document,
     configuration_revision,
@@ -28,7 +27,7 @@ class ConfigurationConflict(ValueError):
 
 
 _PATCH_GROUPS = {
-    "application", "paths", "backtest", "research", "statistics", "market_data", "runtime", "ui", "schedule",
+    "application", "paths", "backtest", "research", "market_data", "runtime", "ui", "schedule",
 }
 
 _FIELD_LABELS = {
@@ -43,7 +42,7 @@ _FIELD_LABELS = {
     "strategy_id": "策略标识", "strategy_version": "策略版本", "protocol_version": "研究协议",
     "selection_target": "研究方案", "rebalance_days": "自适应换参周期", "mode": "历史研究模式",
     "n_trials": "旧版试验数", "local_search_budget": "历史局部搜索预算", "seed": "根随机种子",
-    "top_candidates": "结果候选展示上限", "max_drawdown": "最大回撤约束", "min_trades": "最少成交笔数",
+    "top_candidates": "结果候选展示上限", "max_principal_drawdown": "最大本金回撤约束", "min_trades": "最少成交笔数",
     "min_history_days": "旧版最少历史", "min_minute_ratio": "最小分钟覆盖率",
     "ranking_mode": "历史排名模式", "hypercube_edge": "超正方体边长", "granularity": "研究刻度",
     "search_method": "搜索方法", "training_budget": "训练评价预算", "validation_budget": "邻域评价预算",
@@ -85,7 +84,7 @@ _FIELD_LABELS = {
 _FIELD_UNITS = {
     "buy_step": "比例；界面显示百分比", "sell_step": "比例；界面显示百分比",
     "commission_rate": "比例；界面显示百分比", "alpha": "权重或比例；界面显示百分比",
-    "tau": "训练区间累计超额收益率；界面显示百分比", "max_drawdown": "比例；界面显示百分比",
+    "tau": "训练区间累计超额收益率；界面显示百分比", "max_principal_drawdown": "比例；界面显示百分比",
     "min_minute_ratio": "比例；界面显示百分比", "eta_limit": "初始持仓 P0 的倍数",
     "eta_hard_cap": "初始持仓 P0 的倍数", "eta_floor": "初始持仓 P0 的倍数",
     "floor_k_ref": "卖出网格整格数",
@@ -106,7 +105,7 @@ _FIELD_UNITS = {
     "initial_shares": "股或份", "min_shares": "股或份", "max_shares": "股或份",
 }
 
-_METHOD_GROUPS = {"backtest", "research", "statistics"}
+_METHOD_GROUPS = {"backtest", "research"}
 
 
 def _resolve_schema(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:
@@ -242,7 +241,6 @@ def configuration_schema() -> dict[str, Any]:
             "paths": {"label": "路径", "restart_required": True},
             "backtest": {"label": "回测默认值", "restart_required": False},
             "research": {"label": "研究", "restart_required": False},
-            "statistics": {"label": "统计诊断", "restart_required": False},
             "market_data": {"label": "行情数据", "restart_required": False},
             "runtime": {"label": "运行资源", "restart_required": False},
             "ui": {"label": "界面交互", "restart_required": False},
@@ -250,15 +248,11 @@ def configuration_schema() -> dict[str, Any]:
         },
         "json_schema": settings_schema,
         "fields": _field_catalog(defaults, settings_schema),
-        "auxiliary_schemas": {
-            "statistics": StatisticsSettings.model_json_schema(),
-            "ui": UiSettings.model_json_schema(),
-        },
+        "auxiliary_schemas": {"ui": UiSettings.model_json_schema()},
         "units": {
             "research.alpha": "小数；界面显示百分比",
             "research.tau": "训练区间累计超额收益率小数",
             "research.beta": "评分惩罚系数",
-            "statistics.alpha": "显著性水平",
         },
     }
 

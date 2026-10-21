@@ -319,6 +319,7 @@ def test_source_api_reads_cache_and_rejects_undetected_optional_source(tmp_path,
         probe_payload = app.state.store.job(job_id)["payload"]
         probe_payload["source"] = "sina"
         app.state.store.update_job(job_id, payload=probe_payload)
+        assert app.state.store.claim_job(job_id, "test-worker")
         execute_job(str(tmp_path), job_id)
         job = client.get(f"/api/v1/jobs/{job_id}").json()
         assert job["status"] == "completed", job.get("error")

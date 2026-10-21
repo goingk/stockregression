@@ -82,7 +82,7 @@ class ParameterSpace:
     def __init__(self, config: OptimizationConfig, *, field_order: Iterable[str] | None = None):
         self.config = config
         self.base: BacktestConfig = config.base
-        default_order = ROBUST_FIELDS if int(config.strategy.strategy_version) == 4 else FIELDS
+        default_order = ROBUST_FIELDS if int(config.strategy.strategy_version) == 5 else FIELDS
         self.order = tuple(default_order if field_order is None else field_order)
         if not self.order or len(set(self.order)) != len(self.order) or not set(self.order) <= set(ALL_FIELDS):
             raise ValueError("参数空间轴定义无效")
@@ -103,7 +103,7 @@ class ParameterSpace:
                     f"{'0.0001' if minimum == 0.0001 else int(minimum)} 的正整数倍"
                 )
         dimensions: dict[str, Dimension] = {}
-        robust_natural = int(self.strategy.strategy_version) == 4
+        robust_natural = int(self.strategy.strategy_version) == 5
         unlimited = self.strategy.max_shares_mode == "unlimited" or robust_natural
         for name in self.order:
             if name == "max_shares" and unlimited:

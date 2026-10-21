@@ -1,5 +1,6 @@
 # 项目主配置与数据快照
 
+> v5 说明：研究只支持 `protocol_version=5`、`strategy_version=5`、`ranking_mode=robust_j` 和 `result_schema_version=2`。下表中标注为“历史”的 v1–v4、验证窗和 bootstrap 行只解释旧配置迁移；它们位于 `research.legacy` 时会原样保留，不能作为当前研究开关。
 项目运行配置只有一个持久化来源：`config/application.json`。文件保存后各字段都是显式值，程序不再叠加旧隐藏设置、浏览器缓存或业务环境变量。`STOCKREGRESSION_HOME` 只用于定位项目和本文件，不能覆盖业务参数。`.local/settings.json`、`config/backups/application.previous.json` 和浏览器草稿都不参与运行时优先级。
 
 ## 版本、保存与任务边界
@@ -56,25 +57,28 @@
 | 配置键 | 类型 / 单位 | 默认值 | 校验 | 消费模块 | 前端入口 | 生效方式 | 方法标识 |
 |---|---|---|---|---|---|---|---|
 | `research.defaults.strategy_id` | 枚举 | `geometric_robust_j` | 与版本一致 | 研究调度 | 由策略选择派生 | 下次研究 | 是 |
-| `research.defaults.strategy_version` | 1–4 | `4` | 4 为新版，1–3 为历史 | selector | 研究策略 | 下次研究 | 是 |
-| `research.defaults.protocol_version` | 1–4 | `4` | 新版必须为 4 | scientific / research | 研究协议 | 下次研究 | 是 |
-| `research.defaults.selection_target` | 枚举 | `both` | fixed/adaptive/both | 外层流程 | 参数方案 | 下次研究 | 是 |
+| `research.defaults.strategy_version` | 枚举 | `5` | 当前只能为 5 | research | 研究策略 | 下次研究 | 是 |
+| `research.defaults.protocol_version` | 枚举 | `5` | 当前只能为 5 | research | 研究协议 | 下次研究 | 是 |
+| `research.defaults.selection_target` | 枚举 | `fixed` | fixed/adaptive/both | 外层流程 | 参数方案 | 下次研究 | 是 |
 | `research.defaults.rebalance_days` | 整数 / 交易日 | `63` | ≥1 | 自适应换参 | 换参周期 | 下次研究 | 是 |
 | `research.defaults.mode` | 枚举 | `both` | 历史 v1 枚举 | 旧版 v1 | 历史协议 | 下次研究 | 历史版本是 |
 | `research.defaults.n_trials` | 整数 | `1000` | 1–5000 | 旧版搜索 | 旧版试验数 | 下次研究 | 历史版本是 |
 | `research.defaults.local_search_budget` | 整数 | `3000` | 1–5000 | v3 局部搜索 | 历史 v3 预算 | 下次研究 | 历史版本是 |
 | `research.defaults.seed` | 整数 | `42` | 安全整数 | 稳定随机流 | 随机种子 | 下次研究 | 是 |
 | `research.defaults.top_candidates` | 整数 | `20` | 1–100 | 结果展示切片 | 结果候选展示上限 | 下次结果读取 | 否 |
-| `research.defaults.max_drawdown` | 小数 / 比例 | `0.20` | >0，≤1 | 中心风险资格 | 选择与样本约束 | 下次研究 | 是 |
+| `research.defaults.max_principal_drawdown` | 小数 / 比例 | `0.20` | >0，≤1 | 本金回撤资格 | 选择与样本约束 | 下次研究 | 是 |
 | `research.defaults.min_trades` | 整数 / 笔 | `10` | 非负 | 中心资格 | 选择与样本约束 | 下次研究 | 是 |
 | `research.defaults.min_history_days` | 整数 / 交易日 | `250` | ≥20 | 历史版本 | 历史协议 | 下次研究 | 历史版本是 |
 | `research.defaults.min_minute_ratio` | 小数 / 比例 | `0.95` | 0–1 | 数据资格 | 选择与样本约束 | 下次研究 | 是 |
-| `research.defaults.ranking_mode` | 枚举 | `fixed_mean` | 与历史版本一致 | 历史 v1/v2 | 派生 | 下次研究 | 历史版本是 |
+| `research.defaults.ranking_mode` | 枚举 | `robust_j` | 当前只能为 robust_j | 稳健 J 排名 | 研究目标 | 下次研究 | 是 |
 | `research.defaults.hypercube_edge` | 正奇数 / 研究刻度 | `3` | 1–99 且为奇数 | 邻域与 J | 超正方体边长 | 下次研究 | 是 |
 | `research.defaults.granularity` | 四轴对象 | 间距 `0.0001`、股数 `100` | 最小单位正整数倍；四轴完整 | 参数轴与邻域 | 四轴研究细粒度 | 下次研究 | 是 |
 | `research.defaults.search_method` | 枚举 | `auto` | auto/hierarchical/exhaustive；穷举须过预检 | CandidateSearcher | 搜索方法 | 下次研究 | 是 |
 | `research.defaults.training_budget` | 唯一回测点 | `20000` | 1–1,000,000 | EvaluationSession | 训练预算 | 下次研究 | 是 |
 | `research.defaults.validation_budget` | 唯一回测点 | `100000` | 1–2,000,000 | 邻域和峰值核验 | 邻域预算 | 下次研究 | 是 |
+| `research.defaults.reporting_budget` | 唯一回测点 | `1000` | 0–2,000,000；展示阶段独立上限 | 展示补算 | 报告预算 | 下次研究 | 是 |
+| `research.defaults.total_evaluation_budget` | 唯一回测点或 null | `null` | 1–10,000,000；提交时冻结有效上限 | 全阶段预算管理器 | 总评价预算 | 下次研究 | 是 |
+| `research.defaults.max_runtime_seconds` | 秒 | `3600` | 1–86400 | 调度器与预算管理器 | 任务时限 | 下次研究 | 是 |
 | `research.defaults.recommendation_count` | 整数 / 组 | `10` | 1–100 | J 排名推荐数量；旧策略为 Top-K 峰区 | 推荐参数个数 | 下次研究 | 是 |
 | `research.defaults.max_shares_mode` | 枚举 | `unlimited` | search/unlimited | 历史适配 | 历史最高持股 | 下次研究 | 历史版本是 |
 | `research.defaults.slippage_mode` | 枚举 | `configured` | configured/zero | 费用与成交 | 滑点处理 | 下次研究 | 是 |
@@ -93,6 +97,7 @@
 | `research.defaults.gamma_min` | 非负系数 | `0.0` | 0–1000 | 底仓期上涨整格二次惩罚 | 持仓状态 | 下次研究 | 是 |
 | `research.defaults.training_min_days` | 整数 / 交易日 | `250` | 20–5000 | 数据准备与 TrainingWindowPolicy | 训练窗口 | 下次准备与研究 | 是 |
 | `research.defaults.training_max_days` | 整数 / 交易日 | `500` | ≥training_min_days | 数据准备与窗口 | 训练窗口 | 下次准备与研究 | 是 |
+| `research.defaults.training_window_mode` | 枚举 | `same_price` | same_price/fixed | TrainingWindowPolicy | 训练窗口 | 下次准备与研究 | 是 |
 | `research.defaults.peak_tolerance` | 绝对 J 容差 | `1e-12` | >0，≤0.1 | PeakAnalyzer | J 参数 | 下次研究 | 是 |
 | `research.defaults.start_min` | 起点数 | `20` | 1–1000，≤start_max | 多起点发现 | 搜索高级参数 | 下次研究 | 是 |
 | `research.defaults.start_max` | 起点数 | `64` | 1–1000，≥start_min | 多起点发现 | 搜索高级参数 | 下次研究 | 是 |
@@ -107,16 +112,13 @@
 | `research.defaults.stress_region_count` | 峰区数 | `3` | 0–50 | 费用压力诊断 | 训练与费用压力 | 下次研究 | 是 |
 | `research.legacy` | 旧默认值对象 | 首次迁移生成 | 按原版本解释 | 历史任务与复现 | 历史结果视图 | 不回写新默认值 | 历史版本是 |
 
-新版四轴顺序固定为 `buy_step → sell_step → buy_shares → sell_shares`。中心收益 `R` 是训练区间网格收益率减独立买入持有收益率；`J`、邻域均值、下行风险、两项持仓惩罚和平台状态都写入结果。`research.defaults.tau` 与 `statistics.alpha` 是不同字段，界面中文标签也分开。
+新版四轴顺序固定为 `buy_step → sell_step → buy_shares → sell_shares`。中心收益 `R` 是训练区间峰值本金收益率，基础超额为网格收益减同注资持有收益；回撤为逐 bar 最大本金回撤。候选资格要求 `J > 0`。`research.defaults.tau` 只属于 J 下行风险参数。
 
 ### 统计、行情、运行时、界面与调度
 
 | 配置键 | 类型 / 单位 | 默认值 | 校验 | 消费模块 | 前端入口 | 生效方式 | 方法标识 |
 |---|---|---|---|---|---|---|---|
-| `statistics.bootstrap_reps` | 整数 | `10000` | 100–1,000,000 | 配对 Bootstrap | 统计与复现 | 下次统计 | 是 |
-| `statistics.block_lengths` | 正整数数组 | `[20,10,40]` | 非空且全为正 | 区块 Bootstrap | 统计与复现 | 下次统计 | 是 |
-| `statistics.alpha` | 小数 / 显著性 | `0.05` | >0，<1 | 家族校正和末段检验 | 统计与复现 | 下次统计 | 是 |
-| `statistics.outer_validation_days` | 整数 / 交易日 | `126` | 20–1000 | 外层核验 | 统计与复现 | 下次研究 | 是 |
+| `statistics.*` | 历史对象 | 仅迁移保留 | 不参与 v5 计算 | 旧结果解释 | 不再展示 | 不生效 | 历史版本是 |
 | `market_data.cache_mb` | MiB | `256` | 0–16384 | ByteLRU | 文件 | 保存后配置缓存 | 否 |
 | `market_data.recent_minute_source` | 枚举 | `sina` | sina/tdx | 近期分钟主来源；同花顺为自动回退 | 文件 / 数据操作 | 新同步 | 否 |
 | `market_data.etf_daily_source` | 枚举 | `baostock` | baostock/eastmoney | ETF 日线来源 | 文件 / 数据操作 | 新同步 | 否 |

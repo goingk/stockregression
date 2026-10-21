@@ -1,5 +1,7 @@
 # 参数研究 v4：四维稳健 J 峰值
 
+> 历史资料：v1–v4 研究请求与新结果入口已移除，旧结果只能在历史列表识别为“不支持的历史版本”。当前协议见[参数研究 v5](parameter-research-v5.md)。
+
 新版研究使用 `protocol_version=4`、`strategy_version=4`、`schema_version=3`，结果几何标识为 `geometry="robust_j"`。历史 v1、v2、v3 仍通过各自版本入口复现。旧六维受限策略与新四维自然持仓策略属于不同策略族，结果不宣称严格等价。
 
 ## 参数空间与执行账户

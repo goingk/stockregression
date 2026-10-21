@@ -788,6 +788,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/jobs/{job_id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Resume Job */
+        post: operations["resume_job_api_v1_jobs__job_id__resume_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/jobs/{job_id}/items": {
         parameters: {
             query?: never;
@@ -814,6 +831,23 @@ export interface paths {
         };
         /** Results */
         get: operations["results_api_v1_results_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/results/{result_id}/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Result Summary */
+        get: operations["result_summary_api_v1_results__result_id__summary_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -850,6 +884,23 @@ export interface paths {
         get: operations["result_landscape_api_v1_results__result_id__landscape_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/results/{result_id}/completion": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Submit Result Completion */
+        post: operations["submit_result_completion_api_v1_results__result_id__completion_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1260,17 +1311,16 @@ export interface components {
         ConfigurationDocument: {
             /**
              * Config Schema Version
-             * @default 4
+             * @default 5
              * @enum {integer}
              */
-            config_schema_version: 1 | 2 | 3 | 4;
+            config_schema_version: 1 | 2 | 3 | 4 | 5;
             /** Config Revision */
             config_revision?: string | null;
             application?: components["schemas"]["ApplicationSection"];
             paths?: components["schemas"]["PathsSection"];
             backtest?: components["schemas"]["BacktestSection"];
             research?: components["schemas"]["ResearchSection"];
-            statistics?: components["schemas"]["StatisticsSettings"];
             market_data?: components["schemas"]["MarketDataSettings"];
             runtime?: components["schemas"]["PerformanceSettings"];
             ui?: components["schemas"]["UiSettings"];
@@ -1777,10 +1827,10 @@ export interface components {
             base: components["schemas"]["BacktestConfig"];
             /**
              * Protocol Version
-             * @default 1
-             * @enum {integer}
+             * @default 5
+             * @constant
              */
-            protocol_version: 1 | 2 | 3 | 4;
+            protocol_version: 5;
             /**
              * Selection Target
              * @default both
@@ -1793,39 +1843,6 @@ export interface components {
              */
             rebalance_days: number;
             /**
-             * Bootstrap Reps
-             * @default 10000
-             */
-            bootstrap_reps: number;
-            /** Bootstrap Block Lengths */
-            bootstrap_block_lengths?: number[];
-            /**
-             * Significance Alpha
-             * @default 0.05
-             */
-            significance_alpha: number;
-            /**
-             * Outer Validation Days
-             * @default 126
-             */
-            outer_validation_days: number;
-            /**
-             * Mode
-             * @default both
-             * @enum {string}
-             */
-            mode: "historical" | "robust" | "both";
-            /**
-             * N Trials
-             * @default 200
-             */
-            n_trials: number;
-            /**
-             * Local Search Budget
-             * @default 3000
-             */
-            local_search_budget: number;
-            /**
              * Seed
              * @default 42
              */
@@ -1836,10 +1853,10 @@ export interface components {
              */
             top_candidates: number;
             /**
-             * Max Drawdown
+             * Max Principal Drawdown
              * @default 0.2
              */
-            max_drawdown: number;
+            max_principal_drawdown: number;
             /**
              * Min Trades
              * @default 10
@@ -1847,7 +1864,7 @@ export interface components {
             min_trades: number;
             /**
              * Min History Days
-             * @default 504
+             * @default 250
              */
             min_history_days: number;
             /**
@@ -1967,9 +1984,34 @@ export interface components {
              */
             value: number;
         };
+        /** ResearchCompletionRequest */
+        ResearchCompletionRequest: {
+            /**
+             * Decision
+             * @default current
+             * @enum {string}
+             */
+            decision: "current" | "fixed" | "adaptive";
+            /**
+             * Decision Index
+             * @default 0
+             */
+            decision_index: number;
+            /**
+             * Reporting Budget
+             * @default 1000
+             */
+            reporting_budget: number;
+            /**
+             * Target
+             * @default return_leader
+             * @constant
+             */
+            target: "return_leader";
+        };
         /**
          * ResearchContext
-         * @description Public v4 research input independent of backtest search values.
+         * @description Public v5 research input independent of backtest search values.
          */
         ResearchContext: {
             /** Symbol */
@@ -2018,15 +2060,15 @@ export interface components {
             /**
              * Strategy Id
              * @default geometric_robust_j
-             * @enum {string}
+             * @constant
              */
-            strategy_id: "geometric_excess_neighborhood" | "geometric_robust_j";
+            strategy_id: "geometric_robust_j";
             /**
              * Protocol Version
-             * @default 4
-             * @enum {integer}
+             * @default 5
+             * @constant
              */
-            protocol_version: 1 | 2 | 3 | 4;
+            protocol_version: 5;
             /**
              * Selection Target
              * @default both
@@ -2039,39 +2081,6 @@ export interface components {
              */
             rebalance_days: number;
             /**
-             * Bootstrap Reps
-             * @default 10000
-             */
-            bootstrap_reps: number;
-            /** Bootstrap Block Lengths */
-            bootstrap_block_lengths?: number[];
-            /**
-             * Significance Alpha
-             * @default 0.05
-             */
-            significance_alpha: number;
-            /**
-             * Outer Validation Days
-             * @default 126
-             */
-            outer_validation_days: number;
-            /**
-             * Mode
-             * @default both
-             * @enum {string}
-             */
-            mode: "historical" | "robust" | "both";
-            /**
-             * N Trials
-             * @default 1000
-             */
-            n_trials: number;
-            /**
-             * Local Search Budget
-             * @default 3000
-             */
-            local_search_budget: number;
-            /**
              * Seed
              * @default 42
              */
@@ -2082,10 +2091,10 @@ export interface components {
              */
             top_candidates: number;
             /**
-             * Max Drawdown
+             * Max Principal Drawdown
              * @default 0.2
              */
-            max_drawdown: number;
+            max_principal_drawdown: number;
             /**
              * Min Trades
              * @default 10
@@ -2103,16 +2112,16 @@ export interface components {
             min_minute_ratio: number;
             /**
              * Ranking Mode
-             * @default fixed_mean
-             * @enum {string}
+             * @default robust_j
+             * @constant
              */
-            ranking_mode: "max_volume" | "fixed_mean";
+            ranking_mode: "robust_j";
             /**
              * Strategy Version
-             * @default 4
-             * @enum {integer}
+             * @default 5
+             * @constant
              */
-            strategy_version: 1 | 2 | 3 | 4;
+            strategy_version: 5;
             /**
              * Hypercube Edge
              * @default 3
@@ -2139,16 +2148,28 @@ export interface components {
              */
             validation_budget: number;
             /**
+             * Reporting Budget
+             * @default 1000
+             */
+            reporting_budget: number;
+            /** Total Evaluation Budget */
+            total_evaluation_budget?: number | null;
+            /**
+             * Max Runtime Seconds
+             * @default 3600
+             */
+            max_runtime_seconds: number;
+            /**
              * Recommendation Count
              * @default 10
              */
             recommendation_count: number;
             /**
              * Max Shares Mode
-             * @default search
-             * @enum {string}
+             * @default unlimited
+             * @constant
              */
-            max_shares_mode: "search" | "unlimited";
+            max_shares_mode: "unlimited";
             /**
              * Slippage Mode
              * @default configured
@@ -2156,7 +2177,7 @@ export interface components {
              */
             slippage_mode: "configured" | "zero";
             /** Neighborhood Fields */
-            neighborhood_fields?: ("buy_step" | "sell_step" | "sell_shares" | "buy_shares" | "min_shares" | "max_shares")[];
+            neighborhood_fields?: ("buy_step" | "sell_step" | "sell_shares" | "buy_shares")[];
             /** Fixed Half Widths */
             fixed_half_widths?: {
                 [key: string]: number;
@@ -2226,6 +2247,12 @@ export interface components {
              */
             training_max_days: number;
             /**
+             * Training Window Mode
+             * @default same_price
+             * @enum {string}
+             */
+            training_window_mode: "same_price" | "fixed";
+            /**
              * Peak Tolerance
              * @default 1e-12
              */
@@ -2293,10 +2320,10 @@ export interface components {
             step?: number | null;
         };
         /**
-         * ResearchRequestV4
+         * ResearchRequestV5
          * @description Standalone public request that does not carry backtest search defaults.
          */
-        ResearchRequestV4: {
+        ResearchRequestV5: {
             research_context: components["schemas"]["ResearchContext"];
             /** Ranges */
             ranges: {
@@ -2315,23 +2342,6 @@ export interface components {
              */
             rebalance_days: number;
             /**
-             * Bootstrap Reps
-             * @default 10000
-             */
-            bootstrap_reps: number;
-            /** Bootstrap Block Lengths */
-            bootstrap_block_lengths?: number[];
-            /**
-             * Significance Alpha
-             * @default 0.05
-             */
-            significance_alpha: number;
-            /**
-             * Outer Validation Days
-             * @default 126
-             */
-            outer_validation_days: number;
-            /**
              * Seed
              * @default 42
              */
@@ -2342,10 +2352,10 @@ export interface components {
              */
             top_candidates: number;
             /**
-             * Max Drawdown
+             * Max Principal Drawdown
              * @default 0.2
              */
-            max_drawdown: number;
+            max_principal_drawdown: number;
             /**
              * Min Trades
              * @default 10
@@ -2380,15 +2390,15 @@ export interface components {
             /**
              * Strategy Id
              * @default geometric_robust_j
-             * @enum {string}
+             * @constant
              */
-            strategy_id: "geometric_excess_neighborhood" | "geometric_robust_j";
+            strategy_id: "geometric_robust_j";
             /**
              * Strategy Version
-             * @default 4
-             * @enum {integer}
+             * @default 5
+             * @constant
              */
-            strategy_version: 1 | 2 | 3 | 4;
+            strategy_version: 5;
             /**
              * Search Method
              * @default auto
@@ -2397,10 +2407,10 @@ export interface components {
             search_method: "auto" | "hierarchical" | "exhaustive";
             /**
              * Ranking Mode
-             * @default fixed_mean
-             * @enum {string}
+             * @default robust_j
+             * @constant
              */
-            ranking_mode: "max_volume" | "fixed_mean";
+            ranking_mode: "robust_j";
             /**
              * Hypercube Edge
              * @default 3
@@ -2421,16 +2431,28 @@ export interface components {
              */
             validation_budget: number;
             /**
+             * Reporting Budget
+             * @default 1000
+             */
+            reporting_budget: number;
+            /** Total Evaluation Budget */
+            total_evaluation_budget?: number | null;
+            /**
+             * Max Runtime Seconds
+             * @default 3600
+             */
+            max_runtime_seconds: number;
+            /**
              * Recommendation Count
              * @default 10
              */
             recommendation_count: number;
             /**
              * Max Shares Mode
-             * @default search
-             * @enum {string}
+             * @default unlimited
+             * @constant
              */
-            max_shares_mode: "search" | "unlimited";
+            max_shares_mode: "unlimited";
             /**
              * Slippage Mode
              * @default configured
@@ -2438,7 +2460,7 @@ export interface components {
              */
             slippage_mode: "configured" | "zero";
             /** Neighborhood Fields */
-            neighborhood_fields?: ("buy_step" | "sell_step" | "sell_shares" | "buy_shares" | "min_shares" | "max_shares")[];
+            neighborhood_fields?: ("buy_step" | "sell_step" | "sell_shares" | "buy_shares")[];
             /** Fixed Half Widths */
             fixed_half_widths?: {
                 [key: string]: number;
@@ -2503,6 +2525,12 @@ export interface components {
              * @default 500
              */
             training_max_days: number;
+            /**
+             * Training Window Mode
+             * @default same_price
+             * @enum {string}
+             */
+            training_window_mode: "same_price" | "fixed";
             /**
              * Peak Tolerance
              * @default 1e-12
@@ -2610,26 +2638,6 @@ export interface components {
             high: number;
             /** Step */
             step?: number | null;
-        };
-        /** StatisticsSettings */
-        StatisticsSettings: {
-            /**
-             * Bootstrap Reps
-             * @default 10000
-             */
-            bootstrap_reps: number;
-            /** Block Lengths */
-            block_lengths?: number[];
-            /**
-             * Alpha
-             * @default 0.05
-             */
-            alpha: number;
-            /**
-             * Outer Validation Days
-             * @default 126
-             */
-            outer_validation_days: number;
         };
         /** UiSettings */
         UiSettings: {
@@ -3964,7 +3972,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["OptimizationConfig"] | components["schemas"]["ResearchRequestV4"];
+                "application/json": components["schemas"]["OptimizationConfig"] | components["schemas"]["ResearchRequestV5"];
             };
         };
         responses: {
@@ -3997,7 +4005,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["OptimizationConfig"] | components["schemas"]["ResearchRequestV4"];
+                "application/json": components["schemas"]["OptimizationConfig"] | components["schemas"]["ResearchRequestV5"];
             };
         };
         responses: {
@@ -4043,7 +4051,11 @@ export interface operations {
     };
     jobs_api_v1_jobs_get: {
         parameters: {
-            query?: never;
+            query?: {
+                status?: string | null;
+                offset?: number;
+                limit?: number;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -4057,6 +4069,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -4185,6 +4206,37 @@ export interface operations {
             };
         };
     };
+    resume_job_api_v1_jobs__job_id__resume_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     job_items_api_v1_jobs__job_id__items_get: {
         parameters: {
             query?: {
@@ -4222,7 +4274,10 @@ export interface operations {
     };
     results_api_v1_results_get: {
         parameters: {
-            query?: never;
+            query?: {
+                offset?: number;
+                limit?: number;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -4238,12 +4293,55 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    result_summary_api_v1_results__result_id__summary_get: {
+        parameters: {
+            query?: {
+                revision?: number | null;
+            };
+            header?: never;
+            path: {
+                result_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
         };
     };
     get_result_api_v1_results__result_id__get: {
         parameters: {
             query?: {
                 full?: boolean;
+                revision?: number | null;
             };
             header?: never;
             path: {
@@ -4288,6 +4386,7 @@ export interface operations {
                 x?: string | null;
                 y?: string | null;
                 anchor?: string;
+                revision?: number | null;
             };
             header?: never;
             path: {
@@ -4317,12 +4416,48 @@ export interface operations {
             };
         };
     };
+    submit_result_completion_api_v1_results__result_id__completion_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                result_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResearchCompletionRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     export_region_api_v1_results__result_id__regions__region_id__export_get: {
         parameters: {
             query?: {
                 decision?: string;
                 decision_index?: number;
                 format?: string;
+                revision?: number | null;
             };
             header?: never;
             path: {
@@ -4357,6 +4492,7 @@ export interface operations {
         parameters: {
             query?: {
                 kind?: string;
+                revision?: number | null;
             };
             header?: never;
             path: {

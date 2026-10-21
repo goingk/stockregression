@@ -37,20 +37,23 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
         "buy_shares": 100, "sell_shares": 100,
     }
     assert defaults["dca"] == {"frequency": "monthly", "shares": 100, "initial_shares": 0}
-    assert defaults["research"]["mode"] == "both"
-    assert defaults["research"]["n_trials"] == 1000
-    assert defaults["research"]["protocol_version"] == 4
-    assert defaults["research"]["strategy_version"] == 4
-    assert defaults["research"]["ranking_mode"] == "fixed_mean"
+    assert defaults["research"]["protocol_version"] == 5
+    assert defaults["research"]["strategy_version"] == 5
+    assert defaults["research"]["ranking_mode"] == "robust_j"
+    assert defaults["research"]["max_principal_drawdown"] == 0.2
+    assert defaults["research"]["training_window_mode"] == "same_price"
     assert defaults["research"]["hypercube_edge"] == 3
     assert defaults["research"]["granularity"] == {
         "buy_step": 0.0001, "sell_step": 0.0001,
         "sell_shares": 100.0, "buy_shares": 100.0,
     }
-    assert defaults["research"]["local_search_budget"] == 3000
+    assert defaults["research"]["training_budget"] == 20_000
+    assert defaults["research"]["validation_budget"] == 100_000
+    assert defaults["research"]["reporting_budget"] == 1_000
     assert defaults["research"]["selection_target"] == "both"
     assert defaults["research"]["rebalance_days"] == 63
-    assert defaults["research"]["bootstrap_reps"] == 10000
+    for retired in ("mode", "n_trials", "local_search_budget", "bootstrap_reps", "max_drawdown"):
+        assert retired not in defaults["research"]
     assert defaults["research"]["ranges"] == {
         "buy_step": {"low": 0.005, "high": 0.1, "step": None},
         "sell_step": {"low": 0.005, "high": 0.1, "step": None},
@@ -65,7 +68,8 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
             "grid": {"buy_step": 0.05},
             "position": {"initial_shares": 1200},
             "research": {
-                "n_trials": 75,
+                "training_budget": 12_345,
+                "reporting_budget": 0,
                 "ranges": {"buy_shares": {"high": 2000}},
             },
         },
@@ -81,7 +85,8 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
     assert saved.workbench_defaults.grid.sell_step == 0.03
     assert saved.workbench_defaults.position.initial_shares == 1200
     assert saved.workbench_defaults.position.max_shares == 2000
-    assert saved.workbench_defaults.research.n_trials == 75
+    assert saved.workbench_defaults.research.training_budget == 12_345
+    assert saved.workbench_defaults.research.reporting_budget == 0
     assert saved.workbench_defaults.research.ranges["buy_shares"].model_dump() == {
         "low": 100.0, "high": 2000.0, "step": None,
     }
@@ -185,13 +190,13 @@ def test_settings_api_merges_workbench_defaults_and_keeps_fee_defaults(settings_
             "fee_defaults": {"commission_rate": 0},
             "workbench_defaults": {
                 "grid": {"grid_mode": "geometric", "buy_step": 0.05},
-                "research": {"n_trials": 333},
+                "research": {"reporting_budget": 333},
             },
         })
         assert response.status_code == 200
         assert response.json()["workbench_defaults"]["grid"]["grid_mode"] == "geometric"
         assert response.json()["workbench_defaults"]["grid"]["sell_step"] == 0.03
-        assert response.json()["workbench_defaults"]["research"]["n_trials"] == 333
+        assert response.json()["workbench_defaults"]["research"]["reporting_budget"] == 333
         assert response.json()["fee_defaults"] == {"commission_rate": 0, "min_commission": 0.1}
 
         invalid = client.put("/api/v1/settings", json={

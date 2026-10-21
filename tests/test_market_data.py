@@ -570,7 +570,9 @@ def test_market_data_api_imports_and_defaults_sync_to_base_timeframes(tmp_path):
             "calendar_path": str(calendar), "label_convention": "end",
         })
         assert submitted.status_code == 200
-        execute_job(str(root), submitted.json()["job_id"])
+        job_id = submitted.json()["job_id"]
+        assert Store(root).claim_job(job_id, "test-worker")
+        execute_job(str(root), job_id)
         datasets = client.get("/api/v1/data/datasets?timeframe=1day").json()["items"]
         bars = client.get("/api/v1/data/bars/600000.SH?frequency=1day").json()
         assert len(datasets) == 1 and datasets[0]["storage"] == "parquet-source"
@@ -594,6 +596,7 @@ def test_sync_job_summary_counts_and_failure_periods(tmp_path, monkeypatch, outc
         job_id = client.post("/api/v1/data/sync", json={
             "symbols": ["159516.SZ"], "timeframes": ["1day", "1min"],
         }).json()["job_id"]
+        assert Store(root).claim_job(job_id, "test-worker")
         execute_job(str(root), job_id)
         job = client.get(f"/api/v1/jobs/{job_id}").json()
         assert job["status"] == outcome, job
@@ -626,6 +629,7 @@ def test_single_upload_picker_path_saves_job_and_removes_staging_files(tmp_path)
         job_id = response.json()["job_id"]
         payload = app.state.store.job(job_id)["payload"]
         assert all((root / relative).exists() for relative in payload["upload_dirs"])
+        assert app.state.store.claim_job(job_id, "test-worker")
         execute_job(str(root), job_id)
         assert client.get("/api/v1/jobs/" + job_id).json()["status"] == "completed"
         assert app.state.store.snapshot("600000.SH")["market_data"] is True
@@ -650,6 +654,7 @@ def test_folder_upload_accepts_relative_paths_and_keeps_calendar_outside_batch_s
         )
         assert response.status_code == 200, response.text
         job_id = response.json()["job_id"]
+        assert app.state.store.claim_job(job_id, "test-worker")
         execute_job(str(root), job_id)
         job = client.get("/api/v1/jobs/" + job_id).json()
         assert job["status"] == "completed", job.get("error")

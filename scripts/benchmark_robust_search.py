@@ -94,7 +94,7 @@ def row(space: ParameterSpace, coordinate: tuple[int, ...], scenario: str) -> di
     return {
         "params": space.params(coordinate), "key": coordinate, "coordinate": list(coordinate),
         "evaluation_status": "completed", "training_excess_return": excess,
-        "training_drawdown": 0.0 if coordinate[0] == coordinate[1] else .05,
+        "max_principal_drawdown": 0.0 if coordinate[0] == coordinate[1] else .05,
         "trade_count": trades, "buy_count": trades // 2, "sell_count": trades // 2,
         "actual_max_pos_ratio": max_position,
         "actual_min_pos_ratio": 0.0 if coordinate[0] % 2 else 1.0,
@@ -118,7 +118,7 @@ def exhaustive_reference(config: OptimizationConfig, space: ParameterSpace, scen
     scores = tensor_robust_scores(space, rows, config.strategy)
     candidates = [
         coordinate for coordinate, score in scores.items()
-        if eligible(rows.get(coordinate), score, max_drawdown=config.max_drawdown, min_trades=config.min_trades, strategy=config.strategy)
+        if eligible(rows.get(coordinate), score, max_principal_drawdown=config.max_principal_drawdown, min_trades=config.min_trades, strategy=config.strategy)
     ]
     candidates.sort(key=lambda coordinate: _score_sort(scores[coordinate], coordinate))
     analyzer = PeakAnalyzer(space, TOL)
@@ -130,7 +130,7 @@ def exhaustive_reference(config: OptimizationConfig, space: ParameterSpace, scen
         analysis = analyzer.inspect(
             coordinate,
             lambda point: scores.get(point),
-            lambda point: eligible(rows.get(point), scores.get(point), max_drawdown=config.max_drawdown, min_trades=config.min_trades, strategy=config.strategy),
+            lambda point: eligible(rows.get(point), scores.get(point), max_principal_drawdown=config.max_principal_drawdown, min_trades=config.min_trades, strategy=config.strategy),
         )
         if analysis.complete and analysis.representative is not None:
             peaks.setdefault(analysis.representative, coordinate)
@@ -164,7 +164,7 @@ def sparse_search(config: OptimizationConfig, space: ParameterSpace, scenario: s
     analyzer = PeakAnalyzer(space, TOL)
     candidates = [
         coordinate for coordinate, score in session.scores.items()
-        if eligible(session.rows.get(coordinate), score, max_drawdown=config.max_drawdown, min_trades=config.min_trades, strategy=config.strategy)
+        if eligible(session.rows.get(coordinate), score, max_principal_drawdown=config.max_principal_drawdown, min_trades=config.min_trades, strategy=config.strategy)
     ]
     candidates.sort(key=lambda coordinate: _score_sort(session.scores[coordinate], coordinate))
     peaks = {}
@@ -184,7 +184,7 @@ def sparse_search(config: OptimizationConfig, space: ParameterSpace, scenario: s
         "training_points": session.spent["training"],
         "neighborhood_points": session.spent["validation"],
         "unique_backtests": session.attempts,
-        "cache_hits": max(0, session.requested - session.attempts),
+        "cache_hits": max(0, session.requested - session.attempts - session.skipped),
         "start_count": len(starts),
         "incomplete_verifications": incomplete,
         "seconds": time.perf_counter() - started,

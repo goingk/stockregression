@@ -310,11 +310,21 @@ export interface EquityPoint {
   equity: number
   cash?: number
   position?: number
-  position_ratio?: number
-  drawdown?: number | null
-  normalized_equity?: number | null
   total_invested?: number
+  /** v5 peak-principal accounting: the principal denominator the ratio is measured against. */
+  peak_principal?: number | null
+  /** v5 peak-principal accounting: profit accumulated since the run started. */
   cumulative_profit?: number | null
+  /** v5 peak-principal accounting: 1 + cumulative profit / peak principal. */
+  principal_curve?: number | null
+  /** v5 peak-principal accounting: drawdown of the principal profit curve. */
+  principal_drawdown?: number | null
+  /** Legacy unit-NAV fields; only archived pre-v5 backtest results still carry them. */
+  normalized_equity?: number | null
+  /** Legacy unit-NAV drawdown; v5 reports `principal_drawdown` instead. */
+  drawdown?: number | null
+  /** Legacy position ratio; v5 reports the share count only. */
+  position_ratio?: number | null
 }
 
 export interface Trade {
@@ -339,7 +349,6 @@ export interface StrategyResult {
   equity_frequency?: string
   trades: Trade[]
   rejections: Array<Record<string, unknown>>
-  period_returns: Array<Record<string, unknown>>
 }
 
 export interface BacktestResult {
@@ -355,9 +364,10 @@ export interface BacktestResult {
   equity_frequency?: string
   quality?: Record<string, unknown>
   warnings?: string[]
-  strategies: Record<'grid' | 'dca' | 'buy_hold' | string, StrategyResult>
+  strategies: Record<'grid' | 'dca' | 'buy_hold' | 'matched_funding_hold' | string, StrategyResult>
   schema_version?: number
-  funding?: { reserve_cash?: number; initial_equity: number; initial_principal?: number; initial_cash?: number; funding_mode?: string; topups?: number; peak_invested?: number; peak_invested_date?: string | null; final_invested?: number; funding_flows?: Array<{ timestamp: string; amount: number }>; valuation_price: number; reference_price: number; reference_date: string; dca_initial_equity?: number; buy_hold_initial_shares?: number; buy_hold_initial_equity?: number }
+  result_schema_version?: number
+  funding?: { reserve_cash?: number; initial_equity: number; initial_principal?: number; initial_cash?: number; funding_mode?: string; topups?: number; external_topups?: number; peak_invested?: number; peak_principal?: number; peak_invested_date?: string | null; final_invested?: number; funding_flows?: Array<{ timestamp: string; amount: number }>; valuation_price: number; reference_price: number; reference_date: string; dca_initial_equity?: number; buy_hold_initial_shares?: number; buy_hold_initial_equity?: number; matched_funding_hold_invested?: number }
   effective_end_date?: string
   accounting_basis?: string
   floor_episode_count?: number

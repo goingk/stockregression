@@ -93,13 +93,14 @@ def _saved_result(version: str) -> dict:
     fixed_quality = _quality()
     fixed_quality["warnings"].append("新浪分钟备源不可用：nested quality-only provider failure")
     return {
-        "protocol_version": 2,
+        "protocol_version": 5,
+        "result_schema_version": 2,
         "data_version": version,
         "symbol": "159611.SZ",
         "config": {
-            "protocol_version": 2,
+            "protocol_version": 5,
             "base": {
-                "schema_version": 2,
+                "schema_version": 3,
                 "symbol": "159611.SZ",
                 "start_date": "2024-01-03",
                 "end_date": "2024-01-04",
@@ -109,7 +110,10 @@ def _saved_result(version: str) -> dict:
         "warnings": [stale],
         "source_events": [],
         "quality": top_quality,
-        "evidence": {"trial_archive": [{"trial": 17, "params": {"grid_step": 0.02}, "payload": [1, 2, 3]}]},
+        "evidence": {
+            "trial_archive": [{"trial": 17, "params": {"grid_step": 0.02}, "payload": [1, 2, 3]}],
+            "search_candidate_archive": [{"candidate_id": 9, "params": {"buy_step": .01}}],
+        },
         "fixed": {
             "candidate_archive": [{"candidate_id": 9, "costs": [[0.1, 0.2]]}],
             "test_result": {
@@ -141,7 +145,7 @@ def _warnings(result: dict):
     return values
 
 
-def test_public_v2_result_moves_old_provider_warnings_but_keeps_current_risks_and_import_span():
+def test_public_v5_result_moves_old_provider_warnings_but_keeps_current_risks_and_import_span():
     result = _saved_result("snapshot-v1")
     metadata = {
         "warnings": ["历史分钟下载失败：Sina endpoint timeout"],
@@ -159,6 +163,7 @@ def test_public_v2_result_moves_old_provider_warnings_but_keeps_current_risks_an
     public = public_result(result, data_metadata=metadata)
 
     assert "trial_archive" not in public["evidence"]
+    assert "search_candidate_archive" not in public["evidence"]
     assert "candidate_archive" not in public["fixed"]
     assert not any("endpoint timeout" in warning or "provider failure" in warning for warning in _warnings(public))
     assert {event["message"] for event in public["source_events"]} >= {
@@ -186,9 +191,8 @@ def test_public_v2_result_moves_old_provider_warnings_but_keeps_current_risks_an
     assert public["diagnostics"]["status"] == public["adaptive"]["test_result"]["diagnostics"]["status"]
 
 
-def test_public_legacy_daily_result_does_not_claim_minute_quality_downgrade():
+def test_public_daily_backtest_does_not_claim_minute_quality_downgrade():
     result = {
-        "protocol_version": 1,
         "config": {
             "symbol": "159611.SZ",
             "start_date": "2024-01-02",
@@ -222,48 +226,3 @@ def test_public_legacy_daily_result_does_not_claim_minute_quality_downgrade():
     assert diagnostics["minute_ratio"] is None
     assert diagnostics["raw_complete"] is None
     assert not any("整日降级" in warning or "分钟数据当前缺口" in warning for warning in public["warnings"])
-
-
-@pytest.mark.skip(reason="Legacy snapshot market-bar projection was removed")
-def test_result_get_uses_locked_rows_without_network_or_prepare_and_marketbars_stays_local(tmp_path, monkeypatch):
-    app = create_app(str(tmp_path), start_jobs=False)
-    version = _seed_snapshot(app.state.store)
-    store = app.state.store
-    raw_result = _saved_result(version)
-    result_id = store.save_result("optimization", raw_result, "159611.SZ", "diagnostics projection fixture")
-    stored = store.result(result_id)
-    raw_bytes = (store.root / "results" / f"{result_id}.json").read_bytes()
-
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("GET result must not fetch or run prepare_bundle")
-
-    monkeypatch.setattr(DataService, "sync", forbidden, raising=False)
-    monkeypatch.setattr(DataService, "ensure_bundle", forbidden)
-    for name in ("fetch_auxiliary_routed", "fetch_tdx", "fetch_sina", "fetch_reference_5m", "fetch_latest_trading_date"):
-        monkeypatch.setattr(data_module, name, forbidden)
-
-    with TestClient(app) as client:
-        with monkeypatch.context() as result_get:
-            result_get.setattr(data_module, "prepare_bundle", forbidden)
-            response = client.get(f"/api/v1/results/{result_id}")
-            full_response = client.get(f"/api/v1/results/{result_id}?full=true")
-            raw_export = client.get(f"/api/v1/results/{result_id}/export?kind=json")
-        # The bars endpoint may rebuild local coverage for a legacy manifest,
-        # but its provider entry points remain blocked throughout this request.
-        marketbars_response = client.get("/api/v1/market/bars/159611.SZ?frequency=1m&start_date=2024-01-03&end_date=2024-01-04&limit=2000")
-
-    assert response.status_code == 200
-    public = response.json()
-    spans = public["diagnostics"]["source_spans"]
-    assert [(span["source"], span["source_kind"], span["start"], span["end"]) for span in spans] == [
-        ("import", "import", "2024-01-03", "2024-01-03"),
-        ("sina", "provider", "2024-01-04", "2024-01-04"),
-    ]
-    assert full_response.status_code == raw_export.status_code == 200
-    assert marketbars_response.status_code == 200
-    assert marketbars_response.json()["bars"]
-    assert full_response.json() == stored
-    assert full_response.json()["evidence"]["trial_archive"] == raw_result["evidence"]["trial_archive"]
-    assert full_response.json()["fixed"]["candidate_archive"] == raw_result["fixed"]["candidate_archive"]
-    assert raw_export.content == dumps(stored).encode("utf-8") == raw_bytes
-    assert raw_export.json() == stored

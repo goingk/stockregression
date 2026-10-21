@@ -1,9 +1,17 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds } from '../src/taskState.ts'
+import { isResearchJob, mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds, taskLabel } from '../src/taskState.ts'
 
 const job = (id, status, values = {}) => ({ id, kind: 'backtest', status, progress: 0, message: '', ...values })
 const ids = (jobs) => jobs.map((entry) => entry.id)
+
+test('research completion jobs are treated as research tasks and labelled as such', () => {
+  assert.equal(isResearchJob({ kind: 'research_completion' }), true)
+  assert.ok(taskLabel({ kind: 'research_completion', payload: {} }).includes('补算'))
+  assert.equal(isResearchJob({ kind: 'optimization' }), true)
+  assert.equal(isResearchJob({ kind: 'optimize' }), true)
+  assert.equal(isResearchJob({ kind: 'backtest' }), false)
+})
 
 test('first history load restores queued and running notices without replaying old terminal results', () => {
   const initial = [

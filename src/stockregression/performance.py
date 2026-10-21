@@ -4,6 +4,7 @@ import contextlib
 import contextvars
 import math
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -150,6 +151,77 @@ def rebalance_cpu_budget() -> int:
 
 def current_workspace_bytes() -> int:
     return max(256 * 1024 * 1024, int(_WORKSPACE_BYTES.get()))
+
+
+_WINDOWS_MEMORY_COUNTERS: Any = None
+
+
+def _windows_rss_bytes() -> int:
+    """Read ``WorkingSetSize`` for this process through ``psapi``."""
+    import ctypes
+    from ctypes import wintypes
+
+    global _WINDOWS_MEMORY_COUNTERS
+    if _WINDOWS_MEMORY_COUNTERS is None:
+        class ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        _WINDOWS_MEMORY_COUNTERS = ProcessMemoryCounters
+    counters = _WINDOWS_MEMORY_COUNTERS()
+    counters.cb = ctypes.sizeof(counters)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.GetCurrentProcess()
+    call = None
+    for name in ("K32GetProcessMemoryInfo", "GetProcessMemoryInfo"):
+        candidate = getattr(kernel32, name, None)
+        if candidate is not None:
+            call = candidate
+            break
+    if call is None:  # pragma: no cover - legacy Windows without kernel32 export
+        call = ctypes.WinDLL("psapi").GetProcessMemoryInfo
+    call.argtypes = [wintypes.HANDLE, ctypes.POINTER(_WINDOWS_MEMORY_COUNTERS), wintypes.DWORD]
+    call.restype = wintypes.BOOL
+    if not call(handle, ctypes.byref(counters), counters.cb):
+        return 0
+    return int(counters.WorkingSetSize)
+
+
+def _posix_rss_bytes() -> int:
+    """Read the kernel's maximum resident size for this process."""
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - POSIX without resource
+        return 0
+    usage = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    # Linux and the BSDs report kilobytes, macOS reports bytes.
+    return usage if sys.platform == "darwin" else usage * 1024
+
+
+def current_process_rss_bytes() -> int:
+    """Resident set size of the current process in bytes.
+
+    Windows reads the live working set through ``GetProcessMemoryInfo``;
+    POSIX falls back to the kernel's peak resident size.  The sampler never
+    raises: an unavailable counter reports ``0`` so a caller can skip the
+    memory check instead of stopping the task.
+    """
+    try:
+        if os.name == "nt":
+            return max(0, _windows_rss_bytes())
+        return max(0, _posix_rss_bytes())
+    except Exception:  # pragma: no cover - defensive: never break a task
+        return 0
 
 
 def current_blas_threads() -> int:

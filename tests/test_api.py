@@ -24,8 +24,20 @@ def test_missing_data_requests_are_rejected_without_demo_fallback(tmp_path):
         assert missing_data.json()["detail"]["code"] == "DATA_NOT_READY"
         batch = client.post("/api/v1/backtests/batch", json={"configs": [{"symbol": "600000.SH", "start_date": "2026-01-01"}]})
         assert batch.status_code == 409
-        optimization = client.post("/api/v1/optimizations", json={"base": {"symbol": "600000.SH", "start_date": "2026-01-01"}, "n_trials": 1})
+        optimization = client.post("/api/v1/optimizations", json={
+            "base": {"schema_version": 3, "symbol": "600000.SH", "start_date": "2026-01-01"},
+        })
         assert optimization.status_code == 409
+        assert optimization.json()["detail"]["code"] == "DATA_NOT_READY"
+        legacy_optimization = client.post("/api/v1/optimizations", json={
+            "base": {"symbol": "600000.SH", "start_date": "2026-01-01"}, "n_trials": 1,
+        })
+        assert legacy_optimization.status_code == 422
+        old_protocol = client.post("/api/v1/optimizations", json={
+            "protocol_version": 4,
+            "base": {"schema_version": 3, "symbol": "600000.SH", "start_date": "2026-01-01"},
+        })
+        assert old_protocol.status_code == 422
         assert client.post("/api/v1/data/demo", json={"days": 20}).status_code in {404, 405}
         assert client.post("/api/v1/data/migrate-legacy", json={}).status_code in {404, 405}
 

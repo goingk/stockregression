@@ -238,7 +238,10 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
     points = return_days + pd.Timedelta(hours=15) if preview or daily_details else prepared["stamps"]
     indices = np.arange(len(points)) if preview or daily_details else np.flatnonzero(prepared["tradable"])
     openings = pd.to_datetime(prepared["opens"]).strftime("%Y-%m-%dT%H:%M:%S").tolist() if not summary_only else []
-    initial_equities = (money["initial_equity"], money["dca_initial_equity"], money["buy_hold_initial_equity"])
+    initial_equities = (
+        money["initial_equity"], money["dca_initial_equity"],
+        money["buy_hold_initial_equity"], money["initial_equity"],
+    )
     flow_aware = config.schema_version == 3
     peak_invested = float(funding_stats[0, 2]) if flow_aware else initial_equities[0]
     peak_day = int(round(funding_stats[0, 3])) if flow_aware and math.isfinite(funding_stats[0, 3]) else -1
@@ -254,9 +257,30 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
             "final_invested": float(funding_stats[0, 4]),
             "funding_flows": funding_flows,
         })
-    for account, name in enumerate(("grid", "dca", "buy_hold")):
-        metric = {key: (int(round(metrics[account, i])) if key in {"trade_count", "buy_count", "sell_count"} else float(metrics[account, i]) if math.isfinite(metrics[account, i]) else None) for i, key in enumerate(engine._METRIC_KEYS)}
+    for account, name in enumerate(("grid", "dca", "buy_hold", "matched_funding_hold")):
+        metric = {
+            "peak_principal_return": float(metrics[account, 0]) if math.isfinite(metrics[account, 0]) else None,
+            "max_principal_drawdown": float(metrics[account, 2]) if math.isfinite(metrics[account, 2]) else None,
+            "trade_count": int(round(metrics[account, 5])),
+            "total_fees": float(metrics[account, 6]) if math.isfinite(metrics[account, 6]) else None,
+            "turnover": float(metrics[account, 7]) if math.isfinite(metrics[account, 7]) else None,
+            "buy_count": int(round(metrics[account, 8])),
+            "sell_count": int(round(metrics[account, 9])),
+            "return_basis": "peak_principal",
+            "risk_basis": "principal_profit_drawdown",
+        }
         metric["initial_equity"] = initial_equities[account]
+        if metric.get("peak_principal_return") is None or metric.get("max_principal_drawdown") is None:
+            metric["unevaluable_reason"] = "评价区间外部本金峰值为零"
+        if account == 0:
+            metric.update({
+                "matched_funding_hold_return": float(funding_stats[0, 16]) if math.isfinite(funding_stats[0, 16]) else None,
+                "matched_funding_hold_drawdown": float(funding_stats[0, 17]) if math.isfinite(funding_stats[0, 17]) else None,
+                "total_invested": float(funding_stats[0, 4]),
+                "external_topups": float(funding_stats[0, 1]),
+                "total_profit": float(funding_stats[0, 6]),
+                "matched_funding_hold_invested": float(funding_stats[0, 21]),
+            })
         if account == 0:
             metric.update(
                 actual_min_pos_ratio=float(funding_stats[0, 9]),
@@ -269,8 +293,6 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
                     "floor_episode_count": int(round(funding_stats[0, 13])),
                     "floor_penalty": float(funding_stats[0, 14]),
                 })
-        if account != 1 and initial_equities[account] <= 0 and not (flow_aware and account == 0 and peak_invested > 0):
-            metric.update({key: None for key in ("total_return", "cagr", "max_drawdown", "sharpe", "calmar", "turnover")})
         if account == 1:
             metric.update(total_invested=float(metrics[account, 10]), skipped_periods=len(set(prepared["period_keys"])) - metric["buy_count"])
         if flow_aware and account == 0:
@@ -280,21 +302,39 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
                 "total_invested": float(funding_stats[0, 4]),
                 "external_topups": float(funding_stats[0, 1]),
                 "total_profit": float(funding_stats[0, 6]),
-                "time_weighted_total_return": None if not math.isfinite(funding_stats[0, 7]) else float(funding_stats[0, 7]),
-                "return_basis": "peak_invested_roi",
-                "risk_return_basis": "cash_flow_adjusted_unit_nav",
+                "peak_principal_return": float(metrics[account, 0]) if math.isfinite(metrics[account, 0]) else None,
+                "max_principal_drawdown": float(metrics[account, 2]) if math.isfinite(metrics[account, 2]) else None,
+                "return_basis": "peak_principal",
+                "risk_basis": "principal_profit_drawdown",
+            })
+        if flow_aware and account == 3:
+            metric.update({
+                "peak_principal_return": float(metrics[account, 0]) if math.isfinite(metrics[account, 0]) else None,
+                "max_principal_drawdown": float(metrics[account, 2]) if math.isfinite(metrics[account, 2]) else None,
+                "total_invested": float(funding_stats[0, 21]) if funding_stats.shape[1] > 21 else None,
+                "external_topups": float(funding_stats[0, 22]) if funding_stats.shape[1] > 22 else None,
+                "return_basis": "peak_principal",
+                "risk_basis": "principal_profit_drawdown",
             })
         equity = []
         if not summary_only:
+            principal_denominator = {
+                0: peak_invested,
+                1: float(metrics[1, 10]),
+                2: initial_equities[2],
+                3: float(funding_stats[0, 23]),
+            }[account]
             for i in indices:
-                if account == 0 and flow_aware:
-                    invested_at_point = float(invested[0, i])
-                    profit = float(eq[account, i]) - invested_at_point
-                    normalized = 1.0 + profit / peak_invested if peak_invested > 0 else None
-                else:
-                    invested_at_point = float(invested[1, i]) if account == 1 else initial_equities[account]
-                    normalized = float(eq[account, i] / invested_at_point) if invested_at_point > 0 else None
-                equity.append({"timestamp": points[i].isoformat(), "equity": float(eq[account, i]), "cash": float(cash[account, i]), "position": float(shares[account, i]), "drawdown": None if account == 1 else float(drawdown[account, i]), "normalized_equity": normalized, "total_invested": invested_at_point, "cumulative_profit": (float(eq[account, i]) - invested_at_point) if account == 0 and flow_aware else None})
+                invested_at_point = float(invested[account, i])
+                profit = float(eq[account, i]) - invested_at_point
+                principal_curve = 1.0 + profit / principal_denominator if principal_denominator > 0 else None
+                equity.append({
+                    "timestamp": points[i].isoformat(), "equity": float(eq[account, i]),
+                    "cash": float(cash[account, i]), "position": float(shares[account, i]),
+                    "total_invested": invested_at_point, "peak_principal": principal_denominator,
+                    "cumulative_profit": profit, "principal_curve": principal_curve,
+                    "principal_drawdown": float(drawdown[account, i]) if principal_denominator > 0 else None,
+                })
         trades = [{"timestamp": openings[int(tb[j])], "side": "buy" if ts[j] == 1 else "sell", "quantity": int(tq[j]), "price": float(tp[j]), "fees": float(tf[j]), "cash": float(tc[j]), "shares": int(th[j]), "reason": engine._TRADE_REASONS[int(tr[j])], "external_topup": float(ttop[j]) if account == 0 else 0.0} for j in range(len(tb)) if ta[j] == account]
         rejections = [{"timestamp": pd.Timestamp(rt[j]).isoformat(), "side": "buy" if rs[j] == 1 else "sell", "reason": "parameter_update" if int(rr[j]) == 12 else engine._REJECTION_REASONS[int(rr[j])], "requested_quantity": int(rq[j])} for j in range(len(rb)) if ra[j] == account]
         if account == 1 and not summary_only and not preview:
@@ -303,9 +343,12 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
                 if key not in bought:
                     day = [d for d, p in zip(prepared["days"], prepared["period_keys"]) if p == key][-1]
                     rejections.append({"timestamp": (day + pd.Timedelta(hours=15)).isoformat(), "side": "buy", "reason": "dca_period_skipped", "requested_quantity": config.dca.shares})
-        returns = [] if account == 1 or summary_only else [{"timestamp": (day + pd.Timedelta(hours=15)).isoformat(), "return": float(periods[account, i])} for i, day in enumerate(return_days)]
-        strategy_basis = "peak_invested" if account == 0 and flow_aware else "cost" if account == 1 else "initial_equity"
-        strategy_result = {"metrics": metric, "equity": equity, "equity_frequency": "1d" if preview or daily_details else config.frequency, "trades": trades, "rejections": rejections, "period_returns": returns, "return_basis": strategy_basis}
+        strategy_basis = "peak_principal" if account in (0, 3) else "cost" if account == 1 else "initial_equity"
+        strategy_result = {
+            "metrics": metric, "equity": equity,
+            "equity_frequency": "1d" if preview or daily_details else config.frequency,
+            "trades": trades, "rejections": rejections, "return_basis": strategy_basis,
+        }
         if account == 0 and config.floor_penalty_config is not None:
             strategy_result.update({
                 "floor_episode_count": int(round(funding_stats[0, 13])),
@@ -321,8 +364,8 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
     retrospective = bool(selection_asof and config.start_date <= selection_asof)
     if retrospective:
         warnings.append(f"参数选定于 {selection_asof}；选参截止日及以前的历史重跑属于样本内回看，不是样本外成绩。")
-    accounting_basis = "cash_flow_adjusted_peak_contributions_v1" if flow_aware else "independent_contributions_v1"
-    result = {"schema_version": config.schema_version, "accounting_basis": accounting_basis, "symbol": config.symbol, "config": config.model_dump(mode="json"), "data_version": data.version, "quality": data.quality, "is_demo": bool(data.metadata.get("is_demo")), "funding": money, "requested_end_date": str(config.end_date) if config.end_date else None, "effective_end_date": prepared["end"], "warnings": warnings, "strategies": strategies}
+    accounting_basis = "peak_principal_v2" if flow_aware else "independent_contributions_v1"
+    result = {"schema_version": config.schema_version, "result_schema_version": 2, "accounting_basis": accounting_basis, "symbol": config.symbol, "config": config.model_dump(mode="json"), "data_version": data.version, "quality": data.quality, "is_demo": bool(data.metadata.get("is_demo")), "funding": money, "requested_end_date": str(config.end_date) if config.end_date else None, "effective_end_date": prepared["end"], "warnings": warnings, "strategies": strategies}
     if config.floor_penalty_config is not None:
         grid = strategies["grid"]
         result.update({
@@ -344,16 +387,17 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
 
 def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
                    cancelled=None, parallel=True, allow_odd_lot_exit=False):
-    """Compact day-by-candidate returns with exact intrabar fold risk.
+    """Evaluate candidates with exact intrabar fold risk.
 
-    The cash budget is determined once from ``base`` and shared by every row.
-    All folds are measurements on the same continuous candidate ledger.
+    All folds are measurements on the same continuous candidate ledger.  The
+    result contains peak-principal summaries only; no daily-return matrix is
+    allocated.
     """
     from . import engine
     from .models import BacktestConfig
     from .share_kernel import simulate, simulate_research_batch
-    if base.schema_version not in (2, 3):
-        raise ValueError("科学研究需要股数配置")
+    if base.schema_version != 3:
+        raise ValueError("科学研究需要 schema_version=3 的股数配置")
     if not math.isfinite(cost_multiplier) or cost_multiplier <= 0:
         raise ValueError("成本倍数必须为正数")
     prepared, money = _inputs(base, data), funding(base, data)
@@ -369,17 +413,14 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
     for patch in params:
         if patch.get("initial_shares", base.initial_shares) != base.initial_shares:
             raise ValueError("科学研究不能搜索初始持股")
-        if base.schema_version == 2 and patch.get("reserve_cash", money["reserve_cash"]) != money["reserve_cash"]:
-            raise ValueError("科学研究不能改变现金预算")
         candidate = BacktestConfig.model_validate({**base.model_dump(mode="python"), **patch})
         rows.append([candidate.min_shares, np.inf if candidate.max_shares is None else candidate.max_shares, candidate.buy_step,
                      candidate.sell_step, candidate.grid_step, candidate.buy_shares, candidate.sell_shares])
     values = np.asarray(rows, dtype=np.float64).reshape((-1, 7))
     dates = _return_days(prepared)
-    returns = np.empty((len(dates), len(values)), dtype=np.float64)
     metric_values = np.empty((len(values), 11), dtype=np.float64)
     fold_values = np.empty((len(values), len(fold_ranges), 9), dtype=np.float64)
-    funding_stats = np.empty((len(values), 16), dtype=np.float64)
+    funding_stats = np.empty((len(values), 24), dtype=np.float64)
     episode_values = [np.empty(0, dtype=np.int64) for _ in values]
     options = _options(
         base, prepared, money, cost_multiplier=cost_multiplier,
@@ -393,10 +434,7 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
         old_threads = get_num_threads()
         active_threads = min(old_threads, rebalance_cpu_budget())
         set_num_threads(active_threads)
-    bytes_per_candidate = max(
-        8192,
-        len(dates) * 8 + max(1, len(fold_ranges)) * 72 + 128,
-    )
+    bytes_per_candidate = max(8192, max(1, len(fold_ranges)) * 72 + 128)
     chunk_size = max(1, min(256, int(current_workspace_bytes() // (bytes_per_candidate * 4))))
     record_details(
         research_threads=active_threads,
@@ -413,11 +451,11 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
                     active_threads = refreshed
                     set_num_threads(active_threads)
                 with blas_thread_limit(1):
-                    r, m, f, e, s = simulate_research_batch(
+                    m, f, e, s = simulate_research_batch(
                         prepared["arrays"], options, values[begin:end],
                         fold_ids, len(fold_ranges),
                     )
-                returns[:, begin:end], metric_values[begin:end], fold_values[begin:end], funding_stats[begin:end] = r, m, f, s
+                metric_values[begin:end], fold_values[begin:end], funding_stats[begin:end] = m, f, s
                 for offset in range(end - begin):
                     episode_values[begin + offset] = e[offset]
             else:
@@ -427,8 +465,8 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
                     individual = (*options[:3], p[0], p[1], options[5], p[2], p[3], p[4],
                                   *options[9:12], int(p[5]), int(p[6]), *options[14:])
                     output = runner(*prepared["arrays"], *individual, empty_days, empty_values,
-                                    fold_ids, len(fold_ranges), True, False)
-                    returns[:, index], metric_values[index], fold_values[index], funding_stats[index] = output[5][0], output[0][0], output[-3], output[-1][0]
+                                    fold_ids, len(fold_ranges), False, False)
+                    metric_values[index], fold_values[index], funding_stats[index] = output[0][0], output[-3], output[-1][0]
                     episode_values[index] = output[-2]
             record_count("research_candidates", end - begin)
         if cancelled and cancelled():
@@ -439,8 +477,24 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
             set_num_threads(old_threads)
     metrics = []
     for index, row in enumerate(metric_values):
-        metric = {key: int(round(row[i])) if key in {"trade_count", "buy_count", "sell_count"} else float(row[i]) for i, key in enumerate(engine._METRIC_KEYS)}
+        metric = {
+            "peak_principal_return": float(funding_stats[index, 18]),
+            "max_principal_drawdown": float(funding_stats[index, 19]),
+            "matched_funding_hold_return": float(funding_stats[index, 16]),
+            "matched_funding_hold_drawdown": float(funding_stats[index, 17]),
+            "trade_count": int(round(row[5])),
+            "total_fees": float(row[6]),
+            "turnover": float(row[7]),
+            "buy_count": int(round(row[8])),
+            "sell_count": int(round(row[9])),
+        }
         metric["initial_equity"] = money["initial_equity"]
+        metric["total_invested"] = float(funding_stats[index, 4])
+        metric["external_topups"] = float(funding_stats[index, 1])
+        metric["total_profit"] = float(funding_stats[index, 6])
+        metric["matched_funding_hold_invested"] = float(funding_stats[index, 21])
+        metric["return_basis"] = "peak_principal"
+        metric["risk_basis"] = "principal_profit_drawdown"
         metric.update({
             "actual_min_pos_ratio": float(funding_stats[index, 9]),
             "actual_max_pos_ratio": float(funding_stats[index, 10]),
@@ -453,7 +507,7 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
                 "floor_penalty": float(funding_stats[index, 14]),
             })
         metrics.append(metric)
-    keys = ("max_drawdown", "trade_count", "buy_count", "sell_count", "total_fees", "turnover", "profit", "principal", "end_assets")
+    keys = ("principal_drawdown", "trade_count", "buy_count", "sell_count", "total_fees", "turnover", "profit", "principal", "end_assets")
     fold_metrics = [[{key: int(round(row[j])) if key.endswith("count") else float(row[j]) for j, key in enumerate(keys)} for row in candidate] for candidate in fold_values]
     position_stats = [{
         "actual_min_pos_ratio": float(row[9]),
@@ -467,34 +521,11 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
             "floor_penalty_basis": "episode_grids_v1",
         } if base.floor_penalty_config is not None else {}),
     } for index, row in enumerate(funding_stats)]
-    return {"dates": dates, "daily_returns": returns, "fold_drawdowns": fold_values[:, :, 0],
+    return {"dates": dates, "fold_drawdowns": fold_values[:, :, 0],
             "fold_metrics": fold_metrics, "metrics": metrics, "funding": money,
             "funding_stats": funding_stats, "position_stats": position_stats,
+            "matched_funding_returns": funding_stats[:, 16],
             "backend": "numba_batch" if old_threads is not None else "serial"}
-
-
-def research_passive(config, data):
-    from . import engine
-    from .share_kernel import simulate
-    prepared, money = _inputs(config, data), funding(config, data)
-    runner = simulate if engine._NUMBA_FASTPATH_ENABLED else getattr(simulate, "py_func", simulate)
-    output = runner(*prepared["arrays"], *_options(config, prepared, money),
-                    np.zeros(0, dtype=np.int64), np.zeros((0, 7), dtype=np.float64),
-                    np.full(len(prepared["days"]), -1, dtype=np.int64), 0, True, True)
-    return {"dates": _return_days(prepared), "daily_returns": output[5][0], "funding": money}
-
-
-def research_buy_hold(config, data):
-    """Daily returns for the independent 1,000-share buy-and-hold account."""
-    from . import engine
-    from .share_kernel import simulate
-
-    prepared, money = _inputs(config, data), funding(config, data)
-    runner = simulate if engine._NUMBA_FASTPATH_ENABLED else getattr(simulate, "py_func", simulate)
-    output = runner(*prepared["arrays"], *_options(config, prepared, money),
-                    np.zeros(0, dtype=np.int64), np.zeros((0, 7), dtype=np.float64),
-                    np.full(len(prepared["days"]), -1, dtype=np.int64), 0, False, True)
-    return {"dates": _return_days(prepared), "daily_returns": output[5][2], "funding": money}
 
 
 def run_passive_backtest(config, data, progress=None, cancelled=None, **kwargs):

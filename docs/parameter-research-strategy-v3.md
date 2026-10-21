@@ -1,6 +1,6 @@
 # 历史参数研究策略（v3）
 
-> 本文描述 `protocol_version=4`、`strategy_version=3` 的历史超正方体平均超额方法及兼容路径。新研究默认已切换到四维稳健 J，见[参数研究 v4](parameter-research-v4.md)。
+> 历史资料：本文描述 `protocol_version=4`、`strategy_version=3` 的旧超正方体平均超额方法。该协议和兼容入口已移除；当前契约见[参数研究 v5](parameter-research-v5.md)。
 
 本文记录项目当前 `protocol_version=3` 的参数研究实现，描述程序实际执行的流程、资格门槛和结果解释。适用于 `schema_version=3` 配置。v1/v2 历史结果沿用各自原有计算口径，不由本文重新定义。
 
