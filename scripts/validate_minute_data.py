@@ -214,13 +214,14 @@ def _select_saved_study(store: ReadOnlyStore, version: str, requested_id: str | 
         config = result.get("config", {}) if result else {}
         base = config.get("base", {}) if isinstance(config, dict) else {}
         symbol = (result or {}).get("symbol") or base.get("symbol")
-        if (result and result.get("protocol_version") == 2
+        if (result and result.get("protocol_version") == 5
+                and result.get("result_schema_version") == 2
                 and symbol == "159611.SZ"
                 and result.get("data_version") == version
                 and result.get("fixed", {}).get("test_result")
                 and result.get("adaptive", {}).get("test_result")):
             return result
-    raise RuntimeError("找不到使用当前 snapshot 且含 fixed/adaptive 真实回放的已保存 v2 研究；请传入 --result-id")
+    raise RuntimeError("找不到使用当前 snapshot 且含 fixed/adaptive 真实回放的已保存 v5 研究；请传入 --result-id")
 
 
 def _replay_branch(config: BacktestConfig, bundle, schedule=None) -> dict:

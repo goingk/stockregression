@@ -37,7 +37,7 @@ def make_config(training_budget: int, validation_budget: int) -> OptimizationCon
         buy_step=.03, sell_step=.03,
     )
     strategy = ResearchStrategySpec.model_validate({
-        "strategy_version": 4, "search_method": "hierarchical", "ranking_mode": "fixed_mean",
+        "strategy_version": 5, "search_method": "hierarchical", "ranking_mode": "robust_j",
         "granularity": {"buy_step": .001, "sell_step": .001, "buy_shares": 100, "sell_shares": 100},
         "hypercube_edge": 3, "sigma": 1.0, "alpha": .30, "beta": 1.20, "tau": .01,
         "eta_limit": 2.0, "eta_hard_cap": 3.5, "gamma_max": .40,
@@ -49,7 +49,7 @@ def make_config(training_budget: int, validation_budget: int) -> OptimizationCon
         "validation_reserve_fraction": .25, "stress_region_count": 0,
     })
     return OptimizationConfig(
-        base=base, protocol_version=4, strategy=strategy, selection_target="fixed",
+        base=base, protocol_version=5, strategy=strategy, selection_target="fixed",
         ranges={
             "buy_step": {"low": .001, "high": .007},
             "sell_step": {"low": .001, "high": .007},

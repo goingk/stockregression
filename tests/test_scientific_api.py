@@ -1,48 +1,54 @@
+"""v5 研究协议下的结果发布、配置迁移与研究登记契约。
+
+旧协议的公开结果压缩测试已经从 v2 形状迁移到 protocol_version=5 /
+result_schema_version=2；旧的 v1/v2 模型默认值、旧版研究偏好迁移与 v2
+科学研究的 API 兼容用例随协议一并移除。
+"""
+
 from __future__ import annotations
 
-from datetime import date
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 
-import pandas as pd
-import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+import pytest
 
-from stockregression import optimization, scientific
 from stockregression.api import create_app, public_result
-from stockregression.jobs import _research_protocol_hash, execute_job
+from stockregression.jobs import _research_protocol_hash
 from stockregression.models import BacktestConfig, OptimizationConfig
 from stockregression.settings import ResearchDefaults
 from stockregression.storage import Store, dumps
 
 
-def test_public_v2_results_keep_ui_summaries_and_drop_raw_archives_and_cost_matrices(tmp_path):
+def test_public_v5_results_keep_ui_summaries_and_drop_raw_archives_and_cost_matrices(tmp_path):
     candidates = [
         {
             "candidate_id": index,
             "params": {"buy_step": 0.01 * index},
             "score": 0.1 * index,
             "cost_scores": {"original_cost": 0.1 * index},
-            "folds": [{"start": "2024-01-02", "end": "2024-01-03", "days": 2}],
+            "training_excess_return": 0.01 * index,
+            "max_principal_drawdown": 0.05,
         }
         for index in range(5)
     ]
     archive = [{"candidate_id": index, "payload": [index] * 10} for index in range(50)]
     trial_archive = [{"trial": index, "status": "completed", "params": {"x": index}} for index in range(40)]
     cost_matrix = [[float(row * 100 + column) for column in range(100)] for row in range(50)]
-    bootstrap = {
-        "method": "paired_stationary_bootstrap_white_reality_check",
-        "primary": {"p_value": 0.25, "completed_reps": 100, "candidate_count": 5},
-        "sensitivity": {"20": {"p_value": 0.25, "completed_reps": 100}},
-    }
     curve = [
         {"timestamp": "2024-01-02T10:00:00", "equity": 100.0},
         {"timestamp": "2024-01-02T15:00:00", "equity": 101.0},
     ]
     run = {"strategies": {"grid": {"equity": curve, "trades": [{"timestamp": "2024-01-02T15:00:00", "side": "buy"}]}}}
     result = {
-        "protocol_version": 2,
-        "config": {"protocol_version": 2, "top_candidates": 2},
+        "protocol_version": 5,
+        "result_schema_version": 2,
+        "config": {
+            "protocol_version": 5,
+            "top_candidates": 2,
+            "strategy": {"strategy_version": 5, "ranking_mode": "robust_j"},
+        },
         "computation": {"candidate_count": 150, "cost_evaluations": 300, "decision_count": 3},
         "fixed": {
             "status": "completed",
@@ -60,7 +66,7 @@ def test_public_v2_results_keep_ui_summaries_and_drop_raw_archives_and_cost_matr
                     "validation_evaluation_count": 100,
                     "trial_status_counts": {"completed": 4},
                     "costs": {"original_cost": {"fold_utility": cost_matrix}},
-                    "candidate_family_bootstrap": {"family_count": 5, "candidate_ids": list(range(5)), "bootstrap": bootstrap},
+                    "candidate_ids": list(range(5)),
                 },
             },
             "test_result": run,
@@ -81,8 +87,8 @@ def test_public_v2_results_keep_ui_summaries_and_drop_raw_archives_and_cost_matr
             }],
             "candidate_archives": {"fixed": archive, "adaptive": archive},
             "trial_archives": {"fixed": trial_archive, "adaptive": trial_archive},
-            "current_candidate_family_bootstrap": {"family_count": 5, "candidate_ids": list(range(5)), "bootstrap": bootstrap},
-            "final_126_day_check": {"status": "completed", "bootstrap": bootstrap},
+            "search_candidate_archives": {"current": archive},
+            "current_decision": {"decision": "current"},
         },
     }
 
@@ -95,15 +101,17 @@ def test_public_v2_results_keep_ui_summaries_and_drop_raw_archives_and_cost_matr
     assert "trial_archive" not in compact["fixed"]["current"]
     assert "candidate_archives" not in compact["evidence"]
     assert "trial_archives" not in compact["evidence"]
+    assert "search_candidate_archives" not in compact["evidence"]
     assert len(compact["evidence"]["decisions"][0]["candidates"]) == 2
     assert compact["evidence"]["decisions"][0]["candidate_count"] == 50
+    assert compact["evidence"]["current_decision"] == {"decision": "current"}
     assert compact["fixed"]["current"]["diagnostics"]["candidate_count"] == 50
     assert compact["fixed"]["current"]["diagnostics"]["validation_evaluation_count"] == 100
     assert compact["fixed"]["current"]["diagnostics"]["trial_status_counts"] == {"completed": 4}
     assert "costs" not in compact["fixed"]["current"]["diagnostics"]
     assert "costs" not in compact["evidence"]["decisions"][0]["diagnostics"]
+    assert "candidate_ids" not in compact["fixed"]["current"]["diagnostics"]
     assert compact["fixed"]["candidates"][0]["cost_scores"] == candidates[0]["cost_scores"]
-    assert compact["evidence"]["final_126_day_check"]["bootstrap"] == bootstrap
     assert compact["adaptive"]["schedule"] == result["adaptive"]["schedule"]
     assert compact["computation"] == result["computation"]
     assert len(compact["fixed"]["test_result"]["strategies"]["grid"]["equity"]) == 1
@@ -116,7 +124,7 @@ def test_public_v2_results_keep_ui_summaries_and_drop_raw_archives_and_cost_matr
     assert len(result["fixed"]["test_result"]["strategies"]["grid"]["equity"]) == 2
 
     app = create_app(str(tmp_path), start_jobs=False)
-    result_id = app.state.store.save_result("optimization", result, "000001.SZ", "v2 API payload")
+    result_id = app.state.store.save_result("optimization", result, "000001.SZ", "v5 API payload")
     with TestClient(app) as client:
         default_response = client.get(f"/api/v1/results/{result_id}")
         full_response = client.get(f"/api/v1/results/{result_id}?full=true")
@@ -127,172 +135,70 @@ def test_public_v2_results_keep_ui_summaries_and_drop_raw_archives_and_cost_matr
     assert len(full_response.json()["fixed"]["test_result"]["strategies"]["grid"]["equity"]) == 2
 
 
-def test_public_result_keeps_legacy_candidate_data_unchanged():
-    result = {
-        "protocol_version": 1,
-        "historical": {
-            "candidate_archive": [{"trial": 1}],
-            "best_result": {"strategies": {"grid": {"equity": [
-                {"timestamp": "2024-01-02T10:00:00", "equity": 100.0},
-                {"timestamp": "2024-01-02T15:00:00", "equity": 101.0},
-            ]}}},
-        },
-    }
-
-    compact = public_result(result)
-
-    assert compact["historical"]["candidate_archive"] == [{"trial": 1}]
-    assert len(compact["historical"]["best_result"]["strategies"]["grid"]["equity"]) == 1
-
-
-def _seed_daily_history(store: Store, days: int = 640) -> pd.DatetimeIndex:
-    calendar = pd.bdate_range("2020-01-02", periods=days)
-    close = pd.Series(10 + pd.RangeIndex(days).to_numpy() * 0.002, dtype=float)
-    daily = pd.DataFrame({
-        "date": calendar,
-        "open": close,
-        "high": close + 0.05,
-        "low": close - 0.05,
-        "close": close,
-        "preclose": close.shift(1).fillna(close),
-        "volume": 100_000,
-        "turnover": close * 100_000,
-        "tradestatus": 1,
-        "is_st": False,
-    })
-    store.publish(
-        "000001.SZ",
-        pd.DataFrame(),
-        daily,
-        pd.DataFrame(),
-        pd.DataFrame({"date": calendar}),
-        {"name": "测试股票", "listing_date": str(calendar[0].date()), "actions_verified": True, "is_demo": False},
-        {},
-    )
-    return calendar
-
-
-def test_v2_models_keep_legacy_defaults_and_serialize_only_v2_fields():
-    legacy = OptimizationConfig(base={"symbol": "600000.SH", "start_date": "2024-01-02"})
-    assert legacy.protocol_version == 1
-    assert legacy.n_trials == 200
-    assert "reserve_cash" not in BacktestConfig(symbol="600000.SH", start_date=date(2024, 1, 2)).model_dump(mode="json")
-
+def test_v5_models_reject_retired_protocol_fields():
     with pytest.raises(ValidationError):
-        OptimizationConfig(protocol_version=2, base={"symbol": "600000.SH", "start_date": "2024-01-02"})
+        BacktestConfig(
+            schema_version=3, symbol="600000.SH", start_date=date(2024, 1, 2), reserve_cash=0,
+        )
+    with pytest.raises(ValidationError):
+        OptimizationConfig(
+            base={"schema_version": 3, "symbol": "600000.SH", "start_date": "2024-01-02"},
+            mode="historical",
+        )
+    with pytest.raises(ValidationError):
+        OptimizationConfig(
+            base={"schema_version": 3, "symbol": "600000.SH", "start_date": "2024-01-02"},
+            n_trials=8,
+        )
 
-    scientific = OptimizationConfig(
-        protocol_version=2,
-        base={"schema_version": 2, "symbol": "600000.SH", "start_date": "2024-01-02", "reserve_cash": 0, "selection_asof": "2023-12-29"},
+    serialized = BacktestConfig(
+        schema_version=3, symbol="600000.SH", start_date=date(2024, 1, 2),
+    ).model_dump(mode="json")
+    assert "reserve_cash" not in serialized
+
+    config = OptimizationConfig(
+        base={"schema_version": 3, "symbol": "600000.SH", "start_date": "2024-01-02"},
     )
-    assert scientific.n_trials == 1000
-    serialized = scientific.base.model_dump(mode="json")
-    assert serialized["reserve_cash"] == 0
-    assert serialized["selection_asof"] == "2023-12-29"
+    assert config.protocol_version == 5
+    assert config.strategy.strategy_version == 5
+    assert config.strategy.ranking_mode == "robust_j"
+    assert config.strategy.strategy_id == "geometric_robust_j"
+    assert set(config.ranges) == {"buy_step", "sell_step", "buy_shares", "sell_shares"}
+    assert all(value.step is None for value in config.ranges.values())
+    assert config.protocol_description()["result_schema_version"] == 2
 
 
-def test_old_research_preferences_fill_new_defaults_and_keep_custom_ranges():
-    old = ResearchDefaults.model_validate({
+def test_legacy_research_preferences_migrate_to_v5_defaults():
+    legacy = ResearchDefaults.model_validate({
+        "protocol_version": 4,
         "mode": "robust",
         "n_trials": 321,
+        "bootstrap_reps": 10_000,
+        "max_drawdown": 0.5,
         "ranges": ResearchDefaults().model_dump()["ranges"],
     })
-    assert old.protocol_version == 4
-    assert old.n_trials == 321
-    assert old.mode == "robust"
-    assert len(old.ranges) == 4
-    assert {"buy_step", "sell_step"} <= set(old.ranges)
-    assert old.selection_target == "both"
-    assert old.rebalance_days == 63
-    assert old.bootstrap_reps == 10_000
 
-    legacy = ResearchDefaults.model_validate({
-        "strategy_version": 3,
-        "ranges": {
-            **ResearchDefaults.model_validate({"strategy_version": 3}).model_dump()["ranges"],
-            "max_shares": {"low": 2000, "high": 2200, "step": 100},
-        },
-    })
-    assert len(legacy.ranges) == 7
-    assert legacy.ranges["max_shares"].high == 2200
+    assert legacy.protocol_version == 5
+    assert legacy.strategy_version == 5
+    assert legacy.ranking_mode == "robust_j"
+    assert legacy.strategy_id == "geometric_robust_j"
+    assert legacy.max_shares_mode == "unlimited"
+    assert legacy.neighborhood_fields == ["buy_step", "sell_step", "buy_shares", "sell_shares"]
+    assert set(legacy.ranges) == {"buy_step", "sell_step", "buy_shares", "sell_shares"}
+    assert all(value.step is None for value in legacy.ranges.values())
+    assert set(legacy.granularity) == {"buy_step", "sell_step", "buy_shares", "sell_shares"}
+    assert set(legacy.fixed_half_widths) == {"buy_step", "sell_step", "buy_shares", "sell_shares"}
+    assert legacy.selection_target == "both"
+    assert legacy.rebalance_days == 63
+    # 只在迁移整份旧对象时丢弃已退役的控制项。
+    assert not hasattr(legacy, "mode")
+    assert not hasattr(legacy, "n_trials")
+    assert not hasattr(legacy, "bootstrap_reps")
+    assert not hasattr(legacy, "max_drawdown")
 
-
-@pytest.mark.skip(reason="Legacy snapshot research seed was removed")
-def test_scientific_result_daily_clipping_preserves_fields_and_exports_both_selections(tmp_path, monkeypatch):
-    app = create_app(str(tmp_path), start_jobs=False)
-    dates = _seed_daily_history(app.state.store)
-    base = {
-        "protocol_version": 2,
-        "selection_target": "both",
-        "base": {
-            "schema_version": 2,
-            "symbol": "000001.SZ",
-            "start_date": str(dates[550].date()),
-            "end_date": str(dates[-1].date()),
-            "frequency": "1d",
-        },
-    }
-
-    def fake_optimize(config, bundle, progress=None, cancelled=None):
-        assert config.base.start_date == dates[550].date()
-        assert bundle.calendar.min() == dates[45]
-        assert bundle.calendar.max() == dates[-1]
-        assert bundle.metadata["research_preparation"]["requested_lookback_trading_days"] == 504
-        if progress:
-            progress(1, "完成")
-        equity = [
-            {"timestamp": "2022-01-03 10:00:00", "equity": 100.0},
-            {"timestamp": "2022-01-03 15:00:00", "equity": 101.0},
-        ]
-        return {
-            "protocol_version": 2,
-            "status": "completed",
-            "config": config.model_dump(mode="json"),
-            "fixed": {"status": "completed", "params": {"buy_shares": 100}, "as_of": "2022-01-03", "test_result": {"strategies": {"grid": {"equity": equity, "trades": [{"date": "2022-01-03"}]}}}},
-            "adaptive": {"status": "completed", "schedule": [], "latest_params": {"buy_shares": 200}, "test_result": {"strategies": {"grid": {"equity": equity, "trades": [{"date": "2022-01-03"}]}}}},
-            "evidence": {"fixed_decision": {"windows": [{"start": "2022-01-01", "end": "2022-01-03", "days": 3}]}, "notes": ["audit remains visible"]},
-            "data_version": bundle.version,
-            "quality": {"is_demo": False},
-        }
-
-    monkeypatch.setattr(optimization, "optimize", fake_optimize)
-    with TestClient(app) as client:
-        response = client.post("/api/v1/optimizations", json=base)
-        assert response.status_code == 200
-        job_id = response.json()["job_id"]
-        job = client.get(f"/api/v1/jobs/{job_id}").json()
-        assert job["payload"]["version"] is not None
-        assert job["payload"]["config"]["n_trials"] == 1000
-        execute_job(str(tmp_path), job_id)
-
-        job = client.get(f"/api/v1/jobs/{job_id}").json()
-        assert job["status"] == "completed", job.get("error")
-        result = client.get(f"/api/v1/jobs/{job_id}/result").json()
-        frozen = job["payload"]["configuration_snapshot"]
-        assert result["configuration_snapshot"] == frozen
-        assert result["execution"]["configuration_revision"] == frozen["revision"]
-        assert result["execution"]["data_version"] == job["payload"]["version"]
-        assert result["execution"]["cpu_units"] >= 1
-        assert result["execution"]["resource_settings"]["workspace_mb"] >= 256
-        assert result["fixed"]["params"]["buy_shares"] == 100
-        assert result["adaptive"]["latest_params"]["buy_shares"] == 200
-        assert result["evidence"]["notes"] == ["audit remains visible"]
-        intervals = result["evidence"]["local_audit"]["validation_intervals"]
-        assert {item["kind"] for item in intervals} == {"input_evaluation", "evidence.fixed_decision.windows"}
-        # Two intraday rows on the same date are reduced to one daily point.
-        assert len(result["fixed"]["test_result"]["strategies"]["grid"]["equity"]) == 1
-        assert result["fixed"]["test_result"]["strategies"]["grid"]["equity_frequency"] == "1d"
-        exported = client.get(f"/api/v1/results/{job['result_id']}/export?kind=equity")
-        assert b"selection,strategy" in exported.content
-        assert b"fixed,grid" in exported.content and b"adaptive,grid" in exported.content
-
-        repeated_id = client.post("/api/v1/optimizations", json=base).json()["job_id"]
-        execute_job(str(tmp_path), repeated_id)
-        repeated_job = client.get(f"/api/v1/jobs/{repeated_id}").json()
-        repeated_result = client.get(f"/api/v1/jobs/{repeated_id}/result").json()
-        assert repeated_job["status"] == "completed"
-        assert repeated_result["evidence"]["local_audit"]["overlapping_prior_studies"] == 1
-        assert repeated_result["evidence"]["local_audit"]["exact_repeat_prior_studies"] == 1
+    # 当前协议下提交已退役的控制项必须报错，而不是被静默丢弃。
+    with pytest.raises(ValidationError):
+        ResearchDefaults.model_validate({"protocol_version": 5, "mode": "robust"})
 
 
 def test_research_registry_counts_overlap_even_after_seed_or_snapshot_changes(tmp_path):
@@ -322,8 +228,8 @@ def test_research_registry_serializes_concurrent_overlap_checks(tmp_path):
 
 
 def test_protocol_hash_excludes_evaluation_dates_but_tracks_seed():
-    first = OptimizationConfig(protocol_version=2, base={
-        "schema_version": 2, "symbol": "600000.SH", "start_date": "2024-01-02", "end_date": "2024-06-28",
+    first = OptimizationConfig(protocol_version=5, base={
+        "schema_version": 3, "symbol": "600000.SH", "start_date": "2024-01-02", "end_date": "2024-06-28",
     })
     shifted = first.model_copy(update={
         "base": first.base.model_copy(update={"start_date": date(2024, 2, 1), "end_date": date(2024, 8, 30)}),
@@ -331,43 +237,3 @@ def test_protocol_hash_excludes_evaluation_dates_but_tracks_seed():
     reseeded = first.model_copy(update={"seed": first.seed + 1})
     assert _research_protocol_hash(first) == _research_protocol_hash(shifted)
     assert _research_protocol_hash(first) != _research_protocol_hash(reseeded)
-
-
-def test_selection_rng_seed_is_independent_of_asof_date(monkeypatch):
-    dates = pd.bdate_range("2022-01-03", periods=220)
-    prices = pd.Series(10 + pd.RangeIndex(len(dates)).to_numpy() * 0.001, dtype=float)
-    daily = pd.DataFrame({"date": dates, "open": prices, "high": prices, "low": prices, "close": prices, "volume": 1000, "turnover": prices * 1000})
-    bars = pd.DataFrame({"timestamp": dates + pd.Timedelta(hours=15), "open": prices, "high": prices, "low": prices, "close": prices, "volume": 1000, "turnover": prices * 1000, "frequency": "1d", "tradable": True, "is_synthetic": False})
-    bundle = scientific.DataBundle(symbol="600000.SH", bars=bars, daily=daily, calendar=dates, quality={"minute_ratio": 1.0})
-    config = OptimizationConfig(protocol_version=2, n_trials=1, seed=39, base={
-        "schema_version": 2,
-        "symbol": "600000.SH",
-        "start_date": str(dates[-1].date()),
-        "frequency": "1d",
-    })
-    seeds = []
-
-    def trial_params(_config, base, names, **kwargs):
-        seeds.append(kwargs["seed"])
-        params = {name: getattr(base, name) for name in names}
-        params["initial_shares"] = base.initial_shares
-        return [params], [{"status": "completed", "params": params}], False
-
-    def candidate_family(sampled, _config, _base, _names):
-        row = {
-            "key": ("candidate",), "candidate_id": 1, "params": sampled[0], "raw_score": 0.1,
-            "eligible": True, "constraint_reasons": [], "max_drawdown": 0.1,
-            "trade_count": 20, "buy_count": 10, "sell_count": 10, "turnover": 0.2,
-            "folds": [], "stress_folds": [], "cost_scores": {},
-        }
-        return [row], {row["key"]: [row["key"]]}
-
-    def evaluate_family(family_rows, _config, _base, _data, _dates, _folds, **_kwargs):
-        return family_rows, {"status": "completed", "fold_count": 4}, False
-
-    monkeypatch.setattr(scientific, "_trial_params", trial_params)
-    monkeypatch.setattr(scientific, "_candidate_family", candidate_family)
-    monkeypatch.setattr(scientific, "_evaluate_family", evaluate_family)
-    scientific._select_at(config, config.base, bundle, dates[-1], reserve_cash=None, seed_offset=1, progress=None, cancelled=None)
-    scientific._select_at(config, config.base, bundle, dates[-2], reserve_cash=None, seed_offset=1, progress=None, cancelled=None)
-    assert seeds == [40, 40]

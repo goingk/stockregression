@@ -1,4 +1,4 @@
-"""Run a small real-data acceptance for the four-axis robust-J protocol."""
+"""Run a small real-data acceptance for the four-axis robust-J protocol v5."""
 from __future__ import annotations
 
 import argparse
@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from stockregression.data import DataService
 from stockregression.models import BacktestConfig, OptimizationConfig
 from stockregression.research_preparation import prepare_research_bundle
-from stockregression.scientific import optimize_scientific
+from stockregression.research_v5 import optimize_v5
 from stockregression.settings import load_settings
 from stockregression.storage import Store
 
@@ -22,8 +22,9 @@ def render_markdown(payload: dict) -> str:
     diagnostics = payload["diagnostics"]
     window = diagnostics.get("training_window") or {}
     timing = payload["timing_seconds"]
+    oos = payload["oos_metrics"]
     lines = [
-        "# 稳健 J v4 真实日线验收",
+        "# 稳健 J v5 真实日线验收",
         "",
         f"验收日期：{payload['generated_at'][:10]}（Asia/Shanghai）  ",
         f"标的：`{payload['symbol']}`  ",
@@ -31,7 +32,9 @@ def render_markdown(payload: dict) -> str:
         f"评估区间：{payload['evaluation']['start']} 至 {payload['evaluation']['end']}  ",
         f"协议：`schema_version={payload['strategy']['schema_version']}`、"
         f"`protocol_version={payload['strategy']['protocol_version']}`、"
-        f"`strategy_version={payload['strategy']['strategy_version']}`",
+        f"`result_schema_version={payload['strategy']['result_schema_version']}`、"
+        f"`strategy_version={payload['strategy']['strategy_version']}`、"
+        f"`ranking_mode={payload['strategy']['ranking_mode']}`",
         "",
         "## 固定样本",
         "",
@@ -57,8 +60,15 @@ def render_markdown(payload: dict) -> str:
         f"| 评分完整 | {str(diagnostics.get('score_complete')).lower()} |",
         f"| 局部峰值已核验 | {str(diagnostics.get('local_peak_verified')).lower()} |",
         f"| 全局空间已覆盖 | {str(diagnostics.get('global_exhaustive')).lower()} |",
-        f"| 训练唯一点 | {diagnostics.get('training_unique_count')} |",
-        f"| 邻域新增唯一点 | {diagnostics.get('neighborhood_unique_count')} |",
+        f"| 内部验证折数 | {diagnostics.get('internal_validation_folds')} |",
+        f"| 收益基准 | `{diagnostics.get('return_basis')}` |",
+        f"| 排名基线 | `{diagnostics.get('ranking_baseline')}` |",
+        f"| 风险口径 | `{diagnostics.get('risk_basis')}` |",
+        f"| 显著性检验 | `{(diagnostics.get('statistics_applicability') or {}).get('status')}` |",
+        f"| 峰值本金收益 | {oos.get('peak_principal_return')} |",
+        f"| 本金收益回撤 | {oos.get('principal_drawdown')} |",
+        f"| 同资金持有收益 | {oos.get('matched_funding_hold_return')} |",
+        f"| 超额收益 | {oos.get('excess_return')} |",
         f"| 训练时段准备 | {timing['data_preparation']:.2f} 秒 |",
         f"| 研究计算 | {timing['research']:.2f} 秒 |",
         "",
@@ -80,6 +90,8 @@ def render_markdown(payload: dict) -> str:
         "",
         "- 四轴当前坐标顺序为 `buy_step → sell_step → buy_shares → sell_shares`。",
         "- 新版强制自然持仓，结果不把训练期观察最大持仓转成可执行护栏。",
+        "- 收益以峰值本金为分母，排名基线是同资金持有账户；不再提供内部验证折。",
+        "- 显著性检验在本版本不适用，`outer_validation` 只报告真实连续样本外账本。",
         "- 所有合法中心的 J 均完整计算；没有用中心 `R` 过滤候选。"
         if diagnostics.get("global_exhaustive") else
         "- 稀疏搜索只认证实际完整评分的中心；未覆盖空间会明确报告为搜索覆盖不足。",
@@ -117,8 +129,8 @@ def main():
         buy_step=.015, sell_step=.015, fees=settings.fee_defaults.model_dump(),
     )
     config = OptimizationConfig.model_validate({
-        "base": base.model_dump(mode="python"), "protocol_version": 4, "selection_target": "fixed",
-        "bootstrap_reps": 200, "min_trades": 1, "max_drawdown": .5, "min_minute_ratio": 0,
+        "base": base.model_dump(mode="python"), "protocol_version": 5, "selection_target": "fixed",
+        "min_trades": 1, "max_principal_drawdown": .5, "min_minute_ratio": 0,
         "ranges": {
             "buy_step": {"low": .015, "high": .016},
             "sell_step": {"low": .015, "high": .015},
@@ -126,7 +138,7 @@ def main():
             "sell_shares": {"low": 1000, "high": 1000},
         },
         "strategy": {
-            "strategy_version": 4, "search_method": "auto", "ranking_mode": "fixed_mean",
+            "strategy_version": 5, "search_method": "auto", "ranking_mode": "robust_j",
             "granularity": {"buy_step": .0001, "sell_step": .0001, "buy_shares": 100, "sell_shares": 100},
             "hypercube_edge": 3, "sigma": 1, "alpha": .3, "beta": 1.2, "tau": .01,
             "eta_limit": 2, "eta_hard_cap": 3.5, "gamma_max": .4,
@@ -141,20 +153,23 @@ def main():
     )
     prepared = time.perf_counter() - started
     research_started = time.perf_counter()
-    result = optimize_scientific(config, bundle)
+    result = optimize_v5(config, bundle)
     seconds = time.perf_counter() - research_started
     fixed = result.get("fixed") or {}
     current = fixed.get("current") or {}
     diagnostics = current.get("diagnostics") or fixed.get("diagnostics") or {}
+    regions = current.get("recommendation_regions") or fixed.get("recommendation_regions") or []
     payload = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "symbol": args.symbol, "frequency": args.frequency, "data_version": bundle.version,
         "evaluation": {"start": args.start, "end": args.end},
         "strategy": {
             "schema_version": config.base.schema_version,
-            "protocol_version": config.protocol_version,
+            "protocol_version": result.get("protocol_version", config.protocol_version),
+            "result_schema_version": result.get("result_schema_version"),
             "strategy_version": config.strategy.strategy_version,
             "strategy_id": config.strategy.strategy_id,
+            "ranking_mode": config.strategy.ranking_mode,
             "recommendation_count": config.strategy.recommendation_count,
             "training_min_days": config.strategy.training_min_days,
             "training_max_days": config.strategy.training_max_days,
@@ -162,20 +177,27 @@ def main():
         "budgets": {"training": args.training_budget, "validation": args.validation_budget},
         "status": result.get("status"),
         "fixed_status": fixed.get("status"),
-        "recommendation_status": fixed.get("recommendation_status"),
-        "recommendation_count": len(fixed.get("recommendation_regions") or []),
+        "recommendation_status": current.get("recommendation_status"),
+        "recommendation_count": len(regions),
+        "oos_metrics": fixed.get("oos_metrics") or {},
+        "outer_validation": result.get("outer_validation") or {},
+        "computation": result.get("computation") or {},
+        "warnings": result.get("warnings") or [],
         "diagnostics": {
             key: diagnostics.get(key) for key in (
                 "geometry", "strategy_id", "strategy_version", "search_method",
                 "legal_combination_count", "training_unique_count", "neighborhood_unique_count",
                 "scored_center_count", "eligible_center_count", "score_complete",
                 "local_peak_verified", "global_exhaustive", "coverage_status",
-                "training_window", "platforms", "computation",
+                "training_window", "internal_validation_folds", "return_basis",
+                "ranking_baseline", "risk_basis", "statistics_applicability",
+                "platforms", "computation",
             )
         },
         "regions": [{
-            "region_id": item.get("region_id"), "center_coordinate": item.get("center_coordinate"),
-            "center_params": item.get("center_params"), "q_buy": item.get("q_buy"), "q_sell": item.get("q_sell"),
+            "region_id": item.get("region_id"), "geometry": item.get("geometry"),
+            "center_coordinate": item.get("center_coordinate"), "center_params": item.get("center_params"),
+            "edge_length": item.get("edge_length"), "q_buy": item.get("q_buy"), "q_sell": item.get("q_sell"),
             "j_score": item.get("j_score"), "center_excess_return": item.get("center_excess_return"),
             "neighborhood_mean": item.get("mean_excess_return"), "downside_risk": item.get("downside_risk_tau"),
             "position_penalty": item.get("pos_penalty"), "actual_min_pos_ratio": item.get("actual_min_pos_ratio"),
@@ -184,7 +206,7 @@ def main():
             "score_complete": item.get("score_complete"), "local_peak_verified": item.get("local_peak_verified"),
             "platform_type": item.get("platform_type"), "platform_size": item.get("platform_size"),
             "global_exhaustive": item.get("global_exhaustive"), "stress": item.get("stress"),
-        } for item in fixed.get("recommendation_regions") or []],
+        } for item in regions],
         "timing_seconds": {"data_preparation": prepared, "research": seconds},
     }
     output = Path(args.output)
