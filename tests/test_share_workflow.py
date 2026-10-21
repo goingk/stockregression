@@ -1,4 +1,3 @@
-from datetime import date
 import time
 
 import numpy as np
@@ -10,7 +9,6 @@ from stockregression import engine
 from stockregression.api import create_app
 from stockregression.data import DataService
 from stockregression.models import BacktestConfig, DataBundle, DcaConfig, FeeConfig, FloorPenaltyConfig, OptimizationConfig
-from stockregression.optimization import optimize
 from stockregression.providers import normalize_actions
 from stockregression.rules import instrument_terms
 from stockregression.storage import Store
@@ -241,22 +239,6 @@ def test_fee_decimals_quantities_and_inactive_fields():
             BacktestConfig.model_validate({**raw, "buy_shares": value})
 
 
-@pytest.mark.skip(reason="Legacy snapshot reference-price path was removed")
-def test_incremental_partitions_reference_price_and_chart_ma(tmp_path):
-    config, bundle = fixture("510300.SH")
-    store = Store(tmp_path)
-    meta = {**bundle.metadata, "actions_verified": True}
-    first = store.publish(config.symbol, bundle.bars, bundle.daily, bundle.actions, pd.DataFrame({"date": bundle.daily.date}), meta, {})
-    updated = store.publish(config.symbol, bundle.bars.tail(2), bundle.daily.tail(2), bundle.actions, pd.DataFrame({"date": bundle.daily.date.tail(2)}), meta, {}, incremental=True)
-    assert first["version"] == updated["version"]
-    assert store.snapshot(config.symbol, first["version"])
-    service = DataService(store)
-    reference = service.reference_price(config.symbol, "2024-01-08")
-    assert reference["reference_date"] == "2024-01-05"
-    bars = service.market_bars(config.symbol, limit=3, ma_periods=[5])
-    assert len(bars["bars"]) == 3
-    assert bars["bars"][0]["ma5"] == pytest.approx(bundle.daily.close.rolling(5).mean().iloc[-3])
-    assert not store.watches()
 
 
 def test_retired_optimization_modes_and_trial_controls_are_rejected():
@@ -327,28 +309,6 @@ def test_initial_holding_receives_first_day_dividend_without_nav_jump():
     assert hold["equity"][1]["cash"] == 600
 
 
-@pytest.mark.skip(reason="Legacy sync orchestration was replaced by MarketDataSyncService")
-def test_market_sync_uses_full_catalog_and_can_resume_failures(tmp_path, monkeypatch):
-    import stockregression.data as module
-    records = [{"symbol": f"{600000 + index}.SH", "name": str(index)} for index in range(125)] + [{"symbol": "159915.SZ", "name": "创业板 ETF"}]
-    monkeypatch.setattr(module, "fetch_instruments", lambda *args: records)
-    monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
-    service = DataService(Store(tmp_path))
-    attempts = []
-    def one(symbol, mode, progress, cancelled):
-        attempts.append(symbol)
-        if symbol == "600001.SH":
-            raise RuntimeError("fixture source unavailable")
-        return {"symbol": symbol, "last_date": "2024-01-03", "minute_through": "2024-01-03 15:00:00"}
-    monkeypatch.setattr(service, "_sync_one", one)
-    first = service.sync([], "history", scope="market")
-    assert len(first["symbols"]) == 125 and len(first["failures"]) == 1
-    assert service.store.watches() == []
-    attempts.clear()
-    monkeypatch.setattr(service, "_sync_one", lambda symbol, *args: {"symbol": symbol, "last_date": "2024-01-03"})
-    second = service.sync([], "history", scope="market", resume=True, retry_failed=True)
-    assert len(second["symbols"]) == 1 and len(second["skipped"]) == 125
-    assert service.store.sync_status(first["run_key"])["counts"] == {"completed": 126}
 
 
 @pytest.mark.parametrize("frequency", ["weekly", "monthly"])
@@ -397,56 +357,8 @@ def test_zero_position_bounds_do_not_create_assets_or_fixed_capital_returns():
     assert all(point["position"] == 1000 for point in result["strategies"]["buy_hold"]["equity"])
 
 
-@pytest.mark.skip(reason="Legacy snapshot config conversion fixture is unavailable; format compatibility itself is unchanged")
-def test_legacy_config_conversion_is_a_separate_draft(tmp_path):
-    config, bundle = fixture()
-    store = Store(tmp_path)
-    store.publish(config.symbol, bundle.bars, bundle.daily, bundle.actions, pd.DataFrame({"date": bundle.daily.date}), bundle.metadata, {})
-    legacy = BacktestConfig(symbol=config.symbol, start_date=config.start_date, end_date=config.end_date, initial_cash=100000).model_dump(mode="json")
-    with TestClient(create_app(str(tmp_path), start_jobs=False)) as client:
-        saved = client.post("/api/v1/configs", json={"name": "legacy", "config": legacy})
-        assert saved.status_code == 200
-        before = client.get("/api/v1/configs").json()
-        converted = client.post("/api/v1/configs/convert", json=legacy)
-        assert converted.status_code == 200
-        draft = converted.json()["config"]
-        assert draft["schema_version"] == 2 and draft["initial_shares"] == 5000
-        assert "initial_cash" not in draft
-        assert client.get("/api/v1/configs").json() == before
-        assert client.get("/api/v1/data/reference-price/600000.SH?start_date=2024-01-02").status_code == 422
 
 
-@pytest.mark.skip(reason="Preview submission now requires a managed market snapshot")
-def test_latest_preview_supersedes_running_and_pending_requests(tmp_path, monkeypatch):
-    import threading
-    import stockregression.preview as module
-    started, release = threading.Event(), threading.Event()
-    config, bundle = fixture()
-    calls = []
-    monkeypatch.setattr(module.DataService, "load_bundle", lambda *args: bundle)
-    def run(config, data, progress=None, cancelled=None, preview=False):
-        calls.append(config.buy_shares)
-        if len(calls) == 1:
-            started.set()
-            assert release.wait(5)
-        return {"shares": config.buy_shares}
-    monkeypatch.setattr(module, "run_backtest", run)
-    manager = module.PreviewManager(Store(tmp_path))
-    try:
-        manager.submit("page", 1, config, "snapshot")
-        assert started.wait(5)
-        manager.submit("page", 2, config.model_copy(update={"buy_shares": 200}), "snapshot")
-        manager.submit("page", 3, config.model_copy(update={"buy_shares": 300}), "snapshot")
-        release.set()
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and manager.snapshot("page")["status"] != "completed":
-            time.sleep(.01)
-        state = manager.snapshot("page")
-        assert state["revision"] == 3 and state["result"] == {"shares": 300}
-        assert calls == [100, 300]
-    finally:
-        release.set()
-        manager.stop()
 
 
 def test_latest_preview_edit_reuses_inflight_same_range_preparation(tmp_path, monkeypatch):
@@ -492,25 +404,6 @@ def test_latest_preview_edit_reuses_inflight_same_range_preparation(tmp_path, mo
         manager.stop()
 
 
-@pytest.mark.skip(reason="Legacy sync job kind was removed")
-def test_all_failed_sync_keeps_report_and_status_api(tmp_path, monkeypatch):
-    from stockregression.jobs import execute_job
-    store = Store(tmp_path)
-    report = {"status": "failed", "message": "0 completed", "failures": [{"symbol": "510300.SH", "reason": "unavailable"}], "symbols": []}
-    monkeypatch.setattr(DataService, "sync", lambda *args, **kwargs: report)
-    job = store.new_job("sync", {"symbols": ["510300.SH"]})
-    assert store.claim_job(job, "test-worker")
-    execute_job(str(tmp_path), job)
-    state = store.job(job)
-    assert state["status"] == "failed"
-    stored = store.result(state["result_id"])
-    assert {key: stored[key] for key in report} == report
-    store.sync_item("run", "510300.SH", status="completed", daily_status="completed", minute_status="unavailable", daily_through="2024-01-03")
-    Store(tmp_path)  # Schema initialization is repeatable.
-    with TestClient(create_app(str(tmp_path), start_jobs=False)) as client:
-        response = client.get("/api/v1/data/sync-status?run_key=run").json()
-        assert response["total"] == 1
-        assert response["items"][0]["minute_status"] == "unavailable"
 
 
 def test_etf_dated_limits_and_fees_do_not_use_stock_defaults():
@@ -523,21 +416,6 @@ def test_etf_dated_limits_and_fees_do_not_use_stock_defaults():
     assert commissions_and_taxes(10000, "sell", "2014-01-01", 0, 0, symbol="510300.SH")["total"] == 0
 
 
-@pytest.mark.skip(reason="Legacy sync checkpoint was replaced by MarketDataSyncService")
-def test_incremental_sync_checkpoint_uses_actual_trading_calendar(tmp_path, monkeypatch):
-    import stockregression.data as module
-    monkeypatch.setattr(module, "latest_closed_date", lambda: pd.Timestamp("2024-01-07"))
-    monkeypatch.setattr(module, "fetch_latest_trading_date", lambda day: pd.Timestamp("2024-01-05"))
-    service = DataService(Store(tmp_path))
-    calls = []
-    def one(symbol, *args):
-        calls.append(service._sync_context.cutoff)
-        return {"symbol": symbol, "last_date": "2024-01-05"}
-    monkeypatch.setattr(service, "_sync_one", one)
-    first = service.sync(["510300.SH"], "daily", resume=True)
-    second = service.sync(["510300.SH"], "daily", resume=True)
-    assert first["run_key"].endswith("2024-01-05")
-    assert len(calls) == 1 and second["skipped"] == ["510300.SH"]
 
 
 def test_market_dry_run_reports_universe_without_creating_data_job(tmp_path, monkeypatch):
@@ -569,34 +447,5 @@ def test_incremental_publish_reuses_other_year_and_keeps_old_snapshot(tmp_path):
     assert store.read_files(historical["files"]["daily"]).volume.sum() == daily.volume.sum()
 
 
-@pytest.mark.skip(reason="Legacy import_files snapshot path was removed")
-def test_etf_import_without_st_field_updates_rules_and_action_verification(tmp_path):
-    config, bundle = fixture("159985.SZ")
-    root = tmp_path / "store"
-    store = Store(root)
-    store.put_instrument(config.symbol, etf_category="stock", settlement="T1")
-    store.publish(config.symbol, bundle.bars, bundle.daily, bundle.actions, pd.DataFrame({"date": bundle.daily.date}), {**bundle.metadata, "actions_verified": False, "actions_unverified_years": [2024]}, {})
-    bundle.daily.drop(columns="is_st").to_csv(tmp_path / "daily.csv", index=False)
-    bundle.actions.to_csv(tmp_path / "actions.csv", index=False)
-    pd.DataFrame({"date": bundle.daily.date}).to_csv(tmp_path / "calendar.csv", index=False)
-    DataService(store).import_files({"symbol": config.symbol, "etf_category": "commodity", "daily_path": str(tmp_path / "daily.csv"), "actions_path": str(tmp_path / "actions.csv"), "calendar_path": str(tmp_path / "calendar.csv")})
-    assert store.instrument(config.symbol)["settlement"] == "T0"
-    assert store.snapshot(config.symbol)["metadata"]["actions_unverified_years"] == []
-    assert DataService(store).load_bundle(config).metadata["actions_verified"] is True
 
 
-@pytest.mark.skip(reason="Legacy quote browser projection was removed")
-def test_quote_browser_keeps_real_period_and_marks_unverified_gaps(tmp_path):
-    config, bundle = fixture("518880.SH", days=1)
-    day = bundle.calendar[0]
-    raw = pd.DataFrame([{"timestamp": day + pd.Timedelta(hours=9, minutes=minute), "open": 1., "close": 1.001, "high": 1.002, "low": 1., "volume": 100, "source_verified": False} for minute in [31, 32, 34, 35]])
-    store = Store(tmp_path)
-    store.publish(config.symbol, raw, bundle.daily, bundle.actions, pd.DataFrame({"date": bundle.daily.date}), bundle.metadata, {})
-    service = DataService(store)
-    one = service.market_bars(config.symbol, frequency="1m")
-    assert len(one["bars"]) == 4 and one["bars"][2]["missing_minutes"] == 1
-    five = service.market_bars(config.symbol, frequency="5m")
-    assert len(five["bars"]) == 1 and five["bars"][0]["missing_minutes"] == 1
-    assert five["bars"][0]["frequency"] == "5m"
-    assert any("未核验" in flag for flag in five["quality_flags"])
-    assert any("缺少分钟" in flag for flag in five["quality_flags"])

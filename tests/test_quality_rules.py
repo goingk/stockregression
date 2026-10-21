@@ -70,106 +70,12 @@ def test_unnamed_datetime_index_is_promoted_to_timestamp():
     assert frame.timestamp.tolist() == list(stamps)
 
 
-@pytest.mark.skip(reason="Legacy multi-file import return shape was replaced by managed-period imports")
-def test_import_accepts_index_clock_minute_file(tmp_path):
-    days = pd.bdate_range("2026-01-05", periods=3)
-    daily = daily_fixture(days)
-    minute = index_clock_minute(days)
-    daily_path, minute_path, calendar_path = [tmp_path / name for name in ("daily.csv", "159611.SZ.parquet", "calendar.csv")]
-    daily.to_csv(daily_path, index=False)
-    minute.to_parquet(minute_path)
-    pd.DataFrame({"date": days}).to_csv(calendar_path, index=False)
-    store = Store(tmp_path / "data")
-    service = DataService(store)
-
-    result = service.import_files({"symbol": "159611.SZ", "etf_category": "stock", "daily_path": str(daily_path),
-                                   "minute_path": str(minute_path), "calendar_path": str(calendar_path), "label_convention": "end"})
-
-    assert result["profiles"]["import"]["verified"] is True
-    assert result["profiles"]["import"]["convention"] == "end"
-    published = store.read_files(store.snapshot("159611.SZ", result["version"])["files"]["minute"])
-    assert len(published) == len(days) * 240
 
 
-@pytest.mark.skip(reason="Legacy multi-file import return shape was replaced by managed-period imports")
-def test_import_without_explicit_label_is_not_silently_verified(tmp_path):
-    days = pd.bdate_range("2026-01-05", periods=3)
-    daily = daily_fixture(days)
-    timestamps = minute_slots(days[0]).append(minute_slots(days[1])).append(minute_slots(days[2]))
-    minute = pd.DataFrame({"timestamp": timestamps, "open": 10, "high": 10.1, "low": 9.9, "close": 10, "volume": 100, "turnover": 1000})
-    daily_path, minute_path, calendar_path = [tmp_path / name for name in ("daily.csv", "minute.csv", "calendar.csv")]
-    daily.to_csv(daily_path, index=False)
-    minute.to_csv(minute_path, index=False)
-    pd.DataFrame({"date": days}).to_csv(calendar_path, index=False)
-    service = DataService(Store(tmp_path / "data"))
-    result = service.import_files({"symbol": "600000.SH", "daily_path": str(daily_path), "minute_path": str(minute_path), "calendar_path": str(calendar_path)})
-    assert not result["profiles"]["import"]["verified"]
-    explicit = service.import_files({"symbol": "600000.SH", "daily_path": str(daily_path), "minute_path": str(minute_path), "calendar_path": str(calendar_path), "label_convention": "end"})
-    assert explicit["profiles"]["import"]["verified"]
 
 
-@pytest.mark.parametrize("existing", ["none", "partial", "complete", "demo"])
-@pytest.mark.skip(reason="Managed imports no longer auto-fetch daily bars")
-def test_minute_only_import_syncs_missing_daily(tmp_path, monkeypatch, existing):
-    from stockregression.providers import normalize_actions
-    from stockregression.rules import instrument_terms
-
-    days = pd.bdate_range("2026-01-05", periods=3)
-    minute_path = tmp_path / "159611.SZ.parquet"
-    index_clock_minute(days).to_parquet(minute_path)
-    daily = daily_fixture(days)
-    calendar = pd.DataFrame({"date": days})
-    actions = normalize_actions(pd.DataFrame())
-    store = Store(tmp_path / "data")
-    if existing != "none":
-        prior = daily.iloc[:1] if existing == "partial" else daily
-        store.publish("159611.SZ", pd.DataFrame(), prior, actions, calendar,
-                      instrument_terms("159611.SZ", {"is_demo": existing == "demo", "actions_verified": True}), {})
-    calls = []
-
-    def fetch(store, symbol, start, end, cancelled):
-        calls.append((symbol, start, end))
-        return daily, actions, calendar, {"actions_verified": False, "actions_unverified_years": [2026], "warnings": ["分红资料待核验"]}
-
-    monkeypatch.setattr("stockregression.data.fetch_auxiliary_routed", fetch)
-    monkeypatch.setattr("baostock.login", lambda: pytest.fail("已有或刚获取的交易日历应直接复用"))
-    payload = {"symbol": "159611.SZ", "minute_path": str(minute_path), "label_convention": "end"}
-    result = DataService(store).import_files(payload)
-    assert len(calls) == (0 if existing == "complete" else 1)
-    if calls:
-        assert calls[0] == ("159611.SZ", days[1] if existing == "partial" else days.min(), days.max())
-    snapshot = store.snapshot("159611.SZ", result["version"])
-    assert len(store.read_files(snapshot["files"]["daily"])) == 3
-    assert len(store.read_files(snapshot["files"]["minute"])) == 720
-    assert not snapshot["metadata"]["is_demo"]
-    if calls:
-        assert snapshot["metadata"]["actions_verified"] is False
-        assert "分红资料待核验" in snapshot["metadata"]["warnings"]
 
 
-@pytest.mark.parametrize("failure", ["network", "empty", "incomplete", "cancelled"])
-@pytest.mark.skip(reason="Managed imports no longer auto-fetch daily bars")
-def test_minute_only_import_does_not_publish_when_daily_sync_fails(tmp_path, monkeypatch, failure):
-    from stockregression.providers import normalize_actions
-
-    days = pd.bdate_range("2026-01-05", periods=3)
-    minute_path = tmp_path / "minute.parquet"
-    index_clock_minute(days).to_parquet(minute_path)
-    store = Store(tmp_path / "data")
-
-    def fetch(*args):
-        if failure == "network":
-            raise RuntimeError("connection refused")
-        if failure == "cancelled":
-            raise InterruptedError("任务已取消")
-        daily = daily_fixture(days[:1]) if failure == "incomplete" else pd.DataFrame()
-        return daily, normalize_actions(pd.DataFrame()), pd.DataFrame({"date": days}), {}
-
-    monkeypatch.setattr("stockregression.data.fetch_auxiliary_routed", fetch)
-    expected = InterruptedError if failure == "cancelled" else DataQualityError
-    with pytest.raises(expected, match="任务已取消" if failure == "cancelled" else "自动同步日线失败"):
-        DataService(store).import_files({"symbol": "159611.SZ", "minute_path": str(minute_path)})
-    assert store.snapshot("159611.SZ") is None
 
 
 @pytest.mark.parametrize("kind", ["minute", "daily"])
