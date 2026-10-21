@@ -74,6 +74,8 @@ class RobustScore:
     neighborhood_max_eta: float | None
     complete: bool
     missing_count: int
+    floor_episode_count: int | None = None
+    floor_episode_grids: tuple[int, ...] = ()
     rows: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
     def as_dict(self) -> dict[str, Any]:
@@ -92,14 +94,39 @@ class RobustScore:
             "neighborhood_max_eta": self.neighborhood_max_eta,
             "score_complete": self.complete,
             "score_missing_count": self.missing_count,
+            "floor_episode_count": self.floor_episode_count,
+            "floor_episode_grids": list(self.floor_episode_grids),
+            "floor_penalty": self.min_position_penalty,
+            "floor_penalty_basis": "episode_grids_v1",
         }
+
+
+def episode_grids(row: Mapping[str, Any] | None) -> tuple[int, ...] | None:
+    if row is None:
+        return None
+    values = row.get("floor_episode_grids")
+    if not isinstance(values, (list, tuple)):
+        return None
+    output = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        number = int(value)
+        if number < 0 or float(value) != number:
+            return None
+        output.append(number)
+    return tuple(output)
 
 
 def position_penalty(row: Mapping[str, Any], strategy: ResearchStrategySpec) -> tuple[float, float, float]:
     maximum = float(row.get("actual_max_pos_ratio", math.inf))
-    minimum = float(row.get("actual_min_pos_ratio", 0.0))
     maximum_penalty = float(strategy.gamma_max) * max(0.0, maximum - float(strategy.eta_limit)) ** 2 if math.isfinite(maximum) else 0.0
-    minimum_penalty = float(strategy.gamma_min) * max(0.0, float(strategy.eta_floor) - minimum) ** 2 if math.isfinite(minimum) else 0.0
+    grids = episode_grids(row)
+    minimum_penalty = (
+        float(strategy.gamma_min) * math.fsum(
+            (grid / float(strategy.floor_k_ref)) ** 2 for grid in grids
+        ) if grids is not None else math.nan
+    )
     return maximum_penalty + minimum_penalty, maximum_penalty, minimum_penalty
 
 
@@ -115,11 +142,16 @@ def robust_score(
     missing = [point for point in points if not completed(rows.get(point))]
     center_row = rows.get(center) if completed(rows.get(center)) else None
     center_return = float(center_row["training_excess_return"]) if center_row is not None else math.nan
-    if center_row is None or missing or len(weights) != len(points):
+    floors = episode_grids(center_row)
+    if center_row is None or missing or len(weights) != len(points) or floors is None:
         return RobustScore(
-            center_return, math.nan, math.nan, math.nan, math.nan, math.nan,
-            math.nan, len(points) - len(missing), len(points) - len(missing), math.nan, math.nan,
-            None, False, len(missing), {},
+            center_return=center_return, neighborhood_mean=math.nan,
+            downside_risk=math.nan, position_penalty=math.nan,
+            max_position_penalty=math.nan, min_position_penalty=math.nan,
+            j_score=math.nan, neighborhood_size=len(points) - len(missing),
+            support_size=len(points) - len(missing), positive_ratio=math.nan,
+            safe_ratio=math.nan, neighborhood_max_eta=None, complete=False,
+            missing_count=len(missing) + (0 if floors is not None else 1), rows={},
         )
     returns = [float(rows[point]["training_excess_return"]) for point in points]
     mean = math.fsum(weight * value for weight, value in zip(weights, returns))
@@ -151,6 +183,8 @@ def robust_score(
         neighborhood_max_eta=max(finite_etas) if finite_etas else None,
         complete=True,
         missing_count=0,
+        floor_episode_count=len(floors),
+        floor_episode_grids=floors,
         rows={str(point): dict(rows[point]) for point in points},
     )
 
@@ -230,12 +264,17 @@ def tensor_robust_scores(
         row = rows.get(coordinate)
         center_return = float(row["training_excess_return"]) if completed(row) else math.nan
         missing = int(legal_count[index] - observed_count[index])
-        if not completed(row) or missing or legal_weight_mass[index] <= 0:
+        floors = episode_grids(row)
+        if not completed(row) or missing or legal_weight_mass[index] <= 0 or floors is None:
             output[coordinate] = RobustScore(
-                center_return, math.nan, math.nan, math.nan, math.nan, math.nan,
-                math.nan, int(legal_count[index]), int(observed_count[index]), math.nan, math.nan,
-                float(maximum_eta[index]) if np.isfinite(maximum_eta[index]) else None,
-                False, missing, {},
+                center_return=center_return, neighborhood_mean=math.nan,
+                downside_risk=math.nan, position_penalty=math.nan,
+                max_position_penalty=math.nan, min_position_penalty=math.nan,
+                j_score=math.nan, neighborhood_size=int(legal_count[index]),
+                support_size=int(observed_count[index]), positive_ratio=math.nan,
+                safe_ratio=math.nan,
+                neighborhood_max_eta=float(maximum_eta[index]) if np.isfinite(maximum_eta[index]) else None,
+                complete=False, missing_count=missing + (0 if floors is not None else 1), rows={},
             )
             continue
         mass = float(legal_weight_mass[index])
@@ -257,7 +296,8 @@ def tensor_robust_scores(
             positive_ratio=float(positive_count[index] / count) if count else math.nan,
             safe_ratio=float(safe_count[index] / count) if count else math.nan,
             neighborhood_max_eta=float(maximum_eta[index]) if np.isfinite(maximum_eta[index]) else None,
-            complete=True, missing_count=0, rows={},
+            complete=True, missing_count=0, floor_episode_count=len(floors),
+            floor_episode_grids=floors, rows={},
         )
     return output
 

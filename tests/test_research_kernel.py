@@ -6,7 +6,7 @@ import pandas as pd
 import pytest
 
 from stockregression import engine
-from stockregression.models import BacktestConfig, DataBundle, OptimizationConfig
+from stockregression.models import BacktestConfig, DataBundle, FloorPenaltyConfig, OptimizationConfig
 from stockregression.research_v4.evaluator import BatchEvaluator
 from stockregression.research_v4.space import ParameterSpace
 from stockregression.providers import normalize_actions
@@ -163,11 +163,18 @@ def test_latest_parameters_replay_is_explicitly_retrospective():
 
 def test_batch_python_reference_matches_compiled(monkeypatch):
     config, bundle = market()
+    config = config.model_copy(update={
+        "schema_version": 3, "reserve_cash": None,
+        "grid_mode": "geometric",
+        "floor_penalty_config": FloorPenaltyConfig(eta_floor=.5, gamma_min=.4, floor_k_ref=10),
+    })
     fast = research_batch(config, bundle, [{}, {"sell_shares": 200}], folds(bundle))
     monkeypatch.setattr(engine, "_NUMBA_FASTPATH_ENABLED", False)
     slow = research_batch(config, bundle, [{}, {"sell_shares": 200}], folds(bundle))
     assert fast["metrics"] == slow["metrics"]
     assert fast["fold_metrics"] == slow["fold_metrics"]
+    assert fast["position_stats"] == slow["position_stats"]
+    assert all("floor_episode_grids" in row for row in fast["position_stats"])
     np.testing.assert_array_equal(fast["daily_returns"], slow["daily_returns"])
 
 

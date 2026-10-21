@@ -10,11 +10,10 @@ from fastapi.testclient import TestClient
 from stockregression.api import create_app
 from stockregression.jobs import execute_job
 from stockregression.market_data import MarketDataService
-from stockregression.market_data.sync import MarketDataSyncService
+from stockregression.market_data.sync import MarketDataSyncService, _recent_minute_incomplete
 from stockregression.market_data.aggregation import AggregationService
 from stockregression.market_data.models import MarketDataError
 from stockregression.market_data.quality import validate_and_fill
-from stockregression.market_data.sync import MarketDataSyncService
 from stockregression.models import BacktestConfig
 from stockregression.quality import minute_slots
 from stockregression.storage import Store
@@ -36,6 +35,50 @@ def _verified_minute_without_closing_placeholder_ticks(days):
                 "is_synthetic": False, "is_auction_placeholder": False,
             })
     return pd.DataFrame(rows)
+
+
+def _minute_rows(day, slots):
+    return pd.DataFrame({
+        "timestamp": list(slots), "open": 1.0, "high": 1.01, "low": 0.99,
+        "close": 1.0, "volume": 100, "turnover": 100.0,
+    })
+
+
+def test_recent_minute_incomplete_detects_a_late_started_session():
+    day = pd.Timestamp("2026-10-08")
+    slots = minute_slots(day)[10:]
+    frame = _minute_rows(day, slots)
+
+    reason = _recent_minute_incomplete(frame, "517520.SH", day, day + pd.Timedelta(days=1))
+
+    assert reason is not None and "缺" in reason
+
+
+def test_recent_minute_incomplete_accepts_a_complete_session():
+    day = pd.Timestamp("2026-10-08")
+    frame = _minute_rows(day, minute_slots(day))
+
+    assert _recent_minute_incomplete(frame, "517520.SH", day, day + pd.Timedelta(days=1)) is None
+
+
+def test_recent_minute_incomplete_accepts_sz_closing_auction_placeholders():
+    day = pd.Timestamp("2026-10-08")
+    slots = [slot for index, slot in enumerate(minute_slots(day)) if index not in {237, 238}]
+    frame = _minute_rows(day, slots)
+
+    assert _recent_minute_incomplete(frame, "159611.SZ", day, day + pd.Timedelta(days=1)) is None
+
+
+def test_recent_minute_incomplete_detects_a_partial_incremental_tail():
+    day = pd.Timestamp("2026-10-08")
+    slots = [day + pd.Timedelta(hours=15)]
+    frame = _minute_rows(day, slots)
+
+    reason = _recent_minute_incomplete(
+        frame, "517520.SH", day + pd.Timedelta(hours=14, minutes=58), day + pd.Timedelta(hours=15),
+    )
+
+    assert reason is not None and "缺 2 根" in reason
 
 
 @pytest.mark.parametrize("symbol,expected_status,expected_missing", [

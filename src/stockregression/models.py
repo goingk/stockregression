@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+import math
 from typing import Any, Literal
 
 import pandas as pd
@@ -56,6 +57,15 @@ class DcaConfig(BaseModel):
     initial_shares: int = Field(default=0, ge=0, multiple_of=100)
 
 
+class FloorPenaltyConfig(BaseModel):
+    """Episode-based floor penalty applied to share-account geometric grids."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    eta_floor: float = Field(default=0.0, ge=0, le=1)
+    gamma_min: float = Field(default=0.0, ge=0, le=1000)
+    floor_k_ref: float = Field(default=10.0, gt=0, le=1_000_000)
+
+
 class BacktestConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     # Unversioned records retain their original accounting. New clients send 3.
@@ -86,6 +96,7 @@ class BacktestConfig(BaseModel):
     reference_price: float | None = Field(default=None, gt=0)
     lower_price: float | None = Field(default=None, gt=0)
     upper_price: float | None = Field(default=None, gt=0)
+    floor_penalty_config: FloorPenaltyConfig | None = None
     buy_quantity: QuantityConfig = Field(default_factory=QuantityConfig)
     sell_quantity: QuantityConfig = Field(default_factory=QuantityConfig)
     fees: FeeConfig = Field(default_factory=FeeConfig)
@@ -130,6 +141,10 @@ class BacktestConfig(BaseModel):
             values.pop("reserve_cash", None)
         if self.schema_version in (2, 3):
             values.pop("grid_step", None)
+        if self.schema_version < 3:
+            values.pop("floor_penalty_config", None)
+        if values.get("floor_penalty_config") is None:
+            values.pop("floor_penalty_config", None)
         return values
 
     @model_validator(mode="after")
@@ -148,6 +163,9 @@ class BacktestConfig(BaseModel):
             raise ValueError("schema_version=3 已取消固定可用现金；请通过配置转换生成 v3 草稿")
         if self.lower_price and self.upper_price and self.lower_price >= self.upper_price:
             raise ValueError("网格价格下限必须小于上限")
+        if self.floor_penalty_config is not None:
+            if self.schema_version != 3 or self.grid_mode != "geometric" or self.initial_shares <= 0:
+                raise ValueError("底仓分段惩罚仅适用于有初始持仓的 schema_version=3 等比网格")
         return self
 
 
@@ -236,6 +254,7 @@ class ResearchStrategySpec(BaseModel):
     gamma_max: float = Field(default=.40, ge=0, le=1000)
     eta_floor: float = Field(default=0.0, ge=0, le=1)
     gamma_min: float = Field(default=0.0, ge=0, le=1000)
+    floor_k_ref: float = Field(default=10.0, gt=0, le=1_000_000)
     training_min_days: int = Field(default=250, ge=20, le=5000)
     training_max_days: int = Field(default=500, ge=20, le=5000)
     peak_tolerance: float = Field(default=1e-12, gt=0, le=.1)
@@ -340,6 +359,8 @@ class ResearchStrategySpec(BaseModel):
         if self.strategy_version == 4:
             if self.eta_floor > self.eta_limit:
                 raise ValueError("底仓保护阈值不能高于持仓免罚阈值")
+            if not math.isfinite(self.floor_k_ref) or self.floor_k_ref <= 0:
+                raise ValueError("底仓参考格数必须为正数")
             if self.eta_hard_cap is not None and self.eta_hard_cap < self.eta_limit:
                 raise ValueError("最大持仓淘汰阈值不能低于持仓免罚阈值")
             if len(self.initial_strides) > 8:
@@ -547,6 +568,11 @@ class OptimizationConfig(BaseModel):
             if strategy.strategy_version == 4:
                 base_values["min_shares"] = 0
                 base_values["max_shares"] = None
+                base_values["floor_penalty_config"] = {
+                    "eta_floor": strategy.eta_floor,
+                    "gamma_min": strategy.gamma_min,
+                    "floor_k_ref": strategy.floor_k_ref,
+                }
             elif strategy.max_shares_mode == "unlimited":
                 base_values["max_shares"] = None
             elif base_values.get("max_shares") is None:

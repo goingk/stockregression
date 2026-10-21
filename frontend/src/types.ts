@@ -21,7 +21,7 @@ export interface DataSourceHealth {
 export interface DataSourceOption {
   source: string
   label: string
-  role: 'default' | 'optional'
+  role: 'default' | 'optional' | 'fallback'
   selected: boolean
   selectable: boolean
   states: DataSourceHealth[]
@@ -166,6 +166,8 @@ export interface DataPreparationPlan {
   package_id: string
   package_version: number
   gaps: Array<{ kind?: string; timeframe?: string; message?: string }>
+  warnings?: string[]
+  degraded_days?: Array<{ date: string; timeframe?: string; reason?: string }>
   steps: DataPreparationStep[]
   config: BacktestConfig
 }
@@ -183,6 +185,12 @@ export interface FeeConfig {
 export interface QuantityConfig {
   mode: QuantityMode
   value: number
+}
+
+export interface FloorPenaltyConfig {
+  eta_floor: number
+  gamma_min: number
+  floor_k_ref: number
 }
 
 export interface BacktestConfig {
@@ -211,6 +219,7 @@ export interface BacktestConfig {
   reference_price: number | null
   lower_price: number | null
   upper_price: number | null
+  floor_penalty_config?: FloorPenaltyConfig | null
   fees: FeeConfig
 }
 
@@ -321,6 +330,10 @@ export interface Trade {
 
 export interface StrategyResult {
   metrics: Record<string, number | null>
+  floor_episode_count?: number
+  floor_episode_grids?: number[]
+  floor_penalty?: number
+  floor_penalty_basis?: string
   return_basis?: string
   equity: EquityPoint[]
   equity_frequency?: string
@@ -347,6 +360,10 @@ export interface BacktestResult {
   funding?: { reserve_cash?: number; initial_equity: number; initial_principal?: number; initial_cash?: number; funding_mode?: string; topups?: number; peak_invested?: number; peak_invested_date?: string | null; final_invested?: number; funding_flows?: Array<{ timestamp: string; amount: number }>; valuation_price: number; reference_price: number; reference_date: string; dca_initial_equity?: number; buy_hold_initial_shares?: number; buy_hold_initial_equity?: number }
   effective_end_date?: string
   accounting_basis?: string
+  floor_episode_count?: number
+  floor_episode_grids?: number[]
+  floor_penalty?: number
+  floor_penalty_basis?: string
 }
 
 export interface Coverage {

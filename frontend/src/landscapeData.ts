@@ -34,6 +34,10 @@ export type LandscapePoint = {
   actual_min_pos_ratio?: number | null
   actual_max_pos_ratio?: number | null
   neighborhood_max_eta?: number | null
+  floor_episode_count?: number | null
+  floor_episode_grids?: number[]
+  floor_penalty?: number | null
+  floor_penalty_basis?: string
   stockout_count?: number | null
   tplus1_block_count?: number | null
   local_peak_verified?: boolean

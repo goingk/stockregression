@@ -42,6 +42,7 @@ export interface ResearchDefaults {
   gamma_max: number
   eta_floor: number
   gamma_min: number
+  floor_k_ref: number
   training_min_days: number
   training_max_days: number
   peak_tolerance: number
@@ -106,7 +107,7 @@ export function defaultWorkbenchDefaults(): WorkbenchDefaults {
     grid: { grid_mode: 'trailing', buy_step: .03, sell_step: .03, lower_price: null, upper_price: null },
     position: { initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 100 },
     dca: { frequency: 'monthly', shares: 100, initial_shares: 0 },
-    research: { strategy_id: 'geometric_robust_j', protocol_version: 4, strategy_version: 4, selection_target: 'both', rebalance_days: 63, bootstrap_reps: 10000, bootstrap_block_lengths: [20, 10, 40], significance_alpha: .05, outer_validation_days: 126, mode: 'both', n_trials: 1000, local_search_budget: 3000, seed: 42, top_candidates: 20, max_drawdown: .2, min_trades: 10, min_history_days: 250, min_minute_ratio: .95, ranking_mode: 'fixed_mean', hypercube_edge: 3, granularity: { buy_step: .0001, sell_step: .0001, sell_shares: 100, buy_shares: 100 }, search_method: 'auto', training_budget: 20000, validation_budget: 100000, recommendation_count: 10, max_shares_mode: 'unlimited', slippage_mode: 'configured', neighborhood_fields: [...v4RobustFields], fixed_half_widths: { buy_step: .001, sell_step: .001, sell_shares: 100, buy_shares: 100, min_shares: 500, max_shares: 500 }, sigma: 1, alpha: .3, beta: 1.2, tau: .01, eta_limit: 2, eta_hard_cap: 3.5, gamma_max: .4, eta_floor: 0, gamma_min: 0, training_min_days: 250, training_max_days: 500, peak_tolerance: 1e-12, start_min: 20, start_max: 64, starts_per_candidate: 4, initial_strides: [1, 2], stride_multiplier: 2, max_stride_fraction: .25, validation_reserve_fraction: .25, exhaustive_memory_limit_mb: 512, estimated_bytes_per_point: 512, stress_cost_multiplier: 2, stress_region_count: 3, ranges: defaultSearchRanges() },
+    research: { strategy_id: 'geometric_robust_j', protocol_version: 4, strategy_version: 4, selection_target: 'both', rebalance_days: 63, bootstrap_reps: 10000, bootstrap_block_lengths: [20, 10, 40], significance_alpha: .05, outer_validation_days: 126, mode: 'both', n_trials: 1000, local_search_budget: 3000, seed: 42, top_candidates: 20, max_drawdown: .2, min_trades: 10, min_history_days: 250, min_minute_ratio: .95, ranking_mode: 'fixed_mean', hypercube_edge: 3, granularity: { buy_step: .0001, sell_step: .0001, sell_shares: 100, buy_shares: 100 }, search_method: 'auto', training_budget: 20000, validation_budget: 100000, recommendation_count: 10, max_shares_mode: 'unlimited', slippage_mode: 'configured', neighborhood_fields: [...v4RobustFields], fixed_half_widths: { buy_step: .001, sell_step: .001, sell_shares: 100, buy_shares: 100, min_shares: 500, max_shares: 500 }, sigma: 1, alpha: .3, beta: 1.2, tau: .01, eta_limit: 2, eta_hard_cap: 3.5, gamma_max: .4, eta_floor: 0, gamma_min: 0, floor_k_ref: 10, training_min_days: 250, training_max_days: 500, peak_tolerance: 1e-12, start_min: 20, start_max: 64, starts_per_candidate: 4, initial_strides: [1, 2], stride_multiplier: 2, max_stride_fraction: .25, validation_reserve_fraction: .25, exhaustive_memory_limit_mb: 512, estimated_bytes_per_point: 512, stress_cost_multiplier: 2, stress_region_count: 3, ranges: defaultSearchRanges() },
   }
 }
 
@@ -153,6 +154,7 @@ export function validResearchDefaults(value: unknown): value is ResearchDefaults
     || !fraction(item.alpha) || !positive(item.sigma) || !positive(item.beta)
     || !finite(item.tau) || n(item.tau) < -1 || n(item.tau) > 10
     || !nonnegative(item.eta_limit) || !nonnegative(item.gamma_max) || !fraction(item.eta_floor) || !nonnegative(item.gamma_min)
+    || !positive(item.floor_k_ref) || n(item.floor_k_ref) > 1000000
     || n(item.eta_floor) > n(item.eta_limit)
     || (item.eta_hard_cap != null && (!positive(item.eta_hard_cap) || n(item.eta_hard_cap) < n(item.eta_limit)))
     || !integer(item.training_min_days, 20, 5000) || !integer(item.training_max_days, 20, 5000) || n(item.training_min_days) > n(item.training_max_days)
@@ -276,6 +278,7 @@ function normalizeResearchDefaults(value: unknown): ResearchDefaults {
     gamma_max: nonnegative(item.gamma_max) ? item.gamma_max as number : defaults.gamma_max,
     eta_floor: fraction(item.eta_floor) ? item.eta_floor as number : defaults.eta_floor,
     gamma_min: nonnegative(item.gamma_min) ? item.gamma_min as number : defaults.gamma_min,
+    floor_k_ref: positive(item.floor_k_ref) && n(item.floor_k_ref) <= 1000000 ? item.floor_k_ref as number : defaults.floor_k_ref,
     training_min_days: integer(item.training_min_days, 20, 5000) ? item.training_min_days as number : defaults.training_min_days,
     training_max_days: integer(item.training_max_days, 20, 5000) ? item.training_max_days as number : defaults.training_max_days,
     peak_tolerance: positive(item.peak_tolerance) ? item.peak_tolerance as number : defaults.peak_tolerance,

@@ -8,6 +8,7 @@ from stockregression.api import create_app
 from stockregression.market_data import MarketDataService
 from stockregression.market_data.preparation import MarketPreparationService
 from stockregression.models import BacktestConfig
+from stockregression.quality import minute_slots
 from stockregression.jobs import execute_job
 from stockregression.storage import Store
 
@@ -17,6 +18,62 @@ def _config():
         symbol="600000.SH", start_date=pd.Timestamp("2026-01-05").date(),
         end_date=pd.Timestamp("2026-01-06").date(), frequency="1d",
     )
+
+
+def _gapped_minute_fixture(tmp_path, count=40):
+    days = pd.bdate_range("2026-01-05", periods=count)
+    prior = pd.Timestamp("2026-01-02")
+    all_days = pd.DatetimeIndex([prior]).append(days)
+    minute_rows = []
+    for day in all_days:
+        for timestamp in minute_slots(day):
+            minute_rows.append({
+                "timestamp": timestamp, "open": 10.0, "high": 10.5, "low": 9.5,
+                "close": 10.2, "volume": 100.0, "turnover": 1000.0,
+            })
+    minute = pd.DataFrame(minute_rows)
+    gap_day = days[1]
+    gap_slots = minute_slots(gap_day)
+    minute = minute[~minute.timestamp.between(gap_slots[0], gap_slots[49])].copy()
+    daily = pd.DataFrame({
+        "date": all_days, "open": 10.0, "high": 10.5, "low": 9.5,
+        "close": 10.2, "preclose": 10.2, "volume": 24_000.0,
+        "turnover": 240_000.0, "tradestatus": 1, "is_st": 0,
+    })
+    daily.loc[daily.date == gap_day, ["volume", "turnover"]] = [19_000.0, 190_000.0]
+    calendar = tmp_path / "calendar.csv"
+    pd.DataFrame({"date": all_days}).to_csv(calendar, index=False)
+    daily_path, minute_path = tmp_path / "daily.csv", tmp_path / "minute.csv"
+    daily.to_csv(daily_path, index=False)
+    minute.to_csv(minute_path, index=False)
+    service = MarketDataService(Store(tmp_path / "data"))
+    service.import_file("600000.SH", "1day", daily_path, calendar_path=calendar)
+    service.import_file("600000.SH", "1min", minute_path, calendar_path=calendar, label_convention="end")
+    config = BacktestConfig(
+        symbol="600000.SH", start_date=pd.Timestamp("2026-01-04").date(),
+        end_date=days[-1].date(), frequency="1m",
+    )
+    return service, config, gap_day
+
+
+def test_readiness_allows_a_bounded_minute_gap_to_degrade_to_daily(tmp_path):
+    service, config, gap_day = _gapped_minute_fixture(tmp_path, count=40)
+    readiness = service.readiness(config)
+
+    assert readiness["ready"] is True
+    assert [row["date"] for row in readiness["degraded_days"]] == [str(gap_day.date())]
+    bundle = service.load_backtest_bundle(config)
+    assert bundle.quality["daily_days"] == 1
+    assert bundle.quality["minute_ratio"] >= 0.95
+    assert bundle.quality["days"][1]["mode"] == "daily"
+
+
+def test_readiness_rejects_a_minute_gap_above_the_fallback_budget(tmp_path):
+    service, config, _ = _gapped_minute_fixture(tmp_path, count=10)
+    readiness = service.readiness(config)
+
+    assert readiness["ready"] is False
+    assert any(gap["kind"] == "quality" for gap in readiness["gaps"])
 
 
 def test_preparation_plan_lists_dependencies_without_network(tmp_path):

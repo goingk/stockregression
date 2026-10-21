@@ -190,6 +190,7 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
               </> : <>
                 <div><small>{result.schema_version === 3 ? '时间加权年化' : '年化收益'}</small><strong>{percent(metrics?.cagr)}</strong></div><div><small>{result.schema_version === 3 ? '资金流调整回撤' : '最大回撤'}</small><strong className='loss'>{percent(metrics?.max_drawdown)}</strong></div><div><small>夏普比率</small><strong>{metrics?.sharpe == null || !Number.isFinite(metrics.sharpe) ? '—' : metrics.sharpe.toFixed(2)}</strong></div><div><small>成交笔数</small><strong>{metrics?.trade_count ?? '—'}</strong></div>
               </>}</div>
+              {strategy.value.floor_penalty_basis && <p className='field-hint'>底仓惩罚 {percent(strategy.value.floor_penalty, 4)} · {strategy.value.floor_episode_count ?? 0} 段 · 各段上涨格数 {strategy.value.floor_episode_grids?.length ? strategy.value.floor_episode_grids.join(' / ') : '无'}</p>}
             </div>
           })}</div>
         </>}

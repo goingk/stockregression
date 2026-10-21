@@ -11,6 +11,7 @@ from stockregression.numerics.robust import (
     NeighborhoodOperator,
     PeakAnalyzer,
     eligible,
+    position_penalty,
     robust_score,
     tensor_robust_scores,
 )
@@ -59,6 +60,7 @@ def row(space: ParameterSpace, coordinate, value: float, *, drawdown=.05, trades
         "training_drawdown": float(drawdown), "trade_count": int(trades),
         "buy_count": max(1, int(trades) // 2), "sell_count": max(1, int(trades) // 2),
         "actual_max_pos_ratio": float(max_pos), "actual_min_pos_ratio": float(min_pos),
+        "floor_episode_count": 0, "floor_episode_grids": [], "floor_penalty": 0.0,
     }
 
 
@@ -160,6 +162,42 @@ def test_missing_or_failed_neighbour_never_becomes_a_complete_zero_sample():
     removed["evaluation_status"] = "failed"
     rows[neighbour] = removed
     assert not robust_score(center, rows, space, config.strategy).complete
+
+
+def test_floor_penalty_accumulates_episode_grid_squares():
+    config = make_config(strategy={"gamma_min": .4, "eta_floor": .5, "floor_k_ref": 10.0})
+    assert config.base.floor_penalty_config is not None
+    assert config.base.floor_penalty_config.eta_floor == .5
+    assert config.base.floor_penalty_config.gamma_min == .4
+    assert config.base.floor_penalty_config.floor_k_ref == 10.0
+    assert config.base.model_dump(mode="json")["floor_penalty_config"]["floor_k_ref"] == 10.0
+    item = row(
+        ParameterSpace(make_config()), (1, 1, 1, 1), .05,
+        min_pos=.1, max_pos=1.0,
+    )
+    item["floor_episode_count"] = 2
+    item["floor_episode_grids"] = [3, 4]
+    total, maximum, minimum = position_penalty(item, config.strategy)
+    assert maximum == pytest.approx(0.0)
+    assert minimum == pytest.approx(.4 * (.3 ** 2 + .4 ** 2))
+    assert total == pytest.approx(.1)
+
+    item["floor_episode_grids"] = [5]
+    assert position_penalty(item, config.strategy)[2] == pytest.approx(.1)
+    item["floor_episode_grids"] = [0, 0, 0, 0, 0]
+    assert position_penalty(item, config.strategy)[2] == 0.0
+
+
+def test_missing_floor_episode_evidence_makes_the_score_incomplete():
+    config = make_config(strategy={"gamma_min": .4, "eta_floor": .5})
+    space = ParameterSpace(config)
+    rows = complete_field(space, lambda coordinate: .05)
+    center = space.full_coordinate((2, 1))
+    rows[center].pop("floor_episode_grids")
+    direct = robust_score(center, rows, space, config.strategy)
+    tensor = tensor_robust_scores(space, rows, config.strategy)[center]
+    assert not direct.complete and not tensor.complete
+    assert not math.isfinite(direct.position_penalty)
 
 
 def test_peak_analyzer_closes_a_flat_plateau_and_detects_a_higher_exit():
@@ -324,6 +362,7 @@ class SearchFakeEvaluator:
                 "training_excess_stress": .01, "max_drawdown": .05,
                 "trade_count": 20, "actual_min_pos_ratio": 0.0,
                 "actual_max_pos_ratio": 1.0,
+                "floor_episode_count": 0, "floor_episode_grids": [], "floor_penalty": 0.0,
             }
             for coordinate in coordinates
         }

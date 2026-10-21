@@ -41,6 +41,23 @@ def _nb_cell(price, anchor, grid_mode, buy_step, sell_step):
 
 
 @_jit(cache=True)
+def _nb_floor_grid(anchor, high, sell_step):
+    if anchor <= 0 or high <= anchor or sell_step <= 0:
+        return 0
+    strides = math.log(high / anchor) / math.log1p(sell_step) + 1e-10
+    return max(0, int(math.floor(strides)))
+
+
+@_jit(cache=True)
+def _nb_close_floor(active, anchor, high, sell_step, grids, count, squares):
+    if not active:
+        return active, anchor, high, grids, count, squares
+    grid = _nb_floor_grid(anchor, high, sell_step)
+    grids = np.append(grids, np.int64(grid))
+    return False, 0.0, 0.0, grids, count + 1, squares + float(grid) * float(grid)
+
+
+@_jit(cache=True)
 def _nb_grid_intent(close, position, reference, anchor, active_cell,
                     grid_mode, buy_step, sell_step, grid_step,
                     lower_price, upper_price, min_shares, max_shares,
@@ -205,6 +222,7 @@ def simulate(
     buy_hold_initial_shares: int, valuation_price: float, tick: float,
     t0: bool, output_mode: int, funding_mode: int,
     allow_odd_lot_exit: bool,
+    floor_eta_floor: float, floor_gamma_min: float, floor_k_ref: float,
     parameter_days: np.ndarray, parameter_values: np.ndarray,
     fold_ids: np.ndarray, fold_count: int,
     grid_only: bool, passive_grid: bool,
@@ -247,6 +265,15 @@ def simulate(
     sell_count = np.zeros(3, dtype=np.int64)
     actual_min_position = 0.0
     actual_max_position = 0.0
+    floor_enabled = floor_eta_floor >= 0 and floor_k_ref > 0
+    floor_limit = floor_eta_floor * float(seed_shares)
+    floor_active = floor_enabled and float(seed_shares) <= floor_limit + 1e-9
+    floor_anchor = float(valuation_price) if floor_active else 0.0
+    floor_high = floor_anchor
+    floor_sell_step = sell_step if floor_active else 0.0
+    floor_episode_grids = np.empty(0, dtype=np.int64)
+    floor_episode_count = 0
+    floor_grid_squares = 0.0
     stockout_count = 0.0
     stockout_signal_active = False
     tplus1_block_count = 0.0
@@ -363,6 +390,7 @@ def simulate(
     current_day_id = -1
     dca_day_index = 0
     for i in range(n):
+        floor_position_changed = False
         day_id = day_ids[i]
         if day_id != current_day_id:
             current_day_id = day_id
@@ -436,6 +464,9 @@ def simulate(
                     if fixed_anchor[account] > 0:
                         fixed_anchor[account] *= factor
                     last_grid_price *= factor
+                    if floor_active:
+                        floor_anchor *= factor
+                        floor_high *= factor
                 for action in range(action_count):
                     if action_ex_day[action] == day_id:
                         cash_claim = entitlement_cash[account, action]
@@ -464,6 +495,7 @@ def simulate(
                     current_position = float(shares[0] + share_receivable[0])
                     actual_min_position = min(actual_min_position, current_position)
                     actual_max_position = max(actual_max_position, current_position)
+                    floor_position_changed = True
         if first_dca_day[i]:
             dca_due = True
 
@@ -490,6 +522,17 @@ def simulate(
         opening = opens[i]
         close = closes[i]
         volume = volumes[i]
+        if floor_active:
+            floor_high = max(floor_high, opening)
+        if floor_position_changed and floor_enabled:
+            position = float(shares[0] + share_receivable[0])
+            if floor_active and position > floor_limit + 1e-9:
+                floor_active, floor_anchor, floor_high, floor_episode_grids, floor_episode_count, floor_grid_squares = _nb_close_floor(
+                    floor_active, floor_anchor, floor_high, floor_sell_step,
+                    floor_episode_grids, floor_episode_count, floor_grid_squares,
+                )
+            elif not floor_active and position <= floor_limit + 1e-9:
+                floor_active, floor_anchor, floor_high, floor_sell_step = True, opening, opening, sell_step
         for account in range(account_count):
             traded = False
             if pending_side[account] != 0:
@@ -523,6 +566,14 @@ def simulate(
                         current_position = float(shares[0] + share_receivable[0])
                         actual_min_position = min(actual_min_position, current_position)
                         actual_max_position = max(actual_max_position, current_position)
+                        if floor_enabled:
+                            if floor_active and current_position > floor_limit + 1e-9:
+                                floor_active, floor_anchor, floor_high, floor_episode_grids, floor_episode_count, floor_grid_squares = _nb_close_floor(
+                                    floor_active, floor_anchor, floor_high, floor_sell_step,
+                                    floor_episode_grids, floor_episode_count, floor_grid_squares,
+                                )
+                            elif not floor_active and current_position <= floor_limit + 1e-9:
+                                floor_active, floor_anchor, floor_high, floor_sell_step = True, result[5], result[5], sell_step
                     if account == 0 and result[10] > 0:
                         top_up = float(result[10])
                         if unit_initialized[0]:
@@ -718,6 +769,9 @@ def simulate(
                 invested_values[0, out] = grid_invested if top_up_mode else initial_equities[0]
                 invested_values[1, out] = dca_invested
 
+        if floor_active:
+            floor_high = max(floor_high, close)
+
         fold_id = fold_ids[day_id]
         if fold_id >= 0:
             if top_up_mode and unit_count[0] > 0:
@@ -804,7 +858,11 @@ def simulate(
     metrics[1, 10] = dca_invested
     for index in (1, 2, 3, 4, 7):
         metrics[1, index] = np.nan
-    funding_stats = np.zeros((3, 13), dtype=np.float64)
+    floor_active, floor_anchor, floor_high, floor_episode_grids, floor_episode_count, floor_grid_squares = _nb_close_floor(
+        floor_active, floor_anchor, floor_high, floor_sell_step,
+        floor_episode_grids, floor_episode_count, floor_grid_squares,
+    )
+    funding_stats = np.zeros((3, 16), dtype=np.float64)
     funding_stats[0, 0] = initial_equities[0]
     funding_stats[0, 1] = grid_topups
     funding_stats[0, 2] = grid_peak_invested
@@ -819,6 +877,9 @@ def simulate(
     funding_stats[0, 10] = actual_max_position / baseline_position
     funding_stats[0, 11] = stockout_count
     funding_stats[0, 12] = tplus1_block_count
+    funding_stats[0, 13] = floor_episode_count
+    funding_stats[0, 14] = floor_gamma_min * floor_grid_squares / (floor_k_ref * floor_k_ref) if floor_enabled else np.nan
+    funding_stats[0, 15] = floor_grid_squares
     if top_up_mode and grid_peak_invested > 0:
         metrics[0, 0] = (last_equity[0] - grid_invested) / grid_peak_invested
     return (
@@ -830,7 +891,7 @@ def simulate(
         rejection_bar[:rejection_n], rejection_ts[:rejection_n],
         rejection_strategy[:rejection_n], rejection_side[:rejection_n],
         rejection_reason[:rejection_n], rejection_quantity[:rejection_n], invested_values,
-        fold_stats, funding_stats,
+        fold_stats, floor_episode_grids, funding_stats,
     )
 
 
@@ -842,7 +903,8 @@ def simulate_research_batch(arrays, options, parameters, fold_ids, fold_count):
     returns = np.zeros((day_count, count), dtype=np.float64)
     metrics = np.zeros((count, 11), dtype=np.float64)
     folds = np.zeros((count, fold_count, 9), dtype=np.float64)
-    funding = np.zeros((count, 13), dtype=np.float64)
+    funding = np.zeros((count, 16), dtype=np.float64)
+    episodes = [np.empty(0, dtype=np.int64) for _ in range(count)]
     empty_days = np.zeros(0, dtype=np.int64)
     empty_values = np.zeros((0, 7), dtype=np.float64)
     for index in prange(count):
@@ -851,12 +913,14 @@ def simulate_research_batch(arrays, options, parameters, fold_ids, fold_count):
             p[2], p[3], p[4], options[9], options[10], options[11], int(p[5]), int(p[6]),
             options[14], options[15], options[16], options[17], options[18], options[19],
             options[20], options[21], options[22], options[23], options[24], options[25],
-            options[26], options[27], options[28], options[29], empty_days, empty_values,
+            options[26], options[27], options[28], options[29], options[30], options[31], options[32],
+            empty_days, empty_values,
             fold_ids, fold_count, True, False)
         output = simulate(*(arrays + individual))
         returns[:, index] = output[5][0]
         metrics[index] = output[0][0]
-        folds[index] = output[-2]
+        folds[index] = output[-3]
+        episodes[index] = output[-2]
         funding[index] = output[-1][0]
-    return returns, metrics, folds, funding
+    return returns, metrics, folds, episodes, funding
 

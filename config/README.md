@@ -88,8 +88,9 @@
 | `research.defaults.eta_limit` | P0 倍数 | `2.0` | 非负 | 上界持仓惩罚 | 持仓状态 | 下次研究 | 是 |
 | `research.defaults.eta_hard_cap` | P0 倍数或 null | `3.5` | ≥eta_limit；null 关闭 | 中心事后资格 | 持仓状态 | 下次研究 | 是 |
 | `research.defaults.gamma_max` | 非负系数 | `0.40` | 0–1000 | 上界二次惩罚 | 持仓状态 | 下次研究 | 是 |
-| `research.defaults.eta_floor` | P0 倍数 | `0.0` | 0–1，≤eta_limit | 下界二次惩罚 | 持仓状态 | 下次研究 | 是 |
-| `research.defaults.gamma_min` | 非负系数 | `0.0` | 0–1000 | 下界二次惩罚 | 持仓状态 | 下次研究 | 是 |
+| `research.defaults.eta_floor` | P0 倍数 | `0.0` | 0–1，≤eta_limit | 底仓期触发阈值 | 持仓状态 | 下次研究 | 是 |
+| `research.defaults.floor_k_ref` | 卖出整格数 | `10` | >0 | 底仓整格惩罚参考尺度 | 持仓状态 | 下次研究 | 是 |
+| `research.defaults.gamma_min` | 非负系数 | `0.0` | 0–1000 | 底仓期上涨整格二次惩罚 | 持仓状态 | 下次研究 | 是 |
 | `research.defaults.training_min_days` | 整数 / 交易日 | `250` | 20–5000 | 数据准备与 TrainingWindowPolicy | 训练窗口 | 下次准备与研究 | 是 |
 | `research.defaults.training_max_days` | 整数 / 交易日 | `500` | ≥training_min_days | 数据准备与窗口 | 训练窗口 | 下次准备与研究 | 是 |
 | `research.defaults.peak_tolerance` | 绝对 J 容差 | `1e-12` | >0，≤0.1 | PeakAnalyzer | J 参数 | 下次研究 | 是 |
@@ -117,7 +118,7 @@
 | `statistics.alpha` | 小数 / 显著性 | `0.05` | >0，<1 | 家族校正和末段检验 | 统计与复现 | 下次统计 | 是 |
 | `statistics.outer_validation_days` | 整数 / 交易日 | `126` | 20–1000 | 外层核验 | 统计与复现 | 下次研究 | 是 |
 | `market_data.cache_mb` | MiB | `256` | 0–16384 | ByteLRU | 文件 | 保存后配置缓存 | 否 |
-| `market_data.recent_minute_source` | 枚举 | `sina` | sina/tdx | 近期分钟来源 | 文件 / 数据操作 | 新同步 | 否 |
+| `market_data.recent_minute_source` | 枚举 | `sina` | sina/tdx | 近期分钟主来源；同花顺为自动回退 | 文件 / 数据操作 | 新同步 | 否 |
 | `market_data.etf_daily_source` | 枚举 | `baostock` | baostock/eastmoney | ETF 日线来源 | 文件 / 数据操作 | 新同步 | 否 |
 | `market_data.network_timeout_seconds` | 秒 | `15` | 1–300 | HTTP 请求 | 文件 | 下次请求 | 否 |
 | `market_data.request_retries` | 次数 | `1` | 0–5 | 来源重试 | 文件 | 下次请求 | 否 |

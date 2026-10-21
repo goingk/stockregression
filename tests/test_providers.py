@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 import sys
 import types
@@ -80,6 +81,100 @@ def test_sina_minute_adapter_reuses_session_and_makes_one_request(monkeypatch):
     assert calls[0][1]["params"] == {"symbol": "sz159611", "scale": "1", "ma": "no", "datalen": "1970"}
     assert calls[0][1]["timeout"] == 15
     assert len(first) == len(second) == 1
+
+
+def test_fetch_ths_decodes_prices_volume_and_estimates_turnover(monkeypatch):
+    payload = {
+        "total": "3",
+        "start": "202610080930",
+        "priceFactor": 1000,
+        "dates": "10080930,10080931,10081500",
+        "price": "1824,16,21,11,1826,9,20,18,1820,1,5,3",
+        "volumn": "1000,2000,3000",
+    }
+    calls = []
+
+    class Response:
+        text = "quotebridge_v6_line_hs_517520_61_all(" + json.dumps(payload) + ")"
+
+        def raise_for_status(self):
+            return None
+
+    class Session:
+        headers = {}
+
+        def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return Response()
+
+    monkeypatch.setattr(providers, "_THS_LOCAL", types.SimpleNamespace(session=Session()))
+    monkeypatch.setattr(providers, "latest_closed_date", lambda: pd.Timestamp("2026-10-20"))
+    daily = pd.DataFrame({
+        "date": [pd.Timestamp("2026-10-08")],
+        "open": [1.840], "high": [1.846], "low": [1.820], "close": [1.823],
+        "volume": [6000], "turnover": [12000.0],
+    })
+
+    frame = providers.fetch_ths("517520.SH", network_timeout=7, daily=daily)
+
+    assert calls[0][0] == "https://d.10jqka.com.cn/v6/line/hs_517520/61/all.js"
+    assert calls[0][1]["timeout"] == 7
+    assert frame.timestamp.tolist() == [
+        pd.Timestamp("2026-10-08 09:30"),
+        pd.Timestamp("2026-10-08 09:31"),
+        pd.Timestamp("2026-10-08 15:00"),
+    ]
+    assert frame.iloc[0][["open", "high", "low", "close"]].tolist() == [1.84, 1.845, 1.824, 1.835]
+    assert frame.volume.tolist() == [1000, 2000, 3000]
+    assert abs(frame.turnover.sum() - 12000.0) < 1e-9
+    assert frame.source.tolist() == ["ths"] * 3
+
+
+def test_ths_timestamps_roll_over_new_year():
+    stamps = providers._ths_timestamps(["12311459", "01020931"], "202512310930")
+
+    assert stamps == [pd.Timestamp("2025-12-31 14:59"), pd.Timestamp("2026-01-02 09:31")]
+
+
+def test_fetch_ths_drops_an_incomplete_current_session(monkeypatch):
+    payload = {
+        "total": "6",
+        "start": "202610200930",
+        "priceFactor": 1000,
+        "dates": "10200930,10200931,10201500,10210930,10210931,10211500",
+        "price": "1824,16,21,11,1826,9,20,18,1820,1,5,3,1800,10,30,0,1801,9,29,1,1802,8,28,2",
+        "volumn": "1000,2000,3000,500,600,700",
+    }
+
+    class Response:
+        text = "quotebridge_v6_line_hs_517520_61_all(" + json.dumps(payload) + ")"
+
+        def raise_for_status(self):
+            return None
+
+    class Session:
+        headers = {}
+
+        def get(self, url, **kwargs):
+            return Response()
+
+    class FixedDateTime:
+        @classmethod
+        def now(cls, tz):
+            return pd.Timestamp("2026-10-21 17:30", tz="Asia/Shanghai")
+
+    monkeypatch.setattr(providers, "_THS_LOCAL", types.SimpleNamespace(session=Session()))
+    monkeypatch.setattr(providers, "latest_closed_date", lambda: pd.Timestamp("2026-10-21"))
+    monkeypatch.setattr(providers, "datetime", FixedDateTime)
+    daily = pd.DataFrame({
+        "date": [pd.Timestamp("2026-10-20"), pd.Timestamp("2026-10-21")],
+        "open": [1.824, 1.810], "high": [1.845, 1.900], "low": [1.820, 1.800],
+        "close": [1.823, 1.900], "volume": [6000, 5000], "turnover": [12000.0, 9000.0],
+    })
+
+    frame = providers.fetch_ths("517520.SH", daily=daily)
+
+    assert frame.timestamp.dt.normalize().unique().tolist() == [pd.Timestamp("2026-10-20")]
 
 
 def test_baostock_session_is_reused_within_worker(monkeypatch):

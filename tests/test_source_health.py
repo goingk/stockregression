@@ -9,6 +9,7 @@ from stockregression.api import create_app
 from stockregression.jobs import execute_job
 from stockregression.settings import MarketDataSettings, Settings
 from stockregression.source_health import (
+    SourceFailure,
     SourceRouter,
     fetch_auxiliary_routed,
     probe_source,
@@ -79,6 +80,97 @@ def test_transient_optional_failure_retries_once_before_fallback(tmp_path, monke
     )
     assert selected == "sina" and calls == ["tdx", "tdx"]
     assert source_state(store, "tdx", "recent_minute", "stock")["error_category"] == "timeout"
+
+
+def test_http_5xx_is_treated_as_transient():
+    class Response:
+        status_code = 502
+
+    error = RuntimeError("Bad Gateway")
+    error.response = Response()
+
+    assert source_health.classify_source_error(error) == "network"
+
+
+def test_recent_minute_falls_back_to_ths_after_default_failure(tmp_path):
+    store = Store(tmp_path / "data")
+    calls = []
+
+    def unavailable_sina():
+        calls.append("sina")
+        raise ConnectionError("sina unavailable")
+
+    def available_ths():
+        calls.append("ths")
+        return _minute_frame("ths")
+
+    frame, selected, route = SourceRouter(store).call(
+        "recent_minute", "stock",
+        {"sina": unavailable_sina, "ths": available_ths},
+        fallbacks=("ths",),
+    )
+
+    assert selected == "ths" and len(frame) == 2
+    assert route["fallback"] is True and route["effective"] == "ths"
+    assert "sina unavailable" in route["reason"]
+    assert calls == ["sina", "sina", "ths"]
+    assert source_state(store, "sina", "recent_minute", "stock")["status"] == "failed"
+    assert source_state(store, "ths", "recent_minute", "stock")["status"] == "passed"
+
+
+def test_recent_minute_tries_ths_after_optional_and_default_fail(tmp_path):
+    store = Store(
+        tmp_path / "data",
+        settings=Settings(data_dir=str(tmp_path / "data"), recent_minute_source="tdx"),
+    )
+    record_success(store, "tdx", "recent_minute", "stock", rows=1)
+    calls = []
+
+    def unavailable(name):
+        def call():
+            calls.append(name)
+            raise RuntimeError(name + " unavailable")
+        return call
+
+    _, selected, route = SourceRouter(store).call(
+        "recent_minute", "stock",
+        {
+            "tdx": unavailable("tdx"), "sina": unavailable("sina"),
+            "ths": lambda: _minute_frame("ths"),
+        },
+        fallbacks=("ths",),
+    )
+
+    assert selected == "ths" and route["fallback"] is True
+    assert calls == ["tdx", "sina"]
+    assert "tdx unavailable" in route["reason"] and "sina unavailable" in route["reason"]
+
+
+def test_partial_primary_response_is_rejected_and_falls_back_to_ths(tmp_path):
+    store = Store(tmp_path / "data")
+    calls = []
+
+    def sina():
+        calls.append("sina")
+        return _minute_frame("sina")
+
+    def ths():
+        calls.append("ths")
+        return _minute_frame("ths")
+
+    def require_complete(value, source):
+        if source == "sina":
+            raise SourceFailure(source, "recent_minute", "empty", "分钟窗口不完整")
+
+    frame, selected, route = SourceRouter(store).call(
+        "recent_minute", "stock", {"sina": sina, "ths": ths},
+        fallbacks=("ths",), accept=require_complete,
+    )
+
+    assert selected == "ths" and len(frame) == 2
+    assert calls == ["sina", "ths"]
+    assert route["fallback"] is True and "不完整" in route["reason"]
+    assert source_state(store, "sina", "recent_minute", "stock")["status"] == "unknown"
 
 
 def test_one_symbol_empty_response_does_not_suspend_the_source(tmp_path, monkeypatch):
@@ -200,6 +292,11 @@ def test_source_api_reads_cache_and_rejects_undetected_optional_source(tmp_path,
         capabilities = {item["capability"]: item for item in response.json()["capabilities"]}
         assert capabilities["recent_minute"]["configured"] == "sina"
         assert capabilities["etf_daily"]["configured"] == "baostock"
+        ths = next(
+            option for option in capabilities["recent_minute"]["sources"]
+            if option["source"] == "ths"
+        )
+        assert ths["role"] == "fallback" and ths["selectable"] is False
         revision = client.get("/api/v1/settings").json()["config_revision"]
         rejected = client.put("/api/v1/settings", json={"base_revision": revision, "recent_minute_source": "tdx"})
         assert rejected.status_code == 422 and "通达信" in rejected.text

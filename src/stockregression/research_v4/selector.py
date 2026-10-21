@@ -560,7 +560,7 @@ def strategy_descriptions() -> dict[str, Any]:
                 "recommendation_count": 10, "hypercube_edge": 3,
                 "sigma": 1.0, "alpha": .30, "beta": 1.20, "tau": .01,
                 "eta_limit": 2.0, "eta_hard_cap": 3.5, "gamma_max": .40,
-                "eta_floor": 0.0, "gamma_min": 0.0,
+                "eta_floor": 0.0, "gamma_min": 0.0, "floor_k_ref": 10.0,
             },
         }, {
             "strategy_id": "geometric_excess_neighborhood",

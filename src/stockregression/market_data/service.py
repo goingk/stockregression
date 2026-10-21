@@ -38,6 +38,10 @@ from .validation import validate_incremental
 
 
 BASE_TIMEFRAMES = ("1day", "1min")
+# Mirrors the default research minute-coverage gate.  A small fraction of
+# sessions may use verified daily OHLC when the intraday path is unavailable;
+# the research layer still enforces its own min_minute_ratio setting.
+MAX_DAILY_FALLBACK_RATIO = 0.05
 DERIVED_SOURCES = {
     "5min": "1min", "15min": "1min", "30min": "1min", "60min": "1min",
     "1week": "1day", "1month": "1day",
@@ -1320,6 +1324,7 @@ class MarketDataService:
             pd.Timestamp(daily.get("last_time")).normalize() if daily and daily.get("last_time") else pd.Timestamp(config.start_date).normalize()
         )
         requested_start = pd.Timestamp(config.start_date).normalize()
+        degraded_days: list[dict] = []
         if target in DERIVED_SOURCES and not version:
             try:
                 self.ensure_timeframe(
@@ -1338,12 +1343,17 @@ class MarketDataService:
             elif minute and minute.get("file_status") != "readable":
                 message = f"{target} 行情文件缺失" if minute.get("file_status") == "missing" else f"{target} 行情文件已被外部修改，需要重新登记和校验"
                 gaps.append({"kind": "bars", "timeframe": target, "message": message})
-            elif minute and not self._validation_covers(
-                self.repository.dataset(symbol, DERIVED_SOURCES.get(target, target)),
-                requested_start, requested_end,
-            ):
-                gaps.append({"kind": "quality", "timeframe": target,
-                             "message": minute.get("reason") or f"{target} 在本次请求区间尚未完成质量核验"})
+            elif minute:
+                contract = self.repository.dataset(symbol, DERIVED_SOURCES.get(target, target))
+                if not self._validation_covers(contract, requested_start, requested_end):
+                    degradable = self._degradable_minute_days(
+                        contract, requested_start, requested_end,
+                    )
+                    if degradable is None:
+                        gaps.append({"kind": "quality", "timeframe": target,
+                                     "message": minute.get("reason") or f"{target} 在本次请求区间尚未完成质量核验"})
+                    else:
+                        degraded_days.extend(degradable)
             if minute and minute.get("file_status") == "readable":
                 selected_version = (
                     int(market_versions[target]["version"])
@@ -1440,8 +1450,18 @@ class MarketDataService:
                     gaps.append({"kind": "range", "timeframe": target, "message": f"开始日期早于本地 {target} 覆盖"})
                 if config.end_date and target_dataset.get("last_time") and pd.Timestamp(config.end_date) > pd.Timestamp(target_dataset["last_time"]):
                     gaps.append({"kind": "range", "timeframe": target, "message": f"结束日期晚于本地 {target} 覆盖"})
+        warnings = []
+        if degraded_days:
+            dates = ", ".join(item["date"] for item in degraded_days[:8])
+            total_days = len(self.repository.trading_days(symbol, requested_start, requested_end))
+            ratio = 1 - len(degraded_days) / max(1, total_days)
+            warnings.append(
+                f"{len(degraded_days)} 个交易日将按已校验日线降级：{dates}；"
+                f"分钟覆盖率 {ratio:.2%}"
+            )
         return {"ready": not gaps, "symbol": symbol, "frequency": config.frequency,
                 "asset_type": asset_type, "gaps": gaps,
+                "degraded_days": degraded_days, "warnings": warnings,
                 "checked_start": str(config.start_date),
                 "checked_end": str(config.end_date) if config.end_date else None,
                 "package_id": self.repository.package_id,
@@ -1475,6 +1495,80 @@ class MarketDataService:
             and pd.Timestamp(verified_through).normalize() >= pd.Timestamp(state.get("expected_end") or end).normalize()
             and not state.get("failed") and not state.get("pending")
         )
+
+    def _degradable_minute_days(self, dataset: dict | None, start, end) -> list[dict] | None:
+        """Return failed minute sessions that can use a verified daily row.
+
+        The engine already supports mixed daily/minute bundles.  Readiness was
+        rejecting every failed minute day before that fallback could be used.
+        Only bounded, genuine intraday gaps are accepted here; invalid prices,
+        missing daily bars and unvalidated pending days remain hard failures.
+        """
+        if not dataset:
+            return None
+        symbol = str(dataset.get("symbol"))
+        timeframe = str(dataset.get("timeframe"))
+        adjustment = str(dataset.get("adjustment") or "none")
+        state = self.repository.validation_state(
+            symbol, timeframe, adjustment=adjustment, start=start, end=end,
+        )
+        if not state.get("calendar_available") or state.get("pending"):
+            return None
+        failed = [str(day) for day in (state.get("failed") or [])]
+        if not failed:
+            return None
+        expected = self.repository.trading_days(symbol, start, end)
+        expected_start = state.get("expected_start")
+        expected_end = state.get("expected_end")
+        if (
+            not len(expected) or not expected_start or not expected_end
+            or pd.Timestamp(expected_start).normalize() != expected[0].normalize()
+            or pd.Timestamp(expected_end).normalize() != expected[-1].normalize()
+            or len(failed) / len(expected) > MAX_DAILY_FALLBACK_RATIO
+        ):
+            return None
+        records = {
+            str(row["trade_date"]): row
+            for row in self.repository.day_validations(
+                symbol, timeframe, adjustment=adjustment, start=start, end=end,
+            )
+        }
+        daily = self.repository.bars(symbol, "1day", start=start, end=end)
+        if daily.empty:
+            return None
+        daily["_day"] = pd.to_datetime(daily["timestamp"]).dt.normalize()
+        daily_by_day = {
+            pd.Timestamp(day).normalize(): part.iloc[-1]
+            for day, part in daily.groupby("_day", sort=True)
+        }
+        degraded = []
+        for day in failed:
+            record = records.get(day) or {}
+            report = record.get("report") or {}
+            reason = str(report.get("reason") or "")
+            unfillable = int(report.get("unfillable") or 0)
+            if int(report.get("blocked_price_rows") or 0) > 0 or report.get("price_anomalies"):
+                return None
+            if unfillable <= 0 and "缺口" not in reason and "未补齐" not in reason:
+                return None
+            row = daily_by_day.get(pd.Timestamp(day).normalize())
+            if row is None:
+                return None
+            try:
+                status = int(row.get("tradestatus"))
+                volume = float(row.get("volume"))
+                prices = [float(row.get(field)) for field in ("open", "high", "low", "close")]
+            except (TypeError, ValueError):
+                return None
+            if status not in (0, 1) or volume <= 0 or any(
+                not math.isfinite(price) or price <= 0 for price in prices
+            ):
+                return None
+            degraded.append({
+                "date": day, "timeframe": timeframe,
+                "reason": reason or f"{unfillable} 根分钟缺口",
+            })
+        return degraded
 
     def load_backtest_bundle(self, config: BacktestConfig, version: str | None = None):
         target = normalize_timeframe(config.frequency)

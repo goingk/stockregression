@@ -21,8 +21,9 @@ SOURCE_CAPABILITIES = {
         "label": "近期 1 分钟",
         "default": "sina",
         "optional": "tdx",
+        "fallback": "ths",
         "markets": ("stock", "etf"),
-        "description": "新浪提供近期分钟行情；通达信为检测通过后可选的来源。",
+        "description": "新浪提供近期分钟行情；通达信为检测通过后可选的来源；两者都失败时自动转同花顺。",
     },
     "etf_daily": {
         "label": "ETF 日线",
@@ -36,6 +37,7 @@ SOURCE_CAPABILITIES = {
 SOURCE_LABELS = {
     "sina": "新浪（AKShare）",
     "tdx": "通达信",
+    "ths": "同花顺",
     "baostock": "BaoStock",
     "eastmoney": "东方财富（AKShare）",
     "akshare": "AKShare",
@@ -65,6 +67,9 @@ def classify_source_error(exc: BaseException) -> str:
         return "network"
     if isinstance(exc, SourceFailure):
         return exc.category
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int) and (500 <= status < 600 or status in {408, 429}):
+        return "network"
     message = str(exc).lower()
     original = getattr(exc, "original_exception", None)
     if original is not None:
@@ -236,6 +241,8 @@ class SourceRouter:
         calls: dict[str, Callable[[], object]],
         *,
         record: bool = True,
+        fallbacks: Iterable[str] = (),
+        accept: Callable[[object, str], None] | None = None,
     ):
         choice = self.route(capability, market)
         primary = choice["effective"]
@@ -263,6 +270,8 @@ class SourceRouter:
             retries = int(self.market_settings.request_retries)
             try:
                 value = calls[source]()
+                if accept is not None:
+                    accept(value, source)
                 if record:
                     rows = len(value) if isinstance(value, (pd.DataFrame, list, tuple)) else None
                     start, end = decode_coverage(value) if isinstance(value, pd.DataFrame) else (None, None)
@@ -286,6 +295,8 @@ class SourceRouter:
                 for _attempt in range(retries if is_transient(category) else 0):
                     try:
                         value = calls[source]()
+                        if accept is not None:
+                            accept(value, source)
                         if record:
                             rows = len(value) if isinstance(value, (pd.DataFrame, list, tuple)) else None
                             start, end = decode_coverage(value) if isinstance(value, pd.DataFrame) else (None, None)
@@ -313,15 +324,28 @@ class SourceRouter:
 
         if primary not in calls:
             raise ValueError(f"来源 {primary} 不支持 {capability}")
+        chain = []
+        for source in (primary, SOURCE_CAPABILITIES[capability]["default"], *fallbacks):
+            if source in calls and source not in chain:
+                chain.append(source)
+        failures: list[str] = []
+        last_category = "provider"
         try:
-            try:
-                return (*invoke(primary), choice)
-            except SourceFailure as exc:
-                fallback = SOURCE_CAPABILITIES[capability]["default"]
-                if primary == fallback or fallback not in calls:
-                    raise
-                value, actual = invoke(fallback)
-                return value, actual, {**choice, "effective": fallback, "fallback": True, "reason": str(exc)}
+            for index, source in enumerate(chain):
+                try:
+                    value, actual = invoke(source)
+                    if index == 0:
+                        return value, actual, choice
+                    return value, actual, {
+                        **choice, "effective": actual, "fallback": True,
+                        "reason": "；".join(failures) or choice.get("reason"),
+                    }
+                except SourceFailure as exc:
+                    failures.append(str(exc))
+                    last_category = exc.category
+            if failures:
+                raise SourceFailure(primary, capability, last_category, "；".join(failures))
+            raise SourceFailure(primary, capability, "provider", f"来源 {primary} 不可用")
         finally:
             if recovery_lock is not None:
                 recovery_lock.release()
@@ -345,14 +369,18 @@ def configured_sources(store: Store) -> dict:
         field = "recent_minute_source" if name == "recent_minute" else "etf_daily_source"
         configured = getattr(settings, field)
         sources = []
-        for source in (spec["default"], spec["optional"]):
+        fallback = spec.get("fallback")
+        options = (spec["default"], spec["optional"], *([fallback] if fallback else []))
+        for source in options:
             states = [source_state(store, source, name, market) for market in spec["markets"]]
             sources.append({
                 "source": source,
                 "label": SOURCE_LABELS.get(source, source),
-                "role": "default" if source == spec["default"] else "optional",
+                "role": "default" if source == spec["default"] else "fallback" if source == fallback else "optional",
                 "selected": configured == source,
-                "selectable": source == spec["default"] or all(state["status"] == "passed" for state in states),
+                "selectable": source != fallback and (
+                    source == spec["default"] or all(state["status"] == "passed" for state in states)
+                ),
                 "states": states,
             })
         capabilities.append({
@@ -491,12 +519,15 @@ def probe_source(
     cancelled: Callable[[], bool] = lambda: False,
 ) -> dict:
     """Probe a source without writing market data or changing the selected source."""
-    from .providers import fetch_etf_daily, fetch_sina, fetch_tdx, latest_closed_date
+    from .providers import fetch_etf_daily, fetch_sina, fetch_tdx, fetch_ths, latest_closed_date
 
     if capability not in SOURCE_CAPABILITIES:
         raise ValueError("未知数据源能力：" + capability)
     spec = SOURCE_CAPABILITIES[capability]
-    if source not in {spec["default"], spec["optional"]}:
+    allowed = {spec["default"], spec["optional"]}
+    if spec.get("fallback"):
+        allowed.add(spec["fallback"])
+    if source not in allowed:
         raise ValueError(f"{source} 不适用于 {capability}")
     if capability == "etf_daily" and source not in {"baostock", "eastmoney"}:
         raise ValueError("ETF 日线探测来源应为 baostock 或 eastmoney")
@@ -513,14 +544,19 @@ def probe_source(
         try:
             with probe_guard(store, source, capability, item):
                 if capability == "recent_minute":
-                    frame = (
-                        fetch_tdx(
+                    if source == "tdx":
+                        frame = fetch_tdx(
                             symbol, earliest=start, cancelled=cancelled,
                             network_timeout=network_timeout,
-                        ) if source == "tdx" else fetch_sina(
+                        )
+                    elif source == "ths":
+                        frame = fetch_ths(
                             symbol, network_timeout=network_timeout,
                         )
-                    )
+                    else:
+                        frame = fetch_sina(
+                            symbol, network_timeout=network_timeout,
+                        )
                 else:
                     frame = fetch_etf_daily(
                         symbol, start, end, source, cancelled,

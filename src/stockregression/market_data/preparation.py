@@ -81,6 +81,8 @@ class MarketPreparationService:
             "package_id": self.repository.package_id,
             "package_version": int(self.repository.package.manifest().get("package_version", 0)),
             "gaps": readiness.get("gaps", []),
+            "warnings": readiness.get("warnings", []),
+            "degraded_days": readiness.get("degraded_days", []),
             "steps": steps,
             "config": config.model_dump(mode="json"),
         }
@@ -96,10 +98,15 @@ class MarketPreparationService:
         if blocked:
             raise MarketDataError(blocked[0]["reason"])
         if plan["ready"]:
+            warnings = list(plan.get("warnings") or [])
+            message = "本次请求已有可用数据包数据"
+            if warnings:
+                message += "；" + "；".join(warnings)
             return {
                 "status": "completed", "mode": "already_ready", "symbol": config.symbol,
                 "steps": [], "remaining_gaps": [], "readiness": {"ready": True},
-                "package_id": plan["package_id"], "message": "本次请求已有可用数据包数据",
+                "package_id": plan["package_id"], "warnings": warnings,
+                "message": message,
             }
         results = []
         auxiliary_done = False

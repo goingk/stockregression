@@ -41,7 +41,7 @@ def make_config(training_budget: int, validation_budget: int) -> OptimizationCon
         "granularity": {"buy_step": .001, "sell_step": .001, "buy_shares": 100, "sell_shares": 100},
         "hypercube_edge": 3, "sigma": 1.0, "alpha": .30, "beta": 1.20, "tau": .01,
         "eta_limit": 2.0, "eta_hard_cap": 3.5, "gamma_max": .40,
-        "eta_floor": 0.0, "gamma_min": 0.0, "peak_tolerance": TOL,
+        "eta_floor": 0.0, "gamma_min": 0.0, "floor_k_ref": 10.0, "peak_tolerance": TOL,
         "training_budget": training_budget, "validation_budget": validation_budget,
         "recommendation_count": K, "start_min": 20, "start_max": 64,
         "starts_per_candidate": 4, "initial_strides": [1, 2],
@@ -98,6 +98,7 @@ def row(space: ParameterSpace, coordinate: tuple[int, ...], scenario: str) -> di
         "trade_count": trades, "buy_count": trades // 2, "sell_count": trades // 2,
         "actual_max_pos_ratio": max_position,
         "actual_min_pos_ratio": 0.0 if coordinate[0] % 2 else 1.0,
+        "floor_episode_count": 0, "floor_episode_grids": [], "floor_penalty": 0.0,
     }
 
 

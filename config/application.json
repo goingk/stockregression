@@ -60,8 +60,8 @@
       },
       "search_method": "auto",
       "training_budget": 30000,
-      "validation_budget": 100000,
-      "recommendation_count": 10,
+      "validation_budget": 50000,
+      "recommendation_count": 5,
       "max_shares_mode": "unlimited",
       "slippage_mode": "zero",
       "neighborhood_fields": [
@@ -103,12 +103,13 @@
       "sigma": 1.0,
       "alpha": 0.45,
       "beta": 1.0,
-      "tau": 0.01,
+      "tau": 0.05,
       "eta_limit": 2.0,
       "eta_hard_cap": 3.5,
       "gamma_max": 0.5,
-      "eta_floor": 0.01,
-      "gamma_min": 0.0,
+      "eta_floor": 0.05,
+      "gamma_min": 0.5,
+      "floor_k_ref": 10.0,
       "training_min_days": 250,
       "training_max_days": 450,
       "peak_tolerance": 1e-12,
@@ -220,6 +221,7 @@
         "gamma_max": 0.4,
         "eta_floor": 0.0,
         "gamma_min": 0.0,
+        "floor_k_ref": 10.0,
         "training_min_days": 250,
         "training_max_days": 500,
         "peak_tolerance": 1e-12,
@@ -329,5 +331,5 @@
     "subprocess_timeout_seconds": 45,
     "lock_timeout_seconds": 30
   },
-  "config_revision": "15c464e5e7f2121f5eb6c6bf55a495b076a2f938adf1f02ae47553f823eb509e"
+  "config_revision": "961a3bf758e59726d41d3a13956ee4735ca81d52587a3a7c77f017d1a8055e11"
 }

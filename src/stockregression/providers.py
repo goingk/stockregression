@@ -24,8 +24,10 @@ _BAOSTOCK_LOCK = threading.RLock()
 _AKSHARE_HTTP_LOCK = threading.RLock()
 _SINA_LOCAL = threading.local()
 _BAOSTOCK_LOCAL = threading.local()
+_THS_LOCAL = threading.local()
 _MARKET_CALENDAR_CACHE: dict[tuple[int, str, str], pd.DataFrame] = {}
 _SINA_MINUTE_URL = "https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataService.getKLineData"
+_THS_MINUTE_URL = "https://d.10jqka.com.cn/v6/line/hs_{code}/61/all.js"
 
 
 def serialized_baostock(function):
@@ -247,6 +249,155 @@ def _fetch_sina_minute(sina_symbol: str, network_timeout: float | None = None) -
     if frame.empty:
         return frame
     return frame.iloc[:, :7].copy()
+
+
+def _ths_session():
+    import requests
+
+    session = getattr(_THS_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "Accept": "text/javascript,application/json,*/*",
+            "Referer": "https://stockpage.10jqka.com.cn/",
+        })
+        _THS_LOCAL.session = session
+    return session
+
+
+def _decode_ths_payload(text: str) -> dict:
+    match = re.search(r"\((.*)\)\s*;?\s*$", text, flags=re.DOTALL)
+    if not match:
+        raise ValueError("同花顺分钟响应不是 JSONP")
+    payload = json.loads(match.group(1))
+    if not isinstance(payload, dict):
+        raise ValueError("同花顺分钟响应不是记录对象")
+    return payload
+
+
+def _ths_timestamps(dates: list[str], start: str | None) -> list[pd.Timestamp]:
+    """Resolve MMDDHHMM labels with the year supplied by the payload start."""
+    year = None
+    if start and len(start) >= 4 and str(start)[:4].isdigit():
+        year = int(str(start)[:4])
+    if year is None:
+        year = int(datetime.now(ZoneInfo("Asia/Shanghai")).year)
+    output = []
+    previous_month = None
+    for value in dates:
+        raw = str(value).strip()
+        if len(raw) != 8 or not raw.isdigit():
+            raise ValueError("同花顺分钟时间标签格式无效：" + raw)
+        month = int(raw[:2])
+        if previous_month is not None and month < previous_month - 6:
+            year += 1
+        previous_month = month
+        output.append(pd.Timestamp(
+            year=year, month=month, day=int(raw[2:4]),
+            hour=int(raw[4:6]), minute=int(raw[6:8]),
+        ))
+    return output
+
+
+def fetch_ths(
+    symbol: str,
+    network_timeout: float | None = None,
+    *,
+    daily: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Read THS's rolling 1-minute feed as an independent fallback.
+
+    THS publishes low/open-low/high-low/close-low tuples and share volume but
+    no per-minute turnover. Turnover is estimated from volume and OHLC4, then
+    scaled to the official daily turnover when local daily bars are supplied.
+    The estimate never changes OHLC or volume and is not presented as a vendor
+    amount field.
+    """
+    code, _exchange = normalize_symbol(symbol).split(".")
+    response = _ths_session().get(
+        _THS_MINUTE_URL.format(code=code),
+        timeout=_network_timeout(network_timeout),
+    )
+    response.raise_for_status()
+    payload = _decode_ths_payload(response.text)
+    dates = [value for value in str(payload.get("dates") or "").split(",") if value]
+    price_parts = [value for value in str(payload.get("price") or "").split(",") if value]
+    volume_parts = [value for value in str(payload.get("volumn") or "").split(",") if value]
+    if not dates:
+        raise RuntimeError("同花顺未返回近期分钟行情")
+    if len(price_parts) != len(dates) * 4 or len(volume_parts) != len(dates):
+        raise ValueError(
+            "同花顺分钟字段长度不一致："
+            f"{len(dates)} 根、{len(price_parts)} 个价格字段、{len(volume_parts)} 个成交量"
+        )
+    factor = float(payload.get("priceFactor") or 1)
+    if not factor > 0:
+        raise ValueError("同花顺分钟 priceFactor 无效")
+    prices = [float(value) for value in price_parts]
+    volumes = [int(round(float(value))) for value in volume_parts]
+    rows = []
+    for index, stamp in enumerate(_ths_timestamps(dates, payload.get("start"))):
+        low_raw, open_raw, high_raw, close_raw = prices[index * 4:index * 4 + 4]
+        low = low_raw / factor
+        opening = (low_raw + open_raw) / factor
+        high = (low_raw + high_raw) / factor
+        close = (low_raw + close_raw) / factor
+        volume = volumes[index]
+        rows.append({
+            "timestamp": stamp, "open": opening, "high": high,
+            "low": low, "close": close, "volume": volume,
+            "turnover": volume * (opening + high + low + close) / 4.0,
+        })
+    frame = canonical_frame(pd.DataFrame(rows), source="ths")
+    today = pd.Timestamp(datetime.now(ZoneInfo("Asia/Shanghai")).date())
+    verifiable = (
+        daily is not None and not daily.empty
+        and ("date" in daily.columns or "timestamp" in daily.columns)
+        and {"open", "high", "low", "close", "volume", "turnover"}.issubset(daily.columns)
+    )
+    if not verifiable:
+        # Without an official daily bar, a same-day session may still be in
+        # progress in the vendor's rolling feed. Wait for the next sync.
+        frame = frame[frame.timestamp < today].copy()
+    else:
+        day_column = "date" if "date" in daily else "timestamp"
+        reference = daily.copy()
+        reference["day"] = pd.to_datetime(reference[day_column], errors="coerce").dt.normalize()
+        reference["turnover"] = pd.to_numeric(reference["turnover"], errors="coerce")
+        reference = reference.dropna(subset=["day"]).drop_duplicates("day", keep="last").set_index("day")
+        frame["day"] = frame.timestamp.dt.normalize()
+        estimated = frame.groupby("day").turnover.transform("sum")
+        official = frame.day.map(reference.turnover)
+        usable = estimated.gt(0) & official.gt(0)
+        frame.loc[usable, "turnover"] = (
+            frame.loc[usable, "turnover"] * (official[usable] / estimated[usable])
+        )
+        if today in set(frame.day):
+            # The rolling feed can expose a partial current session after the
+            # local 16:00 cutoff. Keep it only when the official daily bar
+            # already matches its volume and OHLC; otherwise the next sync will
+            # pick it up after the vendor finalizes the day.
+            part = frame[frame.day == today]
+            row = reference.loc[today] if today in reference.index else None
+            complete = False
+            if row is not None and all(name in reference for name in ("open", "high", "low", "close", "volume")):
+                daily_volume = pd.to_numeric(row.get("volume"), errors="coerce")
+                volume_ok = bool(pd.notna(daily_volume) and float(daily_volume) > 0 and abs(
+                    float(part.volume.sum()) / float(daily_volume) - 1
+                ) <= 0.01)
+                close_ok = abs(float(part.close.iloc[-1]) - float(row.get("close"))) <= 0.0011
+                high_ok = abs(float(part.high.max()) - float(row.get("high"))) <= 0.0011
+                low_ok = abs(float(part.low.min()) - float(row.get("low"))) <= 0.0011
+                complete = volume_ok and close_ok and high_ok and low_ok
+            if not complete:
+                frame = frame[frame.day != today].copy()
+        frame = frame.drop(columns=["day"])
+    frame = frame[frame.timestamp < latest_closed_date() + pd.Timedelta(days=1)].copy()
+    if frame.empty:
+        raise RuntimeError("同花顺未返回已收盘的分钟行情")
+    return frame
 
 
 @serialized_baostock

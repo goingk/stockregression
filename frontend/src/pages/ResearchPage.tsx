@@ -21,7 +21,7 @@ type Dict = Record<string, unknown>
 type Candidate = Dict & { params?: Dict; metrics?: Record<string, number | null> }
 type SearchConfig = { base?: BacktestConfig; mode?: string; protocol_version?: number; n_trials?: number; local_search_budget?: number; seed?: number; ranges?: Dict; [key: string]: unknown }
 type TestRun = Partial<BacktestResult> & { strategies?: Record<string, { metrics?: Record<string, number | null>; equity?: Array<{ timestamp: string; equity: number }> }> }
-type RecommendationRegion = { region_id?: number; center_params?: Dict; radii?: Dict; edge_length?: number; geometry?: string; scoring_basis?: string; normalized_volume?: number; combination_count?: number; completed_count?: number; center_excess_return?: number | null; mean_excess_return?: number | null; min_excess_return?: number | null; j_score?: number | null; downside_risk_tau?: number | null; pos_penalty?: number | null; actual_min_pos_ratio?: number | null; actual_max_pos_ratio?: number | null; neighborhood_max_eta?: number | null; pos_win_rate?: number | null; safe_win_rate?: number | null; stockout_count?: number | null; tplus1_block_count?: number | null; platform_size?: number | null; score_complete?: boolean; local_peak_verified?: boolean; complete?: boolean; maximum_search_complete?: boolean; global_exhaustive?: boolean; stress?: Dict }
+type RecommendationRegion = { region_id?: number; center_params?: Dict; radii?: Dict; edge_length?: number; geometry?: string; scoring_basis?: string; normalized_volume?: number; combination_count?: number; completed_count?: number; center_excess_return?: number | null; mean_excess_return?: number | null; min_excess_return?: number | null; j_score?: number | null; downside_risk_tau?: number | null; pos_penalty?: number | null; actual_min_pos_ratio?: number | null; actual_max_pos_ratio?: number | null; neighborhood_max_eta?: number | null; pos_win_rate?: number | null; safe_win_rate?: number | null; stockout_count?: number | null; tplus1_block_count?: number | null; floor_episode_count?: number | null; floor_episode_grids?: number[]; floor_penalty?: number | null; floor_penalty_basis?: string; platform_size?: number | null; score_complete?: boolean; local_peak_verified?: boolean; complete?: boolean; maximum_search_complete?: boolean; global_exhaustive?: boolean; stress?: Dict }
 type Recommendation = { params?: Dict | null; recommended_params?: Dict | null; diagnostic_params?: Dict | null; as_of?: string; score?: unknown; raw_score?: unknown; status?: string; reasons?: unknown; candidates?: Candidate[]; diagnostics?: Dict; recommendation_status?: string; recommendation_regions?: RecommendationRegion[] }
 type OptimizationResult = {
   protocol_version?: number; mode?: string; seed?: number; n_trials?: number; data_version?: string; label?: string; warnings?: string[]
@@ -291,7 +291,7 @@ function constraintLabel(value: boolean | undefined) {
 }
 
 export default function ResearchPage({ base, settings, onSettingsChange, onBaseChange, onLoadConfig, requestedJobId, onRequestHandled, onSelectedJobChange, onFeeDefaultsEdit, onDefaultsEdit, onRestore, onPrepareData }: Props) {
-  const { protocol_version: protocolVersion, selection_target: selectionTarget, rebalance_days: rebalanceDays, bootstrap_reps: bootstrapReps, bootstrap_block_lengths: bootstrapBlockLengths, significance_alpha: significanceAlpha, outer_validation_days: outerValidationDays, mode, n_trials: trials, local_search_budget: localSearchBudget, seed, top_candidates: topCandidates, max_drawdown: maxDrawdown, min_trades: minTrades, min_history_days: minHistoryDays, min_minute_ratio: minMinuteRatio, strategy_version: strategyVersion, hypercube_edge: hypercubeEdge, granularity, search_method: searchMethod, training_budget: trainingBudget, validation_budget: validationBudget, recommendation_count: recommendationCount, max_shares_mode: maxSharesMode, slippage_mode: slippageMode, neighborhood_fields: neighborhoodFields, fixed_half_widths: fixedHalfWidths, sigma, alpha, beta: scoreBeta, tau, eta_limit: etaLimit, eta_hard_cap: etaHardCap, gamma_max: gammaMax, eta_floor: etaFloor, gamma_min: gammaMin, training_min_days: trainingMinDays, training_max_days: trainingMaxDays, peak_tolerance: peakTolerance, start_min: startMin, start_max: startMax, starts_per_candidate: startsPerCandidate, initial_strides: initialStrides, stride_multiplier: strideMultiplier, max_stride_fraction: maxStrideFraction, validation_reserve_fraction: validationReserveFraction, exhaustive_memory_limit_mb: exhaustiveMemoryLimitMb, estimated_bytes_per_point: estimatedBytesPerPoint, stress_cost_multiplier: stressCostMultiplier, stress_region_count: stressRegionCount } = settings
+  const { protocol_version: protocolVersion, selection_target: selectionTarget, rebalance_days: rebalanceDays, bootstrap_reps: bootstrapReps, bootstrap_block_lengths: bootstrapBlockLengths, significance_alpha: significanceAlpha, outer_validation_days: outerValidationDays, mode, n_trials: trials, local_search_budget: localSearchBudget, seed, top_candidates: topCandidates, max_drawdown: maxDrawdown, min_trades: minTrades, min_history_days: minHistoryDays, min_minute_ratio: minMinuteRatio, strategy_version: strategyVersion, hypercube_edge: hypercubeEdge, granularity, search_method: searchMethod, training_budget: trainingBudget, validation_budget: validationBudget, recommendation_count: recommendationCount, max_shares_mode: maxSharesMode, slippage_mode: slippageMode, neighborhood_fields: neighborhoodFields, fixed_half_widths: fixedHalfWidths, sigma, alpha, beta: scoreBeta, tau, eta_limit: etaLimit, eta_hard_cap: etaHardCap, gamma_max: gammaMax, eta_floor: etaFloor, gamma_min: gammaMin, floor_k_ref: floorKRef, training_min_days: trainingMinDays, training_max_days: trainingMaxDays, peak_tolerance: peakTolerance, start_min: startMin, start_max: startMax, starts_per_candidate: startsPerCandidate, initial_strides: initialStrides, stride_multiplier: strideMultiplier, max_stride_fraction: maxStrideFraction, validation_reserve_fraction: validationReserveFraction, exhaustive_memory_limit_mb: exhaustiveMemoryLimitMb, estimated_bytes_per_point: estimatedBytesPerPoint, stress_cost_multiplier: stressCostMultiplier, stress_region_count: stressRegionCount } = settings
   const tasks = useTasks()
   const researchJobs = useMemo(() => tasks.jobs.filter(isOptimizationJob), [tasks.jobs])
   const viewableJobs = useMemo(() => researchJobs.filter(job => Boolean(job.result_id)), [researchJobs])
@@ -405,7 +405,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
           strategy_version: strategyVersion, strategy_id: strategyVersion === 4 ? 'geometric_robust_j' : 'geometric_excess_neighborhood', search_method: searchMethod, ranking_mode: 'fixed_mean', hypercube_edge: hypercubeEdge, granularity, training_budget: trainingBudget,
           validation_budget: validationBudget, recommendation_count: recommendationCount,
           max_shares_mode: maxSharesMode, slippage_mode: slippageMode, neighborhood_fields: submittedNeighborhoodFields, fixed_half_widths: fixedHalfWidths,
-          sigma, alpha, beta: scoreBeta, tau, eta_limit: etaLimit, eta_hard_cap: etaHardCap, gamma_max: gammaMax, eta_floor: etaFloor, gamma_min: gammaMin,
+          sigma, alpha, beta: scoreBeta, tau, eta_limit: etaLimit, eta_hard_cap: etaHardCap, gamma_max: gammaMax, eta_floor: etaFloor, gamma_min: gammaMin, floor_k_ref: floorKRef,
           training_min_days: trainingMinDays, training_max_days: trainingMaxDays, peak_tolerance: peakTolerance, start_min: startMin, start_max: startMax,
           starts_per_candidate: startsPerCandidate, initial_strides: initialStrides, stride_multiplier: strideMultiplier, max_stride_fraction: maxStrideFraction,
           validation_reserve_fraction: validationReserveFraction, exhaustive_memory_limit_mb: exhaustiveMemoryLimitMb,
@@ -459,6 +459,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     const originalBase = result.config?.base ?? searchConfigOf(selectedJob?.payload?.config)?.base
     if (!originalBase) { setError('这条研究任务未保存原始股票与区间配置，无法安全载入。请重新运行参数研究。'); return }
     const locked = record(result.locked_funding) ?? {}
+    const frozenStrategy = record(result.config?.strategy) ?? record(record(selectedJob?.payload?.config)?.strategy)
     const { buy_ratio: _oldBuyRatio, sell_ratio: _oldSellRatio, ...configParams } = params
     const patch = configParams as Partial<BacktestConfig>
     const config: BacktestConfig = {
@@ -468,6 +469,9 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
       grid_mode: Number(actualVersion) === 4 ? 'geometric' : patch.grid_mode ?? originalBase.grid_mode,
       initial_shares: finite(locked.initial_shares) ? locked.initial_shares : originalBase.initial_shares,
       selection_asof: selectionAsOf ?? originalBase.end_date ?? originalBase.start_date,
+      floor_penalty_config: frozenStrategy && finite(frozenStrategy.eta_floor) && finite(frozenStrategy.gamma_min) && finite(frozenStrategy.floor_k_ref)
+        ? { eta_floor: frozenStrategy.eta_floor, gamma_min: frozenStrategy.gamma_min, floor_k_ref: frozenStrategy.floor_k_ref }
+        : null,
       fees: { ...originalBase.fees, ...patch.fees },
     }
     void loadConfig(config).then(value => onLoadConfig(value.config)).catch(cause => setError(err(cause)))
@@ -635,10 +639,11 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
               <NumField label='最大持仓淘汰阈值（0 表示关闭）' min={0} max={1000} step='.1' value={etaHardCap ?? 0} onChange={next => next != null && updateSettings({ eta_hard_cap: next > 0 ? next : null })} hint='仅判断中心是否合格，不提前停止回测或截断买入。' />
               <NumField label='上界二次惩罚 γ max' min={0} max={1000} step='.05' value={gammaMax} onChange={next => next != null && updateSettings({ gamma_max: next })} hint={'例如实际最大持仓 2.5 倍、免罚上限 2、γ=0.4 时扣 0.1。'} />
               <NumField label='底仓保护下限 η floor' min={0} max={100} step='1' percentValue suffix='%' value={etaFloor} onChange={next => next != null && updateSettings({ eta_floor: next })} />
-              <NumField label='下界二次惩罚 γ min' min={0} max={1000} step='.05' value={gammaMin} onChange={next => next != null && updateSettings({ gamma_min: next })} />
+              <NumField label='底仓整格惩罚 γ min' min={0} max={1000} step='.05' value={gammaMin} onChange={next => next != null && updateSettings({ gamma_min: next })} />
+              <NumField label='底仓参考格数 K ref' min={.01} max={1000000} step='.1' value={floorKRef} onChange={next => next != null && updateSettings({ floor_k_ref: next })} hint='每段按该候选的卖出间距计整格；扣分为 γ min × Σ(k/K ref)²。' />
               <NumField label='峰值比较绝对容差' min={1e-15} max={.1} step='any' value={peakTolerance} onChange={next => next != null && updateSettings({ peak_tolerance: next })} />
             </div>
-            <p className='field-hint'>J = αR + (1−α)μΩ − βσ⁻Ω − Cpos。原始 R 只作为中心收益与诊断，候选峰值按 J 搜寻；回撤 0、收益 0 都按真实数值处理。</p>
+            <p className='field-hint'>J = αR + (1−α)μΩ − βσ⁻Ω − Cpos。底仓惩罚按每段触底后继续上涨的卖出整格数累计，首次触底和底仓附近震荡不扣分；原始 R 只作为中心收益与诊断。</p>
           </Disclosure>}
           {protocolVersion === 4 && strategyVersion === 4 && <Disclosure id='research-robust-search' title='多起点搜索与预算控制' summary={`起点 ${startMin}–${startMax} · 每候选 ${startsPerCandidate} · 核验预留 ${percent(validationReserveFraction)}`}>
             <div className='form-grid two'>

@@ -1174,6 +1174,7 @@ export interface components {
             lower_price?: number | null;
             /** Upper Price */
             upper_price?: number | null;
+            floor_penalty_config?: components["schemas"]["FloorPenaltyConfig"] | null;
             buy_quantity?: components["schemas"]["QuantityConfig"];
             sell_quantity?: components["schemas"]["QuantityConfig"];
             fees?: components["schemas"]["FeeConfig"];
@@ -1403,6 +1404,27 @@ export interface components {
              * @default 0.1
              */
             min_commission: number;
+        };
+        /**
+         * FloorPenaltyConfig
+         * @description Episode-based floor penalty applied to share-account geometric grids.
+         */
+        FloorPenaltyConfig: {
+            /**
+             * Eta Floor
+             * @default 0
+             */
+            eta_floor: number;
+            /**
+             * Gamma Min
+             * @default 0
+             */
+            gamma_min: number;
+            /**
+             * Floor K Ref
+             * @default 10
+             */
+            floor_k_ref: number;
         };
         /** GridDefaults */
         GridDefaults: {
@@ -1671,7 +1693,7 @@ export interface components {
              * Source
              * @enum {string}
              */
-            source: "sina" | "tdx" | "baostock" | "eastmoney";
+            source: "sina" | "tdx" | "ths" | "baostock" | "eastmoney";
             /**
              * Capability
              * @enum {string}
@@ -2189,6 +2211,11 @@ export interface components {
              */
             gamma_min: number;
             /**
+             * Floor K Ref
+             * @default 10
+             */
+            floor_k_ref: number;
+            /**
              * Training Min Days
              * @default 250
              */
@@ -2461,6 +2488,11 @@ export interface components {
              * @default 0
              */
             gamma_min: number;
+            /**
+             * Floor K Ref
+             * @default 10
+             */
+            floor_k_ref: number;
             /**
              * Training Min Days
              * @default 250

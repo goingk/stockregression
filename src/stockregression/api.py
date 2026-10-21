@@ -177,7 +177,7 @@ class MarketPreparationRequest(BaseModel):
 
 
 class MarketSourceProbeRequest(BaseModel):
-    source: Literal["sina", "tdx", "baostock", "eastmoney"]
+    source: Literal["sina", "tdx", "ths", "baostock", "eastmoney"]
     capability: Literal["recent_minute", "etf_daily"]
     market: Literal["all", "stock", "etf"] = "all"
 
@@ -317,6 +317,7 @@ def _landscape_point(row: dict, sample: str, cost: str, fold: int | None, fallba
         **{name: row.get(name) for name in (
             "actual_min_pos_ratio", "actual_max_pos_ratio", "neighborhood_max_eta",
             "stockout_count", "tplus1_block_count", "buy_count", "sell_count",
+            "floor_episode_count", "floor_episode_grids", "floor_penalty", "floor_penalty_basis",
         )},
     }
 
@@ -1001,8 +1002,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     def probe_data_source(payload: MarketSourceProbeRequest):
         try:
             values = payload.model_dump()
-            if payload.capability == "recent_minute" and payload.source not in {"sina", "tdx"}:
-                raise ValueError("近期 1 分钟探测来源应为 sina 或 tdx")
+            if payload.capability == "recent_minute" and payload.source not in {"sina", "tdx", "ths"}:
+                raise ValueError("近期 1 分钟探测来源应为 sina、tdx 或 ths")
             if payload.capability == "etf_daily" and payload.source not in {"baostock", "eastmoney"}:
                 raise ValueError("ETF 日线探测来源应为 baostock 或 eastmoney")
             if payload.capability == "etf_daily" and payload.market == "stock":

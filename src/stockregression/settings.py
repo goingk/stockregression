@@ -188,6 +188,7 @@ class ResearchDefaults(_WorkbenchPreference):
     gamma_max: float = Field(default=.40, ge=0, le=1000)
     eta_floor: float = Field(default=0.0, ge=0, le=1)
     gamma_min: float = Field(default=0.0, ge=0, le=1000)
+    floor_k_ref: float = Field(default=10.0, gt=0, le=1_000_000)
     training_min_days: int = Field(default=250, ge=20, le=5000)
     training_max_days: int = Field(default=500, ge=20, le=5000)
     peak_tolerance: float = Field(default=1e-12, gt=0, le=.1)
@@ -209,7 +210,12 @@ class ResearchDefaults(_WorkbenchPreference):
         if isinstance(values, dict):
             values = dict(values)
             if "strategy_version" not in values:
-                values["strategy_version"] = 4 if "ranking_mode" not in values else (1 if values.get("ranking_mode") == "fixed_mean" else 3)
+                if "ranking_mode" in values:
+                    values["strategy_version"] = 1 if values.get("ranking_mode") == "fixed_mean" else 3
+                elif int(values.get("protocol_version", 4)) < 4:
+                    values["strategy_version"] = 3
+                else:
+                    values["strategy_version"] = 4
             elif int(values.get("strategy_version")) == 2 and values.get("ranking_mode") == "max_volume":
                 # The connected-component selector is no longer offered for new
                 # studies.  Remembered v4 settings move to the hypercube mode.
@@ -368,6 +374,8 @@ class ResearchDefaults(_WorkbenchPreference):
                 raise ValueError("底仓保护阈值不能高于持仓免罚阈值")
             if self.eta_hard_cap is not None and self.eta_hard_cap < self.eta_limit:
                 raise ValueError("最大持仓淘汰阈值不能低于持仓免罚阈值")
+            if not math.isfinite(self.floor_k_ref) or self.floor_k_ref <= 0:
+                raise ValueError("底仓参考格数必须为正数")
         return self
 
 

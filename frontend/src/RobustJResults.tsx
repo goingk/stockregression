@@ -29,6 +29,7 @@ export function RobustPointSummary({ point, kind, onLoad }: { point: LandscapePo
         <span><small>正收益占比</small><strong>{pct(point.pos_win_rate)}</strong></span>
         <span><small>邻域点数</small><strong>{point.neighborhood_support_size ?? point.neighborhood_size ?? '—'}</strong></span>
         <span><small>评分完整</small><strong>{point.score_complete === true ? '是' : point.score_complete === false ? '否' : '未计算'}</strong></span>
+        <span><small>底仓惩罚</small><strong>{pct(point.floor_penalty, 4)}</strong></span>
       </div>
     </> : <p className='field-hint'>尚无完整 J 评分。</p>}
   </article>
@@ -52,6 +53,8 @@ export function RobustJRanking({ points, total, count, coverage, onLoad }: { poi
         <span><small>邻域均值</small><strong>{pct(point.neighborhood_mean, 4)}</strong></span>
         <span><small>下行风险</small><strong>{pct(point.downside_risk_tau, 4)}</strong></span>
         <span><small>持仓惩罚</small><strong>{pct(point.pos_penalty, 4)}</strong></span>
+        <span><small>底仓段数</small><strong>{point.floor_episode_count ?? '—'}</strong></span>
+        <span><small>触底后上涨格数</small><strong>{point.floor_episode_grids?.length ? point.floor_episode_grids.join(' / ') : point.floor_episode_count === 0 ? '无' : '—'}</strong></span>
       </div>
       <div className='research-peak-status'>
         <Badge tone={point.constraint_eligible ? 'green' : 'amber'}>{point.constraint_eligible ? '满足约束' : '未满足约束'}</Badge>
@@ -64,6 +67,8 @@ export function RobustJRanking({ points, total, count, coverage, onLoad }: { poi
         <summary>持仓与成交诊断</summary>
         <div className='research-peak-detail-grid'>
           <span><small>实际持仓范围</small><strong>{point.actual_min_pos_ratio?.toFixed(3) ?? '—'} – {point.actual_max_pos_ratio?.toFixed(3) ?? '—'}</strong></span>
+          <span><small>底仓惩罚 / 段数</small><strong>{pct(point.floor_penalty, 4)} / {point.floor_episode_count ?? '—'}</strong></span>
+          <span><small>各段上涨格数</small><strong>{point.floor_episode_grids?.length ? point.floor_episode_grids.join(' / ') : point.floor_episode_count === 0 ? '无' : '未记录'}</strong></span>
           <span><small>邻域最高持仓</small><strong>{point.neighborhood_max_eta?.toFixed(3) ?? '—'}</strong></span>
           <span><small>正收益 / 安全垫</small><strong>{pct(point.pos_win_rate)} / {pct(point.safe_win_rate)}</strong></span>
           <span><small>成交笔数</small><strong>{point.trade_count ?? '—'}</strong></span>

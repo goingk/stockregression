@@ -193,6 +193,7 @@ def _parameter_arrays(config, prepared, parameter_schedule):
 
 def _options(config, prepared, money, mode=0, cost_multiplier=1.0, allow_odd_lot_exit=False):
     terms, fees = prepared["terms"], config.fees
+    floor = config.floor_penalty_config
     return (money["initial_equity"], money["dca_initial_equity"], money["buy_hold_initial_equity"],
         float(config.min_shares), np.inf if config.max_shares is None else float(config.max_shares),
         {"trailing": 0, "arithmetic": 1, "geometric": 2}[config.grid_mode],
@@ -203,7 +204,10 @@ def _options(config, prepared, money, mode=0, cost_multiplier=1.0, allow_odd_lot
         fees.share_face_value, config.initial_shares, money["reserve_cash"], config.dca.initial_shares,
         config.dca.shares, money["buy_hold_initial_shares"], money["valuation_price"],
         terms["price_tick"], terms["settlement"] == "T0", mode,
-        1 if config.schema_version == 3 else 0, bool(allow_odd_lot_exit))
+        1 if config.schema_version == 3 else 0, bool(allow_odd_lot_exit),
+        float(floor.eta_floor) if floor is not None else -1.0,
+        float(floor.gamma_min) if floor is not None else 0.0,
+        float(floor.floor_k_ref) if floor is not None else 1.0)
 
 
 def _return_days(prepared):
@@ -228,7 +232,7 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
                     np.full(len(prepared["days"]), -1, dtype=np.int64), 0, False, passive_grid)
     if cancelled and cancelled():
         raise InterruptedError("回测已取消")
-    metrics, eq, cash, shares, drawdown, periods, tb, ta, ts, tq, tp, tf, tc, th, tr, ttop, rb, rt, ra, rs, rr, rq, invested, _, funding_stats = output
+    metrics, eq, cash, shares, drawdown, periods, tb, ta, ts, tq, tp, tf, tc, th, tr, ttop, rb, rt, ra, rs, rr, rq, invested, _, floor_episode_grids, funding_stats = output
     strategies = {}
     return_days = _return_days(prepared)
     points = return_days + pd.Timedelta(hours=15) if preview or daily_details else prepared["stamps"]
@@ -260,6 +264,11 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
                 stockout_count=int(round(funding_stats[0, 11])),
                 tplus1_block_count=int(round(funding_stats[0, 12])),
             )
+            if config.floor_penalty_config is not None:
+                metric.update({
+                    "floor_episode_count": int(round(funding_stats[0, 13])),
+                    "floor_penalty": float(funding_stats[0, 14]),
+                })
         if account != 1 and initial_equities[account] <= 0 and not (flow_aware and account == 0 and peak_invested > 0):
             metric.update({key: None for key in ("total_return", "cagr", "max_drawdown", "sharpe", "calmar", "turnover")})
         if account == 1:
@@ -296,7 +305,15 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
                     rejections.append({"timestamp": (day + pd.Timedelta(hours=15)).isoformat(), "side": "buy", "reason": "dca_period_skipped", "requested_quantity": config.dca.shares})
         returns = [] if account == 1 or summary_only else [{"timestamp": (day + pd.Timedelta(hours=15)).isoformat(), "return": float(periods[account, i])} for i, day in enumerate(return_days)]
         strategy_basis = "peak_invested" if account == 0 and flow_aware else "cost" if account == 1 else "initial_equity"
-        strategies[name] = {"metrics": metric, "equity": equity, "equity_frequency": "1d" if preview or daily_details else config.frequency, "trades": trades, "rejections": rejections, "period_returns": returns, "return_basis": strategy_basis}
+        strategy_result = {"metrics": metric, "equity": equity, "equity_frequency": "1d" if preview or daily_details else config.frequency, "trades": trades, "rejections": rejections, "period_returns": returns, "return_basis": strategy_basis}
+        if account == 0 and config.floor_penalty_config is not None:
+            strategy_result.update({
+                "floor_episode_count": int(round(funding_stats[0, 13])),
+                "floor_episode_grids": [int(value) for value in floor_episode_grids],
+                "floor_penalty": float(funding_stats[0, 14]),
+                "floor_penalty_basis": "episode_grids_v1",
+            })
+        strategies[name] = strategy_result
     if progress:
         progress(1.0, "股数回测完成")
     warnings = list(dict.fromkeys([*data.warnings, *data.metadata.get("warnings", [])]))
@@ -306,6 +323,14 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
         warnings.append(f"参数选定于 {selection_asof}；选参截止日及以前的历史重跑属于样本内回看，不是样本外成绩。")
     accounting_basis = "cash_flow_adjusted_peak_contributions_v1" if flow_aware else "independent_contributions_v1"
     result = {"schema_version": config.schema_version, "accounting_basis": accounting_basis, "symbol": config.symbol, "config": config.model_dump(mode="json"), "data_version": data.version, "quality": data.quality, "is_demo": bool(data.metadata.get("is_demo")), "funding": money, "requested_end_date": str(config.end_date) if config.end_date else None, "effective_end_date": prepared["end"], "warnings": warnings, "strategies": strategies}
+    if config.floor_penalty_config is not None:
+        grid = strategies["grid"]
+        result.update({
+            "floor_episode_count": grid["floor_episode_count"],
+            "floor_episode_grids": grid["floor_episode_grids"],
+            "floor_penalty": grid["floor_penalty"],
+            "floor_penalty_basis": grid["floor_penalty_basis"],
+        })
     result["diagnostics"] = data.metadata.get("diagnostics", {})
     result["source_events"] = data.metadata.get("source_events", [])
     if schedule:
@@ -354,7 +379,8 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
     returns = np.empty((len(dates), len(values)), dtype=np.float64)
     metric_values = np.empty((len(values), 11), dtype=np.float64)
     fold_values = np.empty((len(values), len(fold_ranges), 9), dtype=np.float64)
-    funding_stats = np.empty((len(values), 13), dtype=np.float64)
+    funding_stats = np.empty((len(values), 16), dtype=np.float64)
+    episode_values = [np.empty(0, dtype=np.int64) for _ in values]
     options = _options(
         base, prepared, money, cost_multiplier=cost_multiplier,
         allow_odd_lot_exit=allow_odd_lot_exit,
@@ -387,11 +413,13 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
                     active_threads = refreshed
                     set_num_threads(active_threads)
                 with blas_thread_limit(1):
-                    r, m, f, s = simulate_research_batch(
+                    r, m, f, e, s = simulate_research_batch(
                         prepared["arrays"], options, values[begin:end],
                         fold_ids, len(fold_ranges),
                     )
                 returns[:, begin:end], metric_values[begin:end], fold_values[begin:end], funding_stats[begin:end] = r, m, f, s
+                for offset in range(end - begin):
+                    episode_values[begin + offset] = e[offset]
             else:
                 runner = simulate if engine._NUMBA_FASTPATH_ENABLED else getattr(simulate, "py_func", simulate)
                 for index in range(begin, end):
@@ -400,7 +428,8 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
                                   *options[9:12], int(p[5]), int(p[6]), *options[14:])
                     output = runner(*prepared["arrays"], *individual, empty_days, empty_values,
                                     fold_ids, len(fold_ranges), True, False)
-                    returns[:, index], metric_values[index], fold_values[index], funding_stats[index] = output[5][0], output[0][0], output[-2], output[-1][0]
+                    returns[:, index], metric_values[index], fold_values[index], funding_stats[index] = output[5][0], output[0][0], output[-3], output[-1][0]
+                    episode_values[index] = output[-2]
             record_count("research_candidates", end - begin)
         if cancelled and cancelled():
             raise InterruptedError("研究已取消")
@@ -418,6 +447,11 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
             "stockout_count": int(round(funding_stats[index, 11])),
             "tplus1_block_count": int(round(funding_stats[index, 12])),
         })
+        if base.floor_penalty_config is not None:
+            metric.update({
+                "floor_episode_count": int(round(funding_stats[index, 13])),
+                "floor_penalty": float(funding_stats[index, 14]),
+            })
         metrics.append(metric)
     keys = ("max_drawdown", "trade_count", "buy_count", "sell_count", "total_fees", "turnover", "profit", "principal", "end_assets")
     fold_metrics = [[{key: int(round(row[j])) if key.endswith("count") else float(row[j]) for j, key in enumerate(keys)} for row in candidate] for candidate in fold_values]
@@ -426,7 +460,13 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
         "actual_max_pos_ratio": float(row[10]),
         "stockout_count": int(round(row[11])),
         "tplus1_block_count": int(round(row[12])),
-    } for row in funding_stats]
+        **({
+            "floor_episode_count": int(round(row[13])),
+            "floor_episode_grids": [int(value) for value in episode_values[index]],
+            "floor_penalty": float(row[14]),
+            "floor_penalty_basis": "episode_grids_v1",
+        } if base.floor_penalty_config is not None else {}),
+    } for index, row in enumerate(funding_stats)]
     return {"dates": dates, "daily_returns": returns, "fold_drawdowns": fold_values[:, :, 0],
             "fold_metrics": fold_metrics, "metrics": metrics, "funding": money,
             "funding_stats": funding_stats, "position_stats": position_stats,

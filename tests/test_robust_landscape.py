@@ -15,6 +15,7 @@ def test_j_ranking_uses_configured_count_even_when_every_candidate_is_ineligible
         "evaluation_status": "completed", "training_excess_return": index / 100,
         "training_drawdown": .8, "trade_count": 0, "buy_count": 0, "sell_count": 0,
         "actual_min_pos_ratio": 0.0, "actual_max_pos_ratio": 4.0,
+        "floor_episode_count": 0, "floor_episode_grids": [], "floor_penalty": 0.0,
         "j_score": -index / 100, "neighborhood_mean": -.01,
         "downside_risk_tau": .02, "pos_penalty": .03, "score_complete": True,
         "neighborhood_size": 3, "neighborhood_support_size": 3, "score_missing_count": 0,
@@ -100,7 +101,8 @@ def test_old_results_complete_focus_from_locked_data_once_without_rewriting_hist
     def raw(coordinate):
         return {"params": space.params(coordinate), "key": list(coordinate), "evaluation_status": "completed",
                 "training_excess_return": coordinate[0] / 100, "training_drawdown": .01,
-                "trade_count": 20, "buy_count": 10, "sell_count": 10, "actual_max_pos_ratio": 1.0}
+                    "trade_count": 20, "buy_count": 10, "sell_count": 10, "actual_max_pos_ratio": 1.0,
+                    "floor_episode_count": 0, "floor_episode_grids": [], "floor_penalty": 0.0}
 
     class Evaluator:
         chunk_size = 100

@@ -14,11 +14,11 @@ import pandas as pd
 from ..models import normalize_symbol
 from ..performance import SharedSlots, effective_cpu_budget, record_count, record_details
 from ..providers import (
-    _baostock_reset, _baostock_session, fetch_sina, fetch_tdx,
+    _baostock_reset, _baostock_session, fetch_sina, fetch_tdx, fetch_ths,
     latest_closed_date, serialized_baostock,
 )
 from ..settings import Settings
-from ..source_health import SourceRouter, fetch_auxiliary_routed, market_for_symbol
+from ..source_health import SourceFailure, SourceRouter, fetch_auxiliary_routed, market_for_symbol
 from ..storage import Store
 from ..rules import instrument_terms
 from ..quality import minute_slots
@@ -31,6 +31,55 @@ from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe, timeframe_spec
 
 SOURCE_VERSION = "market-sync-v2-package"
 DAILY_BATCH_SIZE = 128
+
+
+def _longest_true_run(mask) -> int:
+    longest = current = 0
+    for value in mask:
+        current = current + 1 if bool(value) else 0
+        longest = max(longest, current)
+    return longest
+
+
+def _recent_minute_incomplete(frame, symbol, start, end) -> str | None:
+    """Describe a materially incomplete response from a recent-minute source.
+
+    A provider can succeed at the HTTP level while returning only a tail slice
+    of an otherwise available session. That is the failure mode that left
+    recent gaps undetected, so assess only sessions the response actually
+    starts returning; wholly absent earlier days remain a separate coverage
+    gap rather than a reason to discard the usable tail.
+    """
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return "未返回行情"
+    stamps = pd.DatetimeIndex(pd.to_datetime(frame.get("timestamp"), errors="coerce").dropna())
+    if not len(stamps):
+        return "时间字段无效"
+    for day in sorted(pd.DatetimeIndex(stamps.normalize().unique())):
+        day = pd.Timestamp(day).normalize()
+        expected = minute_slots(day)
+        expected = expected[(expected >= pd.Timestamp(start)) & (expected <= pd.Timestamp(end))]
+        if not len(expected):
+            continue
+        observed = stamps[(stamps >= day) & (stamps < day + pd.Timedelta(days=1))]
+        missing = expected.difference(observed)
+        if not len(missing):
+            continue
+        if symbol.endswith(".SZ") and day >= pd.Timestamp("2023-02-17"):
+            placeholders = pd.DatetimeIndex([
+                day + pd.Timedelta(hours=14, minutes=58),
+                day + pd.Timedelta(hours=14, minutes=59),
+            ])
+            anchors = pd.DatetimeIndex([
+                day + pd.Timedelta(hours=14, minutes=57),
+                day + pd.Timedelta(hours=15),
+            ])
+            if missing.equals(placeholders) and anchors.isin(observed).all():
+                continue
+        longest = _longest_true_run(expected.isin(missing))
+        if len(missing) > 5 or longest > 3 or missing[0] == expected[0] or missing[-1] == expected[-1]:
+            return f"{day.date()} 缺 {len(missing)} 根，最长连续 {longest} 根"
+    return None
 
 
 def _prepare_daily_worker(
@@ -585,6 +634,15 @@ class MarketDataSyncService:
             with SharedSlots(
                 self.store.root, "recent-minute-source", self.download_capacity
             ).acquire(cancelled):
+                def accept_recent(value, source):
+                    if source == "ths":
+                        return
+                    reason = _recent_minute_incomplete(value, symbol, start, end)
+                    if reason:
+                        raise SourceFailure(
+                            source, "recent_minute", "empty", "分钟窗口不完整：" + reason,
+                        )
+
                 frame, source, route = SourceRouter(
                     self.store, settings=self.service.settings,
                 ).call(
@@ -598,7 +656,16 @@ class MarketDataSyncService:
                             symbol, earliest=start, cancelled=cancelled,
                             network_timeout=self.market_settings.network_timeout_seconds,
                         ),
+                        "ths": lambda: fetch_ths(
+                            symbol,
+                            network_timeout=self.market_settings.network_timeout_seconds,
+                            daily=self.repository.active_rows(
+                                symbol, "1day", start=start, end=end,
+                            ),
+                        ),
                     },
+                    fallbacks=("ths",),
+                    accept=accept_recent,
                 )
             metadata["label_convention"] = "end"
             metadata["recent_minute_route"] = route

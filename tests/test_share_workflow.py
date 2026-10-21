@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from stockregression import engine
 from stockregression.api import create_app
 from stockregression.data import DataService
-from stockregression.models import BacktestConfig, DataBundle, DcaConfig, FeeConfig, OptimizationConfig
+from stockregression.models import BacktestConfig, DataBundle, DcaConfig, FeeConfig, FloorPenaltyConfig, OptimizationConfig
 from stockregression.optimization import optimize
 from stockregression.providers import normalize_actions
 from stockregression.rules import instrument_terms
@@ -25,6 +25,28 @@ def fixture(symbol="600000.SH", days=8, **metadata):
     bars["frequency"], bars["tradable"], bars["is_synthetic"] = "1d", True, False
     config = BacktestConfig(schema_version=2, symbol=symbol, start_date=dates[1].date(), end_date=dates[-1].date(), frequency="1d", fees={"commission_rate": 0, "min_commission": 0, "slippage_bps": 0}, dca={"frequency": "daily", "shares": 100})
     bundle = DataBundle(symbol=symbol, bars=bars, daily=daily, calendar=dates[1:], actions=normalize_actions(pd.DataFrame()), metadata=instrument_terms(symbol, metadata), version="fixture-v2")
+    return config, bundle
+
+
+def floor_grid_fixture(opens, closes):
+    config, bundle = fixture(days=len(opens) - 1)
+    opens, closes = np.asarray(opens, dtype=float), np.asarray(closes, dtype=float)
+    for name, values in (
+        ("open", opens), ("close", closes),
+        ("high", np.maximum(opens, closes) + .01), ("low", np.minimum(opens, closes) - .01),
+        ("preclose", np.r_[closes[0], closes[:-1]]), ("turnover", closes * 100000),
+    ):
+        bundle.daily[name] = values
+    bundle.bars = bundle.daily.iloc[1:].copy()
+    bundle.bars["timestamp"] = bundle.bars.date + pd.Timedelta(hours=15)
+    bundle.bars["frequency"], bundle.bars["tradable"], bundle.bars["is_synthetic"] = "1d", True, False
+    config = config.model_copy(update={
+        "schema_version": 3, "initial_shares": 10000, "min_shares": 0, "max_shares": None,
+        "buy_shares": 1000, "sell_shares": 5500, "grid_mode": "geometric",
+        "buy_step": .02, "sell_step": .02, "reference_price_mode": "manual", "reference_price": 10,
+        "fees": FeeConfig(commission_rate=0, min_commission=0, slippage_bps=0),
+        "floor_penalty_config": FloorPenaltyConfig(eta_floor=.5, gamma_min=.4, floor_k_ref=10),
+    })
     return config, bundle
 
 
@@ -52,6 +74,60 @@ def test_grid_position_audit_records_stockout_once_for_a_repeated_sell_signal():
     assert grid["metrics"]["tplus1_block_count"] == 0
     assert grid["metrics"]["actual_min_pos_ratio"] == pytest.approx(.5)
     assert grid["metrics"]["actual_max_pos_ratio"] == pytest.approx(1.0)
+
+
+def test_floor_episode_counts_five_grids_even_after_the_position_reaches_zero():
+    config, bundle = floor_grid_fixture(
+        [10, 10, 10.2, 10.2, 11.2700, 11.2700],
+        [10, 10, 10.2, 10.4, 11.2700, 11.2700],
+    )
+    result = engine.run_backtest(config, bundle)
+    grid = result["strategies"]["grid"]
+    assert result["floor_episode_grids"] == [5]
+    assert result["floor_penalty"] == pytest.approx(.1)
+    assert grid["floor_episode_count"] == 1
+    assert grid["floor_episode_grids"] == [5]
+    assert grid["floor_penalty"] == pytest.approx(.1)
+    assert grid["trades"][-1]["shares"] == 0
+
+
+def test_floor_episode_without_a_new_sell_grid_has_zero_penalty():
+    config, bundle = floor_grid_fixture(
+        [10, 10, 10.2, 9.9, 9.8, 9.8],
+        [10, 10, 10.2, 9.9, 9.8, 9.8],
+    )
+    grid = engine.run_backtest(config, bundle)["strategies"]["grid"]
+    assert grid["floor_episode_count"] == 1
+    assert grid["floor_episode_grids"] == [0]
+    assert grid["floor_penalty"] == 0.0
+
+
+def test_initial_position_at_the_floor_starts_an_episode_and_buyback_closes_it():
+    config, bundle = floor_grid_fixture(
+        [10, 10, 10.2, 10.2, 9.9, 9.8],
+        [10, 10, 10.2, 9.9, 9.8, 9.8],
+    )
+    config = config.model_copy(update={
+        "floor_penalty_config": FloorPenaltyConfig(eta_floor=1.0, gamma_min=.4, floor_k_ref=10),
+    })
+    grid = engine.run_backtest(config, bundle)["strategies"]["grid"]
+    assert grid["floor_episode_count"] == 1
+    assert len(grid["floor_episode_grids"]) == 1
+    assert grid["trades"][-1]["side"] == "buy"
+    assert grid["trades"][-1]["shares"] > config.initial_shares * .5
+
+
+def test_floor_penalty_does_not_change_the_trading_path():
+    opens = [10, 10, 10.2, 10.2, 11.2700, 11.2700]
+    closes = [10, 10, 10.2, 10.4, 11.2700, 11.2700]
+    penalized, bundle = floor_grid_fixture(opens, closes)
+    plain = penalized.model_copy(update={"floor_penalty_config": None})
+    left = engine.run_backtest(penalized, bundle)["strategies"]["grid"]
+    right = engine.run_backtest(plain, bundle)["strategies"]["grid"]
+    assert left["trades"] == right["trades"]
+    assert left["equity"] == right["equity"]
+    for key in ("total_return", "max_drawdown", "trade_count"):
+        assert left["metrics"][key] == right["metrics"][key]
 
 
 def test_existing_shares_sell_first_day_and_orders_use_hundreds(monkeypatch):
