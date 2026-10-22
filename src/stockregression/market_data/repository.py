@@ -503,20 +503,33 @@ class MarketDataRepository:
             **{key: value for key, value in scalar_metadata.items() if key not in {"symbol", "ts_code"}},
         }
         incoming = pd.DataFrame([payload])
-        temporary = path.with_name(path.name + ".writing")
-        if path.is_file():
-            with duckdb.connect() as connection:
-                connection.register("incoming_basic", incoming)
-                connection.execute(
-                    "COPY (SELECT * FROM read_parquet(?) WHERE ts_code<>? "
-                    "UNION ALL BY NAME SELECT * FROM incoming_basic) TO '" +
-                    str(temporary).replace("'", "''") +
-                    "' (FORMAT PARQUET, COMPRESSION ZSTD)",
-                    [str(path), symbol],
-                )
-        else:
-            incoming.to_parquet(temporary, compression="zstd", index=False)
-        os.replace(temporary, path)
+        # The basic-info file is shared by every symbol of an asset type, so the
+        # whole read/merge/replace cycle has to run under one exclusive lock.
+        # Without it two writers merge against the same stale snapshot and one
+        # of their rows is silently lost, and the fixed temporary name makes
+        # concurrent writers fight over the same ".writing" file.
+        with self.file_lock(path):
+            temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".writing")
+            try:
+                if path.is_file():
+                    with duckdb.connect() as connection:
+                        connection.register("incoming_basic", incoming)
+                        connection.execute(
+                            "COPY (SELECT * FROM read_parquet(?) WHERE ts_code<>? "
+                            "UNION ALL BY NAME SELECT * FROM incoming_basic) TO '" +
+                            str(temporary).replace("'", "''") +
+                            "' (FORMAT PARQUET, COMPRESSION ZSTD)",
+                            [str(path), symbol],
+                        )
+                else:
+                    incoming.to_parquet(temporary, compression="zstd", index=False)
+                os.replace(temporary, path)
+            finally:
+                if temporary.exists():
+                    try:
+                        temporary.unlink()
+                    except OSError:
+                        pass
         self.package.record_file(
             self.package.relative(path), row_count=None, sha256=None,
             metadata={"kind": "basic"},

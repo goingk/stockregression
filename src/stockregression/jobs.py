@@ -440,11 +440,35 @@ def execute_job(root: str, job_id: str, observer=None):
                 raise ValueError("1 分钟行情不支持全市场在线初始化；请登记本地数据包或导入文件。")
             combined = []
             failures = []
-            for timeframe in sorted(set(timeframes), key=lambda value: 0 if value == "1day" else 1):
+            ordered = sorted(set(timeframes), key=lambda value: 0 if value == "1day" else 1)
+            # Every timeframe reports its own 0..1 fraction.  Giving each one
+            # a slice of a single scale keeps the bar from restarting at 0%
+            # every time the next period begins, so the job reads as one
+            # continuous run instead of several short ones.
+            for index, timeframe in enumerate(ordered):
+                base = index / len(ordered)
+                span = 1 / len(ordered)
+
+                def period_progress(fraction, message, base=base, span=span):
+                    progress(base + span * max(0.0, min(1.0, float(fraction))), message)
+
                 selected = list(symbols)
+                sync_progress = period_progress
                 if scope == "market":
                     if payload.get("initialize"):
-                        service.refresh_instruments(progress, cancelled)
+                        # Catalog refresh is its own stage before market sync.
+                        # Reserve the first tenth of this timeframe's slice for
+                        # it, then map sync into the remaining nine tenths so
+                        # progress never drops back after the refresh finishes.
+                        service.refresh_instruments(
+                            lambda fraction, message: period_progress(
+                                0.1 * max(0.0, min(1.0, float(fraction))), message,
+                            ),
+                            cancelled,
+                        )
+                        sync_progress = lambda fraction, message: period_progress(
+                            0.1 + 0.9 * max(0.0, min(1.0, float(fraction))), message,
+                        )
                         selected = [row["symbol"] for row in store.instruments(limit=None)]
                     else:
                         selected = MarketDataService(store, settings=configured).repository.symbols_for_timeframe(timeframe)
@@ -455,7 +479,7 @@ def execute_job(root: str, job_id: str, observer=None):
                     start=payload.get("start_date"), end=payload.get("end_date"),
                     resume=payload.get("resume", False), retry_failed=payload.get("retry_failed", False),
                     workers=payload.get("workers", configured.performance.download_workers),
-                    progress=progress, cancelled=cancelled,
+                    progress=sync_progress, cancelled=cancelled,
                 )
                 combined.append(one)
                 failures.extend({**item, "timeframe": timeframe} for item in one.get("failures", []))

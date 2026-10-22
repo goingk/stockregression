@@ -59,6 +59,37 @@ def test_exchange_calendar_parallel_writes_preserve_all_dates(tmp_path):
     assert not list(repository.package_dir.rglob("*.writing"))
 
 
+@pytest.mark.parametrize("existing_file", [False, True])
+def test_basic_info_parallel_writes_preserve_all_symbols(tmp_path, existing_file):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    repository = MarketDataService(Store(tmp_path / "data")).repository
+    symbols = [f"{159500 + index}.SZ" for index in range(8)]
+    expected = {symbol: f"ETF {index}" for index, symbol in enumerate(symbols)}
+    if existing_file:
+        # Preserve an unrelated row while updating one existing symbol and
+        # inserting the remaining symbols into the shared asset file.
+        repository.save_basic_info("159999.SZ", {"cname": "Existing ETF"})
+        repository.save_basic_info(symbols[0], {"cname": "Old name"})
+        expected["159999.SZ"] = "Existing ETF"
+    ready = Barrier(len(symbols))
+
+    def write(symbol):
+        ready.wait(timeout=15)
+        return repository.save_basic_info(symbol, {"cname": expected[symbol]})
+
+    with ThreadPoolExecutor(max_workers=len(symbols)) as pool:
+        paths = list(pool.map(write, symbols))
+
+    assert len(set(paths)) == 1
+    saved = pd.read_parquet(paths[0])
+    assert len(saved) == len(expected)
+    assert saved.ts_code.is_unique
+    assert saved.set_index("ts_code").cname.to_dict() == expected
+    assert not list(repository.package_dir.rglob("*.writing"))
+
+
 def test_repository_writes_parquet_and_cached_results_are_isolated(tmp_path):
     configure_cache(1)
     service = MarketDataService(Store(tmp_path / "data"))

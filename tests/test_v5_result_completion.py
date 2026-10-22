@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from stockregression.api import create_app
 from stockregression.reproducibility import computation_provenance, reproducibility_mismatches
 from stockregression.research_completion import complete_research_result
+from stockregression.settings import PROJECT_ROOT
 from stockregression.storage import CompletionRevisionError, Store, _write_candidate_archive
 
 
@@ -198,7 +199,7 @@ def test_completion_worker_refuses_to_mix_fingerprints(tmp_path):
 def test_completion_worker_passes_the_provenance_gate_for_a_matching_result(tmp_path):
     store = Store(str(tmp_path))
     current = computation_provenance(
-        "D:/project/stockregression", configuration=v5_result()["config"]
+        PROJECT_ROOT, configuration=v5_result()["config"]
     )
     result = v5_result(computation_provenance=provenance(
         source_fingerprint=current["source_fingerprint"],
@@ -241,7 +242,7 @@ def test_unrelated_commit_metadata_does_not_invalidate_identical_computation_con
 
 
 def test_configuration_fingerprint_changes_with_the_configuration():
-    root = "D:/project/stockregression"
+    root = PROJECT_ROOT
     first = computation_provenance(root, configuration={"symbol": "600000.SH"})
     second = computation_provenance(root, configuration={"symbol": "600519.SH"})
 
@@ -496,7 +497,7 @@ def test_checkpoint_identity_separates_fresh_runs_from_resumes(tmp_path):
     """检查点键必须区分不同的补算运行，恢复才复用原检查点。"""
     from stockregression import research_completion
 
-    current = computation_provenance("D:/project/stockregression", configuration={"symbol": "600000.SH"})
+    current = computation_provenance(PROJECT_ROOT, configuration={"symbol": "600000.SH"})
     first = research_completion._checkpoint_key(
         result_id="r-1", data_version="v-1", decision="current", decision_index=0,
         provenance=current, checkpoint_id="job-1",

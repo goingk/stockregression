@@ -4,6 +4,8 @@ import { formatLandscapeParameter, landscapeLabels, type LandscapePoint } from '
 type LoadPoint = (params: Record<string, unknown>) => void
 const fields = ['buy_step', 'sell_step', 'buy_shares', 'sell_shares']
 const pct = (value: number | null | undefined, digits = 2) => value == null || !Number.isFinite(value) ? '—' : `${(value * 100).toFixed(digits)}%`
+/** Red-up / green-down tone shared with the rest of the workbench. */
+const toneClass = (value: number | null | undefined) => value == null || !Number.isFinite(value) ? '' : value > 0 ? 'gain' : value < 0 ? 'loss' : ''
 
 function Parameters({ point }: { point: LandscapePoint }) {
   return <div className='research-parameter-badges'>
@@ -15,15 +17,16 @@ function Parameters({ point }: { point: LandscapePoint }) {
 
 export function RobustPointSummary({ point, kind, onLoad }: { point: LandscapePoint | null; kind: 'excess' | 'j'; onLoad?: LoadPoint }) {
   const title = kind === 'excess' ? '超额收益最高点' : 'J 最高点'
+  const headline = kind === 'excess' ? point?.excess_return : point?.j_score
   return <article className='research-representative'>
     <div className='research-representative-head'>
-      <div><small>{title}{point ? ` · #${point.candidate_id}` : ''}</small><strong>{kind === 'excess' ? '超额收益 ' : '稳健 J '}{pct(kind === 'excess' ? point?.excess_return : point?.j_score)}</strong></div>
+      <div><small>{title}{point ? ` · #${point.candidate_id}` : ''}</small><strong className={toneClass(headline)}>{kind === 'excess' ? '超额收益 ' : '稳健 J '}{pct(headline)}</strong></div>
       {point && onLoad && <Button variant='quiet' aria-label={`载入${title}参数`} onClick={() => onLoad(point.params)}>载入</Button>}
     </div>
     {point ? <>
       <Parameters point={point} />
       <div className='research-representative-metrics'>
-        <span><small>{kind === 'excess' ? '稳健 J' : '中心超额'}</small><strong>{pct(kind === 'excess' ? point.j_score : point.excess_return)}</strong></span>
+        <span><small>{kind === 'excess' ? '稳健 J' : '中心超额'}</small><strong className={toneClass(kind === 'excess' ? point.j_score : point.excess_return)}>{pct(kind === 'excess' ? point.j_score : point.excess_return)}</strong></span>
         <span><small>邻域均值</small><strong>{pct(point.neighborhood_mean)}</strong></span>
         <span><small>下行风险</small><strong>{pct(point.downside_risk_tau)}</strong></span>
         <span><small>正收益占比</small><strong>{pct(point.pos_win_rate)}</strong></span>
@@ -45,11 +48,11 @@ export function RobustJRanking({ points, total, count, coverage, onLoad }: { poi
       <div className='research-peak-region-main'>
         <span className='research-peak-rank'>#{index + 1}</span>
         <div className='research-peak-params'><Parameters point={point} /></div>
-        <div className={`research-peak-score${(point.j_score ?? 0) < 0 ? ' negative' : ''}`}><small>稳健 J</small><strong>{pct(point.j_score, 4)}</strong></div>
+        <div className={`research-peak-score${(point.j_score ?? 0) < 0 ? ' negative' : ''}`}><small>稳健 J</small><strong className={toneClass(point.j_score)}>{pct(point.j_score, 4)}</strong></div>
         {onLoad && <Button variant='quiet' onClick={() => onLoad(point.params)}>载入</Button>}
       </div>
       <div className='research-peak-metrics'>
-        <span><small>中心 R</small><strong>{pct(point.excess_return, 4)}</strong></span>
+        <span><small>中心 R</small><strong className={toneClass(point.excess_return)}>{pct(point.excess_return, 4)}</strong></span>
         <span><small>邻域均值</small><strong>{pct(point.neighborhood_mean, 4)}</strong></span>
         <span><small>下行风险</small><strong>{pct(point.downside_risk_tau, 4)}</strong></span>
         <span><small>持仓惩罚</small><strong>{pct(point.pos_penalty, 4)}</strong></span>

@@ -12,7 +12,7 @@ import type { BacktestResult, ResultSummary, StrategyResult, Trade } from '../ty
 
 type Props = { requestedResult: string | null; clearRequestedResult: () => void }
 const names: Record<string, string> = { grid: '网格策略', dca: '定期定额', buy_hold: '买入并持有', same_account_passive: '同账户被动持有', matched_funding_hold: '同资金被动持有' }
-const colors: Record<string, string> = { grid: '#2864dc', dca: '#e29136', buy_hold: '#8795aa', same_account_passive: '#13957b', matched_funding_hold: '#7a4fd1' }
+const colors: Record<string, string> = { grid: '#2563eb', dca: '#d97706', buy_hold: '#64748b', same_account_passive: '#0d9488', matched_funding_hold: '#7c3aed' }
 const reasonNames: Record<string, string> = {
   initial_position: '初始建仓', dca: '定期购买', buy_hold: '初始全仓', grid_buy: '网格买入', grid_sell: '网格卖出',
   dca_period_skipped: '该期无可成交时点，未投入资金', non_tradable_bar: '不可交易行情', suspended_day: '当日停牌', invalid_open: '开盘价无效', zero_volume: '无成交量',
@@ -151,13 +151,27 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
       const index = bucketIndex(trade.timestamp, bucketTimes, labels, result?.config?.frequency ?? '')
       if (index < 0) return []
       const buy = String(trade.side).toLowerCase().includes('buy') || String(trade.side).includes('买')
-      return [{ name: trade.side, xAxis: index, yAxis: trade.price, value: buy ? '买' : '卖', itemStyle: { color: buy ? '#d95160' : '#168b78' }, label: { color: '#fff', fontSize: 9 } }]
+      return [{ name: trade.side, xAxis: index, yAxis: trade.price, value: buy ? '买' : '卖', itemStyle: { color: buy ? '#e11d48' : '#0d9488' }, label: { color: '#fff', fontSize: 10, fontWeight: 600 } }]
     })
     return {
-      animation: false, grid: { left: 55, right: 20, top: 18, bottom: 50 }, tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
-      xAxis: { type: 'category', data: labels, boundaryGap: false, axisLabel: { hideOverlap: true } }, yAxis: { scale: true, splitLine: { lineStyle: { color: '#eef1f5' } } },
-      dataZoom: [{ type: 'inside', start: 35, end: 100 }, { type: 'slider', height: 18, bottom: 5 }],
-      series: [{ name: 'K 线', type: 'candlestick', data: rows.map((x) => x.slice(1)), itemStyle: { color: '#d95160', color0: '#168b78', borderColor: '#d95160', borderColor0: '#168b78' }, markPoint: { symbol: 'circle', symbolSize: 8, data: markers } }],
+      animation: false,
+      grid: { left: 58, right: 22, top: 20, bottom: 54 },
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: { type: 'cross' },
+        backgroundColor: 'rgba(15, 23, 42, 0.92)',
+        borderColor: 'rgba(255, 255, 255, 0.12)',
+        borderWidth: 1,
+        textStyle: { color: '#f8fafc', fontSize: 12 },
+        extraCssText: 'backdrop-filter: blur(8px); border-radius: 10px; box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.28); padding: 10px 12px;',
+      },
+      xAxis: { type: 'category', data: labels, boundaryGap: false, axisLabel: { hideOverlap: true, color: '#64748b', fontSize: 11 } },
+      yAxis: { scale: true, axisLabel: { color: '#64748b', fontSize: 11 }, splitLine: { lineStyle: { color: '#e2e8f0', type: 'dashed' } } },
+      dataZoom: [
+        { type: 'inside', start: 35, end: 100 },
+        { type: 'slider', height: 18, bottom: 6, fillerColor: 'rgba(37, 99, 235, 0.10)', borderColor: '#e2e8f0', backgroundColor: '#f8fafc' },
+      ],
+      series: [{ name: 'K 线', type: 'candlestick', data: rows.map((x) => x.slice(1)), itemStyle: { color: '#e11d48', color0: '#0d9488', borderColor: '#e11d48', borderColor0: '#0d9488' }, markPoint: { symbol: 'circle', symbolSize: 10, data: markers } }],
     }
   }, [bars, reference, result?.config?.frequency])
 

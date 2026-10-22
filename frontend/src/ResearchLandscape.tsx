@@ -133,24 +133,24 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
         const point = pointFromEvent(raw)
         if (!point) return ''
         return `${point.is_focus ? '<b>相对最佳单点</b><br/>' : ''}${point.is_center ? '<b>推荐区域中心</b><br/>' : ''}${Object.entries(point.params).filter(([, value]) => value != null).map(([key, value]) => `${landscapeLabels[key] ?? key}: ${formatLandscapeParameter(key, value)}`).join('<br/>')}<br/>差值超额: ${ratio(point.excess_return)}<br/>峰值本金收益: ${ratio(point.grid_return)}<br/>最大本金回撤: ${ratio(point.drawdown)}<br/>成交笔数: ${point.trade_count == null ? '—' : number(Number(point.trade_count), 0)}`
-      } },
+      }, backgroundColor: 'rgba(15, 23, 42, 0.92)', borderColor: 'rgba(255, 255, 255, 0.12)', borderWidth: 1, textStyle: { color: '#f8fafc', fontSize: 12 }, extraCssText: 'backdrop-filter: blur(8px); border-radius: 10px; box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.28); padding: 10px 12px;' },
       grid: { left: 78, right: 34, top: 42, bottom: 92 },
       xAxis: {
         type: 'category', name: landscapeLabels[xName] ?? xName, nameLocation: 'middle', nameGap: 40,
         data: xs.map(value => formatLandscapeAxis(xName, value)),
-        axisLabel: { rotate: xs.length > 10 ? 35 : 0, hideOverlap: true, fontSize: 10, margin: 11 },
+        axisLabel: { rotate: xs.length > 10 ? 35 : 0, hideOverlap: true, fontSize: 10, margin: 11, color: '#475569' },
         splitArea: { show: true },
       },
       yAxis: {
         type: 'category', name: landscapeLabels[yName] ?? yName, nameLocation: 'middle', nameGap: 48,
         data: ys.map(value => formatLandscapeAxis(yName, value)),
-        axisLabel: { fontSize: 10 }, splitArea: { show: true },
+        axisLabel: { fontSize: 10, color: '#475569' }, splitArea: { show: true },
       },
       visualMap: {
         type: 'continuous', dimension: 2, seriesIndex: 0, min: minValue, max: maxValue,
         calculable: true, orient: 'horizontal', left: 'center', bottom: 8, itemWidth: 12, itemHeight: 190,
         text: ['较高', '较低'], textGap: 8,
-        inRange: { color: ['#b42318', '#f5f2ef', '#067647'] },
+        inRange: { color: ['#e11d48', '#f8fafc', '#0d9488'] },
         formatter: (value: unknown) => `${(Number(value) * 100).toFixed(1)}%`,
       },
       series: [

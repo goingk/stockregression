@@ -80,11 +80,11 @@ export function savedGridParameters(value: unknown): ResultParameter[] {
 }
 
 export const resultCurveStyles = [
-  { key: 'grid', name: '网格策略', color: '#2864dc' },
-  { key: 'same_account_passive', name: '同账户被动持有', color: '#13957b' },
-  { key: 'matched_funding_hold', name: '同资金被动持有', color: '#7a4fd1' },
-  { key: 'dca', name: '定投', color: '#e29136' },
-  { key: 'buy_hold', name: '买入并持有', color: '#8795aa' },
+  { key: 'grid', name: '网格策略', color: '#2563eb' },
+  { key: 'same_account_passive', name: '同账户被动持有', color: '#0d9488' },
+  { key: 'matched_funding_hold', name: '同资金被动持有', color: '#7c3aed' },
+  { key: 'dca', name: '定投', color: '#d97706' },
+  { key: 'buy_hold', name: '买入并持有', color: '#64748b' },
 ] as const
 
 export type ResultCurveValues = { returnRate: number | null; drawdown: number | null; asset: number | null; invested: number | null }

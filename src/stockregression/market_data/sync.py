@@ -235,8 +235,17 @@ class MarketDataSyncService:
     ) -> dict:
         results, failures, skipped = [], [], []
         total = len(symbols)
-        completed = 0
+        # Every symbol earns two credits: one when its bars are downloaded and
+        # one when they are written into the package.  A whole batch used to be
+        # worth a single credit, so the bar stayed at 0% for the entire
+        # download and the job looked frozen.
+        downloaded = 0
+        written = 0
         worker_count = self._worker_count(workers)
+
+        def report(message: str) -> None:
+            progress((downloaded + written) / (2 * max(1, total)), message)
+
         for batch_start in range(0, total, self.daily_batch_size):
             if cancelled():
                 raise InterruptedError("任务已取消")
@@ -247,12 +256,15 @@ class MarketDataSyncService:
                 if resume and state and state.get("status") == "completed":
                     skipped.append({"symbol": symbol, "timeframe": "1day", "skipped": True,
                                     "message": "该同步检查点已完成"})
-                    completed += 1
+                    # A settled checkpoint needs no download at all.
+                    downloaded += 1
+                    written += 1
                     continue
                 if retry_failed and (not state or state.get("status") != "failed"):
                     skipped.append({"symbol": symbol, "timeframe": "1day", "skipped": True,
                                     "message": "不属于失败重试范围"})
-                    completed += 1
+                    downloaded += 1
+                    written += 1
                     continue
                 active.append(symbol)
                 self.store.sync_item(run_key, symbol, status="running", mode=mode)
@@ -287,6 +299,7 @@ class MarketDataSyncService:
                     )
                     for future in done:
                         symbol = futures[future]
+                        downloaded += 1
                         try:
                             value = future.result()
                             if value.get("skipped"):
@@ -295,15 +308,18 @@ class MarketDataSyncService:
                                     run_key, symbol, status="completed", mode=mode,
                                     message=value.get("message"),
                                 )
+                                written += 1
                             else:
                                 prepared.append(value)
                         except InterruptedError:
                             raise
                         except Exception as exc:
+                            written += 1
                             failures.append({"symbol": symbol, "reason": str(exc)})
                             self.store.sync_item(
                                 run_key, symbol, status="failed", mode=mode, error=str(exc)
                             )
+                        report(f"{downloaded}/{total} · {symbol} 1day")
             except InterruptedError:
                 _terminate_executor(executor)
                 raise
@@ -345,11 +361,9 @@ class MarketDataSyncService:
                         self.store.sync_item(
                             run_key, symbol, status="failed", mode=mode, error=str(exc)
                         )
-            completed += len(batch)
-            progress(
-                completed / max(1, total),
-                f"{completed}/{total} · 日线批次 {batch_start // self.daily_batch_size + 1}",
-            )
+                    written += 1
+                    report(f"{downloaded}/{total} · {symbol} 1day 写入")
+            report(f"{downloaded}/{total} · 日线批次 {batch_start // self.daily_batch_size + 1}")
         status = "completed" if not failures else "partial" if results else "failed"
         return {
             "status": status, "mode": mode, "timeframe": "1day",

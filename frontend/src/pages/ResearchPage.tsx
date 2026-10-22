@@ -62,6 +62,21 @@ const candidateLabels: Record<string, string> = {
   combination_count: '组合数', edge_length: '超正方体边长', hypercube_edge: '超正方体边长', decision_date: '决策日期',
   effective_date: '生效日期', as_of: '参数截止日', training_start: '训练开始', training_end: '训练结束',
   training_days: '训练交易日', paired_days: '配对交易日数', method: '方法', coverage_status: '覆盖状态',
+  rebalance_days: '换参周期（日）', decision_points: '决策点数', unique_selection_calls: '独立选参调用',
+  outer_backtest_runs: '外层回测次数', resamples: '重抽样次数', bootstrap_iterations: '自举抽样次数',
+  base_trials_per_decision: '单决策基础试验数', trials_per_decision: '单决策试验数',
+  total_evaluations: '总评估次数', unique_evaluations: '唯一参数评估数',
+  neighborhood_evaluations: '邻域核验评估数', stress_evaluations: '压力测试评估数',
+  elapsed_seconds: '耗时（秒）', wall_time_seconds: '耗时（秒）',
+  cpu_budget_mode: 'CPU 预算模式', cpu_budget: 'CPU 线程上限', download_workers: '下载并发数',
+  validation_workers: '校验进程数', blas_threads: '矩阵线程数', workspace_mb: '工作内存（MiB）',
+  peak_invested: '峰值本金', initial_equity: '初始资产', reference_price: '参考价格',
+  reference_date: '估值日期', valuation_price: '估值价格',
+  buy_hold_initial_shares: '全仓初始持股', buy_hold_initial_equity: '全仓初始资产',
+  dca_initial_equity: '定投初始资产', matched_funding_hold_invested: '同资金被动持有投入',
+  configuration_revision: '配置修订号', data_version: '数据版本', protocol_version: '协议版本',
+  strategy_version: '策略版本', ranking_mode: '排名模式', search_method: '搜索方法',
+  training_min_days: '最短训练日数', training_max_days: '最长训练日数', training_window_mode: '训练窗口模式',
 }
 
 function revealDisclosure(id: string) {
@@ -176,10 +191,10 @@ function principalMetrics(value: unknown) {
 function PrincipalMetricRow({ label, metrics }: { label: string; metrics?: unknown }) {
   const values = principalMetrics(metrics)
   return <div className='research-summary-states'>
-    <div><small>{label} · 峰值本金收益</small><strong>{percent(values.peak)}</strong></div>
-    <div><small>最大本金回撤</small><strong>{percent(values.drawdown)}</strong></div>
-    <div><small>同资金被动持有收益</small><strong>{percent(values.matched)}</strong></div>
-    <div><small>差值超额</small><strong>{percent(values.excess)}</strong></div>
+    <div><small>{label} · 峰值本金收益</small><strong className={values.peak != null ? (values.peak >= 0 ? 'gain' : 'loss') : ''}>{percent(values.peak)}</strong></div>
+    <div><small>最大本金回撤</small><strong className={values.drawdown != null && values.drawdown > 0 ? 'loss' : ''}>{percent(values.drawdown)}</strong></div>
+    <div><small>同资金被动持有收益</small><strong className={values.matched != null ? (values.matched >= 0 ? 'gain' : 'loss') : ''}>{percent(values.matched)}</strong></div>
+    <div><small>差值超额</small><strong className={values.excess != null ? (values.excess >= 0 ? 'gain' : 'loss') : ''}>{percent(values.excess)}</strong></div>
     <div><small>成交笔数</small><strong>{values.tradeCount ?? '—'}</strong></div>
   </div>
 }
