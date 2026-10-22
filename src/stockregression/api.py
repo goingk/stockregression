@@ -40,16 +40,15 @@ from .models import BacktestConfig, OptimizationConfig, ResearchRequestV5, norma
 from .market_data import MarketDataService
 from .market_data.aggregation import AggregationService
 from .market_data.models import DataVersionNotFound, MarketDataError
-from .market_data.cache import cache_settings, configure_cache
+from .market_data.cache import configure_cache
 from .market_data.package import scan_etf_package
-from .market_data.package_layout import resolve_package_root
 from .market_data.preparation import MarketPreparationService
 from .market_data.timeframes import normalize_timeframe, public_timeframe
 from .performance import effective_cpu_budget, logical_cpu_count
 from .rules import instrument_terms
 from .research_preparation import preparation_config
 from .schedule import configure_schedule
-from .settings import ConfigurationDocument, PROJECT_ROOT, Settings, load_settings, resolve_project_path, save_settings
+from .settings import ConfigurationDocument, PROJECT_ROOT, Settings, load_settings, resolve_project_path
 from .source_health import configured_sources, validate_source_settings
 from .storage import CompletionRevisionError, Store, dumps, json_safe, now_iso
 from .watchlist_sync import import_watchlist_snapshot
@@ -1094,7 +1093,9 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     else:
         initial_market = MarketDataService(store, package_dir=initial_package)
         package_dir = str(initial_market.repository.package_dir)
-    manager = JobManager(root, configured.max_workers, configured.market_data.scheduler_poll_seconds)
+    active_max_workers = int(configured.max_workers)
+    active_scheduler_poll_seconds = float(configured.market_data.scheduler_poll_seconds)
+    manager = JobManager(root, active_max_workers, active_scheduler_poll_seconds)
     previews = PreviewManager(store)
     instance_id = uuid.uuid4().hex
 
@@ -1115,7 +1116,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     app.state.restart_callback = None
     app.add_middleware(CORSMiddleware, allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
 
-    def submit(kind, payload, dedupe_key=None):
+    def submit(kind, payload, dedupe_key=None, *, include_created=False):
         frozen = dict(payload)
         snapshot = task_configuration_snapshot(
             active_data_dir=root,
@@ -1143,7 +1144,11 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             frozen["submission_provenance"] = computation_provenance(
                 PROJECT_ROOT, configuration=frozen.get("config"),
             )
-        return {"job_id": store.new_job(kind, frozen, dedupe_key=dedupe_key)}
+        job_id, created = store.new_job_info(kind, frozen, dedupe_key=dedupe_key)
+        return {
+            "job_id": job_id,
+            **({"created": created} if include_created else {}),
+        }
 
     def require_ready(config):
         manifest = store.snapshot(config.symbol)
@@ -1588,7 +1593,11 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             raise HTTPException(422, str(exc)) from exc
 
     @app.get("/api/v1/data/bars/{symbol}")
-    def bars(symbol: str, start_date: str | None = None, end_date: str | None = None, frequency: str = "1m", limit: int = Query(1500, ge=1, le=10000), version: str | None = None):
+    def bars(
+        symbol: str, start_date: str | None = None, end_date: str | None = None,
+        frequency: str = "1m", limit: int = Query(1500, ge=1, le=10000),
+        version: str | None = None, before: str | None = None, latest: bool = False,
+    ):
         normalized = normalize_timeframe(frequency)
         market = MarketDataService(store)
         manifest = store.snapshot(symbol, version, persist=False)
@@ -1618,6 +1627,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
                     end=pd.Timestamp(end_date) if end_date else None,
                     version=market_version,
                     limit=limit,
+                    before=pd.Timestamp(before) if before else None,
+                    latest=latest,
                     materialize=False,
                 )
                 return json_safe(payload["rows"])
@@ -1631,7 +1642,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     def backtest(config: BacktestConfig):
         version = require_ready(config)
         if config.schema_version != 3:
-            raise HTTPException(422, "新回测请先通过配置转换生成 schema_version=3 草稿")
+            raise HTTPException(422, "只接受 schema_version=3 的当前股数配置")
         return submit("backtest", {"config": config.model_dump(mode="json"), "version": version})
 
     @app.get("/api/v1/data/reference-price/{symbol}")
@@ -1661,7 +1672,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     def preview(payload: PreviewRequest):
         version = require_ready(payload.config)
         if payload.config.schema_version != 3:
-            raise HTTPException(409, "请先将旧配置转换为股数配置")
+            raise HTTPException(409, "预览只接受 schema_version=3 的当前股数配置")
         # Preview is deliberately submitted without a synchronous coverage scan;
         # the worker reports preparation progress and pins the result version.
         return json_safe(previews.submit(payload.session_id, payload.revision, payload.config, version))
@@ -1678,39 +1689,11 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         previews.cancel(session_id)
         return {"cancelled": True}
 
-    @app.post("/api/v1/configs/convert")
-    def convert_config(config: BacktestConfig):
-        if config.schema_version == 3:
-            return {"config": config.model_dump(mode="json"), "notice": "已载入股数配置"}
-        if config.schema_version == 2:
-            values = config.model_dump(mode="json")
-            values["schema_version"] = 3
-            values.pop("reserve_cash", None)
-            modern = BacktestConfig.model_validate(values)
-            return {"config": modern.model_dump(mode="json"), "notice": "已转换为 v3：取消固定可用现金，买入时按需补足差额，收益率按峰值净投入计算。"}
-        try:
-            service = DataService(store)
-            bundle = service.ensure_bundle(config, check_minutes=False)
-            context = service.reference_price(config.symbol, config.start_date, bundle.version)
-            price = context["reference_price"]
-            def shares(ratio):
-                return int(config.initial_cash * ratio / price / 100) * 100
-            def quantity(value):
-                amount = value.value if value.mode == "shares" else value.value / price if value.mode == "cash" else config.initial_cash * value.value / price
-                return max(200 if config.symbol.startswith(("688", "689")) else 100, int(amount / 100) * 100)
-            values = {key: value for key, value in config.model_dump(mode="json").items() if key not in {"schema_version", "initial_cash", "initial_position", "min_position", "max_position", "buy_quantity", "sell_quantity", "dca_frequency"}}
-            values.pop("reserve_cash", None)
-            values.update(schema_version=3, initial_shares=shares(config.initial_position), min_shares=shares(config.min_position), max_shares=shares(config.max_position), buy_shares=quantity(config.buy_quantity), sell_shares=quantity(config.sell_quantity), reference_price_mode="manual" if config.reference_price else "auto", dca={"frequency": config.dca_frequency, "shares": 200 if config.symbol.startswith(("688", "689")) else 100})
-            modern = BacktestConfig.model_validate(values)
-            return {"config": modern.model_dump(mode="json"), "reference_date": context["reference_date"], "notice": "旧现金/比例配置已按历史参考价换算为股数草稿；资金按新规则重算，请检查后另存，原配置保持保留。"}
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
-
     @app.post("/api/v1/backtests/batch")
     def batch(payload: BatchRequest):
         versions = [require_ready(config) for config in payload.configs]
         if any(config.schema_version != 3 for config in payload.configs):
-            raise HTTPException(422, "批量回测请先通过配置转换生成 schema_version=3 草稿")
+            raise HTTPException(422, "批量回测只接受 schema_version=3 的当前股数配置")
         return {"job_ids": [submit("backtest", {"config": config.model_dump(mode="json"), "version": version})["job_id"] for config, version in zip(payload.configs, versions)]}
 
     @app.post("/api/v1/optimizations")
@@ -1766,16 +1749,33 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
 
     @app.get("/api/v1/research/strategies")
     def research_strategies():
-        from .research_v4 import strategy_descriptions
+        from .research import strategy_descriptions
         return strategy_descriptions()
 
     @app.get("/api/v1/jobs")
     def jobs(
         status: str | None = Query(None),
+        kind: str | None = Query(None, pattern=r"^[a-z_]{1,64}$"),
         offset: int = Query(0, ge=0),
         limit: int = Query(100, ge=1, le=1000),
     ):
-        return store.jobs(limit=limit, status=status, offset=offset)
+        return store.jobs(limit=limit, status=status, kind=kind, offset=offset)
+
+    # Keep the bare-list /jobs contract for existing polling clients.  History
+    # and filtering use this dedicated paged resource so a long-lived install
+    # never truncates the task center at the newest hundred rows.
+    @app.get("/api/v1/jobs/history")
+    def job_history(
+        status: str | None = Query(None, pattern=r"^[a-z_]{1,32}$"),
+        kind: str | None = Query(None, pattern=r"^[a-z_]{1,64}$"),
+        offset: int = Query(0, ge=0),
+        limit: int = Query(50, ge=1, le=500),
+    ):
+        return store.job_history(limit=limit, offset=offset, status=status, kind=kind)
+
+    @app.get("/api/v1/jobs/active")
+    def active_jobs():
+        return store.active_jobs()
 
     @app.get("/api/v1/jobs/{job_id}")
     def get_job(job_id: str):
@@ -1787,7 +1787,15 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     @app.post("/api/v1/jobs/{job_id}/cancel")
     def cancel_job(job_id: str):
         job = get_job(job_id)
-        if job["status"] in ("queued", "running"):
+        if job["status"] == "queued":
+            if store.cancel_queued_job(job_id):
+                from .jobs import _cleanup_uploaded_input
+                _cleanup_uploaded_input(store, job_id)
+            else:
+                # The dispatcher claimed the row between the read and the
+                # atomic queue cancellation.  The worker now owns cleanup.
+                store.update_job(job_id, cancel_requested=1)
+        elif job["status"] == "running":
             store.update_job(job_id, cancel_requested=1)
         return store.job(job_id)
 
@@ -1855,7 +1863,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         payload["resume_from_job"] = job_id
         # Only a resume continues the original checkpoint; a fresh submission
         # always starts a new one.
-        payload["checkpoint_id"] = job_id
+        payload["checkpoint_id"] = payload.get("checkpoint_id") or job_id
         return {**submit("research_completion", payload), "resumed_from": job_id}
 
     @app.get("/api/v1/jobs/{job_id}/items")
@@ -1881,8 +1889,9 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     def results(
         offset: int = Query(0, ge=0),
         limit: int = Query(200, ge=1, le=1000),
+        kind: str | None = Query(None, pattern=r"^[a-z_]{1,64}$"),
     ):
-        return store.results(limit=limit, offset=offset)
+        return store.results(limit=limit, offset=offset, kind=kind)
 
     @app.get("/api/v1/results/{result_id}/summary")
     def result_summary(result_id: str, revision: int | None = Query(None, ge=1)):
@@ -2015,16 +2024,15 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         dedupe_key = "completion:" + hashlib.sha256(
             dumps(identity).encode("utf-8")
         ).hexdigest()
-        submitted = submit("research_completion", payload, dedupe_key=dedupe_key)
-        # The checkpoint belongs to this job: a fresh submission starts a new
-        # checkpoint, and only an explicit resume reuses the original one.
-        store.update_job(submitted["job_id"], payload={
-            **payload, "checkpoint_id": submitted["job_id"],
-        })
+        submitted = submit(
+            "research_completion", payload, dedupe_key=dedupe_key,
+            include_created=True,
+        )
+        created = bool(submitted.pop("created", True))
         job = store.job(submitted["job_id"]) or {}
         return {
             **submitted, "status": job.get("status"),
-            "deduplicated": job.get("dedupe_key") == dedupe_key and job.get("status") in {"queued", "running"},
+            "deduplicated": not created and job.get("status") in {"queued", "running"},
         }
 
     @app.get("/api/v1/results/{result_id}/regions/{region_id}/export")
@@ -2074,7 +2082,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             return StreamingResponse(json_rows(), media_type="application/json", headers=headers)
 
         def csv_rows():
-            from .research_v4.space import ROBUST_FIELDS
+            from .research.space import ROBUST_FIELDS
             output = io.StringIO(newline="")
             writer = csv.writer(output)
             writer.writerow(["candidate_id", *ROBUST_FIELDS, "excess_return", "max_principal_drawdown", "score_complete", "constraint_eligible", "constraint_reasons"])
@@ -2209,6 +2217,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             config = BacktestConfig.model_validate(payload["config"])
         except (ValueError, KeyError) as exc:
             raise HTTPException(422, str(exc)) from exc
+        if config.schema_version != 3:
+            raise HTTPException(422, "只接受 schema_version=3 的当前股数配置")
         config_id = uuid.uuid4().hex
         with store.db() as db:
             db.execute("INSERT INTO configs VALUES(?,?,?,?)", (config_id, payload.get("name", "网格配置"), config.model_dump_json(), now_iso()))
@@ -2220,22 +2230,6 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             db.execute("DELETE FROM configs WHERE id=?", (config_id,))
         return {"deleted": True}
 
-    @app.get("/api/v1/settings")
-    def settings():
-        current = load_settings()
-        document = current_configuration()
-        return {
-            **current.model_dump(), "active_data_dir": root,
-            "active_package_dir": package_dir,
-            "package_dir": current.package_dir or package_dir,
-            "config_revision": document.get("config_revision"),
-            "configuration_document": document,
-            "restart_required": current.data_dir != root or bool(
-                current.package_dir and resolve_package_root(current.package_dir) != Path(package_dir).resolve()
-            ),
-            "market_cache": cache_settings(),
-        }
-
     @app.get("/api/v1/configuration", response_model=ConfigurationEnvelope)
     def get_configuration():
         document = current_configuration()
@@ -2245,6 +2239,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             "pending_restart": pending_restart_fields(
                 document, active_data_dir=root, active_package_dir=package_dir,
                 active_host=configured.host, active_port=configured.port,
+                active_max_workers=active_max_workers,
+                active_scheduler_poll_seconds=active_scheduler_poll_seconds,
             ),
             "active_data_dir": root,
             "active_package_dir": package_dir,
@@ -2267,6 +2263,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         base_revision = payload.base_revision
         patch = payload.patch
         try:
+            candidate = validate_configuration_patch(patch, base_revision=base_revision)
+            validate_source_settings(store, candidate["market_data"])
             document = patch_configuration(patch, base_revision=base_revision)
             configure_cache(int(document["market_data"]["cache_mb"]))
             return {
@@ -2275,6 +2273,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
                 "pending_restart": pending_restart_fields(
                     document, active_data_dir=root, active_package_dir=package_dir,
                     active_host=configured.host, active_port=configured.port,
+                    active_max_workers=active_max_workers,
+                    active_scheduler_poll_seconds=active_scheduler_poll_seconds,
                 ),
             }
         except ConfigurationConflict as exc:
@@ -2296,39 +2296,6 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             "active_leases": leases,
             "reserved_cpu_units": sum(int(row.get("units") or 0) for row in leases),
         }
-
-    @app.put("/api/v1/settings")
-    def update_settings(payload: dict):
-        payload = dict(payload)
-        base_revision = str(payload.pop("base_revision", "") or "")
-        if not base_revision:
-            raise HTTPException(428, detail={
-                "code": "CONFIG_REVISION_REQUIRED",
-                "message": "旧式设置写入必须携带 base_revision；请改用 PATCH /api/v1/configuration",
-            })
-        try:
-            if payload.get("package_dir"):
-                requested = resolve_package_root(str(payload["package_dir"]))
-                if requested != Path(package_dir).resolve():
-                    raise ValueError("固定数据包目录不能通过设置切换到其他目录")
-            validate_source_settings(store, payload)
-            values = save_settings(payload, base_revision=base_revision)
-            configure_cache(values.market_cache_mb)
-            return {
-                **values.model_dump(), "active_data_dir": root,
-                "active_package_dir": package_dir,
-                "restart_required": values.data_dir != root or bool(
-                    values.package_dir and resolve_package_root(values.package_dir) != Path(package_dir).resolve()
-                ),
-                "market_cache": cache_settings(),
-                "config_revision": current_configuration().get("config_revision"),
-            }
-        except RuntimeError as exc:
-            if str(exc) == "CONFIG_REVISION_CONFLICT":
-                raise HTTPException(409, detail={"code": "CONFIG_REVISION_CONFLICT", "message": "配置已被其他页面或手工编辑修改"}) from exc
-            raise
-        except ValueError as exc:
-            raise HTTPException(422, str(exc)) from exc
 
     @app.post("/api/v1/schedule/install")
     def install_schedule():

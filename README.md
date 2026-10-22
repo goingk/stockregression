@@ -2,7 +2,7 @@
 
 基于 FastAPI、React、DuckDB、SQLite 和 Parquet 的本地中文研究工作台，支持沪深 A 股及场内 ETF 各周期行情管理、股数网格回测、固定股数定投和参数研究。界面按 1920×1080 桌面设计，并在当前电脑 3120×2080 显示器的 1560×1040 逻辑分辨率下检查；“行情”“数据管理”“策略回测”“参数研究”“结果分析”为独立页面。回测与研究各自保留草稿，通过明确操作传递配置；临时进度显示在右下角，任务历史和结果入口位于顶部任务中心。服务默认只监听 `127.0.0.1`；行情、配置、任务和结果保存在本机。
 
-正式 ETF 行情固定来自 `data/dataset/etf`，股票数据包预留为 `data/dataset/stock`。旧格式快照、演示数据生成入口和旧数据迁移路径已移除。旧研究结果仍保留在数据库和文件系统，但只在历史列表显示“不支持的历史版本”；其详情、参数分布和导出会明确返回版本错误，不能由当前引擎接续执行或补算。
+正式 ETF 行情固定来自 `data/dataset/etf`，股票数据包预留为 `data/dataset/stock`。旧格式快照、演示数据、旧结果、旧迁移入口和旧配置兼容均已移除；当前数据目录只保留 v5 研究结果和当前股数回测结果。
 
 ## 启动
 
@@ -20,7 +20,7 @@ Windows 需要 Python 3.12、`uv`、Node.js 和 npm。直接双击 `start.cmd` �
 
 “行情 → 数据维护与本机设置”可以切换自动或指定 CPU 上限，并调整下载并发、校验进程、矩阵线程和工作集预算；修改在后续任务生效。`GET /api/v1/performance` 返回有效预算与当前租约。当前实现使用 CPU 多核与矩阵优化，不启用 GPU 后端。
 
-行情同步只请求所需新浪未复权分钟数据，不再额外请求前复权日线；BaoStock 会话在批处理进程内复用。未变化且校验账本完整的区间直接复用结果，不重新扫描行情正文。分阶段本机测量见[运行性能记录](docs/performance-runtime.json)。
+行情同步只请求所需新浪未复权分钟数据，不再额外请求前复权日线；BaoStock 会话在批处理进程内复用。未变化且校验账本完整的区间直接复用结果，不重新扫描行情正文。
 
 运行后可通过顶栏“重启项目”重新加载后端、依赖和前端构建。确认后服务会受控关闭并由 `restart.ps1` 重新运行标准启动脚本；运行中的任务会被中断，排队任务在服务恢复后继续，启动日志写入 `.local/restart.log`。
 
@@ -39,7 +39,7 @@ uv run --frozen stockregression serve --open-browser
 
 证券目录来自 AKShare 的股票清单、新浪 ETF 清单与数据包已有证券资料。日常任务只更新数据包中已有证券；需要加入新证券时必须使用明确的初始化任务（脚本参数 `-Initialize` 或页面中的显式选项）。目录操作不会自动加入自选，包内证券更新也不会刷新全市场清单。
 
-交付脚本 `sync-market.ps1` 默认更新数据包内已有证券的日线和 1 分钟，下载并发为 2。日线先于 1 分钟执行；5/15/30/60 分钟、周线和月线由本地基础行情按需聚合：
+交付脚本 `sync-market.ps1` 默认更新数据包内已有证券的日线和 1 分钟，下载并发为 4。日线先于 1 分钟执行；5/15/30/60 分钟、周线和月线由本地基础行情按需聚合：
 
 ```powershell
 # 仅预检范围，不下载行情
@@ -105,7 +105,7 @@ uv run --frozen stockregression data probe --source eastmoney --capability etf_d
 
 日期默认为上海时区一年前至今天，闰日按上一年当月有效日期处理。改变标的或开始日期会读取**开始日期之前**最近的本地有效交易日收盘价并显示所属日期；可手工修改网格参考价，初始持股估值仍采用历史收盘价。缺少行情或前置历史时，预览、正式回测和参数搜索返回具体缺口，不会自动下载，也不使用区间内未来价格代替估值。结束日期保留用户填写值，同时显示实际截止和滞后提示；补数后仍无有效区间则停止计算。
 
-所有网格模式都分别使用买入间距和卖出间距：参考价下方按买入间距形成买入网格，上方按卖出间距形成卖出网格。固定网格要等价格真正跨过参考价下方一个买入间距才触发首次买入，上方同理等待一个卖出间距。移动网格比较当前价与最近成交价，等差和等比固定网格比较价格相对参考价所在的网格。旧配置中的单一 `grid_step` 会自动映射为两个相同间距。佣金默认 `0.05%`（内部 `0.0005`），最低佣金默认 `0.1` 元，支持连续输入小数。这两个字段的有效修改会自动记入本机设置，重启、新建或重置时填充上次值；载入已保存配置采用该配置的费用，载入动作不覆盖个人记忆。
+所有网格模式都分别使用买入间距和卖出间距：参考价下方按买入间距形成买入网格，上方按卖出间距形成卖出网格。固定网格要等价格真正跨过参考价下方一个买入间距才触发首次买入，上方同理等待一个卖出间距。移动网格比较当前价与最近成交价，等差和等比固定网格比较价格相对参考价所在的网格。佣金默认 `0.05%`（内部 `0.0005`），最低佣金默认 `0.1` 元，支持连续输入小数。这两个字段的有效修改会自动记入本机设置，重启、新建或重置时填充上次值；载入已保存配置采用该配置的费用，载入动作不覆盖个人记忆。
 
 “策略回测”和“参数研究”共用本机记住的默认设置，但切换页面时各页保留当前草稿；显式点击“用当前配置研究”或载入研究候选才会更新另一页配置。刷新或重启时标的留空，点击输入框显示最近提交过回测或参数研究的 10 个去重标的，包含失败或取消的已提交任务；输入代码或名称后切换为证券搜索。网格规则、仓位与交易量、定投设置、参数研究设置与完整搜索范围的有效编辑会自动记入本机设置，跨标的共用。空输入和无效中间值不会覆盖上次有效值；载入已保存配置或研究候选不会改写个人记忆。“恢复上次参数”恢复四组记忆、清空标的并使用新的默认日期；“恢复默认范围”仅重置并记忆研究搜索范围。
 
@@ -125,11 +125,11 @@ uv run --frozen stockregression data probe --source eastmoney --capability etf_d
 
 计算前先检查请求区间、前置估值收盘、交易日历、目标周期和公司行动资料。API 返回 `DATA_NOT_READY` 及结构化缺口，页面提供“去准备数据”入口；提交数据任务后才会联网。严格回测要求目标周期质量覆盖本次请求；分钟数据不完整时仍可浏览，但不会把不完整分钟伪装成可执行策略。缺少必要日线、日历或公司行动资料时同样停止计算，已验证的可用行情保留供以后复用。新数据通过质量检查后发布不可变快照，计算锁定该快照。
 
-旧现金/比例配置仍可显式转换为股数草稿；转换按开始前历史参考价计算，缺少定投初始仓位时补 0，另存后为新版本，不自动覆盖原配置。旧研究结果不再提供当前页面的详情或导出适配，重新运行 v5 研究才会生成可查看、可补算的结果。
+当前回测只接受 `schema_version=3` 的股数配置；旧现金/比例配置和转换入口已移除。旧研究结果同样已从当前项目数据和界面移除，重新运行 v5 研究才会生成可查看、可补算的结果。
 
 ## 参数研究
 
-新版统一使用 `protocol_version=5`、`strategy_version=5`、`ranking_mode=robust_j` 和 `result_schema_version=2`，普通股数回测输入继续使用 `schema_version=3`。旧研究请求明确返回 422；旧结果只在历史列表显示为“不支持的历史版本”，详情、参数分布和导出返回版本错误。历史结果文件、行情快照和数据库记录不会被删除。
+新版统一使用 `protocol_version=5`、`strategy_version=5`、`ranking_mode=robust_j` 和 `result_schema_version=2`，普通股数回测输入继续使用 `schema_version=3`。旧研究请求明确返回 422；旧结果文件和数据库任务已在本次结构清理中删除，当前结果列表只包含可读取的 v5 研究。
 
 研究只搜索买入间距、卖出间距、每次买入和每次卖出四轴，固定为等比网格与自然持仓：最低持仓 0，最高持仓不限。买卖比例仅由股数除以初始持股派生；实际持仓上限作为回测后的风险资格与 J 惩罚，不提前截断成交。训练只使用一段连续窗口，内部验证窗数量为 0。
 
@@ -166,20 +166,19 @@ uv run --frozen stockregression data import-file --frequency 1day --path .\impor
 uv run --frozen stockregression data import-folder --frequency 1min --dry-run
 uv run --frozen stockregression data sync --frequency 1day --mode incremental --scope watchlist
 uv run --frozen stockregression data aggregate --symbol 600000.SH --from 1day --to 1week
-uv run --frozen stockregression data cleanup-legacy
 ```
 
-“行情”的辅助区域和独立“数据管理”页支持本机 CSV / Parquet 导入。单文件与文件夹批量入口都不自动联网，只接受日线和 1 分钟；缺少日线、日历或标签依据时先入库并标记待核验。也可运行兼容命令：
+“行情”的辅助区域和独立“数据管理”页支持本机 CSV / Parquet 导入。单文件与文件夹批量入口都不自动联网，只接受日线和 1 分钟；缺少日线、日历或标签依据时先入库并标记待核验。
 
 数据管理页可以直接选择文件、选择文件夹、选择多个文件，也可以拖入文件或文件夹；批量入口会保留相对路径并显示待导入列表。ETF 数据包登记只读取原始文件的元数据，不复制 K 线。
 
 ```powershell
-uv run --frozen stockregression import-data 600000.SH .\daily.csv --minute-path .\minute.csv --actions-path .\actions.csv --calendar-path .\calendar.csv --label-convention end
-uv run --frozen stockregression import-data 518880.SH .\etf-daily.csv --etf-category commodity --calendar-path .\calendar.csv
-uv run --frozen stockregression data cleanup-legacy --apply
+uv run --frozen stockregression data import-file 600000.SH --frequency 1day --path .\daily.csv --actions-path .\actions.csv --calendar-path .\calendar.csv
+uv run --frozen stockregression data import-file 600000.SH --frequency 1min --path .\minute.csv --calendar-path .\calendar.csv --label-convention end
+uv run --frozen stockregression data import-file 518880.SH --frequency 1day --path .\etf-daily.csv --etf-category commodity --calendar-path .\calendar.csv
 ```
 
-旧 CLI 的代码、日线文件仍作为两个位置参数，兼容层把它们拆成独立的日线和 1 分钟任务；新的 `data` 命令要求明确周期。ETF 类型可明确指定 `stock/bond/crossborder/commodity/money`；股票无需填写。准确字段、时区与质量规则见[数据文件格式](docs/data-format.md)。没有日历文件时导入仍可完成，但质量状态会标记待核验，不能用普通工作日列表替代真实日历。
+`data import-file` 要求明确周期，ETF 类型可明确指定 `stock/bond/crossborder/commodity/money`；股票无需填写。准确字段、时区与质量规则见[数据文件格式](docs/data-format.md)。没有日历文件时导入仍可完成，但质量状态会标记待核验，不能用普通工作日列表替代真实日历。
 
 默认应用目录为 `data/`，行情数据包按资产类型存放在其下的 `dataset/etf/` 和 `dataset/stock/`；当前活动 ETF 数据包为 `data/dataset/etf/`。索引、任务、结果和日志位于 `data/` 的其他子目录，行情 Parquet 正文只放在 `data/dataset/<asset>/`。路径在 `config/application.json` 中配置，也可用 `uv run --frozen stockregression set-data-dir D:\market\stockregression-data` 修改；相对路径按项目根目录解析。业务参数不再由环境变量覆盖，`STOCKREGRESSION_HOME` 只定位项目。
 

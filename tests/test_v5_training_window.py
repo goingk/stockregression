@@ -1,6 +1,6 @@
 """v5 研究协议 K2「选窗」契约测试。
 
-覆盖 stockregression.research_v4.window 的 TrainingWindow /
+覆盖 stockregression.research.window 的 TrainingWindow /
 TrainingWindowPolicy：
 
 * 锚点（anchor）定义与 daily 行情取值规则；
@@ -20,7 +20,7 @@ import pandas as pd
 import pytest
 
 from stockregression.models import DataBundle
-from stockregression.research_v4.window import (
+from stockregression.research.window import (
     TrainingWindow,
     TrainingWindowPolicy,
     training_window,

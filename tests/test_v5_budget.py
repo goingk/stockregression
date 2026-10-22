@@ -22,7 +22,7 @@ from stockregression.research import robust as robust_research
 from stockregression import research_v5
 from stockregression import research_completion
 from stockregression.research.robust import EvaluationBudget, EvaluationSession, _complete_reporting_scores
-from stockregression.research_v4.space import ROBUST_FIELDS, ParameterSpace
+from stockregression.research.space import ROBUST_FIELDS, ParameterSpace
 
 
 def make_config(**strategy_overrides) -> OptimizationConfig:

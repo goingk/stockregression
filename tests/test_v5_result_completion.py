@@ -107,7 +107,7 @@ def test_result_get_never_evaluates_or_loads_market_data(tmp_path, monkeypatch):
 
     monkeypatch.setattr("stockregression.data.DataService.load_bundle", forbidden)
     monkeypatch.setattr("stockregression.market_data.service.MarketDataService.load_backtest_bundle", forbidden)
-    monkeypatch.setattr("stockregression.research_v4.evaluator.BatchEvaluator.__init__", forbidden)
+    monkeypatch.setattr("stockregression.research.evaluator.BatchEvaluator.__init__", forbidden)
     monkeypatch.setattr("stockregression.research_completion.complete_research_result", forbidden)
 
     with TestClient(app) as client:

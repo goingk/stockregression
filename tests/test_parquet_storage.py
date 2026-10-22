@@ -21,7 +21,8 @@ from stockregression.share_engine import funding
 from stockregression.storage import Store
 from stockregression.api import create_app
 from stockregression.jobs import execute_job
-from stockregression.settings import save_settings
+from stockregression.configuration import current_configuration, patch_configuration
+from stockregression.settings import load_settings
 
 
 def _daily(days):
@@ -232,15 +233,20 @@ def test_settings_store_project_paths_relative(tmp_path, monkeypatch):
     import stockregression.settings as settings_module
 
     monkeypatch.setattr(settings_module, "PROJECT_ROOT", tmp_path)
-    monkeypatch.setattr(settings_module, "SETTINGS_FILE", tmp_path / ".local" / "settings.json")
+    monkeypatch.setattr(settings_module, "SETTINGS_FILE", tmp_path / "config" / "application.json")
     monkeypatch.delenv("STOCKREGRESSION_DATA_DIR", raising=False)
     monkeypatch.delenv("STOCKREGRESSION_PACKAGE_DIR", raising=False)
 
-    saved = save_settings({"data_dir": "data", "package_dir": "data/dataset"})
+    document = current_configuration()
+    patch_configuration(
+        {"paths": {"data_dir": "data", "package_dir": "data/dataset"}},
+        base_revision=document["config_revision"],
+    )
+    saved = load_settings()
 
     assert saved.data_dir == str((tmp_path / "data").resolve())
     assert saved.package_dir == str((tmp_path / "data" / "dataset").resolve())
-    stored = json.loads((tmp_path / ".local" / "settings.json").read_text(encoding="utf-8"))
+    stored = json.loads((tmp_path / "config" / "application.json").read_text(encoding="utf-8"))
     assert stored["paths"]["data_dir"] == "data"
     assert stored["paths"]["package_dir"] == "data/dataset"
 

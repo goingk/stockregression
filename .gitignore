@@ -10,6 +10,7 @@ wheels/
 .venv
 node_modules/
 frontend/dist/
+*.tsbuildinfo
 data/
 .cache/
 .pytest_cache/

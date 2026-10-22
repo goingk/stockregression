@@ -14,6 +14,8 @@ from .timeframes import normalize_timeframe, timeframe_spec
 
 MAX_DAILY_FILL = 5
 MAX_RUN_FILL = 3
+SESSION_BOUNDS = ((0, 120), (120, 240))
+FILL_REASON = "少量内部缺口以前值补齐"
 
 
 @dataclass
@@ -21,6 +23,36 @@ class ValidationResult:
     frame: pd.DataFrame
     report: dict
     pending: list[str]
+
+
+def _bool_column(values: pd.Series) -> pd.Series:
+    """Coerce a boolean column and treat a missing value as False.
+
+    ``Series.map(bool)`` turns ``NaN`` into True and raises on nullable
+    dtypes, so a column that crossed a reindex could claim synthetic bars
+    it never had or break a boolean mask.
+    """
+    if values.dtype == bool:
+        return values
+    return values.where(values.notna(), False).astype(bool)
+
+
+def _missing_runs(mask: np.ndarray):
+    """Yield ``(start, length)`` for every contiguous True run in ``mask``.
+
+    The mask is walked once, so a gap is measured exactly one time instead
+    of being re-scanned from every position it covers.
+    """
+    start = -1
+    for position, flag in enumerate(mask):
+        if flag:
+            if start < 0:
+                start = position
+        elif start >= 0:
+            yield start, position - start
+            start = -1
+    if start >= 0:
+        yield start, len(mask) - start
 
 
 def _calendar_dates(calendar) -> pd.DatetimeIndex:
@@ -70,6 +102,9 @@ def validate_and_fill(
     if blocked.size:
         pending.append(f"存在 {blocked.size} 条无效价格记录，相关时间点保持缺口且不自动填充")
     result = frame.copy().sort_values("timestamp", kind="stable").reset_index(drop=True)
+    for column in ("source_verified", "is_synthetic", "is_auction_placeholder"):
+        if column in result.columns:
+            result[column] = _bool_column(result[column])
     dates = _calendar_dates(calendar)
     observed_days = pd.DatetimeIndex(result.timestamp.dt.normalize().unique()).sort_values()
     calendar_available = bool(len(dates))
@@ -96,8 +131,17 @@ def validate_and_fill(
         expected = expected[(expected >= lower) & (expected <= upper)]
         auction_rows = []
         if timeframe == "1min" and symbol.endswith(".SZ"):
+            # Group the day once instead of re-filtering the whole frame for
+            # every session; the auction check needs a per-day view only.
+            by_day = {
+                pd.Timestamp(day).normalize(): part.set_index("timestamp").sort_index()
+                for day, part in result.groupby(result.timestamp.dt.normalize())
+            }
             for day in dates:
-                observed = result[result.timestamp.dt.normalize() == day].set_index("timestamp").reindex(minute_slots(day))
+                observed = by_day.get(pd.Timestamp(day).normalize())
+                if observed is None:
+                    continue
+                observed = observed.reindex(minute_slots(day))
                 mask = observed.close.isna().to_numpy()
                 if not mask.any():
                     continue
@@ -169,9 +213,9 @@ def validate_and_fill(
         _attach_price_anomalies(report, price_anomalies)
         if len(missing_labels):
             pending.append(f"所选区间缺少 {len(missing_labels)} 个{spec.label}记录")
-    result["source_verified"] = result.source_verified.map(bool)
-    result["is_synthetic"] = result.is_synthetic.map(bool)
-    result["is_auction_placeholder"] = result.is_auction_placeholder.map(bool)
+    result["source_verified"] = _bool_column(result.source_verified)
+    result["is_synthetic"] = _bool_column(result.is_synthetic)
+    result["is_auction_placeholder"] = _bool_column(result.is_auction_placeholder)
     report["pending_validation"] = list(dict.fromkeys(pending))
     report["calendar_available"] = calendar_available
     report["coverage_status"] = "unknown" if not calendar_available else (
@@ -239,9 +283,9 @@ def _minute_count_validation(
     }
     _attach_price_anomalies(report, anomalies_from_attrs(result))
     output = result.copy()
-    output["source_verified"] = output.source_verified.map(bool)
-    output["is_synthetic"] = output.is_synthetic.map(bool)
-    output["is_auction_placeholder"] = output.is_auction_placeholder.map(bool)
+    output["source_verified"] = _bool_column(output.source_verified)
+    output["is_synthetic"] = _bool_column(output.is_synthetic)
+    output["is_auction_placeholder"] = _bool_column(output.is_auction_placeholder)
     report["pending_validation"] = list(dict.fromkeys(pending))
     report["first_time"] = output.timestamp.min().isoformat() if len(output) else None
     report["last_time"] = output.timestamp.max().isoformat() if len(output) else None
@@ -258,65 +302,135 @@ def _attach_price_anomalies(report: dict, price_anomalies) -> None:
     report["price_anomalies"] = price_anomalies.head(200)[columns].astype(str).to_dict("records")
 
 
+def _observed_rows(aligned: pd.DataFrame) -> pd.DataFrame:
+    """Keep the bars that carry a price; every missing slot stays missing."""
+    kept = aligned[aligned.close.notna()]
+    return kept.rename_axis("timestamp").reset_index()
+
+
+def _apply_fill(aligned: pd.DataFrame, fillable: pd.Series) -> pd.DataFrame:
+    """Carry the last known close into the fillable slots only.
+
+    A forward fill over the whole session would also give a price to the
+    slots that must stay missing, so the carried values are written into
+    the fillable slots and nowhere else.
+    """
+    result = aligned.copy()
+    selection = fillable.astype(bool)
+    for start, end in SESSION_BOUNDS:
+        chosen = selection.iloc[start:end]
+        if not chosen.any():
+            continue
+        session = result.iloc[start:end].copy()
+        carried = session.close.ffill()
+        updates = {"close": carried}
+        for column in ("open", "high", "low"):
+            if column in session.columns:
+                updates[column] = session[column].fillna(carried)
+        for column, values in updates.items():
+            if column not in session.columns:
+                continue
+            updated = session[column].copy()
+            updated.loc[chosen] = values.loc[chosen]
+            session[column] = updated
+        for column in ("volume", "turnover"):
+            if column in session.columns:
+                updated = session[column].copy()
+                updated.loc[chosen] = 0
+                session[column] = updated
+        if "source_verified" in session.columns:
+            # A carried bar keeps the verification flag of the source it was
+            # derived from; the fill only runs on a verified frame.
+            updated = session["source_verified"].copy()
+            carried_flag = session["source_verified"].astype("boolean").ffill()
+            updated.loc[chosen] = carried_flag.loc[chosen].to_numpy(dtype=object)
+            session["source_verified"] = updated
+        result.iloc[start:end] = session
+    if "is_synthetic" not in result.columns:
+        result["is_synthetic"] = False
+    result.loc[selection, "is_synthetic"] = True
+    if "cutfill_reason" not in result.columns:
+        result["cutfill_reason"] = pd.NA
+    result.loc[selection, "cutfill_reason"] = FILL_REASON
+    return result
+
+
 def _fill_minutes(frame: pd.DataFrame, days: pd.DatetimeIndex, *, blocked: pd.DatetimeIndex | None = None):
-    pieces = []
+    """Fill short intraday gaps causally, one missing run at a time.
+
+    A slot is filled only when its missing run is at most ``MAX_RUN_FILL``
+    bars long, the day's gap budget still allows it and no blocked
+    (invalid price) timestamp takes part in the run.  Session boundary
+    slots, blocked bars and every other unfillable gap stay missing so the
+    quality report keeps counting a real gap instead of a fabricated bar.
+    """
+    pieces: list[pd.DataFrame] = []
     filled = 0
     unfillable: list[pd.Timestamp] = []
-    grouped = {day.normalize(): part.set_index("timestamp").sort_index() for day, part in frame.groupby(frame.timestamp.dt.normalize())}
     blocked = pd.DatetimeIndex([] if blocked is None else blocked)
-    for day in days:
-        observed = grouped.get(day.normalize(), pd.DataFrame())
+    grouped = {
+        pd.Timestamp(day).normalize(): part.set_index("timestamp").sort_index()
+        for day, part in frame.groupby(frame.timestamp.dt.normalize())
+    }
+    filled_timestamps: set[pd.Timestamp] = set()
+    for day in pd.DatetimeIndex(days):
+        day = pd.Timestamp(day).normalize()
+        observed = grouped.get(day)
+        if observed is None:
+            # The session has no record at all: every slot stays a real gap.
+            unfillable.extend(minute_slots(day))
+            continue
         aligned = observed.reindex(minute_slots(day))
         missing = aligned.close.isna()
-        blocked_mask = aligned.index.isin(blocked)
-        if blocked_mask.any():
-            unfillable.extend(aligned.index[blocked_mask & missing])
-        if int(missing.sum()) > MAX_DAILY_FILL:
-            unfillable.extend(aligned.index[missing])
-            pieces.append(aligned[aligned.close.notna()].reset_index().rename(columns={"index": "timestamp"}))
+        blocked_mask = np.asarray(aligned.index.isin(blocked), dtype=bool)
+        missing_values = missing.to_numpy()
+        # A blocked bar is a real gap that the price-quality pass already
+        # reported; count it once here and keep it out of the run accounting.
+        unfillable.extend(aligned.index[missing_values & blocked_mask])
+        if int(missing_values.sum()) > MAX_DAILY_FILL:
+            unfillable.extend(aligned.index[missing_values & ~blocked_mask])
+            pieces.append(_observed_rows(aligned))
             continue
-        sessions = [(0, 120), (120, 240)]
         fillable = pd.Series(False, index=aligned.index)
-        for start, end in sessions:
-            segment_missing = missing.iloc[start:end].to_numpy()
-            if missing.iloc[start] or missing.iloc[end - 1]:
-                unfillable.extend(aligned.index[start:end][segment_missing])
+        budget = 0
+        for start, end in SESSION_BOUNDS:
+            segment = missing_values[start:end]
+            if not segment.any():
                 continue
-            for pos, flag in enumerate(segment_missing):
-                if not flag:
+            if missing_values[start] or missing_values[end - 1]:
+                # The session boundary itself is missing, so the session
+                # cannot be rebuilt from a previous value.
+                unfillable.extend(
+                    aligned.index[start:end][segment & ~blocked_mask[start:end]]
+                )
+                continue
+            for run_start, run in _missing_runs(segment):
+                positions = slice(start + run_start, start + run_start + run)
+                stretch = aligned.index[positions]
+                if (
+                    run > MAX_RUN_FILL
+                    or blocked_mask[positions].any()
+                    or budget + run > MAX_DAILY_FILL
+                ):
+                    unfillable.extend(stretch[~blocked_mask[positions]])
                     continue
-                run_start = pos
-                while pos + 1 < len(segment_missing) and segment_missing[pos + 1]:
-                    pos += 1
-                run = pos - run_start + 1
-                if run <= MAX_RUN_FILL and segment_missing[:run_start].sum() + run <= MAX_DAILY_FILL:
-                    stretch = aligned.index[start + run_start:start + pos + 1]
-                    if not pd.DatetimeIndex(stretch).isin(blocked).any():
-                        fillable.iloc[start + run_start:start + pos + 1] = True
-                    else:
-                        unfillable.extend(stretch[segment_missing[run_start:pos + 1]])
-                else:
-                    unfillable.extend(aligned.index[start + run_start:start + pos + 1])
+                fillable.iloc[positions] = True
+                budget += run
         if fillable.any():
-            for start, end in sessions:
-                session = aligned.iloc[start:end].copy()
-                session["close"] = session.close.ffill()
-                session["open"] = session.open.fillna(session.close)
-                session["high"] = session.high.fillna(session.close)
-                session["low"] = session.low.fillna(session.close)
-                session["volume"] = session.volume.fillna(0)
-                session["turnover"] = session.turnover.fillna(0)
-                session.loc[fillable.iloc[start:end], "is_synthetic"] = True
-                session.loc[fillable.iloc[start:end], "cutfill_reason"] = "少量内部缺口以前值补齐"
-                aligned.iloc[start:end] = session
+            aligned = _apply_fill(aligned, fillable)
             filled += int(fillable.sum())
-        kept = aligned[aligned.close.notna()].reset_index().rename(columns={"index": "timestamp"})
-        pieces.append(kept)
+            filled_timestamps.update(aligned.index[fillable.to_numpy()])
+        pieces.append(_observed_rows(aligned))
     result = pd.concat(pieces, ignore_index=True) if pieces else frame.iloc[0:0].copy()
-    result["source"] = result.source.fillna("fill")
-    result.loc[result.is_synthetic, "source"] = "fill"
-    result["tradable"] = ~result.is_synthetic.astype(bool)
-    return result.sort_values("timestamp").reset_index(drop=True), filled, unfillable
+    result["is_synthetic"] = _bool_column(result["is_synthetic"]) if "is_synthetic" in result.columns else False
+    if "source" not in result.columns:
+        result["source"] = pd.NA
+    # Only the bars this call filled are labelled as filled; real bars keep
+    # the source they were stored with.
+    if filled_timestamps:
+        result.loc[result.timestamp.isin(filled_timestamps), "source"] = "fill"
+    result["tradable"] = ~result["is_synthetic"]
+    return result.sort_values("timestamp").reset_index(drop=True), filled, sorted(set(unfillable))
 
 
 def _group_gaps(missing: pd.DatetimeIndex, interval: int):

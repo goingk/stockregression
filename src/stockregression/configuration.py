@@ -40,10 +40,9 @@ _FIELD_LABELS = {
     "frequency": "定投频率", "shares": "定投数量",
     "commission_rate": "佣金费率", "min_commission": "最低佣金",
     "strategy_id": "策略标识", "strategy_version": "策略版本", "protocol_version": "研究协议",
-    "selection_target": "研究方案", "rebalance_days": "自适应换参周期", "mode": "历史研究模式",
-    "n_trials": "旧版试验数", "local_search_budget": "历史局部搜索预算", "seed": "根随机种子",
+    "selection_target": "研究方案", "rebalance_days": "自适应换参周期", "seed": "根随机种子",
     "top_candidates": "结果候选展示上限", "max_principal_drawdown": "最大本金回撤约束", "min_trades": "最少成交笔数",
-    "min_history_days": "旧版最少历史", "min_minute_ratio": "最小分钟覆盖率",
+    "min_history_days": "最少历史", "min_minute_ratio": "最小分钟覆盖率",
     "ranking_mode": "历史排名模式", "hypercube_edge": "超正方体边长", "granularity": "研究刻度",
     "search_method": "搜索方法", "training_budget": "训练评价预算", "validation_budget": "邻域评价预算",
     "recommendation_count": "Top-K 峰区", "max_shares_mode": "最高持股研究方式", "slippage_mode": "滑点处理",
@@ -58,9 +57,7 @@ _FIELD_LABELS = {
     "stride_multiplier": "大步长倍率", "max_stride_fraction": "大步长跨度比例",
     "validation_reserve_fraction": "峰值核验预算比例", "exhaustive_memory_limit_mb": "穷举内存上限",
     "estimated_bytes_per_point": "单点内存估计", "stress_cost_multiplier": "费用压力倍率",
-    "stress_region_count": "费用压力峰区数", "legacy": "历史默认值",
-    "bootstrap_reps": "Bootstrap 次数", "block_lengths": "Bootstrap 区块长度",
-    "outer_validation_days": "外层核验交易日", "cache_mb": "行情缓存",
+    "stress_region_count": "费用压力峰区数", "cache_mb": "行情缓存",
     "recent_minute_source": "近期分钟来源", "etf_daily_source": "ETF 日线来源",
     "network_timeout_seconds": "网络超时", "request_retries": "请求重试次数",
     "failure_cooldown_hours": "来源失败冷却", "retry_after_seconds": "准备重试等待",
@@ -90,7 +87,7 @@ _FIELD_UNITS = {
     "floor_k_ref": "卖出网格整格数",
     "training_budget": "唯一原始回测点", "validation_budget": "唯一原始回测点",
     "training_min_days": "交易日", "training_max_days": "交易日",
-    "rebalance_days": "交易日", "outer_validation_days": "交易日",
+    "rebalance_days": "交易日",
     "network_timeout_seconds": "秒", "retry_after_seconds": "秒",
     "failure_cooldown_hours": "小时", "source_lock_timeout_seconds": "秒",
     "sync_lock_timeout_seconds": "秒", "prepare_lock_timeout_seconds": "秒",
@@ -145,6 +142,11 @@ def _type_label(schema: dict[str, Any], root: dict[str, Any]) -> str:
 
 def _effect(path: tuple[str, ...]) -> str:
     if path[:1] == ("paths",) or path in {("application", "host"), ("application", "port")}:
+        return "需重启"
+    if path in {
+        ("application", "max_workers"),
+        ("market_data", "scheduler_poll_seconds"),
+    }:
         return "需重启"
     if path[:1] in {("ui",), ("market_data",)}:
         return "后续读取或任务"
@@ -206,6 +208,8 @@ def current_configuration() -> dict[str, Any]:
 def pending_restart_fields(
     document: dict[str, Any], *, active_data_dir: str, active_package_dir: str | None,
     active_host: str | None = None, active_port: int | None = None,
+    active_max_workers: int | None = None,
+    active_scheduler_poll_seconds: float | None = None,
 ) -> list[str]:
     pending: list[str] = []
     data_value = str(document.get("paths", {}).get("data_dir", ""))
@@ -227,6 +231,14 @@ def pending_restart_fields(
         pending.append("application.host")
     if active_port is not None and int(application.get("port", 0)) != int(active_port):
         pending.append("application.port")
+    if active_max_workers is not None and int(application.get("max_workers", 0)) != int(active_max_workers):
+        pending.append("application.max_workers")
+    market_data = document.get("market_data") or {}
+    if (
+        active_scheduler_poll_seconds is not None
+        and float(market_data.get("scheduler_poll_seconds", 0)) != float(active_scheduler_poll_seconds)
+    ):
+        pending.append("market_data.scheduler_poll_seconds")
     return pending
 
 

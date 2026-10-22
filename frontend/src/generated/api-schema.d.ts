@@ -618,23 +618,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/configs/convert": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Convert Config */
-        post: operations["convert_config_api_v1_configs_convert_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/backtests/batch": {
         parameters: {
             query?: never;
@@ -712,6 +695,40 @@ export interface paths {
         };
         /** Jobs */
         get: operations["jobs_api_v1_jobs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/jobs/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Job History */
+        get: operations["job_history_api_v1_jobs_history_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/jobs/active": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Active Jobs */
+        get: operations["active_jobs_api_v1_jobs_active_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -971,24 +988,6 @@ export interface paths {
         post?: never;
         /** Delete Config */
         delete: operations["delete_config_api_v1_configs__config_id__delete"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/settings": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Settings */
-        get: operations["settings_api_v1_settings_get"];
-        /** Update Settings */
-        put: operations["update_settings_api_v1_settings_put"];
-        post?: never;
-        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1312,9 +1311,9 @@ export interface components {
             /**
              * Config Schema Version
              * @default 5
-             * @enum {integer}
+             * @constant
              */
-            config_schema_version: 1 | 2 | 3 | 4 | 5;
+            config_schema_version: 5;
             /** Config Revision */
             config_revision?: string | null;
             application?: components["schemas"]["ApplicationSection"];
@@ -2377,10 +2376,6 @@ export interface components {
         /** ResearchSection */
         ResearchSection: {
             defaults?: components["schemas"]["ResearchDefaults"];
-            /** Legacy */
-            legacy?: {
-                [key: string]: unknown;
-            };
         };
         /**
          * ResearchStrategySpec
@@ -3669,6 +3664,8 @@ export interface operations {
                 frequency?: string;
                 limit?: number;
                 version?: string | null;
+                before?: string | null;
+                latest?: boolean;
             };
             header?: never;
             path: {
@@ -3897,39 +3894,6 @@ export interface operations {
             };
         };
     };
-    convert_config_api_v1_configs_convert_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["BacktestConfig"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     batch_api_v1_backtests_batch_post: {
         parameters: {
             query?: never;
@@ -4053,6 +4017,7 @@ export interface operations {
         parameters: {
             query?: {
                 status?: string | null;
+                kind?: string | null;
                 offset?: number;
                 limit?: number;
             };
@@ -4078,6 +4043,60 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    job_history_api_v1_jobs_history_get: {
+        parameters: {
+            query?: {
+                status?: string | null;
+                kind?: string | null;
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    active_jobs_api_v1_jobs_active_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
         };
@@ -4277,6 +4296,7 @@ export interface operations {
             query?: {
                 offset?: number;
                 limit?: number;
+                kind?: string | null;
             };
             header?: never;
             path?: never;
@@ -4587,61 +4607,6 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    settings_api_v1_settings_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    update_settings_api_v1_settings_put: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": {
-                    [key: string]: unknown;
-                };
-            };
-        };
         responses: {
             /** @description Successful Response */
             200: {

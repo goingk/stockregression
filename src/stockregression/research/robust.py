@@ -27,9 +27,9 @@ from ..numerics.robust import (
 from ..performance import (
     current_process_rss_bytes, current_workspace_bytes, record_count, record_seconds,
 )
-from ..research_v4.evaluator import BatchEvaluator
-from ..research_v4.search import coarse_coordinates
-from ..research_v4.space import ROBUST_FIELDS, ParameterSpace
+from .evaluator import BatchEvaluator
+from .search import coarse_coordinates
+from .space import ROBUST_FIELDS, ParameterSpace
 from .window import TrainingWindow, TrainingWindowPolicy
 from .statistics import market_statistical_profile
 
@@ -253,9 +253,10 @@ class EvaluationSession:
     @property
     def ledger_evaluations(self) -> int:
         # Every numeric candidate evaluates the strategy and its matched-funding
-        # hold account as one paired ledger evaluation.
-        if self.task_budget is not None:
-            return 2 * int(self.task_budget.consumed)
+        # hold account as one paired ledger evaluation.  The count is this
+        # session's own work: one task budget is shared by the fixed, current
+        # and adaptive decisions, so the task-wide total must never be reported
+        # as a single decision's ledger count.
         return 2 * (sum(self.spent.values()) + self.stress_spent)
 
     @property

@@ -1,12 +1,14 @@
 import { researchQuantityUnit } from '../workbenchDefaults'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Download, FlaskConical, RefreshCw, RotateCcw } from 'lucide-react'
 import { ApiError, download, get, post } from '../api'
+import { LatestRequest, PromiseCache } from '../requestState'
+import { resultsPageQuery } from '../resultsReview'
 import ResearchLandscape from '../ResearchLandscape'
 import DataDiagnosticsPanel from '../DataDiagnosticsPanel'
 import Disclosure from '../Disclosure'
 import { useTasks } from '../TaskCenter'
-import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, Field, Loading, NumField, PageHeader, SelectInput, TextInput, configError, configPayload, loadConfig, percent, revealConfigError, useErrorMessage } from '../components'
+import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, Field, Loading, NumField, PageHeader, SelectInput, TextInput, configError, configPayload, loadConfig, percent, useErrorMessage } from '../components'
 import { flushConfiguration } from '../useWorkbenchDefaults'
 import type { BacktestConfig, BacktestResult, DataDiagnostics, DataPreparationRequest, DataSourceEvent, Job } from '../types'
 import { defaultSearchRanges, percentageRanges as pctRange, researchConfigForSubmission, researchRangesForSymbol, validResearchDefaults } from '../workbenchDefaults'
@@ -20,6 +22,7 @@ type Recommendation = { params?: Dict | null; recommended_params?: Dict | null; 
 type CompletionScope = { revision?: number; decision?: string | null; decision_index?: number }
 type CompletionState = { status?: string; latest_revision?: Dict | null; selected_revision?: number | null; revision?: Dict | null; revision_scope?: CompletionScope | null; endpoint?: string }
 type OptimizationResult = {
+  id?: string
   protocol_version?: number; result_schema_version?: number; seed?: number; data_version?: string; warnings?: string[]
   config?: SearchConfig; protocol?: Dict; is_demo?: boolean; quality?: Dict; diagnostics?: DataDiagnostics; source_events?: DataSourceEvent[]
   computation?: Dict; locked_funding?: Dict; configuration_snapshot?: Dict; execution?: Dict; performance?: Dict
@@ -34,9 +37,10 @@ export type Props = {
   onSettingsChange: (settings: ResearchDefaults) => void
   onBaseChange: (config: BacktestConfig | ((previous: BacktestConfig) => BacktestConfig)) => void
   onLoadConfig: (config: BacktestConfig) => void
-  requestedJobId?: string | null
-  onRequestHandled?: () => void
-  onSelectedJobChange?: (id: string) => void
+  requestedResource?: string | null
+  onSelectedResourceChange?: (resource: string) => void
+  completionDecision?: string | null
+  onCompletionDecisionChange?: (decision: string) => void
   onFeeDefaultsEdit?: (defaults: { commission_rate: number; min_commission: number }) => void
   onDefaultsEdit?: (group: 'grid' | 'position' | 'dca', config: BacktestConfig) => void
   onRestore?: () => void
@@ -92,6 +96,12 @@ function warningsOf(value: unknown): string[] {
   const item = record(value)
   return Array.isArray(item?.warnings) ? item.warnings.map(String) : []
 }
+function reasonsOf(value: unknown): string[] {
+  const item = record(value)
+  const diagnostics = record(item?.diagnostics)
+  const values = item?.constraint_reasons ?? item?.reasons ?? diagnostics?.constraint_reasons ?? diagnostics?.reasons
+  return Array.isArray(values) ? values.map(String).filter(Boolean) : []
+}
 function hasDemoFlag(value: unknown) {
   const item = record(value)
   return item?.is_demo === true || record(item?.quality)?.is_demo === true || record(item?.metadata)?.is_demo === true
@@ -101,6 +111,10 @@ function isOptimizationJob(job: Job) {
   return job.kind === 'optimization' || job.kind === 'optimize' || record(config?.base) != null
 }
 function isCompletionJob(job: Job) { return job.kind === 'research_completion' }
+function taskLabelForResearch(job: Job) {
+  const config = searchConfigOf(job.payload?.config)
+  return `${config?.base?.symbol ?? '研究任务'} · ${job.created_at?.slice(0, 10) ?? job.id.slice(0, 12)} · ${statusText(job.status)}`
+}
 function rangeValue(key: string, value: unknown) {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return '—'
@@ -199,84 +213,181 @@ function PrincipalMetricRow({ label, metrics }: { label: string; metrics?: unkno
   </div>
 }
 
-export default function ResearchPage({ base, settings, onSettingsChange, onBaseChange, onLoadConfig, requestedJobId, onRequestHandled, onSelectedJobChange, onFeeDefaultsEdit, onDefaultsEdit, onRestore, onPrepareData }: Props) {
+type PreflightState = {
+  status: 'idle' | 'loading' | 'ready' | 'blocked'
+  preview: Dict | null
+  message: string
+}
+
+export default function ResearchPage({ base, settings, onSettingsChange, onBaseChange, onLoadConfig, requestedResource, onSelectedResourceChange, completionDecision, onCompletionDecisionChange, onFeeDefaultsEdit, onDefaultsEdit, onRestore, onPrepareData }: Props) {
   const { protocol_version: protocolVersion, selection_target: selectionTarget, rebalance_days: rebalanceDays, seed, top_candidates: topCandidates, max_principal_drawdown: maxPrincipalDrawdown, min_trades: minTrades, min_history_days: minHistoryDays, min_minute_ratio: minMinuteRatio, strategy_version: strategyVersion, ranking_mode: rankingMode, hypercube_edge: hypercubeEdge, granularity, search_method: searchMethod, training_budget: trainingBudget, validation_budget: validationBudget, reporting_budget: reportingBudget, total_evaluation_budget: totalEvaluationBudget, max_runtime_seconds: maxRuntimeSeconds, recommendation_count: recommendationCount, slippage_mode: slippageMode, fixed_half_widths: fixedHalfWidths, sigma, alpha, beta: scoreBeta, tau, eta_limit: etaLimit, eta_hard_cap: etaHardCap, gamma_max: gammaMax, eta_floor: etaFloor, gamma_min: gammaMin, floor_k_ref: floorKRef, training_min_days: trainingMinDays, training_max_days: trainingMaxDays, training_window_mode: trainingWindowMode, peak_tolerance: peakTolerance, start_min: startMin, start_max: startMax, starts_per_candidate: startsPerCandidate, initial_strides: initialStrides, stride_multiplier: strideMultiplier, max_stride_fraction: maxStrideFraction, validation_reserve_fraction: validationReserveFraction, exhaustive_memory_limit_mb: exhaustiveMemoryLimitMb, estimated_bytes_per_point: estimatedBytesPerPoint, stress_cost_multiplier: stressCostMultiplier, stress_region_count: stressRegionCount } = settings
   const tasks = useTasks()
   const researchJobs = useMemo(() => tasks.jobs.filter(isOptimizationJob), [tasks.jobs])
-  const viewableJobs = useMemo(() => researchJobs.filter(job => Boolean(job.result_id)), [researchJobs])
-  const ranges = researchRangesForSymbol(settings.ranges, base.symbol)
+  const ranges = useMemo(() => researchRangesForSymbol(settings.ranges, base.symbol), [base.symbol, settings.ranges])
   const updateSettings = (patch: Partial<ResearchDefaults>) => onSettingsChange({ ...settings, ...patch })
-  const [selectedJobId, setSelectedJobId] = useState(requestedJobId ?? '')
+  const [selectedJobId, setSelectedJobId] = useState('')
+  const [selectedResultId, setSelectedResultId] = useState('')
+  const [researchResults, setResearchResults] = useState<Array<{ id: string; symbol: string; created_at: string; title: string; kind: string }>>([])
+  const [researchResultsLoading, setResearchResultsLoading] = useState(true)
+  const [researchResultsError, setResearchResultsError] = useState('')
+  const [researchResultsMore, setResearchResultsMore] = useState(false)
+  const [researchResultsOffset, setResearchResultsOffset] = useState(0)
   const [fallbackJob, setFallbackJob] = useState<Job | null>(null)
   const [loadedResult, setLoadedResult] = useState<{ key: string; value: OptimizationResult } | null>(null)
   const [resultLoading, setResultLoading] = useState(false)
   const [busy, setBusy] = useState(false)
-  const [searchPreview, setSearchPreview] = useState<Dict | null>(null)
+  const [preflight, setPreflight] = useState<PreflightState>({ status: 'idle', preview: null, message: '' })
+  const [preflightToken, setPreflightToken] = useState(0)
   const [error, setError] = useState('')
+  const [retryable, setRetryable] = useState(false)
+  const [retryToken, setRetryToken] = useState(0)
   const [dataIssue, setDataIssue] = useState<DataPreparationRequest | null>(null)
   const [completion, setCompletion] = useState<CompletionState | null>(null)
   const [completionBusy, setCompletionBusy] = useState(false)
   const [completionNote, setCompletionNote] = useState('')
   const [completionToken, setCompletionToken] = useState(0)
-  const jobRequests = useRef(new Map<string, Promise<Job>>())
-  const resultRequests = useRef(new Map<string, Promise<OptimizationResult>>())
+  const jobRequests = useRef(new PromiseCache<string, Job>())
+  const resultRequests = useRef(new PromiseCache<string, OptimizationResult>())
+  const resultsRequest = useRef(new LatestRequest<string>())
+  const preflightRequest = useRef(new LatestRequest<string>())
   const err = useErrorMessage()
-  useEffect(() => { setSearchPreview(null); setError('') }, [base, settings])
+  // Errors that are not a failed job or result read cannot be retried by reloading the task.
+  const reportError = useCallback((message: string) => { setRetryable(false); setError(message) }, [])
+  useEffect(() => { setPreflight({ status: 'idle', preview: null, message: '' }); setError(''); setRetryable(false) }, [base, settings])
   const isStarBoard = base.symbol.startsWith('688') || base.symbol.startsWith('689')
   const selectedJob = researchJobs.find(job => job.id === selectedJobId) ?? (fallbackJob?.id === selectedJobId ? fallbackJob : null)
-  const selectedResultKey = selectedJob?.result_id && ['completed', 'cancelled', 'partial'].includes(selectedJob.status) ? selectedJob.id + ':' + selectedJob.result_id : ''
+  const selectedResultKey = selectedResultId
+    ? 'result:' + selectedResultId
+    : selectedJob?.result_id && ['completed', 'cancelled', 'partial'].includes(selectedJob.status) ? 'job:' + selectedJob.id + ':' + selectedJob.result_id : ''
   const result = loadedResult?.key === selectedResultKey ? loadedResult.value : null
 
-  const selectStudy = (id: string) => {
-    setSelectedJobId(id)
-    onSelectedJobChange?.(id)
+  const selectResult = (id: string) => {
+    setSelectedResultId(id)
+    setSelectedJobId('')
+    setFallbackJob(null)
+    onSelectedResourceChange?.(id)
   }
-  useEffect(() => {
-    if (!requestedJobId) return
-    setSelectedJobId(requestedJobId)
-    onRequestHandled?.()
-  }, [requestedJobId, onRequestHandled])
-  useEffect(() => {
-    if (!selectedJobId && !requestedJobId && viewableJobs[0]) {
-      setSelectedJobId(viewableJobs[0].id)
-      onSelectedJobChange?.(viewableJobs[0].id)
+  const selectJob = (id: string) => {
+    setSelectedJobId(id)
+    setSelectedResultId('')
+    onSelectedResourceChange?.(id)
+  }
+
+  const loadResearchResults = useCallback(async (offset = 0, append = false) => {
+    const ticket = resultsRequest.current.begin(`optimization:${offset}:${append}`)
+    setResearchResultsLoading(true); setResearchResultsError('')
+    try {
+      const page = await get<Array<{ id: string; symbol: string; created_at: string; title: string; kind: string }>>(
+        resultsPageQuery(offset, 50, 'optimization'),
+      )
+      if (!resultsRequest.current.isCurrent(ticket)) return
+      setResearchResults(current => append
+        ? [...current, ...page.filter(item => !current.some(existing => existing.id === item.id))]
+        : page)
+      setResearchResultsOffset(offset)
+      setResearchResultsMore(page.length >= 50)
+      if (!requestedResource && !selectedResultId && !selectedJobId && page[0]) selectResult(page[0].id)
+    } catch (cause) {
+      if (resultsRequest.current.isCurrent(ticket)) setResearchResultsError(err(cause))
+    } finally {
+      if (resultsRequest.current.isCurrent(ticket)) setResearchResultsLoading(false)
     }
-  }, [selectedJobId, requestedJobId, viewableJobs, onSelectedJobChange])
+  }, [err, requestedResource, selectedJobId, selectedResultId])
+
+  useEffect(() => { void loadResearchResults(0, false) }, [])
+  const completedResearchJobs = tasks.jobs.filter(job => isOptimizationJob(job) && ['completed', 'partial', 'failed', 'cancelled'].includes(job.status)).map(job => `${job.id}:${job.status}`).join(',')
+  useEffect(() => {
+    if (completedResearchJobs) void loadResearchResults(0, false)
+  }, [completedResearchJobs])
+
+  // The URL may carry either a saved result id or a job id. Results are
+  // immutable and preferred; a 404 then resolves the id as a task.
+  useEffect(() => {
+    if (!requestedResource) return
+    if (requestedResource === selectedResultId || requestedResource === selectedJobId) return
+    let active = true
+    const resultRequest = get<OptimizationResult>('/results/' + encodeURIComponent(requestedResource))
+    void resultRequest.then(value => {
+      if (!active) return
+      const key = 'result:' + requestedResource
+      resultRequests.current.getOrCreate(key, () => Promise.resolve(value))
+      setSelectedResultId(requestedResource); setSelectedJobId(''); setFallbackJob(null)
+      setLoadedResult({ key, value }); setResultLoading(false); setError(''); setRetryable(false)
+    }).catch(resultCause => {
+      if (!active) return
+      if (!(resultCause instanceof ApiError) || resultCause.status !== 404) {
+        setRetryable(true); setError(err(resultCause)); return
+      }
+      const jobRequest = jobRequests.current.getOrCreate(
+        requestedResource,
+        () => get<Job>('/jobs/' + encodeURIComponent(requestedResource)),
+      )
+      void jobRequest.then(job => {
+        if (!active) return
+        if (!isOptimizationJob(job) && !isCompletionJob(job)) {
+          setRetryable(false); setError('链接中的任务不是参数研究。')
+          return
+        }
+        setSelectedJobId(requestedResource); setSelectedResultId(''); setFallbackJob(job); setError('')
+      }).catch(jobCause => {
+        jobRequests.current.forget(requestedResource, jobRequest)
+        if (!active) return
+        setRetryable(true)
+        setError(jobCause instanceof ApiError && jobCause.status === 404
+          ? '链接中的研究结果或任务已被清理，或不存在。'
+          : err(jobCause))
+      })
+    })
+    return () => { active = false }
+  }, [requestedResource, selectedResultId, selectedJobId, err])
 
   // A result opened from outside this page may predate the task center's current list.
   useEffect(() => {
     if (!selectedJobId || researchJobs.some(job => job.id === selectedJobId)) return
     let active = true
-    let request = jobRequests.current.get(selectedJobId)
-    if (!request) {
-      request = get<Job>('/jobs/' + encodeURIComponent(selectedJobId))
-      jobRequests.current.set(selectedJobId, request)
-    }
+    const request = jobRequests.current.getOrCreate(
+      selectedJobId,
+      () => get<Job>('/jobs/' + encodeURIComponent(selectedJobId)),
+    )
     void request.then(job => {
       if (!active) return
-      if (!isOptimizationJob(job) && !isCompletionJob(job)) { setError('所选任务不是参数研究。'); return }
+      if (!isOptimizationJob(job) && !isCompletionJob(job)) { reportError('所选任务不是参数研究。'); return }
       setFallbackJob(job)
-    }).catch(cause => { if (active) setError(err(cause)) })
+    }).catch(cause => {
+      // A rejected request is dropped so a retry reads the task again. A newer request
+      // for the same id keeps its own entry.
+      jobRequests.current.forget(selectedJobId, request)
+      if (active) { setRetryable(true); setError(err(cause)) }
+    })
     return () => { active = false }
-  }, [selectedJobId, researchJobs, err])
+  }, [selectedJobId, researchJobs, err, retryToken, reportError])
 
   // Cache by the immutable result id so job polling never refetches a completed result.
   useEffect(() => {
     if (!selectedResultKey) { setResultLoading(false); return }
     let active = true
     setResultLoading(true)
-    let request = resultRequests.current.get(selectedResultKey)
-    if (!request) {
-      request = get<OptimizationResult>('/jobs/' + encodeURIComponent(selectedJobId) + '/result')
-      resultRequests.current.set(selectedResultKey, request)
-    }
+    const request = resultRequests.current.getOrCreate(
+      selectedResultKey,
+      () => selectedResultId
+        ? get<OptimizationResult>('/results/' + encodeURIComponent(selectedResultId))
+        : get<OptimizationResult>('/jobs/' + encodeURIComponent(selectedJobId) + '/result'),
+    )
     void request.then(value => { if (active) setLoadedResult({ key: selectedResultKey, value }) })
-      .catch(cause => { if (active) setError(err(cause)) })
+      .catch(cause => {
+        resultRequests.current.forget(selectedResultKey, request)
+        if (active) {
+          setRetryable(true)
+          setError(cause instanceof ApiError && cause.status === 404
+            ? '这条研究结果已经被清理或不存在。'
+            : err(cause))
+        }
+      })
       .finally(() => { if (active) setResultLoading(false) })
     return () => { active = false }
-  }, [selectedResultKey, selectedJobId, err])
+  }, [selectedResultKey, selectedJobId, selectedResultId, err, retryToken])
 
-  const resultId = selectedJob?.result_id ?? ''
+  const resultId = selectedResultId || selectedJob?.result_id || String(result?.id ?? '')
   const jobResultCompletion = result?.completion
   const resultProtocolVersion = Number(result?.protocol_version ?? record(result?.config)?.protocol_version ?? 0)
   const resultSchemaVersion = Number(result?.result_schema_version ?? 0)
@@ -301,83 +412,117 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
 
   const updateRange = (name: string, key: keyof Range, shown: number) => {
     updateSettings({ ranges: { ...settings.ranges, [name]: { ...settings.ranges[name], [key]: shown } } })
-    setSearchPreview(null)
+    setPreflight({ status: 'idle', preview: null, message: '' })
   }
-  const submit = async () => {
+  const researchValidationError = () => {
     const researchBase = researchConfigForSubmission(base)
     const baseError = configError(researchBase)
-    if (baseError) { setError(baseError); revealConfigError(baseError); return }
-    if (!validResearchDefaults(settings)) { setError('请填写有效研究设置；搜索上限应不小于下限；研究细粒度须为参数最小单位（间距 0.01 个百分点、股数 100 股 / 份）的正整数倍；超正方体边长须为正奇数。'); revealDisclosure('research-search-ranges'); return }
+    if (baseError) return baseError
+    if (!validResearchDefaults(settings)) return '请填写有效研究设置；搜索上限应不小于下限；研究细粒度须为参数最小单位（间距 0.01 个百分点、股数 100 股 / 份）的正整数倍；超正方体边长须为正奇数。'
     const minimumBuyShares = isStarBoard ? 200 : 100
-    if (ranges.buy_shares.low < minimumBuyShares || ranges.buy_shares.high < minimumBuyShares) {
-      setError('每次买入搜索范围下限应至少为 ' + minimumBuyShares + ' 股 / 份。')
-      revealDisclosure('research-search-ranges')
+    if (ranges.buy_shares.low < minimumBuyShares || ranges.buy_shares.high < minimumBuyShares) return '每次买入搜索范围下限应至少为 ' + minimumBuyShares + ' 股 / 份。'
+    return ''
+  }
+  const buildResearchRequest = useCallback((configurationRevision?: string) => {
+    const researchBase = researchConfigForSubmission(base)
+    const submittedRanges = Object.fromEntries(Object.entries(ranges).map(([name, value]) => [name, { low: value.low, high: value.high }]))
+    return {
+      base: configPayload(researchBase),
+      protocol_version: 5,
+      selection_target: selectionTarget,
+      rebalance_days: rebalanceDays,
+      seed,
+      top_candidates: topCandidates,
+      max_principal_drawdown: maxPrincipalDrawdown,
+      min_trades: minTrades,
+      min_history_days: minHistoryDays,
+      min_minute_ratio: minMinuteRatio,
+      ranges: submittedRanges,
+      strategy: {
+        strategy_id: 'geometric_robust_j', strategy_version: 5, ranking_mode: 'robust_j',
+        search_method: searchMethod, hypercube_edge: hypercubeEdge, granularity,
+        training_budget: trainingBudget, validation_budget: validationBudget,
+        reporting_budget: reportingBudget, total_evaluation_budget: totalEvaluationBudget,
+        max_runtime_seconds: maxRuntimeSeconds, recommendation_count: recommendationCount,
+        max_shares_mode: 'unlimited', slippage_mode: slippageMode,
+        neighborhood_fields: [...robustFields], fixed_half_widths: fixedHalfWidths,
+        sigma, alpha, beta: scoreBeta, tau,
+        eta_limit: etaLimit, eta_hard_cap: etaHardCap, gamma_max: gammaMax,
+        eta_floor: etaFloor, gamma_min: gammaMin, floor_k_ref: floorKRef,
+        training_min_days: trainingMinDays, training_max_days: trainingMaxDays, training_window_mode: trainingWindowMode,
+        peak_tolerance: peakTolerance, start_min: startMin, start_max: startMax, starts_per_candidate: startsPerCandidate,
+        initial_strides: initialStrides, stride_multiplier: strideMultiplier, max_stride_fraction: maxStrideFraction,
+        validation_reserve_fraction: validationReserveFraction, exhaustive_memory_limit_mb: exhaustiveMemoryLimitMb,
+        estimated_bytes_per_point: estimatedBytesPerPoint,
+        stress_cost_multiplier: stressCostMultiplier, stress_region_count: stressRegionCount,
+      },
+      ...(configurationRevision ? { configuration_revision: configurationRevision } : {}),
+    }
+  }, [base, settings, ranges])
+
+  useEffect(() => {
+    const validation = researchValidationError()
+    if (!base.symbol) {
+      setPreflight({ status: 'idle', preview: null, message: '选择标的并填写有效参数后自动预检。' })
       return
     }
-    setBusy(true); setError(''); setDataIssue(null)
+    if (validation) {
+      setPreflight({ status: 'blocked', preview: null, message: validation })
+      return
+    }
+    const ticket = preflightRequest.current.begin(JSON.stringify(buildResearchRequest()))
+    setPreflight({ status: 'loading', preview: null, message: '正在读取训练时段、预算与内存约束…' })
+    const timer = window.setTimeout(() => {
+      post<Dict>('/optimizations/preview', buildResearchRequest()).then(preview => {
+        if (!preflightRequest.current.isCurrent(ticket)) return
+        const reasons = Array.isArray(preview.reasons) ? preview.reasons.map(String).filter(Boolean) : []
+        setPreflight({
+          status: String(preview.status) === 'ready' ? 'ready' : 'blocked',
+          preview,
+          message: String(preview.status) === 'ready' ? '' : reasons.join('；') || '搜索预检未通过。',
+        })
+        if (String(preview.status) === 'ready') setDataIssue(null)
+        if (String(preview.status) === 'ready') setDataIssue(null)
+      }).catch(cause => {
+        if (!preflightRequest.current.isCurrent(ticket)) return
+        const detail = cause instanceof ApiError ? record(cause.detail) ?? {} : {}
+        if (cause instanceof ApiError && cause.status === 409 && detail.code === 'DATA_NOT_READY') setDataIssue(detail as DataPreparationRequest)
+        setPreflight({
+          status: 'blocked', preview: Object.keys(detail).length ? detail : null,
+          message: String(detail.message ?? err(cause)),
+        })
+      })
+    }, 600)
+    return () => { window.clearTimeout(timer); preflightRequest.current.invalidate(ticket.key) }
+  }, [base, settings, ranges, buildResearchRequest, err, preflightToken])
+
+  const submit = async () => {
+    const validation = researchValidationError()
+    if (validation) {
+      reportError(validation); revealDisclosure('research-search-ranges'); return
+    }
+    if (preflight.status !== 'ready') { reportError(preflight.message || '请等待搜索预检完成并解决阻断项。'); return }
+    setBusy(true); setError(''); setRetryable(false); setDataIssue(null)
     try {
       const configurationRevision = await flushConfiguration()
-      const submittedRanges = Object.fromEntries(Object.entries(ranges).map(([name, value]) => [name, { low: value.low, high: value.high }]))
-      const request = {
-        base: configPayload(researchBase),
-        protocol_version: 5,
-        selection_target: selectionTarget,
-        rebalance_days: rebalanceDays,
-        seed,
-        top_candidates: topCandidates,
-        max_principal_drawdown: maxPrincipalDrawdown,
-        min_trades: minTrades,
-        min_history_days: minHistoryDays,
-        min_minute_ratio: minMinuteRatio,
-        ranges: submittedRanges,
-        strategy: {
-          strategy_id: 'geometric_robust_j', strategy_version: 5, ranking_mode: 'robust_j',
-          search_method: searchMethod, hypercube_edge: hypercubeEdge, granularity,
-          training_budget: trainingBudget, validation_budget: validationBudget,
-          reporting_budget: reportingBudget, total_evaluation_budget: totalEvaluationBudget,
-          max_runtime_seconds: maxRuntimeSeconds, recommendation_count: recommendationCount,
-          max_shares_mode: 'unlimited', slippage_mode: slippageMode,
-          neighborhood_fields: [...robustFields], fixed_half_widths: fixedHalfWidths,
-          sigma, alpha, beta: scoreBeta, tau,
-          eta_limit: etaLimit, eta_hard_cap: etaHardCap, gamma_max: gammaMax,
-          eta_floor: etaFloor, gamma_min: gammaMin, floor_k_ref: floorKRef,
-          training_min_days: trainingMinDays, training_max_days: trainingMaxDays, training_window_mode: trainingWindowMode,
-          peak_tolerance: peakTolerance, start_min: startMin, start_max: startMax, starts_per_candidate: startsPerCandidate,
-          initial_strides: initialStrides, stride_multiplier: strideMultiplier, max_stride_fraction: maxStrideFraction,
-          validation_reserve_fraction: validationReserveFraction, exhaustive_memory_limit_mb: exhaustiveMemoryLimitMb,
-          estimated_bytes_per_point: estimatedBytesPerPoint,
-          stress_cost_multiplier: stressCostMultiplier, stress_region_count: stressRegionCount,
-        },
-        configuration_revision: configurationRevision,
-      }
-      try {
-        const preview = await post<Dict>('/optimizations/preview', request)
-        setSearchPreview(preview)
-        if (String(preview.status) !== 'ready') {
-          const reason = Array.isArray(preview.reasons) ? preview.reasons.map(String).find(Boolean) : undefined
-          setError(reason ?? '搜索预检未通过，请调整范围、预算或训练窗口。')
-          if (String(preview.status) === 'insufficient_range') revealDisclosure('research-search-ranges')
-          return
-        }
-      } catch (cause) {
-        if (!(cause instanceof ApiError && cause.status === 422)) throw cause
-        const detail = record(cause.detail) ?? {}
-        setSearchPreview(detail)
-        setError(String(detail.message ?? err(cause)))
-        return
-      }
+      const request = buildResearchRequest(configurationRevision)
       const response = await tasks.run('参数研究', () => post<{ job_id: string }>('/optimizations', request))
-      selectStudy(response.job_id)
+      selectJob(response.job_id)
+      void loadResearchResults(0, false)
     } catch (cause) {
-      setError(err(cause))
+      reportError(err(cause))
       if (cause instanceof ApiError && cause.status === 409 && cause.detail && typeof cause.detail === 'object' && (cause.detail as Record<string, unknown>).code === 'DATA_NOT_READY') setDataIssue(cause.detail as DataPreparationRequest)
+      if (cause instanceof ApiError && cause.status === 422) {
+        const detail = record(cause.detail) ?? {}
+        setPreflight({ status: 'blocked', preview: detail, message: String(detail.message ?? err(cause)) })
+      }
     } finally { setBusy(false) }
   }
 
   const loadV2 = (params: Dict | undefined, selectionAsOf: string | undefined) => {
-    if (!result || !params) { setError('当前研究结果没有可载入的参数。'); return }
+    if (!result || !params) { reportError('当前研究结果没有可载入的参数。'); return }
     const originalBase = result.config?.base ?? searchConfigOf(selectedJob?.payload?.config)?.base
-    if (!originalBase) { setError('这条研究任务未保存原始股票与区间配置，无法安全载入。请重新运行参数研究。'); return }
+    if (!originalBase) { reportError('这条研究任务未保存原始股票与区间配置，无法安全载入。请重新运行参数研究。'); return }
     const locked = record(result.locked_funding) ?? {}
     const frozenStrategy = record(result.config?.strategy) ?? record(record(selectedJob?.payload?.config)?.strategy)
     const { buy_ratio: _oldBuyRatio, sell_ratio: _oldSellRatio, ...configParams } = params
@@ -393,22 +538,31 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
         : null,
       fees: { ...originalBase.fees, ...patch.fees },
     }
-    void loadConfig(config).then(value => onLoadConfig(value.config)).catch(cause => setError(err(cause)))
+    try { onLoadConfig(loadConfig(config).config) } catch (cause) { reportError(err(cause)) }
   }
 
   const submitCompletion = async () => {
     if (!resultId) return
-    setCompletionBusy(true); setCompletionNote(''); setError('')
+    const rawDecision = completionDecision || 'current:0'
+    const [decisionKind, decisionIndexText] = rawDecision.split(':')
+    const decisionIndex = Math.max(0, Number(decisionIndexText || 0) || 0)
+    if (!['current', 'fixed', 'adaptive'].includes(decisionKind)) {
+      reportError('请选择要补算的研究决策。')
+      return
+    }
+    setCompletionBusy(true); setCompletionNote(''); setError(''); setRetryable(false)
     try {
       const response = await post<{ job_id: string; status?: string; deduplicated?: boolean }>(
         '/results/' + encodeURIComponent(resultId) + '/completion',
-        { decision: 'current', decision_index: 0, reporting_budget: reportingBudget, target: 'return_leader' },
+        { decision: decisionKind, decision_index: decisionIndex, reporting_budget: reportingBudget, target: 'return_leader' },
       )
       setCompletionNote(response.deduplicated
-        ? '同一补算任务已在队列中，完成后刷新补算状态即可看到新的修订号。'
+        ? '相同补算已在队列中；已切换到现有任务，完成后刷新补算状态即可看到新的修订号。'
         : '补算任务已提交（' + String(response.job_id ?? '').slice(0, 12) + '），可在任务中心查看进度。')
+      selectJob(response.job_id)
+      if (response.deduplicated) tasks.showHistory()
       await tasks.refresh()
-    } catch (cause) { setError(err(cause)) } finally { setCompletionBusy(false) }
+    } catch (cause) { reportError(err(cause)) } finally { setCompletionBusy(false) }
   }
 
   const exportFile = async (kind: 'json' | 'candidates' | 'equity' | 'trades') => {
@@ -419,10 +573,10 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     // "selected_revision".
     const revision = completion?.selected_revision ?? null
     if (revision != null) query.set('revision', String(revision))
-    setError('')
+    setError(''); setRetryable(false)
     try {
       await download('/results/' + encodeURIComponent(resultId) + '/export?' + query.toString(), resultId + '-' + kind + (kind === 'json' ? '.json' : '.csv'))
-    } catch (cause) { setError(err(cause)) }
+    } catch (cause) { reportError(err(cause)) }
   }
 
   const resultConfig = result?.config
@@ -456,6 +610,19 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     ...(adaptive?.schedule ?? []).map((item, index) => ({ value: `adaptive:${index}`, label: `自适应 ${item.effective_date ?? index + 1} 的训练候选` })),
     ...(fixed?.as_of ? [{ value: 'fixed:0', label: '固定方案决策的训练候选' }] : []),
   ]
+  const completionDecisionValue = landscapeDecisions.some(item => item.value === completionDecision)
+    ? completionDecision || 'current:0'
+    : landscapeDecisions[0]?.value ?? 'current:0'
+  const [completionDecisionKind, completionDecisionIndexText] = completionDecisionValue.split(':')
+  const completionDecisionIndex = Math.max(0, Number(completionDecisionIndexText || 0) || 0)
+  const completionDecisionBranch = completionDecisionKind === 'adaptive'
+    ? record(result?.evidence?.decisions?.[completionDecisionIndex])
+    : completionDecisionKind === 'fixed' ? record(fixed) : record(current)
+  const completionDecisionEligibility = eligibleOf(completionDecisionBranch, completionDecisionBranch?.diagnostics)
+  const completionBlockedReasons = Array.from(new Set(reasonsOf(completionDecisionBranch)))
+  const completionDecisionLabel = landscapeDecisions.find(item => item.value === completionDecisionValue)?.label ?? '当前建议决策'
+  const previewTraining = record(preflight.preview?.training_window)
+  const preflightReady = preflight.status === 'ready'
   const rangesSummary = robustFields.map(name => labels[name] + ' ' + rangeValue(name, ranges[name].low) + '–' + rangeValue(name, ranges[name].high)).join(' · ')
   const savedRanges = actualRanges && Object.keys(actualRanges).length ? <div className='table-wrap'><table><thead><tr><th>参数</th><th>下限</th><th>上限</th></tr></thead><tbody>{Object.entries(actualRanges).map(([key, raw]) => { const range = record(raw); return <tr key={key}><td>{labels[key] ?? key}</td><td>{range ? rangeValue(key, range.low) : '—'}</td><td>{range ? rangeValue(key, range.high) : '—'}</td></tr> })}</tbody></table></div> : <Empty title='任务中未保存搜索范围' />
   const revision = completion?.selected_revision ?? null
@@ -466,7 +633,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const completionStatusLabel = completion?.status === 'complete' ? '候选评分已完整' : completion?.status === 'available' ? '存在未完成候选，可补算' : '暂无可补算内容'
 
   return <>
-    <PageHeader eyebrow='PARAMETER RESEARCH' title='参数研究' description='用历史训练选择参数，在所选日期内检验固定与自适应方案。' action={<Button busy={busy} disabled={!base.symbol} onClick={() => void submit()}><FlaskConical size={15} />启动参数研究</Button>} />
+    <PageHeader eyebrow='PARAMETER RESEARCH' title='参数研究' description='用历史训练选择参数，在所选日期内检验固定与自适应方案。' action={<Button busy={busy} disabled={!base.symbol || !preflightReady} onClick={() => void submit()}><FlaskConical size={15} />启动参数研究</Button>} />
     <div className='research-guide'>
       <p><strong>研究流程</strong><span>设置标的与评估期 → 选择方案并启动 → 查看样本外表现与补算 → 载入回测</span></p>
       <Disclosure id='research-method-help' title='如何理解日期、方案与收益口径' summary={`评估日期 · ${trainingMinDays}–${trainingMaxDays} 日训练 · 峰值本金口径`}>
@@ -479,7 +646,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
         </div>
       </Disclosure>
     </div>
-    {error && <ErrorBox message={error} onClose={() => setError('')} />}
+    {error && <ErrorBox message={error} onClose={() => setError('')} onRetry={retryable ? () => { setError(''); setRetryToken(token => token + 1) } : undefined} />}
     {dataIssue && <div className='notice'><span>本次研究缺少本地行情或质量依据。请在数据管理中显式准备所需周期和前置历史。</span><Button variant='secondary' onClick={() => onPrepareData?.(dataIssue)}>去准备数据</Button></div>}
     <div className='research-workspace'>
       <aside className='research-config-column'>
@@ -488,7 +655,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
           <Button variant='quiet' disabled={!base.symbol} onClick={() => {
             get<{ first_date?: string }>('/data/coverage/' + base.symbol).then(value => {
               if (value.first_date) onBaseChange(previous => ({ ...previous, start_date: new Date(Date.parse(value.first_date! + 'T00:00:00Z') + 86400000).toISOString().slice(0, 10), reference_price_mode: 'auto', reference_price: null }))
-            }).catch(cause => setError(err(cause)))
+            }).catch(cause => reportError(err(cause)))
           }}>使用全部本地历史</Button>
         </Card>
         <Card title='研究设置' className='research-launch-card' action={onRestore && <Button variant='quiet' onClick={onRestore}><RotateCcw size={14} />恢复默认</Button>}>
@@ -542,14 +709,23 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
               <NumField label='训练回看最短交易日' min={20} max={5000} step='1' value={trainingMinDays} onChange={next => next != null && updateSettings({ training_min_days: next })} />
               <NumField label='训练回看最长交易日' min={20} max={5000} step='1' value={trainingMaxDays} onChange={next => next != null && updateSettings({ training_max_days: next })} />
               <Field label='训练窗口模式'><SelectInput value={trainingWindowMode} onChange={event => updateSettings({ training_window_mode: event.target.value as ResearchDefaults['training_window_mode'] })}><option value='same_price'>同价日起点</option><option value='fixed'>固定天数</option></SelectInput></Field>
-              <NumField label='任务总评价预算（留空表示不限）' min={1} max={10000000} step='1' value={totalEvaluationBudget ?? null} onChange={next => updateSettings({ total_evaluation_budget: next })} hint='限制整次研究可消耗的唯一参数点评价数。' />
+              <NumField label='任务总评价预算（留空表示自动有效上限）' min={1} max={10000000} step='1' value={totalEvaluationBudget ?? null} onChange={next => updateSettings({ total_evaluation_budget: next })} hint='留空时由搜索上限、评估决策数与回放次数自动形成有效上限。' />
               <NumField label='最长运行时间（秒）' min={1} max={86400} step='1' value={maxRuntimeSeconds} onChange={next => next != null && updateSettings({ max_runtime_seconds: next })} />
               <NumField label='费用压力倍率' min={1.01} max={20} step='.1' value={stressCostMultiplier} onChange={next => next != null && updateSettings({ stress_cost_multiplier: next })} />
               <NumField label='费用压力推荐峰区数' min={0} max={50} step='1' value={stressRegionCount} onChange={next => next != null && updateSettings({ stress_region_count: next })} />
             </div>
           </Disclosure>
-          {searchPreview && <p className={['budget_exceeded', 'insufficient_history', 'insufficient_range'].includes(String(searchPreview.status)) ? 'inline-warning' : 'field-hint'}>合法组合 {String(searchPreview.legal_combination_count ?? '—')} 个 · {String(searchPreview.search_method ?? '—')} · 超正方体边长 {String(searchPreview.hypercube_edge ?? hypercubeEdge)} · 单中心 {String(searchPreview.hypercube_volume ?? '—')} 点 · 单峰支持最多 {String(searchPreview.estimated_peak_support_points ?? '—')} 点 · 训练时段 {String(searchPreview.training_days ?? '—')} 日{searchPreview.training_window && record(searchPreview.training_window)?.matched ? '（同价日）' : '（固定天数）'} · 预计内存 {String(searchPreview.estimated_task_memory_mb ?? '—')} MiB · 邻域预算 {String(searchPreview.neighborhood_budget ?? validationBudget)} · 任务评价上限 {String(searchPreview.task_evaluation_upper_bound ?? '—')}{searchPreview.full_training_window === false ? ' · 训练时段不足' : ''}</p>}
-          <div className='research-launch-action'><Button busy={busy} onClick={() => void submit()}><FlaskConical size={15} />启动参数研究</Button><small>{schemeLabel(selectionTarget, rebalanceDays)} · {trainingMinDays}–{trainingMaxDays} 日训练时段 · 设置自动记忆</small></div>
+          <section className={`research-preflight ${preflightReady ? 'ready' : preflight.status === 'loading' ? 'loading' : 'blocked'}`} aria-live='polite'>
+            <div className='research-preflight-head'><div><strong>只读搜索预检</strong><small>参数稳定后自动更新；编辑会立即作废旧结果</small></div><Badge tone={preflightReady ? 'green' : preflight.status === 'loading' ? 'blue' : 'amber'}>{preflightReady ? '可以启动' : preflight.status === 'loading' ? '检查中' : '存在阻断项'}</Badge></div>
+            {preflight.status === 'loading' ? <Loading label={preflight.message} /> : preflightReady ? <div className='research-preflight-grid'>
+              <div><small>训练时段</small><strong>{String(previewTraining?.start ?? '—')} 至 {String(previewTraining?.end ?? '—')}</strong><span>{String(preflight.preview?.training_days ?? '—')} 个交易日{previewTraining?.matched ? ' · 同价日起点' : ' · 固定天数'}</span></div>
+              <div><small>搜索组合</small><strong>{Number(preflight.preview?.legal_combination_count ?? 0).toLocaleString()} 个</strong><span>{String(preflight.preview?.search_method ?? '—')} · 单峰支持 {String(preflight.preview?.estimated_peak_support_points ?? '—')} 点</span></div>
+              <div><small>评价预算</small><strong>{Number(preflight.preview?.effective_total_evaluation_budget ?? 0).toLocaleString()} 点</strong><span>任务上限 {Number(preflight.preview?.task_evaluation_upper_bound ?? 0).toLocaleString()} · 邻域 {Number(preflight.preview?.neighborhood_budget ?? validationBudget).toLocaleString()}</span></div>
+              <div><small>预计内存</small><strong>{Number(preflight.preview?.estimated_task_memory_mb ?? 0).toFixed(1)} MiB</strong><span>工作区上限 {Number(preflight.preview?.workspace_budget_mb ?? 0).toFixed(1)} MiB</span></div>
+              <div><small>数据前置</small><strong>训练窗口可用</strong><span>提交时仍会重新核验冻结的数据版本</span></div>
+            </div> : <div className='research-preflight-blocked'><p>{preflight.message || '预检尚未完成。'}</p>{dataIssue?.gaps?.length ? <ul>{dataIssue.gaps.map((gap, index) => <li key={index}>{String(gap.message ?? gap.kind ?? '数据缺口')}</li>)}</ul> : null}<Button variant='quiet' onClick={() => setPreflightToken(token => token + 1)}><RefreshCw size={14} />重新预检</Button></div>}
+          </section>
+          <div className='research-launch-action'><Button busy={busy} disabled={!preflightReady} onClick={() => void submit()}><FlaskConical size={15} />启动参数研究</Button><small>{schemeLabel(selectionTarget, rebalanceDays)} · {trainingMinDays}–{trainingMaxDays} 日训练时段 · 设置自动记忆</small></div>
           <Disclosure id='research-search-ranges' title='可调搜索范围' summary={rangesSummary}>
             <p className='field-hint'>四个轴各自只有一个步长来源。研究细粒度就是该轴整数刻度宽度，间距以 0.01 个百分点为最小单位，股数以 100 股 / 份为最小单位。</p>
             <div className='research-range-grid'>{robustFields.map(name => {
@@ -589,13 +765,21 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
       <main className='research-main-column' aria-label='参数研究结果'>
         <div className='research-result-toolbar'>
           <h2>研究结果</h2>
-          {viewableJobs.length > 0 && <Field label='选择研究结果'><SelectInput value={selectedJobId} onChange={event => selectStudy(event.target.value)}>
-            {!viewableJobs.some(job => job.id === selectedJobId) && <option value={selectedJobId}>当前选择</option>}
-            {viewableJobs.map(job => { const config = searchConfigOf(job.payload?.config); return <option key={job.id} value={job.id}>{config?.base?.symbol ?? '未识别标的'} · {config?.base?.start_date ?? job.created_at?.slice(0, 10) ?? ''} · 等比网格 v5 · 稳健 J{job.status === 'cancelled' ? ' · 部分结果' : ''}</option> })}
+          {(researchResults.length > 0 || selectedJob) && <Field label='研究结果历史'><SelectInput value={selectedResultId ? 'result:' + selectedResultId : selectedJobId ? 'job:' + selectedJobId : ''} onChange={event => {
+            const [kind, id] = event.target.value.split(':', 2)
+            if (kind === 'result') selectResult(id)
+            else if (kind === 'job') selectJob(id)
+          }}>
+            {selectedJob && <option value={'job:' + selectedJob.id}>{taskLabelForResearch(selectedJob)}</option>}
+            {selectedResultId && !researchResults.some(item => item.id === selectedResultId) && <option value={'result:' + selectedResultId}>链接中的研究结果</option>}
+            {researchResults.map(item => <option key={item.id} value={'result:' + item.id}>{item.symbol || '未识别标的'} · {item.created_at?.slice(0, 10) ?? ''} · {item.title || '等比网格 v5 · 稳健 J'}</option>)}
           </SelectInput></Field>}
-          <Button variant='quiet' onClick={() => void tasks.refresh()} aria-label='刷新研究结果列表'><RefreshCw size={14} />刷新</Button>
+          <Button variant='quiet' busy={researchResultsLoading} onClick={() => { void tasks.refresh(); void loadResearchResults(0, false) }} aria-label='刷新研究结果列表'><RefreshCw size={14} />刷新</Button>
         </div>
-        {resultLoading ? <Card><Loading label='正在读取研究结果…' /></Card> : !result ? <Card><Empty title='研究结果将在这里展示' detail='在左侧启动研究，或从任务中心打开已有研究结果。' /></Card> : !isSupportedResult ? <Card title='不支持的历史版本' subtitle='这条结果产生于已移除的研究协议版本。'>
+        {researchResultsError && <ErrorBox message={'研究结果历史读取失败：' + researchResultsError} onRetry={() => void loadResearchResults(0, false)} />}
+        {researchResultsMore && <div className='button-row'><Button variant='quiet' busy={researchResultsLoading} onClick={() => void loadResearchResults(researchResultsOffset + 50, true)}>加载更早研究结果</Button></div>}
+        {resultLoading && result && <p className='inline-warning'>正在刷新研究结果，当前显示上次成功读取的内容。</p>}
+        {resultLoading && !result ? <Card><Loading label='正在读取研究结果…' /></Card> : !result ? <Card>{selectedJob && ['queued', 'running'].includes(selectedJob.status) ? <><div className='result-meta'><Badge tone='blue'>{statusText(selectedJob.status)}</Badge><span>{selectedJob.message || '任务正在执行'}</span></div><p className='field-hint'>任务完成并保存结果后，这里会自动刷新研究结果历史。</p></> : <Empty title='研究结果将在这里展示' detail='在左侧启动研究，或从任务中心打开已有研究结果。' />}</Card> : !isSupportedResult ? <Card title='不支持的历史版本' subtitle='这条结果产生于已移除的研究协议版本。'>
           <div className='research-legacy-banner'>该历史结果产生于协议版本 {resultProtocolVersion || '未知'}（结果结构版本 {resultSchemaVersion || '未知'}）。本工作台只支持协议 v5 的结果，旧版本不再提供详情、参数分布与导出适配。</div>
           <div className='result-meta'><Badge tone='amber'>不支持的历史版本</Badge><span>请重新运行一次 v5 参数研究以获得可查看、可补算的结果。</span></div>
         </Card> : <>
@@ -621,15 +805,16 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
           <Card title='展示补算' subtitle='对已归档的候选邻域做补算，补算会生成新的修订号，参数分布与导出都会带上该修订。'>
             <div className='result-meta'><Badge tone={completion?.status === 'complete' ? 'green' : completion?.status === 'available' ? 'amber' : 'neutral'}>{completionStatusLabel}</Badge><span>当前修订号：{revision ?? '无'}</span><span>覆盖决策：{revisionScopeLabel}</span></div>
             <p className='field-hint'>补算只使用原结果的数据版本与计算来源；若代码或依赖已变化，后端会拒绝混合旧候选与当前引擎。</p>
+            <div className='form-grid two research-completion-decision'><Field label='要补算的研究决策' hint='提交时绑定这里正在查看的决策，不再固定为 current #0。'><SelectInput value={completionDecisionValue} onChange={event => onCompletionDecisionChange?.(event.target.value)}>{landscapeDecisions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field><div className={`research-eligibility ${completionDecisionEligibility === true ? 'eligible' : completionDecisionEligibility === false ? 'blocked' : ''}`}><small>{completionDecisionLabel} · 约束资格</small><strong>{constraintLabel(completionDecisionEligibility)}</strong>{completionBlockedReasons.length ? <span>{completionBlockedReasons.join('；')}</span> : <span>未返回额外阻断原因</span>}</div></div>
             <div className='button-row'>
-              <Button variant='secondary' busy={completionBusy} disabled={!resultId} onClick={() => void submitCompletion()}>提交展示补算</Button>
+              <Button variant='secondary' busy={completionBusy} disabled={!resultId || !completionDecisionBranch} onClick={() => void submitCompletion()}>提交 {completionDecisionLabel}</Button>
               <Button variant='quiet' onClick={() => setCompletionToken(token => token + 1)}>刷新补算状态</Button>
               <Button variant='quiet' disabled={!resultId} onClick={() => void exportFile('json')}><Download size={14} />JSON</Button>
               <Button variant='quiet' disabled={!resultId} onClick={() => void exportFile('candidates')}><Download size={14} />候选 CSV</Button>
             </div>
             {completionNote && <p className='field-hint'>{completionNote}</p>}
           </Card>
-          {resultId && <ResearchLandscape key={resultId + ':' + (revision ?? 0)} resultId={resultId} defaultParams={relativeBest} onLoad={(params, asOf) => loadV2(params, asOf ?? current?.as_of)} decisionOptions={landscapeDecisions} qualified={Boolean(currentRecommended)} revision={revision} revisionScope={revisionScope} />}
+          {resultId && <ResearchLandscape key={resultId + ':' + (revision ?? 0)} resultId={resultId} defaultParams={relativeBest} onLoad={(params, asOf) => loadV2(params, asOf ?? current?.as_of)} decisionOptions={landscapeDecisions} decision={completionDecisionValue} onDecisionChange={onCompletionDecisionChange} qualified={Boolean(currentRecommended)} revision={revision} revisionScope={revisionScope} />}
           <Disclosure id='research-rebalance-records' title='换参记录与滚动决策' summary={(adaptive?.schedule?.length ?? 0) + ' 次生效 · ' + (result?.evidence?.decisions?.length ?? 0) + ' 个决策点'}>
             <p className='field-hint'>决策日表示何时重选参数；生效日表示参数开始作用的日期。各决策只使用当时已知历史。</p>
             {adaptive?.schedule?.length ? <div className='table-wrap scroll-table'><table><thead><tr><th>决策日期</th><th>生效日期</th><th>参数</th></tr></thead><tbody>{adaptive.schedule.map((item, index) => <tr key={(item.effective_date ?? '') + '-' + index}><td>{item.decision_date ?? '—'}</td><td>{item.effective_date ?? '—'}</td><td>{item.paused ? <Badge tone='amber'>暂停网格交易</Badge> : <ParameterBadges params={item.params} compact />}</td></tr>)}</tbody></table></div> : <Empty title='没有换参记录' detail={statusText(adaptive?.status)} />}

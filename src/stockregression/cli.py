@@ -5,7 +5,6 @@ import os
 import subprocess
 import webbrowser
 import json
-from datetime import datetime
 from pathlib import Path
 import shutil
 
@@ -13,16 +12,15 @@ import typer
 
 from .jobs import execute_job
 from .schedule import configure_schedule
-from .settings import PROJECT_ROOT, load_settings, save_settings
+from .settings import PROJECT_ROOT, load_settings
 from .storage import Store
 from .market_data.package import scan_etf_package
 from .market_data.maintenance import preview_reset, rebuild_state, reset_market_storage
-from .market_data.cleanup import apply_legacy_cleanup, legacy_cleanup_plan
 
 app = typer.Typer(help="本地 A 股及 ETF 行情与网格研究台", no_args_is_help=True)
 schedule_app = typer.Typer(help="安装、移除或查看 Windows 补数计划")
 data_app = typer.Typer(help="按周期管理本地行情数据库")
-config_app = typer.Typer(help="查看、校验及迁移项目主配置")
+config_app = typer.Typer(help="查看并校验项目主配置")
 app.add_typer(schedule_app, name="schedule")
 app.add_typer(data_app, name="data")
 app.add_typer(config_app, name="config")
@@ -115,29 +113,6 @@ def sync(mode: str = "daily", symbol: list[str] = typer.Option(None), scope: str
         "retry_failed": retry_failed, "workers": workers,
         "timeframe": "1day", "timeframes": timeframes,
     })
-
-
-@app.command("import-data")
-def import_data(symbol: str, daily_path: Path, minute_path: Path | None = None,
-                actions_path: Path | None = None, calendar_path: Path | None = None,
-                label_convention: str = "auto", etf_category: str | None = None):
-    """兼容旧命令：把日线与分钟文件作为两个独立周期任务导入。"""
-    if etf_category is not None and etf_category not in {"stock", "bond", "crossborder", "commodity", "money"}:
-        raise typer.BadParameter("etf-category 为 stock/bond/crossborder/commodity/money")
-    _run("market_import", {
-        "symbol": symbol, "timeframe": "1day", "path": str(daily_path),
-        "label_convention": "end", "adjustment": "none", "etf_category": etf_category,
-        "calendar_path": str(calendar_path) if calendar_path else None,
-        "actions_path": str(actions_path) if actions_path else None,
-    })
-    if minute_path:
-        _run("market_import", {
-            "symbol": symbol, "timeframe": "1min", "path": str(minute_path),
-            "label_convention": label_convention, "adjustment": "none",
-            "etf_category": etf_category,
-            "calendar_path": str(calendar_path) if calendar_path else None,
-            "actions_path": None,
-        })
 
 
 @data_app.command("import-file")
@@ -351,26 +326,6 @@ def data_aggregate(
                              "target_timeframe": target, "start_date": start, "end_date": end})
 
 
-@data_app.command("cleanup-legacy")
-def data_cleanup_legacy(
-    apply: bool = typer.Option(False, "--apply", help="确认删除旧行情，默认只输出清单"),
-):
-    """列出并清理旧格式行情；保留结果、任务、配置和自选。"""
-    settings = load_settings()
-    plan = legacy_cleanup_plan(settings.data_dir, current_package_dir=settings.package_dir)
-    if not apply:
-        typer.echo(json.dumps(plan, ensure_ascii=False, indent=2, default=str))
-        return
-    report_path = PROJECT_ROOT / ".local" / (
-        "legacy-cleanup-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".json"
-    )
-    report = apply_legacy_cleanup(
-        settings.data_dir, current_package_dir=settings.package_dir, report_path=report_path,
-    )
-    typer.echo(json.dumps(report, ensure_ascii=False, indent=2, default=str))
-    typer.echo(f"清理报告：{report_path}")
-
-
 @schedule_app.command("install")
 def schedule_install():
     """以当前用户安装每日更新和周末核对任务。"""
@@ -391,8 +346,14 @@ def schedule_status():
 @app.command("set-data-dir")
 def set_data_dir(path: Path):
     """修改数据目录，下次启动生效；原目录内容保留。"""
-    settings = save_settings({"data_dir": str(path.resolve())})
-    typer.echo(settings.data_dir)
+    from .configuration import current_configuration, patch_configuration
+
+    document = current_configuration()
+    patch_configuration(
+        {"paths": {"data_dir": str(path.resolve())}},
+        base_revision=document["config_revision"],
+    )
+    typer.echo(load_settings().data_dir)
 
 
 @config_app.command("show")
@@ -410,27 +371,6 @@ def config_validate(path: Path | None = typer.Option(None, exists=True, dir_okay
 
     _, revision = read_configuration_document(path)
     typer.echo(f"配置有效；revision={revision}")
-
-
-@config_app.command("migrate-legacy")
-def config_migrate_legacy(
-    source: Path | None = typer.Option(None, exists=True, dir_okay=False, help="旧版 settings.json"),
-    replace: bool = typer.Option(False, "--replace", help="主文件已存在时明确允许替换"),
-):
-    """显式导入旧设置；主文件存在时必须加 --replace。"""
-    from . import settings as settings_module
-    from .settings import migrate_configuration_document, save_configuration_document
-
-    old_path = source or settings_module.LEGACY_SETTINGS_FILE
-    if not old_path.exists():
-        raise typer.BadParameter(f"旧配置不存在：{old_path}")
-    if settings_module.SETTINGS_FILE.exists() and not replace:
-        raise typer.BadParameter("主配置已存在；如确认导入旧配置，请重新执行并加 --replace")
-    raw = json.loads(old_path.read_text(encoding="utf-8"))
-    document = migrate_configuration_document(raw)
-    written, _ = save_configuration_document(document, base_revision=None)
-    typer.echo(f"已迁移到 {settings_module.SETTINGS_FILE}")
-    typer.echo(f"revision={written['config_revision']}")
 
 
 def _run(kind: str, payload: dict):

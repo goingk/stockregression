@@ -160,7 +160,7 @@ class BacktestConfig(BaseModel):
         if self.schema_version in (2, 3) and self.symbol.startswith(("688", "689")) and (self.buy_shares < 200 or self.dca.shares < 200):
             raise ValueError("科创板每次买入及定投至少为 200 股")
         if self.schema_version == 3 and self.reserve_cash is not None:
-            raise ValueError("schema_version=3 已取消固定可用现金；请通过配置转换生成 v3 草稿")
+            raise ValueError("schema_version=3 已取消固定可用现金；请删除 reserve_cash 后重新提交")
         if self.lower_price and self.upper_price and self.lower_price >= self.upper_price:
             raise ValueError("网格价格下限必须小于上限")
         if self.floor_penalty_config is not None:

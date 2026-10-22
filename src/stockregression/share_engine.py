@@ -15,6 +15,53 @@ from .performance import (
 _CACHE = OrderedDict()
 BUY_HOLD_INITIAL_SHARES = 1000
 
+# Minutes covered by one intraday bar.  This mirrors the engine's own
+# ``open_timestamp`` rule table; the vectorised helper below applies exactly
+# that rule to a whole bar frame instead of calling it once per bar.
+_FREQUENCY_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}
+_NS_PER_MINUTE = 60_000_000_000
+_NS_PER_DAY = 86_400_000_000_000
+
+
+def _open_timestamps_ns(stamps: pd.DatetimeIndex, frequencies: np.ndarray) -> np.ndarray:
+    """Vectorised twin of ``engine.open_timestamp`` for a whole bar frame.
+
+    The rule is the engine's: a daily bar opens at 09:30, an intraday bar
+    opens at the start of its own session, and the bar that closes a morning
+    or afternoon session opens at that session's boundary.  Every branch of
+    the scalar rule is reproduced here, so the result is bit-identical to
+    ``pd.Timestamp(engine.open_timestamp(ts, frequency)).value``.
+    """
+    timestamps_ns = stamps.asi8.astype(np.int64)
+    count = len(timestamps_ns)
+    day_ns = timestamps_ns // _NS_PER_DAY * _NS_PER_DAY
+    time_ns = timestamps_ns - day_ns
+    minutes = np.fromiter(
+        (0 if value == "1d" else _FREQUENCY_MINUTES.get(value, 1) for value in frequencies),
+        dtype=np.int64, count=count,
+    )
+    start_ns = timestamps_ns - minutes * _NS_PER_MINUTE
+    start_day_ns = start_ns // _NS_PER_DAY * _NS_PER_DAY
+    start_time_ns = start_ns - start_day_ns
+    daily = minutes == 0
+    morning_open = day_ns + (9 * 60 + 30) * _NS_PER_MINUTE
+    afternoon_open = day_ns + 13 * 60 * _NS_PER_MINUTE
+    morning_end = (11 * 60 + 30) * _NS_PER_MINUTE
+    afternoon_end = 15 * 60 * _NS_PER_MINUTE
+    open_timestamps_ns = start_ns.copy()
+    open_timestamps_ns[daily] = morning_open[daily]
+    morning_mask = (
+        (~daily) & (time_ns <= morning_end)
+        & (start_time_ns < (9 * 60 + 30) * _NS_PER_MINUTE)
+    )
+    open_timestamps_ns[morning_mask] = morning_open[morning_mask]
+    afternoon_mask = (
+        (~daily) & (time_ns > morning_end) & (time_ns <= afternoon_end)
+        & (start_time_ns < 13 * 60 * _NS_PER_MINUTE)
+    )
+    open_timestamps_ns[afternoon_mask] = afternoon_open[afternoon_mask]
+    return open_timestamps_ns
+
 
 def period_key(day, frequency):
     day = pd.Timestamp(day)
@@ -73,7 +120,7 @@ def funding(config, data):
 
 
 def _inputs(config, data):
-    from .engine import _prepare_actions, open_timestamp
+    from .engine import _prepare_actions
     fees = config.fees
     key = (id(data), data.version, config.start_date, config.end_date, config.frequency, config.dca.frequency, fees.share_face_value, fees.legacy_sh_transfer_rate, fees.legacy_sh_min_transfer, fees.legacy_sz_transfer_rate)
     if key in _CACHE and _CACHE[key]["data"] is data:
@@ -117,7 +164,7 @@ def _inputs(config, data):
     keys = [period_key(day, config.dca.frequency) for day in days]
     new_period = np.r_[True, np.asarray(keys[1:]) != np.asarray(keys[:-1])]
     lookup = {pd.Timestamp(row["date"]): row for row in daily.to_dict("records")}
-    ups, downs = np.full(n, np.nan), np.full(n, np.nan)
+    daily_ups, daily_downs = np.full(len(days), np.nan), np.full(len(days), np.nan)
     preclose, stamp, transfer, minimum = (np.full(len(days), np.nan) for _ in range(4))
     face, bilateral = np.zeros(len(days), dtype=np.bool_), np.zeros(len(days), dtype=np.bool_)
     for day_id, day in enumerate(days):
@@ -132,10 +179,15 @@ def _inputs(config, data):
             else:
                 calc = calculated_price_limits(previous if previous > 0 else None, terms["board"], day.date(), bool(row.get("is_st", False)))
             up, down = up if pd.notna(up) else calc[0], down if pd.notna(down) else calc[1]
-            ups[codes == day_id], downs[codes == day_id] = up or np.nan, down or np.nan
+            daily_ups[day_id] = up if up else np.nan
+            daily_downs[day_id] = down if down else np.nan
         stamp[day_id] = fee_rates(day.date(), config.symbol)[0]
         transfer[day_id], face[day_id], minimum[day_id] = transfer_fee_terms(day.date(), config.symbol, legacy_sh_transfer_rate=fees.legacy_sh_transfer_rate, legacy_sh_min_transfer=fees.legacy_sh_min_transfer, legacy_sz_transfer_rate=fees.legacy_sz_transfer_rate)
         bilateral[day_id] = day.date() < date(2008, 9, 19)
+    # The daily bands are expanded onto the bars with one index gather.  The
+    # previous per-day mask assignment rescanned the whole bar array once for
+    # every trading day.  A session without a price limit keeps its NaN.
+    ups, downs = daily_ups[codes], daily_downs[codes]
     for column, output in [("limit_up", ups), ("limit_down", downs)]:
         if column in frame:
             values = pd.to_numeric(frame[column], errors="coerce").to_numpy()
@@ -153,7 +205,12 @@ def _inputs(config, data):
         action_data = replace(data, actions=data.actions.loc[relevant])
     actions = _prepare_actions(action_data, config.start_date, end.date())
     day_ids = {day.date(): index for index, day in enumerate(days)}
-    arrays = (opens, closes, pd.to_numeric(frame.volume, errors="coerce").fillna(0).to_numpy(dtype=np.float64), tradable, ups, downs, stamps.asi8, np.asarray([pd.Timestamp(open_timestamp(ts, str(freq))).value for ts, freq in zip(stamps, frame.get("frequency", pd.Series(config.frequency, index=frame.index)))], dtype=np.int64), codes, first & new_period[codes], last, stamp[codes], transfer[codes], face[codes], minimum[codes], bilateral[codes], preclose,
+    frequency_column = frame.get("frequency")
+    frequencies = (
+        np.full(n, str(config.frequency), dtype=object) if frequency_column is None
+        else frequency_column.astype(str).to_numpy()
+    )
+    arrays = (opens, closes, pd.to_numeric(frame.volume, errors="coerce").fillna(0).to_numpy(dtype=np.float64), tradable, ups, downs, stamps.asi8, _open_timestamps_ns(stamps, frequencies), codes, first & new_period[codes], last, stamp[codes], transfer[codes], face[codes], minimum[codes], bilateral[codes], preclose,
               np.asarray([-1 if a.record_date < config.start_date else day_ids.get(a.record_date, -2) for a in actions], dtype=np.int64), np.asarray([day_ids.get(a.ex_date, -2) for a in actions], dtype=np.int64), np.asarray([day_ids.get(a.pay_date, -2) for a in actions], dtype=np.int64), np.asarray([day_ids.get(a.stock_date, -2) for a in actions], dtype=np.int64), np.asarray([a.cash_per_share for a in actions], dtype=np.float64), np.asarray([a.bonus_ratio for a in actions], dtype=np.float64))
     result = {"arrays": arrays, "days": days, "stamps": stamps, "tradable": tradable, "opens": arrays[7], "period_keys": keys, "terms": terms, "data": data, "end": str(end.date())}
     _CACHE[key] = result
@@ -217,7 +274,7 @@ def _return_days(prepared):
 def run_share_backtest(config, data, progress=None, cancelled=None, summary_only=False, preview=False,
                        parameter_schedule=None, passive_grid=False, daily_details=False):
     from . import engine
-    from .share_kernel import simulate
+    from .share_kernel import ACCOUNT_MODE_FULL, simulate
     if cancelled and cancelled():
         raise InterruptedError("回测已取消")
     prepared, money = _inputs(config, data), funding(config, data)
@@ -229,7 +286,8 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
     change_days, change_values, schedule = _parameter_arrays(config, prepared, parameter_schedule)
     runner = simulate if engine._NUMBA_FASTPATH_ENABLED else getattr(simulate, "py_func", simulate)
     output = runner(*prepared["arrays"], *options, change_days, change_values,
-                    np.full(len(prepared["days"]), -1, dtype=np.int64), 0, False, passive_grid)
+                    np.full(len(prepared["days"]), -1, dtype=np.int64), 0, False, passive_grid,
+                    ACCOUNT_MODE_FULL)
     if cancelled and cancelled():
         raise InterruptedError("回测已取消")
     metrics, eq, cash, shares, drawdown, periods, tb, ta, ts, tq, tp, tf, tc, th, tr, ttop, rb, rt, ra, rs, rr, rq, invested, _, floor_episode_grids, funding_stats = output
@@ -386,20 +444,27 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
 
 
 def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
-                   cancelled=None, parallel=True, allow_odd_lot_exit=False):
+                   cancelled=None, parallel=True, allow_odd_lot_exit=False,
+                   account_mode=None):
     """Evaluate candidates with exact intrabar fold risk.
 
     All folds are measurements on the same continuous candidate ledger.  The
     result contains peak-principal summaries only; no daily-return matrix is
     allocated.
+
+    Only the grid ledger and its matched-funding baseline are scored here, so
+    the kernel runs those two ledgers and skips the DCA and buy-and-hold
+    accounts.  ``account_mode`` overrides that for equivalence checks; the
+    default is the research mode of the kernel.
     """
     from . import engine
     from .models import BacktestConfig
-    from .share_kernel import simulate, simulate_research_batch
+    from .share_kernel import ACCOUNT_MODE_RESEARCH, simulate, simulate_research_batch
     if base.schema_version != 3:
         raise ValueError("科学研究需要 schema_version=3 的股数配置")
     if not math.isfinite(cost_multiplier) or cost_multiplier <= 0:
         raise ValueError("成本倍数必须为正数")
+    mode = ACCOUNT_MODE_RESEARCH if account_mode is None else int(account_mode)
     prepared, money = _inputs(base, data), funding(base, data)
     if money["initial_equity"] <= 0:
         raise ValueError("研究账户起始资产必须大于零")
@@ -453,7 +518,7 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
                 with blas_thread_limit(1):
                     m, f, e, s = simulate_research_batch(
                         prepared["arrays"], options, values[begin:end],
-                        fold_ids, len(fold_ranges),
+                        fold_ids, len(fold_ranges), mode,
                     )
                 metric_values[begin:end], fold_values[begin:end], funding_stats[begin:end] = m, f, s
                 for offset in range(end - begin):
@@ -465,7 +530,7 @@ def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,
                     individual = (*options[:3], p[0], p[1], options[5], p[2], p[3], p[4],
                                   *options[9:12], int(p[5]), int(p[6]), *options[14:])
                     output = runner(*prepared["arrays"], *individual, empty_days, empty_values,
-                                    fold_ids, len(fold_ranges), False, False)
+                                    fold_ids, len(fold_ranges), False, False, mode)
                     metric_values[index], fold_values[index], funding_stats[index] = output[0][0], output[-3], output[-1][0]
                     episode_values[index] = output[-2]
             record_count("research_candidates", end - begin)

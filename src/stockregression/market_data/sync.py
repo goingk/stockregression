@@ -41,6 +41,20 @@ def _longest_true_run(mask) -> int:
     return longest
 
 
+def _group_stamps_by_day(stamps: pd.DatetimeIndex) -> dict:
+    """Group timestamps by their trading day in a single pass.
+
+    Filtering the whole frame once per day costs one full scan per day;
+    the grouped view keeps the same membership for every session.
+    """
+    if not len(stamps):
+        return {}
+    return {
+        pd.Timestamp(day).normalize(): pd.DatetimeIndex(part.to_numpy())
+        for day, part in pd.Series(stamps).groupby(stamps.normalize())
+    }
+
+
 def _recent_minute_incomplete(frame, symbol, start, end) -> str | None:
     """Describe a materially incomplete response from a recent-minute source.
 
@@ -55,13 +69,16 @@ def _recent_minute_incomplete(frame, symbol, start, end) -> str | None:
     stamps = pd.DatetimeIndex(pd.to_datetime(frame.get("timestamp"), errors="coerce").dropna())
     if not len(stamps):
         return "时间字段无效"
-    for day in sorted(pd.DatetimeIndex(stamps.normalize().unique())):
+    # Group the response by session once instead of filtering the whole
+    # frame again for every trading day.
+    observed_by_day = _group_stamps_by_day(stamps)
+    for day in sorted(observed_by_day):
         day = pd.Timestamp(day).normalize()
         expected = minute_slots(day)
         expected = expected[(expected >= pd.Timestamp(start)) & (expected <= pd.Timestamp(end))]
         if not len(expected):
             continue
-        observed = stamps[(stamps >= day) & (stamps < day + pd.Timedelta(days=1))]
+        observed = observed_by_day[day]
         missing = expected.difference(observed)
         if not len(missing):
             continue
@@ -568,12 +585,17 @@ class MarketDataSyncService:
         observed = self.repository.active_rows(symbol, timeframe, start=start, end=end + pd.Timedelta(days=1))
         if spec.kind == "minute":
             observed_stamps = pd.DatetimeIndex(observed.timestamp) if not observed.empty else pd.DatetimeIndex([])
+            # Compare every session against its own bars instead of
+            # differencing the whole observed frame day by day.
+            observed_by_day = _group_stamps_by_day(observed_stamps)
             missing_days = []
             bar_size = spec.minutes or 1
             for day in calendar:
                 all_slots = minute_slots(day)
                 expected = pd.DatetimeIndex(sorted(set(all_slots[(bar_size - 1)::bar_size])))
-                missing = expected.difference(observed_stamps)
+                missing = expected.difference(
+                    observed_by_day.get(pd.Timestamp(day).normalize(), pd.DatetimeIndex([]))
+                )
                 if bar_size == 1 and symbol.endswith(".SZ") and day >= pd.Timestamp("2023-02-17"):
                     anchor_1457 = day + pd.Timedelta(hours=14, minutes=57)
                     anchor_1500 = day + pd.Timedelta(hours=15)

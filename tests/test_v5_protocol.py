@@ -8,7 +8,7 @@ from stockregression.models import (
     BacktestConfig, DataBundle, OptimizationConfig, research_protocol_description,
 )
 from stockregression.research.robust import estimate_robust_search, select_robust_at
-from stockregression.research_v4 import strategy_descriptions
+from stockregression.research import strategy_descriptions
 from stockregression.research_v5 import optimize_v5
 
 

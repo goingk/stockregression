@@ -12,6 +12,13 @@ try:
 except ImportError:  # pragma: no cover
     prange = range
 
+# Which ledgers a simulation actually runs.  Every output array keeps its four
+# rows in the original account order (0 grid, 1 DCA, 2 buy-and-hold, 3 matched
+# funding hold), so a caller reads row 0 and row 3 without remapping.
+ACCOUNT_MODE_FULL = 0
+ACCOUNT_MODE_RESEARCH = 1
+ACCOUNT_MODE_GRID = 2
+
 @_jit(cache=True)
 def _nb_buy_lot(quantity, board_code):
     result = max(0, int(math.floor(quantity / 100))) * 100
@@ -234,7 +241,7 @@ def simulate(
     floor_eta_floor: float, floor_gamma_min: float, floor_k_ref: float,
     parameter_days: np.ndarray, parameter_values: np.ndarray,
     fold_ids: np.ndarray, fold_count: int,
-    grid_only: bool, passive_grid: bool,
+    grid_only: bool, passive_grid: bool, account_mode: int,
 ) -> tuple:
     keep_details = output_mode >= 2
     top_up_mode = funding_mode == 1
@@ -242,7 +249,35 @@ def simulate(
     # the same bar.  It is kept in the native ledger so research batches and
     # ordinary backtests use exactly the same execution and corporate-action
     # rules.
-    account_count = 1 if grid_only else 4
+    #
+    # ``account_mode`` selects the ledgers that are simulated at all:
+    #   0 - grid, DCA, buy-and-hold and matched funding hold (ordinary backtest)
+    #   1 - grid and matched funding hold only; research batches never read the
+    #       DCA or buy-and-hold ledgers
+    #   2 - grid only
+    # The surviving ledgers keep their original account index, so every output
+    # array stays four rows wide and row 3 is still the matched funding hold.
+    mode = int(account_mode)
+    if grid_only:
+        mode = ACCOUNT_MODE_GRID
+    active_accounts = np.zeros(4, dtype=np.int64)
+    if mode == ACCOUNT_MODE_RESEARCH:
+        active_accounts[0] = 0
+        active_accounts[1] = 3
+        active_count = 2
+    elif mode == ACCOUNT_MODE_GRID:
+        active_accounts[0] = 0
+        active_count = 1
+    else:
+        active_accounts[0] = 0
+        active_accounts[1] = 1
+        active_accounts[2] = 2
+        active_accounts[3] = 3
+        active_count = 4
+    account_active = np.zeros(4, dtype=np.bool_)
+    for slot in range(active_count):
+        account_active[active_accounts[slot]] = True
+    matched_enabled = bool(account_active[3])
     n = len(opens)
     day_count = 0
     for flag in last_bar_day:
@@ -383,7 +418,8 @@ def simulate(
     actual_max_position = float(seed_shares)
     for action in range(action_count):
         if action_record_day[action] == -1 and action_ex_day[action] >= 0:
-            for account in range(account_count):
+            for slot in range(active_count):
+                account = active_accounts[slot]
                 entitlement_cash[account, action] = initial_holdings[account] * action_cash_per_share[action]
                 entitlement_bonus[account, action] = initial_holdings[account] * action_bonus_ratio[action]
     output_count = n if output_mode == 2 else (day_count if output_mode in (1, 3) else 0)
@@ -448,7 +484,8 @@ def simulate(
                         if intent[0] != 0 and intent[1] > 0:
                             pending_side[0], pending_quantity[0], pending_reason[0] = intent[0], intent[1], intent[2]
                 parameter_index += 1
-            for account in range(account_count):
+            for slot in range(active_count):
+                account = active_accounts[slot]
                 sellable[account] = shares[account]
             cash_delta = 0.0
             bonus_delta = 0.0
@@ -466,7 +503,8 @@ def simulate(
                     factor = max(0.0, (prior_close - cash_delta) / (prior_close * (1.0 + bonus_delta)))
                 if factor <= 0 or not math.isfinite(factor):
                     raise ValueError("公司行动除权参考价无效")
-            for account in range(account_count):
+            for slot in range(active_count):
+                account = active_accounts[slot]
                 if has_ex_action and factor != 1.0 and account == 0:
                     if reference[account] > 0:
                         reference[account] *= factor
@@ -513,7 +551,8 @@ def simulate(
         # trade, a close signal, an equity mark, or a period-return observation.
         if not tradable_mask[i]:
             prior_signal_allowed = False
-            for account in range(account_count):
+            for slot in range(active_count):
+                account = active_accounts[slot]
                 if pending_side[account] != 0:
                     if keep_details:
                         rejection_bar[rejection_n] = i
@@ -542,7 +581,8 @@ def simulate(
                 )
             elif not floor_active and position <= floor_limit + 1e-9:
                 floor_active, floor_anchor, floor_high, floor_sell_step = True, opening, opening, sell_step
-        for account in range(account_count):
+        for slot in range(active_count):
+            account = active_accounts[slot]
             traded = False
             if pending_side[account] != 0:
                 side = pending_side[account]
@@ -588,7 +628,7 @@ def simulate(
                         grid_topups = _nb_round_money(grid_topups + top_up)
                         grid_peak_invested = grid_invested
                         grid_peak_day = day_id
-                        if account_count > 3:
+                        if matched_enabled:
                             # Mirror the real contribution in the same fill event.
                             cash[3] = _nb_round_money(cash[3] + top_up)
                             matched_invested = _nb_round_money(matched_invested + top_up)
@@ -627,7 +667,7 @@ def simulate(
                             active_cell[account] = _nb_cell(result[5], fixed_anchor[account], grid_mode, buy_step, sell_step)
                             has_active_cell[account] = True
 
-            if account_count > 3 and account == 0 and matched_pending_cash > 0 and opening > 0:
+            if matched_enabled and account == 0 and matched_pending_cash > 0 and opening > 0:
                 available_pool = min(matched_pending_cash, cash[3])
                 matched_quantity = _nb_buy_lot(available_pool / opening, board_code)
                 if matched_quantity > 0:
@@ -796,7 +836,8 @@ def simulate(
                     pending_quantity[0] = clipped_quantity
                     pending_reason[0] = intent_reason
 
-        for account in range(account_count):
+        for slot in range(active_count):
+            account = active_accounts[slot]
             equity = cash[account] + cash_receivable[account] + (shares[account] + share_receivable[account]) * close
             if account == 0:
                 current_position = float(shares[0] + share_receivable[0])
@@ -828,7 +869,7 @@ def simulate(
             invested_values[0, out] = grid_invested if top_up_mode else initial_equities[0]
             invested_values[1, out] = dca_invested
             invested_values[2, out] = initial_equities[2]
-            invested_values[3, out] = matched_invested if account_count > 3 else initial_equities[3]
+            invested_values[3, out] = matched_invested if matched_enabled else initial_equities[3]
 
         if floor_active:
             floor_high = max(floor_high, close)
@@ -855,14 +896,16 @@ def simulate(
             dca_day_index += 1
             for action in range(action_count):
                 if action_record_day[action] == day_id:
-                    for account in range(account_count):
+                    for slot in range(active_count):
+                        account = active_accounts[slot]
                         entitlement_cash[account, action] = shares[account] * action_cash_per_share[action]
                         entitlement_bonus[account, action] = shares[account] * action_bonus_ratio[action]
         prior_close = close
         prior_signal_allowed = volumes[i] > 0
 
     metrics = np.zeros((4, 11), dtype=np.float64)
-    for account in range(account_count):
+    for slot in range(active_count):
+        account = active_accounts[slot]
         principal = initial_equities[account]
         peak_principal = initial_equities[account]
         if account == 0:
@@ -885,16 +928,28 @@ def simulate(
         metrics[account, 8] = buy_count[account]
         metrics[account, 9] = sell_count[account]
 
-    metrics[1, 10] = dca_invested
-    for index in (1, 3, 4, 7):
-        metrics[1, index] = np.nan
+    if account_active[1]:
+        metrics[1, 10] = dca_invested
+        for index in (1, 3, 4, 7):
+            metrics[1, index] = np.nan
     floor_active, floor_anchor, floor_high, floor_episode_grids, floor_episode_count, floor_grid_squares = _nb_close_floor(
         floor_active, floor_anchor, floor_high, floor_sell_step,
         floor_episode_grids, floor_episode_count, floor_grid_squares,
     )
-    for account in range(account_count):
+    for slot in range(active_count):
+        account = active_accounts[slot]
         if interval_peak_principal[account] > 0:
             equity_drawdown[account, :] = equity_drawdown[account, :] / interval_peak_principal[account]
+    # The ledgers that were not simulated keep their row and their place in
+    # the original account order, but report nothing as if they had run.
+    for account in range(4):
+        if not account_active[account]:
+            metrics[account, :] = np.nan
+            equity_values[account, :] = np.nan
+            equity_cash[account, :] = np.nan
+            equity_shares[account, :] = np.nan
+            equity_drawdown[account, :] = np.nan
+            invested_values[account, :] = np.nan
     for fold_id in range(fold_count):
         if fold_peak_principal[fold_id] > 0:
             fold_stats[fold_id, 0] = fold_drawdown_raw[fold_id] / fold_peak_principal[fold_id]
@@ -920,8 +975,9 @@ def simulate(
     funding_stats[0, 15] = floor_grid_squares
     if grid_peak_invested > 0:
         metrics[0, 0] = (last_equity[0] - grid_invested) / grid_peak_invested
-    funding_stats[0, 16] = metrics[3, 0]
-    funding_stats[0, 17] = metrics[3, 2]
+    if matched_enabled:
+        funding_stats[0, 16] = metrics[3, 0]
+        funding_stats[0, 17] = metrics[3, 2]
     funding_stats[0, 18] = metrics[0, 0]
     funding_stats[0, 19] = metrics[0, 2]
     funding_stats[0, 20] = initial_equities[3]
@@ -942,8 +998,13 @@ def simulate(
 
 
 @_jit(cache=True, parallel=True)
-def simulate_research_batch(arrays, options, parameters, fold_ids, fold_count):
-    """Parallel independent ledgers; each ledger's time axis stays serial."""
+def simulate_research_batch(arrays, options, parameters, fold_ids, fold_count, account_mode):
+    """Parallel independent ledgers; each ledger's time axis stays serial.
+
+    ``account_mode`` reaches the kernel unchanged, so a research batch runs the
+    grid and its matched-funding baseline without the DCA and buy-and-hold
+    ledgers.
+    """
     count = len(parameters)
     # Scoring consumes peak-principal summaries only; no day-by-candidate
     # return tensor is allocated.
@@ -961,7 +1022,7 @@ def simulate_research_batch(arrays, options, parameters, fold_ids, fold_count):
             options[20], options[21], options[22], options[23], options[24], options[25],
             options[26], options[27], options[28], options[29], options[30], options[31], options[32],
             empty_days, empty_values,
-            fold_ids, fold_count, False, False)
+            fold_ids, fold_count, False, False, account_mode)
         output = simulate(*(arrays + individual))
         metrics[index] = output[0][0]
         folds[index] = output[-3]

@@ -1,6 +1,6 @@
 # 参数研究协议 v5
 
-新版参数研究使用 `protocol_version=5`、`strategy_version=5` 和 `result_schema_version=2`。普通股数回测仍使用输入契约 `schema_version=3`。旧研究请求、旧结果和旧排队任务不再进入当前计算链路；历史结果文件、行情快照和数据库记录不会被物理删除。
+新版参数研究使用 `protocol_version=5`、`strategy_version=5` 和 `result_schema_version=2`。普通股数回测仍使用输入契约 `schema_version=3`。旧研究请求、旧结果和旧排队任务不再进入当前计算链路；当前数据目录只保留可读取的 v5 结果。
 
 ## 单一训练窗口
 

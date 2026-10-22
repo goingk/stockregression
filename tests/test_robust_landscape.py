@@ -111,7 +111,7 @@ def test_v5_landscape_read_never_evaluates_candidates_or_loads_market_data(tmp_p
         raise AssertionError("参数分布读取不得评价候选或加载行情")
 
     monkeypatch.setattr("stockregression.data.DataService.load_bundle", forbidden)
-    monkeypatch.setattr("stockregression.research_v4.evaluator.BatchEvaluator.__init__", forbidden)
+    monkeypatch.setattr("stockregression.research.evaluator.BatchEvaluator.__init__", forbidden)
     monkeypatch.setattr("stockregression.research_completion.complete_research_result", forbidden)
 
     rows = [{

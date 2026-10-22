@@ -175,37 +175,13 @@ def test_v5_models_reject_retired_protocol_fields():
     assert config.protocol_description()["result_schema_version"] == 2
 
 
-def test_legacy_research_preferences_migrate_to_v5_defaults():
-    legacy = ResearchDefaults.model_validate({
-        "protocol_version": 4,
-        "mode": "robust",
-        "n_trials": 321,
-        "bootstrap_reps": 10_000,
-        "max_drawdown": 0.5,
-        "ranges": ResearchDefaults().model_dump()["ranges"],
-    })
-
-    assert legacy.protocol_version == 5
-    assert legacy.strategy_version == 5
-    assert legacy.ranking_mode == "robust_j"
-    assert legacy.strategy_id == "geometric_robust_j"
-    assert legacy.max_shares_mode == "unlimited"
-    assert legacy.neighborhood_fields == ["buy_step", "sell_step", "buy_shares", "sell_shares"]
-    assert set(legacy.ranges) == {"buy_step", "sell_step", "buy_shares", "sell_shares"}
-    assert all(value.step is None for value in legacy.ranges.values())
-    assert set(legacy.granularity) == {"buy_step", "sell_step", "buy_shares", "sell_shares"}
-    assert set(legacy.fixed_half_widths) == {"buy_step", "sell_step", "buy_shares", "sell_shares"}
-    assert legacy.selection_target == "both"
-    assert legacy.rebalance_days == 63
-    # 只在迁移整份旧对象时丢弃已退役的控制项。
-    assert not hasattr(legacy, "mode")
-    assert not hasattr(legacy, "n_trials")
-    assert not hasattr(legacy, "bootstrap_reps")
-    assert not hasattr(legacy, "max_drawdown")
-
-    # 当前协议下提交已退役的控制项必须报错，而不是被静默丢弃。
+def test_retired_research_preferences_are_rejected():
+    with pytest.raises(ValidationError):
+        ResearchDefaults.model_validate({"protocol_version": 4})
     with pytest.raises(ValidationError):
         ResearchDefaults.model_validate({"protocol_version": 5, "mode": "robust"})
+    with pytest.raises(ValidationError):
+        ResearchDefaults.model_validate({"protocol_version": 5, "bootstrap_reps": 10_000})
 
 
 def test_research_registry_counts_overlap_even_after_seed_or_snapshot_changes(tmp_path):

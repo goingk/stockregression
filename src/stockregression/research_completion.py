@@ -13,9 +13,9 @@ from .numerics.robust import NeighborhoodOperator, robust_score
 from .reproducibility import computation_provenance, reproducibility_mismatches
 from .research.robust import EvaluationBudget, _public_row
 from .research_preparation import preparation_config
-from .research_v4.evaluator import BatchEvaluator
-from .research_v4.space import ROBUST_FIELDS, ParameterSpace
-from .research_v4.window import TrainingWindowPolicy
+from .research.evaluator import BatchEvaluator
+from .research.space import ROBUST_FIELDS, ParameterSpace
+from .research.window import TrainingWindowPolicy
 from .share_engine import run_share_backtest
 from .settings import PROJECT_ROOT
 from .storage import Store, _write_candidate_archive, dumps

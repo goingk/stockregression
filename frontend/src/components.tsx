@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
-import { get, post } from './api'
+import { get } from './api'
 import Disclosure from './Disclosure'
 import type { ButtonHTMLAttributes, ChangeEvent, InputHTMLAttributes, ReactNode, SelectHTMLAttributes } from 'react'
 import { AlertCircle, Check, ChevronRight, LoaderCircle, X } from 'lucide-react'
@@ -18,8 +18,8 @@ export function Card({ title, subtitle, action, children, className = '' }: { ti
   </section>
 }
 
-export function ErrorBox({ message, onClose }: { message: string; onClose?: () => void }) {
-  return <div className="notice error"><AlertCircle size={17} /><span>{message}</span>{onClose && <button className="icon-button" onClick={onClose} aria-label="关闭错误"><X size={16} /></button>}</div>
+export function ErrorBox({ message, onClose, onRetry }: { message: string; onClose?: () => void; onRetry?: () => void }) {
+  return <div className="notice error"><AlertCircle size={17} /><span>{message}</span>{onRetry && <button className="text-link" onClick={onRetry}>重试</button>}{onClose && <button className="icon-button" onClick={onClose} aria-label="关闭错误"><X size={16} /></button>}</div>
 }
 
 export function SuccessBox({ children }: { children: ReactNode }) {
@@ -153,17 +153,17 @@ export function configPayload(value: BacktestConfig) {
   return result
 }
 
-export async function loadConfig(value: BacktestConfig): Promise<{ config: BacktestConfig; notice: string }> {
-  const result = await post<{ config: BacktestConfig; notice: string }>('/configs/convert', value)
+export function loadConfig(value: BacktestConfig): { config: BacktestConfig; notice: string } {
+  if (Number(value.schema_version) !== 3) throw new Error('旧版回测配置已移除，请重新填写当前股数配置')
   const defaults = defaultConfig()
   const provenance: Partial<BacktestConfig> = {}
   if (Object.prototype.hasOwnProperty.call(value, 'selection_asof')) provenance.selection_asof = value.selection_asof
-  return { ...result, config: {
+  return { notice: '已载入当前股数配置', config: {
     ...defaults,
-    ...result.config,
+    ...value,
     ...provenance,
-    fees: { ...defaults.fees, ...result.config.fees },
-    dca: { ...defaults.dca, ...result.config.dca },
+    fees: { ...defaults.fees, ...value.fees },
+    dca: { ...defaults.dca, ...value.dca },
   } }
 }
 

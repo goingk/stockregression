@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 from stockregression import settings
 from stockregression.api import create_app
+from stockregression.configuration import current_configuration, patch_configuration
 from stockregression.performance import effective_cpu_budget
 from stockregression.resources import ResourceLease
 from stockregression.settings import PerformanceSettings
@@ -9,12 +10,17 @@ from stockregression.storage import Store
 
 
 def test_performance_settings_merge_partial_updates(tmp_path, monkeypatch):
-    settings_file = tmp_path / "settings.json"
+    settings_file = tmp_path / "config" / "application.json"
     monkeypatch.setattr(settings, "SETTINGS_FILE", settings_file)
 
-    saved = settings.save_settings({"performance": {"download_workers": 6}})
+    document = current_configuration()
+    patch_configuration(
+        {"runtime": {"download_workers": 3}},
+        base_revision=document["config_revision"],
+    )
+    saved = settings.load_settings()
 
-    assert saved.performance.download_workers == 6
+    assert saved.performance.download_workers == 3
     assert saved.performance.validation_workers == 4
     assert saved.performance.workspace_mb == 8192
     assert saved.performance.cpu_budget_mode == "auto"
@@ -40,15 +46,15 @@ def test_resource_lease_rebalances_two_running_research_jobs(tmp_path):
 
 
 def test_performance_api_reports_effective_budget_and_leases(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(settings, "SETTINGS_FILE", tmp_path / "config" / "application.json")
     root = tmp_path / "data"
     app = create_app(str(root), start_jobs=False)
     with TestClient(app) as client:
         response = client.get("/api/v1/performance")
-        initial = client.get("/api/v1/settings").json()
-        saved = client.put("/api/v1/settings", json={
-            "base_revision": initial["config_revision"],
-            "performance": {"cpu_budget_mode": "custom", "cpu_budget": 6},
+        initial = client.get("/api/v1/configuration").json()
+        saved = client.patch("/api/v1/configuration", json={
+            "base_revision": initial["revision"],
+            "patch": {"runtime": {"cpu_budget_mode": "custom", "cpu_budget": 6}},
         })
 
     assert response.status_code == 200
@@ -58,6 +64,6 @@ def test_performance_api_reports_effective_budget_and_leases(tmp_path, monkeypat
     assert payload["settings"]["download_workers"] == 4
     assert payload["active_leases"] == []
     assert saved.status_code == 200
-    assert saved.json()["performance"]["cpu_budget_mode"] == "custom"
-    assert saved.json()["performance"]["cpu_budget"] == 6
-    assert saved.json()["performance"]["validation_workers"] == 4
+    assert saved.json()["config"]["runtime"]["cpu_budget_mode"] == "custom"
+    assert saved.json()["config"]["runtime"]["cpu_budget"] == 6
+    assert saved.json()["config"]["runtime"]["validation_workers"] == 4

@@ -117,15 +117,9 @@ def test_strategy_catalog_defaults_to_robust_j_geometric_research(tmp_path):
         }
 
 
-def test_legacy_config_conversion_removes_cash_budget_and_preserves_null_bound(tmp_path):
+def test_legacy_config_conversion_endpoint_is_removed(tmp_path):
     with TestClient(create_app(str(tmp_path), start_jobs=False)) as client:
         converted = client.post("/api/v1/configs/convert", json={
             "schema_version": 2, "symbol": "600000.SH", "start_date": "2024-01-02",
-            "initial_shares": 1000, "min_shares": 0, "max_shares": None,
-            "buy_shares": 100, "sell_shares": 100, "reserve_cash": 5000,
         })
-        assert converted.status_code == 200
-        config = converted.json()["config"]
-        assert config["schema_version"] == 3
-        assert config["max_shares"] is None
-        assert "reserve_cash" not in config
+        assert converted.status_code in {404, 405}

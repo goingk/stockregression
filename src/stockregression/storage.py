@@ -6,7 +6,7 @@ import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -661,24 +661,38 @@ class Store:
             ):
                 if column not in result_columns:
                     db.execute(f"ALTER TABLE results ADD COLUMN {column} {kind}")
-            legacy_results = db.execute(
-                "SELECT id,path FROM results WHERE protocol_version IS NULL "
-                "AND result_schema_version IS NULL AND reproducible IS NULL"
-            ).fetchall()
-            for result_id, relative in legacy_results:
-                try:
-                    payload = json.loads((self.root / relative).read_text(encoding="utf-8"))
-                except (OSError, ValueError, json.JSONDecodeError):
-                    continue
-                provenance = payload.get("computation_provenance") if isinstance(payload, dict) else None
-                reproducible = provenance.get("reproducible") if isinstance(provenance, dict) else None
+            # A NULL metadata tuple is valid for ordinary backtest and data
+            # result files.  A persistent marker distinguishes those legitimate
+            # values from rows that have not yet been inspected, preventing a
+            # full reread of every historical result on each Store creation.
+            metadata_migration = "results_metadata_v1"
+            migrated = db.execute(
+                "SELECT 1 FROM state WHERE key=?", (metadata_migration,),
+            ).fetchone()
+            if migrated is None:
+                legacy_results = db.execute(
+                    "SELECT id,path FROM results WHERE protocol_version IS NULL "
+                    "AND result_schema_version IS NULL AND reproducible IS NULL"
+                ).fetchall()
+                for result_id, relative in legacy_results:
+                    try:
+                        payload = json.loads((self.root / relative).read_text(encoding="utf-8"))
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        continue
+                    provenance = payload.get("computation_provenance") if isinstance(payload, dict) else None
+                    reproducible = provenance.get("reproducible") if isinstance(provenance, dict) else None
+                    db.execute(
+                        "UPDATE results SET protocol_version=?,result_schema_version=?,reproducible=? WHERE id=?",
+                        (
+                            payload.get("protocol_version") if isinstance(payload, dict) else None,
+                            payload.get("result_schema_version") if isinstance(payload, dict) else None,
+                            None if reproducible is None else int(bool(reproducible)), result_id,
+                        ),
+                    )
                 db.execute(
-                    "UPDATE results SET protocol_version=?,result_schema_version=?,reproducible=? WHERE id=?",
-                    (
-                        payload.get("protocol_version") if isinstance(payload, dict) else None,
-                        payload.get("result_schema_version") if isinstance(payload, dict) else None,
-                        None if reproducible is None else int(bool(reproducible)), result_id,
-                    ),
+                    "INSERT INTO state(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (metadata_migration, now_iso()),
                 )
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS sync_items(run_key TEXT,symbol TEXT,status TEXT,mode TEXT,daily_through TEXT,minute_through TEXT,error TEXT,updated_at TEXT,PRIMARY KEY(run_key,symbol));
@@ -704,7 +718,7 @@ class Store:
                     input_start TEXT,
                     input_end TEXT,
                     data_version TEXT,
-                    validation_intervals TEXT NOT NULL,
+                    evaluation_intervals TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     overlapping_prior_studies INTEGER NOT NULL DEFAULT 0,
                     exact_repeat_prior_studies INTEGER NOT NULL DEFAULT 0
@@ -963,7 +977,8 @@ class Store:
             return live
         return None
 
-    def new_job(self, kind: str, payload: dict, dedupe_key: str | None = None) -> str:
+    def new_job_info(self, kind: str, payload: dict, dedupe_key: str | None = None) -> tuple[str, bool]:
+        """Create a job and report whether this call created a new row."""
         job_id = uuid.uuid4().hex
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -974,13 +989,34 @@ class Store:
                     (dedupe_key,),
                 ).fetchone()
                 if existing:
-                    return existing[0]
+                    return str(existing[0]), False
+            stored_payload = dict(payload)
+            if kind == "research_completion":
+                # Initialise the checkpoint in the same transaction as the
+                # queue row.  A later payload rewrite would erase the frozen
+                # configuration snapshot attached by API submission.
+                stored_payload.setdefault("checkpoint_id", job_id)
+            # The queue is ordered by created_at and id. Keep the timestamp
+            # strictly increasing inside the creation transaction so two jobs
+            # created in the same clock tick still have an insertion order.
+            created_at = now_iso()
+            latest = db.execute("SELECT MAX(created_at) FROM jobs").fetchone()[0]
+            if latest:
+                stamp = datetime.fromisoformat(created_at)
+                previous = datetime.fromisoformat(str(latest))
+                if previous.tzinfo is None:
+                    previous = previous.replace(tzinfo=stamp.tzinfo)
+                if stamp <= previous:
+                    created_at = (previous + timedelta(microseconds=1)).isoformat()
             db.execute(
                 "INSERT INTO jobs(id,kind,status,progress,message,payload,created_at,updated_at,dedupe_key) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
-                (job_id, kind, "queued", 0, "等待执行", dumps(payload), now_iso(), now_iso(), dedupe_key),
+                (job_id, kind, "queued", 0, "等待执行", dumps(stored_payload), created_at, created_at, dedupe_key),
             )
-        return job_id
+        return job_id, True
+
+    def new_job(self, kind: str, payload: dict, dedupe_key: str | None = None) -> str:
+        return self.new_job_info(kind, payload, dedupe_key=dedupe_key)[0]
 
     def update_job(self, job_id: str, *, require_claim: bool = False,
                    expected_claim_token: str | None = None, **values) -> bool:
@@ -1007,11 +1043,18 @@ class Store:
             )
             return cursor.rowcount > 0
 
-    def claim_jobs(self, claim_token: str, max_workers: int, limit: int | None = None) -> list[str]:
+    def claim_jobs(self, claim_token: str, max_workers: int, limit: int | None = None,
+                   cancelled_ids: list[str] | None = None) -> list[str]:
         """Atomically cancel queued cancellations and claim oldest queued jobs."""
         stamp = now_iso()
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
+            if cancelled_ids is not None:
+                cancelled_ids.extend(
+                    str(row[0]) for row in db.execute(
+                        "SELECT id FROM jobs WHERE status='queued' AND cancel_requested=1"
+                    ).fetchall()
+                )
             db.execute(
                 "UPDATE jobs SET status='cancelled',message='排队期间已取消',updated_at=? "
                 "WHERE status='queued' AND cancel_requested=1",
@@ -1039,6 +1082,17 @@ class Store:
                 if cursor.rowcount:
                     claimed.append(job_id)
             return claimed
+
+    def cancel_queued_job(self, job_id: str) -> bool:
+        """Cancel only an unclaimed queue row, avoiding upload cleanup races."""
+        with self.db() as db:
+            cursor = db.execute(
+                "UPDATE jobs SET status='cancelled',cancel_requested=1,"
+                "message='排队期间已取消',updated_at=? "
+                "WHERE id=? AND status='queued'",
+                (now_iso(), job_id),
+            )
+            return cursor.rowcount > 0
 
     def claim_job(self, job_id: str, claim_token: str) -> bool:
         """Claim one known queued job for an in-process CLI worker."""
@@ -1090,19 +1144,80 @@ class Store:
         result["cancel_requested"] = bool(result["cancel_requested"])
         return result
 
-    def jobs(self, limit=100, *, status: str | None = None, offset: int = 0):
+    def jobs(self, limit=100, *, status: str | None = None,
+             kind: str | None = None, offset: int = 0):
         arguments: list[Any] = []
-        where = ""
+        filters: list[str] = []
         if status:
-            where = " WHERE status=?"
+            filters.append("status=?")
             arguments.append(status)
+        if kind:
+            filters.append("kind=?")
+            arguments.append(kind)
+        where = (" WHERE " + " AND ".join(filters)) if filters else ""
         arguments.extend([max(1, int(limit)), max(0, int(offset))])
         with self.db() as db:
-            ids = [r[0] for r in db.execute(
-                f"SELECT id FROM jobs{where} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+            rows = db.execute(
+                f"SELECT * FROM jobs{where} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
                 arguments,
-            )]
-        return [self.job(job_id) for job_id in ids]
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            item["cancel_requested"] = bool(item["cancel_requested"])
+            values.append(item)
+        return values
+
+    def job_history(self, limit: int = 50, *, offset: int = 0,
+                    status: str | None = None, kind: str | None = None) -> dict:
+        """Return one filtered history page without changing the polling contract."""
+        filters: list[str] = []
+        arguments: list[Any] = []
+        if status:
+            filters.append("status=?")
+            arguments.append(status)
+        if kind:
+            filters.append("kind=?")
+            arguments.append(kind)
+        where = (" WHERE " + " AND ".join(filters)) if filters else ""
+        page_limit = max(1, min(500, int(limit)))
+        page_offset = max(0, int(offset))
+        with self.db() as db:
+            total = int(db.execute(f"SELECT COUNT(*) FROM jobs{where}", arguments).fetchone()[0])
+            kind_rows = db.execute(
+                "SELECT kind,COUNT(*) FROM jobs GROUP BY kind ORDER BY kind"
+            ).fetchall()
+            rows = db.execute(
+                f"SELECT * FROM jobs{where} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+                [*arguments, page_limit, page_offset],
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            item["cancel_requested"] = bool(item["cancel_requested"])
+            items.append(item)
+        return {
+            "items": items, "total": total, "offset": page_offset,
+            "limit": page_limit, "status": status, "kind": kind,
+            "kinds": [{"kind": str(row[0]), "count": int(row[1])} for row in kind_rows],
+        }
+
+    def active_jobs(self) -> list[dict]:
+        """Return every queued/running job for lightweight polling."""
+        with self.db() as db:
+            rows = db.execute(
+                "SELECT * FROM jobs WHERE status IN ('queued','running') "
+                "ORDER BY created_at DESC,id DESC"
+            ).fetchall()
+        values = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item["payload"])
+            item["cancel_requested"] = bool(item["cancel_requested"])
+            values.append(item)
+        return values
 
     def recent_submitted_symbols(self, limit: int = 10) -> list[dict[str, str]]:
         """Return the most recently submitted symbols from formal backtest jobs."""
@@ -1194,12 +1309,18 @@ class Store:
         result = json.loads((self.root / row[0]).read_text(encoding="utf-8"))
         return result
 
-    def results(self, limit: int = 200, offset: int = 0):
+    def results(self, limit: int = 200, offset: int = 0, *, kind: str | None = None):
+        where = ""
+        arguments: list[Any] = []
+        if kind:
+            where = " WHERE kind=?"
+            arguments.append(kind)
+        arguments.extend([max(1, int(limit)), max(0, int(offset))])
         with self.db() as db:
             rows = [dict(r) for r in db.execute(
                 "SELECT id,kind,symbol,created_at,title,protocol_version,result_schema_version,reproducible "
-                "FROM results ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
-                (max(1, int(limit)), max(0, int(offset))),
+                f"FROM results{where} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
+                arguments,
             )]
         for row in rows:
             supported = (
@@ -1419,8 +1540,8 @@ class Store:
     ) -> dict[str, Any]:
         """Record a v5 study and count previously used evaluation dates.
 
-        The legacy database column is retained for existing user data.  New API
-        payloads expose the same intervals under the protocol-neutral name.
+        Intervals are stored under the protocol-neutral evaluation name used
+        by current API payloads.
         """
         symbol = normalize_symbol(symbol)
         intervals = []
@@ -1445,7 +1566,7 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             existing = db.execute("SELECT * FROM research_registry WHERE registry_id=?", (registry_id,)).fetchone()
             if existing:
-                intervals = json.loads(existing["validation_intervals"] or "[]")
+                intervals = json.loads(existing["evaluation_intervals"] or "[]")
                 overlap_count = int(existing["overlapping_prior_studies"])
                 exact_count = int(existing["exact_repeat_prior_studies"])
                 return {
@@ -1463,14 +1584,14 @@ class Store:
                     "idempotent_replay": True,
                 }
             prior = db.execute(
-                "SELECT registry_id,validation_intervals FROM research_registry WHERE symbol=?",
+                "SELECT registry_id,evaluation_intervals FROM research_registry WHERE symbol=?",
                 (symbol,),
             ).fetchall()
             current_pairs = {(item["start"], item["end"]) for item in intervals}
             overlapping = set()
             exact = set()
             for row in prior:
-                prior_intervals = json.loads(row["validation_intervals"] or "[]")
+                prior_intervals = json.loads(row["evaluation_intervals"] or "[]")
                 if any(
                     pd.Timestamp(old["start"]) <= pd.Timestamp(new["end"])
                     and pd.Timestamp(new["start"]) <= pd.Timestamp(old["end"])

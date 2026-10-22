@@ -1,4 +1,4 @@
-import { Component, lazy, Suspense, useCallback, useRef, useState } from 'react'
+import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import type { ErrorInfo, ReactNode } from 'react'
 import { Activity, BarChart3, Database, FlaskConical, HardDrive, Layers3, Menu, RotateCcw, TrendingUp } from 'lucide-react'
 import { get, post } from './api'
@@ -6,6 +6,12 @@ import { Button, defaultConfig, Loading } from './components'
 import { TaskButton, TaskProvider } from './TaskCenter'
 import { WorkbenchProvider, useWorkspaces } from './WorkbenchState'
 import { isResearchJob } from './taskState'
+import {
+  navigationFromHistory, navigationFromUrl, navigationHistoryState, navigationUrl,
+} from './navigation'
+import type { AppPage, NavigationState } from './navigation'
+import { newPreparationContext } from './preparationContext'
+import type { PreparationContext } from './preparationContext'
 import type { BacktestConfig, DataPreparationRequest, Job } from './types'
 
 const DataCenterPage = lazy(() => import('./pages/DataCenterPage'))
@@ -14,7 +20,7 @@ const BacktestPage = lazy(() => import('./pages/BacktestPage'))
 const ResultsPage = lazy(() => import('./pages/ResultsPage'))
 const ResearchPage = lazy(() => import('./pages/ResearchPage'))
 
-export type PageKey = 'data' | 'data-admin' | 'backtest' | 'research' | 'results'
+export type PageKey = AppPage
 const nav: Array<{ id: PageKey; label: string; hint: string; icon: typeof Database }> = [
   { id: 'data', label: '行情', hint: '股票 · ETF · 自选', icon: Database },
   { id: 'data-admin', label: '数据管理', hint: '周期 · 导入 · 校验', icon: HardDrive },
@@ -53,28 +59,65 @@ export default function App() {
 
 function AppWindow() {
   const workspace = useWorkspaces()
-  const [page, setPage] = useState<PageKey>('data')
+  const [navigation, setNavigation] = useState<NavigationState>(() => navigationFromUrl(
+    typeof window === 'undefined' ? '' : window.location.search,
+  ))
+  const navigationRef = useRef(navigation)
+  navigationRef.current = navigation
+  const page = navigation.page
   const [mobileOpen, setMobileOpen] = useState(false)
-  const [selectedResult, setSelectedResult] = useState<string | null>(null)
-  const [selectedResearch, setSelectedResearch] = useState<string | null>(null)
-  const [selectedReport, setSelectedReport] = useState<string | null>(null)
   const [transferNotice, setTransferNotice] = useState<{ page: PageKey; message: string } | null>(null)
-  const [dataPreparation, setDataPreparation] = useState<DataPreparationRequest | null>(null)
+  const [dataPreparation, setDataPreparation] = useState<PreparationContext | null>(null)
   const [restartState, setRestartState] = useState<'idle' | 'confirm' | 'running' | 'failed'>('idle')
   const [restartMessage, setRestartMessage] = useState('')
   const previousInstance = useRef<string | null>(null)
-  const go = useCallback((next: PageKey) => { setPage(next); setMobileOpen(false); window.scrollTo({ top: 0, behavior: 'instant' }) }, [])
+  const commitNavigation = useCallback((
+    update: NavigationState | ((previous: NavigationState) => NavigationState),
+    options: { replace?: boolean; scroll?: boolean } = {},
+  ) => {
+    const previous = navigationRef.current
+    const next = typeof update === 'function' ? update(previous) : update
+    if (typeof window !== 'undefined') {
+      const url = navigationUrl(window.location.search, next)
+      const method = options.replace ? 'replaceState' : 'pushState'
+      window.history[method](navigationHistoryState(next), '', url)
+    }
+    navigationRef.current = next
+    setNavigation(next)
+    setMobileOpen(false)
+    if (options.scroll !== false) window.scrollTo({ top: 0, behavior: 'instant' })
+  }, [])
+  useEffect(() => {
+    const initial = navigationRef.current
+    window.history.replaceState(navigationHistoryState(initial), '', navigationUrl(window.location.search, initial))
+    const restore = (event: PopStateEvent) => {
+      const next = navigationFromHistory(event.state) ?? navigationFromUrl(window.location.search)
+      navigationRef.current = next
+      setNavigation(next)
+      setMobileOpen(false)
+      window.scrollTo({ top: 0, behavior: 'instant' })
+    }
+    window.addEventListener('popstate', restore)
+    return () => window.removeEventListener('popstate', restore)
+  }, [])
+  const go = useCallback((next: PageKey) => {
+    commitNavigation(previous => ({ ...previous, page: next }))
+  }, [commitNavigation])
   const openJobResult = useCallback((job: Job) => {
-    if (isResearchJob(job)) { setSelectedResearch(job.id); go('research') }
-    else if (['backtest', 'batch_backtest'].includes(job.kind)) { setSelectedResult(job.result_id ?? null); go('results') }
-    else { setSelectedReport(job.result_id ?? null); go('data-admin') }
-  }, [go])
-  const clearRequestedResult = useCallback(() => setSelectedResult(null), [])
-  const clearRequestedReport = useCallback(() => setSelectedReport(null), [])
+    if (isResearchJob(job)) commitNavigation(previous => ({ ...previous, page: 'research', research: job.id }))
+    else if (['backtest', 'batch_backtest'].includes(job.kind)) commitNavigation(previous => ({ ...previous, page: 'results', result: job.result_id ?? null }))
+    else commitNavigation(previous => ({ ...previous, page: 'data-admin', report: job.result_id ?? null }))
+  }, [commitNavigation])
+  const clearRequestedReport = useCallback(() => commitNavigation(previous => ({ ...previous, report: null }), { replace: true, scroll: false }), [commitNavigation])
   const prepareData = useCallback((request: DataPreparationRequest, origin: 'backtest' | 'research') => {
-    setDataPreparation({ ...request, origin })
-    go('data-admin')
-  }, [go])
+    setDataPreparation(newPreparationContext(request, origin))
+    commitNavigation(previous => ({ ...previous, page: 'data-admin' }))
+  }, [commitNavigation])
+  const finishDataPreparation = useCallback(() => {
+    const origin = dataPreparation?.origin ?? 'backtest'
+    setDataPreparation(null)
+    commitNavigation(previous => ({ ...previous, page: origin, report: null }))
+  }, [commitNavigation, dataPreparation?.origin])
   const researchFromConfig = (config: BacktestConfig) => {
     workspace.transfer('research', config)
     setTransferNotice({ page: 'research', message: '已复制回测配置；可调整本页的评估区间与搜索设置后启动研究。' })
@@ -139,7 +182,12 @@ function AppWindow() {
     setRestartMessage('正在等待新服务响应…')
     await waitForRestart(previousInstance.current)
   }
-  return <TaskProvider onOpenResult={openJobResult}><div className="app-shell">
+  return <TaskProvider
+    onOpenResult={openJobResult}
+    filter={navigation.taskFilter}
+    kind={navigation.taskKind}
+    onFilterChange={(filter, kind) => commitNavigation(previous => ({ ...previous, taskFilter: filter, taskKind: kind }), { replace: true, scroll: false })}
+  ><div className="app-shell">
     <aside className={`sidebar ${mobileOpen ? 'open' : ''}`}>
       <div className="brand"><div className="brand-mark"><TrendingUp size={19} strokeWidth={2.4} /></div><div><strong>StockRegression</strong><span>量化研究工作台</span></div></div>
       <div className="nav-caption">研究空间</div>
@@ -157,11 +205,11 @@ function AppWindow() {
         {transferNotice?.page === page && <div className="notice success"><span>{transferNotice.message}</span><button className="text-link" onClick={() => setTransferNotice(null)}>收起</button></div>}
         <PageErrorBoundary>
           <Suspense fallback={<div className="route-loading">载入工作区…</div>}>
-            {page === 'data' && <DataCenterPage requestedReport={selectedReport} onReportHandled={clearRequestedReport} />}
-            {page === 'data-admin' && <DataManagementPage requestedReport={selectedReport} onReportHandled={clearRequestedReport} preparation={dataPreparation} onReturn={() => go(dataPreparation?.origin === 'research' ? 'research' : 'backtest')} />}
+            {page === 'data' && <DataCenterPage requestedReport={navigation.report} onReportHandled={clearRequestedReport} onOpenDataManagement={() => go('data-admin')} />}
+            {page === 'data-admin' && <DataManagementPage requestedReport={navigation.report} onReportHandled={clearRequestedReport} preparation={dataPreparation} onPreparationJob={(jobId) => setDataPreparation(current => current ? { ...current, preparationJobId: jobId } : current)} onReturn={dataPreparation ? finishDataPreparation : undefined} />}
             {page === 'backtest' && <BacktestPage onResearch={researchFromConfig} onPrepareData={(request) => prepareData(request, 'backtest')} />}
-            {page === 'research' && (workspace.research && workspace.researchSettings ? <ResearchPage base={workspace.research} settings={workspace.researchSettings} onBaseChange={workspace.updateResearch} onSettingsChange={workspace.updateResearchSettings} onLoadConfig={backtestFromResearch} requestedJobId={selectedResearch} onSelectedJobChange={setSelectedResearch} onFeeDefaultsEdit={workspace.rememberFees} onDefaultsEdit={workspace.rememberStrategy} onRestore={() => workspace.restore('research')} onPrepareData={(request) => prepareData(request, 'research')} /> : <Loading label="读取本机研究设置…" />)}
-            {page === 'results' && <ResultsPage requestedResult={selectedResult} clearRequestedResult={clearRequestedResult} />}
+            {page === 'research' && (workspace.research && workspace.researchSettings ? <ResearchPage base={workspace.research} settings={workspace.researchSettings} onBaseChange={workspace.updateResearch} onSettingsChange={workspace.updateResearchSettings} onLoadConfig={backtestFromResearch} requestedResource={navigation.research} onSelectedResourceChange={(resource) => commitNavigation(previous => ({ ...previous, research: resource }), { replace: true, scroll: false })} completionDecision={navigation.researchDecision} onCompletionDecisionChange={(decision) => commitNavigation(previous => ({ ...previous, researchDecision: decision }), { replace: true, scroll: false })} onFeeDefaultsEdit={workspace.rememberFees} onDefaultsEdit={workspace.rememberStrategy} onRestore={() => workspace.restore('research')} onPrepareData={(request) => prepareData(request, 'research')} /> : <Loading label="读取本机研究设置…" />)}
+            {page === 'results' && <ResultsPage selectedResultId={navigation.result} selectedCompareId={navigation.compare} view={navigation.resultView} onSelectionChange={(result, compare) => commitNavigation(previous => ({ ...previous, result, compare }), { replace: true, scroll: false })} onViewChange={(resultView) => commitNavigation(previous => ({ ...previous, resultView }), { replace: true, scroll: false })} />}
           </Suspense>
         </PageErrorBoundary>
       </div>

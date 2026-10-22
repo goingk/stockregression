@@ -297,8 +297,11 @@ def test_source_api_reads_cache_and_rejects_undetected_optional_source(tmp_path,
             if option["source"] == "ths"
         )
         assert ths["role"] == "fallback" and ths["selectable"] is False
-        revision = client.get("/api/v1/settings").json()["config_revision"]
-        rejected = client.put("/api/v1/settings", json={"base_revision": revision, "recent_minute_source": "tdx"})
+        revision = client.get("/api/v1/configuration").json()["revision"]
+        rejected = client.patch("/api/v1/configuration", json={
+            "base_revision": revision,
+            "patch": {"market_data": {"recent_minute_source": "tdx"}},
+        })
         assert rejected.status_code == 422 and "通达信" in rejected.text
         invalid = client.post("/api/v1/data/sources/probe", json={
             "source": "tdx", "capability": "etf_daily", "market": "etf",

@@ -8,7 +8,7 @@
 from datetime import date
 
 from stockregression.models import BacktestConfig, OptimizationConfig
-from stockregression.research_v4.space import ParameterSpace
+from stockregression.research.space import ParameterSpace
 
 
 def _v5_config(granularity: dict[str, float]) -> OptimizationConfig:

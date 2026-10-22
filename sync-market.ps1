@@ -25,10 +25,16 @@ try {
     if (-not $Fresh) { $syncArgs += '--resume' }
     if ($RetryFailed) { $syncArgs += '--retry-failed' }
     if ($Initialize) { $syncArgs += '--initialize' }
-    if ($DryRun) { Write-Output 'dry-run：只检查日线和 1 分钟基础行情；不会下载其他周期。'; return }
+    if ($DryRun) {
+        $dryRunArgs = @('run', '--frozen', 'stockregression', 'sync', '--scope', 'market', '--mode', $Mode, '--workers', $Workers, '--dry-run')
+        if (-not $Fresh) { $dryRunArgs += '--resume' }
+        if ($RetryFailed) { $dryRunArgs += '--retry-failed' }
+        & uv @dryRunArgs
+        exit $LASTEXITCODE
+    }
     & uv @syncArgs
     $syncExitCode = $LASTEXITCODE
-    if ($InstallSchedule -and -not $DryRun) {
+    if ($InstallSchedule) {
         & uv run --frozen stockregression schedule install
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }

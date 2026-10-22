@@ -64,13 +64,13 @@ export default function BacktestPage({ onResearch, onPrepareData }: { onResearch
     setBusy(true); setError('')
     try {
       await tasks.run('批量回测', async () => {
-        const configs = await Promise.all(chosen.map(async item => configPayload((await loadConfig(item.config)).config)))
+        const configs = chosen.map(item => configPayload(loadConfig(item.config).config))
         return post<{ job_ids: string[] }>('/backtests/batch', { configs })
       })
     } catch (cause) { setError(err(cause)) } finally { setBusy(false) }
   }
-  const loadExplicitConfig = async (value: BacktestConfig, copied = false) => {
-    const loaded = await loadConfig(value)
+  const loadExplicitConfig = (value: BacktestConfig, copied = false) => {
+    const loaded = loadConfig(value)
     updateConfig(structuredClone(loaded.config)); setFormRevision(current => current + 1)
     setNotice((copied ? '已复制配置草稿。' : '已载入配置。') + loaded.notice)
   }
@@ -106,7 +106,7 @@ export default function BacktestPage({ onResearch, onPrepareData }: { onResearch
       <section className="workbench-preview-column"><EquityPreview config={config} onFunding={acceptPreviewFunding} /><div className="workbench-run-actions"><span>有效修改后自动重算预览</span><Button variant="secondary" disabled={busy} onClick={() => { if (validate()) onResearch(config) }}><FlaskConical size={15} />用当前配置研究</Button></div></section>
     </div>
     <Disclosure id="backtest-saved-configs" title="已保存配置与批量回测" summary={`${records.length} 份配置`}>
-      {loading ? <Loading /> : !records.length ? <Empty title="还没有保存的配置" detail="保存当前参数后即可复用或批量比较。" /> : <div className="saved-list">{records.map(record => <div className="saved-row" key={record.id}><label className="check-label"><input type="checkbox" checked={selected.includes(record.id)} onChange={event => setSelected(old => event.target.checked ? [...old, record.id] : old.filter(id => id !== record.id))} /><span className="saved-copy"><strong>{record.name}</strong><small>{record.config.symbol} · {record.config.frequency} · {record.config.grid_mode}</small></span></label><div className="saved-actions"><button title="载入" onClick={() => void loadExplicitConfig(record.config).catch(cause => setError(err(cause)))}><RefreshCw size={14} /></button><button title="复制" onClick={() => void loadExplicitConfig(record.config, true).catch(cause => setError(err(cause)))}><Copy size={14} /></button><button title="删除" className="danger-icon" onClick={() => removeConfig(record)}><Trash2 size={14} /></button></div></div>)}</div>}
+      {loading ? <Loading /> : !records.length ? <Empty title="还没有保存的配置" detail="保存当前参数后即可复用或批量比较。" /> : <div className="saved-list">{records.map(record => <div className="saved-row" key={record.id}><label className="check-label"><input type="checkbox" checked={selected.includes(record.id)} onChange={event => setSelected(old => event.target.checked ? [...old, record.id] : old.filter(id => id !== record.id))} /><span className="saved-copy"><strong>{record.name}</strong><small>{record.config.symbol} · {record.config.frequency} · {record.config.grid_mode}</small></span></label><div className="saved-actions"><button title="载入" onClick={() => { try { loadExplicitConfig(record.config) } catch (cause) { setError(err(cause)) } }}><RefreshCw size={14} /></button><button title="复制" onClick={() => { try { loadExplicitConfig(record.config, true) } catch (cause) { setError(err(cause)) } }}><Copy size={14} /></button><button title="删除" className="danger-icon" onClick={() => removeConfig(record)}><Trash2 size={14} /></button></div></div>)}</div>}
       <div className="saved-footer"><Button variant="secondary" disabled={selected.length < 2 || busy} busy={busy} onClick={() => void runBatch()}><Plus size={15} />批量运行所选（{selected.length}）</Button></div>
     </Disclosure>
     {saveDialog && <div className='backtest-dialog-overlay' role='presentation' onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) setSaveDialog(null) }} onKeyDown={(event) => { if (event.key === 'Escape' && !busy) setSaveDialog(null) }}>

@@ -8,7 +8,7 @@ import sys
 
 from filelock import FileLock
 
-from .settings import PROJECT_ROOT, load_settings, save_settings
+from .settings import PROJECT_ROOT, load_settings
 
 TASK_NAMES = ["StockRegression-Daily", "StockRegression-Weekly"]
 
@@ -60,5 +60,11 @@ def configure_schedule(install: bool) -> dict:
         )
     if completed.returncode:
         raise RuntimeError("计划任务注册失败：" + (completed.stderr or completed.stdout).strip())
-    save_settings({"schedule": {"enabled": install}})
+    from .configuration import current_configuration, patch_configuration
+
+    document = current_configuration()
+    patch_configuration(
+        {"schedule": {"enabled": install}},
+        base_revision=document["config_revision"],
+    )
     return {"enabled": install, "task_names": TASK_NAMES, "message": "已注册每日更新和周末核对；以当前登录用户运行，漏跑后补执行" if install else "计划任务已移除"}

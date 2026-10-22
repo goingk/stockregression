@@ -23,7 +23,7 @@ from stockregression.research.robust import (
     _start_coordinates,
     _verify_peak,
 )
-from stockregression.research_v4.space import ParameterSpace
+from stockregression.research.space import ParameterSpace
 
 K = 3
 TOL = 1e-12

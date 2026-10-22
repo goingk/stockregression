@@ -45,16 +45,25 @@ function pointFromEvent(raw: unknown): LandscapePoint | undefined {
   return ((raw as { data?: { item?: LandscapePoint } }).data ?? {}).item
 }
 
-export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, qualified = false, revision = null, revisionScope = null, onLoad }: {
+export default function ResearchLandscape({ resultId, defaultParams, decisionOptions, decision: controlledDecision, onDecisionChange, qualified = false, revision = null, revisionScope = null, onLoad }: {
   resultId: string
   defaultParams?: Dict
   decisionOptions: Array<{ value: string; label: string }>
+  decision?: string
+  onDecisionChange?: (decision: string) => void
   qualified?: boolean
   revision?: number | null
   revisionScope?: LandscapeRevisionScope | null
   onLoad?: (params: Dict, asOf?: string) => void
 }) {
-  const [decision, setDecision] = useState(decisionOptions[0]?.value ?? 'current')
+  const [internalDecision, setInternalDecision] = useState(decisionOptions[0]?.value ?? 'current:0')
+  const decision = controlledDecision ?? internalDecision
+  useEffect(() => {
+    if (!decisionOptions.some(item => item.value === decision) && decisionOptions[0]) {
+      setInternalDecision(decisionOptions[0].value)
+      onDecisionChange?.(decisionOptions[0].value)
+    }
+  }, [decision, decisionOptions, onDecisionChange])
   const [metric, setMetric] = useState<'excess' | 'grid'>('excess')
   const [xName, setXName] = useState('')
   const [yName, setYName] = useState('')
@@ -193,7 +202,7 @@ export default function ResearchLandscape({ resultId, defaultParams, decisionOpt
     action={<Badge tone='blue'>{loading ? '读取中…' : `${data.total.toLocaleString()} 个候选 · 当前切片 ${slice.length.toLocaleString()}`}</Badge>}
   >
     <div className='form-grid four research-landscape-controls'>
-      {decisionOptions.length > 1 && <Field label='研究决策'><SelectInput value={decision} onChange={event => setDecision(event.target.value)}>{decisionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>}
+      {decisionOptions.length > 1 && <Field label='研究决策'><SelectInput value={decision} onChange={event => { setInternalDecision(event.target.value); onDecisionChange?.(event.target.value) }}>{decisionOptions.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</SelectInput></Field>}
       <Field label='着色指标'><SelectInput value={metric} onChange={event => setMetric(event.target.value as 'excess' | 'grid')}><option value='excess'>差值超额</option><option value='grid'>峰值本金收益</option></SelectInput></Field>
       <Field label='横轴参数'><SelectInput value={xName} onChange={event => {
         const next = event.target.value

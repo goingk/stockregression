@@ -36,7 +36,7 @@ from stockregression.research.robust import (
     estimate_robust_search,
     select_robust_at,
 )
-from stockregression.research_v4.space import ParameterSpace
+from stockregression.research.space import ParameterSpace
 
 
 def make_config(*, buy_high: float = .005, share_high: int = 500, strategy: dict | None = None) -> OptimizationConfig:

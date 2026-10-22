@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from stockregression import settings
 from stockregression.api import create_app
+from stockregression.configuration import current_configuration, patch_configuration
 
 
 def test_default_storage_paths_keep_asset_packages_under_data(settings_file):
@@ -20,10 +21,24 @@ def test_default_storage_paths_keep_asset_packages_under_data(settings_file):
 
 @pytest.fixture
 def settings_file(tmp_path, monkeypatch):
-    path = tmp_path / "settings.json"
+    path = tmp_path / "config" / "application.json"
     monkeypatch.setattr(settings, "SETTINGS_FILE", path)
-    monkeypatch.setattr(settings, "LEGACY_SETTINGS_FILE", tmp_path / ".local" / "settings.json")
     return path
+
+
+def patch_settings(patch: dict) -> dict:
+    document = current_configuration()
+    return patch_configuration(patch, base_revision=document["config_revision"])
+
+
+def patch_workbench(patch: dict) -> dict:
+    grouped: dict[str, dict] = {}
+    for group, value in patch.items():
+        if group == "research":
+            grouped["research"] = {"defaults": value}
+        else:
+            grouped.setdefault("backtest", {})[group] = value
+    return patch_settings(grouped)
 
 
 def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(settings_file):
@@ -61,23 +76,23 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
         "sell_shares": {"low": 100.0, "high": 1000.0, "step": None},
     }
 
-    settings.save_settings({
-        "fee_defaults": {"commission_rate": 0.0008},
-        "schedule": {"daily_time": "19:10"},
-        "workbench_defaults": {
+    patch_settings({
+        "backtest": {
+            "fees": {"commission_rate": 0.0008},
             "grid": {"buy_step": 0.05},
             "position": {"initial_shares": 1200},
-            "research": {
-                "training_budget": 12_345,
-                "reporting_budget": 0,
-                "ranges": {"buy_shares": {"high": 2000}},
-            },
         },
+        "research": {"defaults": {
+            "training_budget": 12_345,
+            "reporting_budget": 0,
+            "ranges": {"buy_shares": {"high": 2000}},
+        }},
+        "schedule": {"daily_time": "19:10"},
     })
-    settings.save_settings({
-        "workbench_defaults": {
-            "research": {"ranges": {"buy_step": {"low": 0.01, "high": 0.2}}},
-        },
+    patch_settings({
+        "research": {"defaults": {
+            "ranges": {"buy_step": {"low": 0.01, "high": 0.2}},
+        }},
     })
 
     saved = settings.load_settings()
@@ -96,27 +111,6 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
     assert saved.fee_defaults.commission_rate == 0.0008
     assert saved.fee_defaults.min_commission == 0.1
     assert saved.schedule.daily_time == "19:10"
-
-
-def test_old_settings_gain_workbench_defaults_without_losing_existing_values(settings_file):
-    settings_file.write_text(json.dumps({
-        "port": 8001,
-        "fee_defaults": {"commission_rate": 0.0007, "min_commission": 0.2},
-        "schedule": {"enabled": True, "daily_time": "20:00", "weekly_day": "SAT", "weekly_time": "10:00"},
-    }), encoding="utf-8")
-
-    loaded = settings.load_settings()
-    assert loaded.port == 8001
-    assert loaded.fee_defaults.commission_rate == 0.0007
-    assert loaded.schedule.enabled is True
-    assert loaded.workbench_defaults.grid.grid_mode == "trailing"
-
-    settings.save_settings({"workbench_defaults": {"dca": {"frequency": "weekly"}}})
-    saved = settings.load_settings()
-    assert saved.port == 8001
-    assert saved.fee_defaults.model_dump() == {"commission_rate": 0.0007, "min_commission": 0.2}
-    assert saved.schedule.daily_time == "20:00"
-    assert saved.workbench_defaults.dca.frequency == "weekly"
 
 
 @pytest.mark.parametrize("patch", [
@@ -138,14 +132,16 @@ def test_old_settings_gain_workbench_defaults_without_losing_existing_values(set
     {"research": {"ranges": {"unknown": {"low": 0, "high": 1, "step": 1}}}},
 ])
 def test_invalid_workbench_preferences_do_not_replace_saved_settings(settings_file, patch):
-    settings.save_settings({
-        "fee_defaults": {"commission_rate": 0.0009, "min_commission": 0.3},
-        "workbench_defaults": {"grid": {"buy_step": 0.04}},
+    patch_settings({
+        "backtest": {
+            "fees": {"commission_rate": 0.0009, "min_commission": 0.3},
+            "grid": {"buy_step": 0.04},
+        },
     })
     original = settings_file.read_bytes()
 
     with pytest.raises(ValidationError):
-        settings.save_settings({"workbench_defaults": patch})
+        patch_workbench(patch)
 
     assert settings_file.read_bytes() == original
     restored = settings.load_settings()
@@ -154,8 +150,7 @@ def test_invalid_workbench_preferences_do_not_replace_saved_settings(settings_fi
 
 
 def test_workbench_preferences_allow_valid_zero_values(settings_file):
-    saved = settings.save_settings({
-        "workbench_defaults": {
+    document = patch_workbench({
             "position": {"initial_shares": 0, "min_shares": 0, "max_shares": 0},
             "dca": {"initial_shares": 0},
             "research": {
@@ -168,8 +163,8 @@ def test_workbench_preferences_allow_valid_zero_values(settings_file):
                     "sell_shares": {"low": 100, "high": 100},
                 },
             },
-        },
     })
+    saved = settings.settings_from_document(document)
 
     assert saved.workbench_defaults.position.initial_shares == 0
     assert saved.workbench_defaults.dca.initial_shares == 0
@@ -181,32 +176,39 @@ def test_workbench_preferences_allow_valid_zero_values(settings_file):
 def test_settings_api_merges_workbench_defaults_and_keeps_fee_defaults(settings_file, tmp_path):
     app = create_app(str(tmp_path / "data"), start_jobs=False)
     with TestClient(app) as client:
-        initial = client.get("/api/v1/settings").json()
-        assert initial["workbench_defaults"]["grid"]["grid_mode"] == "trailing"
-        assert len(initial["workbench_defaults"]["research"]["ranges"]) == 4
+        initial = client.get("/api/v1/configuration").json()
+        assert initial["config"]["backtest"]["grid"]["grid_mode"] == "trailing"
+        assert len(initial["config"]["research"]["defaults"]["ranges"]) == 4
 
-        response = client.put("/api/v1/settings", json={
-            "base_revision": initial["config_revision"],
-            "fee_defaults": {"commission_rate": 0},
-            "workbench_defaults": {
-                "grid": {"grid_mode": "geometric", "buy_step": 0.05},
-                "research": {"reporting_budget": 333},
+        response = client.patch("/api/v1/configuration", json={
+            "base_revision": initial["revision"],
+            "patch": {
+                "backtest": {"fees": {"commission_rate": 0}},
+                "research": {"defaults": {"reporting_budget": 333}},
             },
         })
         assert response.status_code == 200
-        assert response.json()["workbench_defaults"]["grid"]["grid_mode"] == "geometric"
-        assert response.json()["workbench_defaults"]["grid"]["sell_step"] == 0.03
-        assert response.json()["workbench_defaults"]["research"]["reporting_budget"] == 333
-        assert response.json()["fee_defaults"] == {"commission_rate": 0, "min_commission": 0.1}
+        assert response.json()["config"]["backtest"]["fees"] == {"commission_rate": 0, "min_commission": 0.1}
+        assert response.json()["config"]["research"]["defaults"]["reporting_budget"] == 333
 
-        invalid = client.put("/api/v1/settings", json={
-            "base_revision": response.json()["config_revision"],
-            "workbench_defaults": {"position": {"initial_shares": 5000}},
+        grid_response = client.patch("/api/v1/configuration", json={
+            "base_revision": response.json()["revision"],
+            "patch": {"backtest": {
+                "grid": {"grid_mode": "geometric", "buy_step": 0.05},
+            }},
+        })
+        assert grid_response.status_code == 200
+        assert grid_response.json()["config"]["backtest"]["grid"]["grid_mode"] == "geometric"
+        assert grid_response.json()["config"]["backtest"]["grid"]["sell_step"] == 0.03
+
+        invalid = client.patch("/api/v1/configuration", json={
+            "base_revision": grid_response.json()["revision"],
+            "patch": {"backtest": {"position": {"initial_shares": 5000}}},
         })
         assert invalid.status_code == 422
-        after = client.get("/api/v1/settings").json()
-        assert after["workbench_defaults"]["position"]["initial_shares"] == 1000
-        assert after["fee_defaults"]["commission_rate"] == 0
+        after = client.get("/api/v1/configuration").json()["config"]
+        assert after["backtest"]["position"]["initial_shares"] == 1000
+        assert after["backtest"]["fees"]["commission_rate"] == 0
 
 
 def test_recent_symbols_reads_formal_jobs_deduplicates_and_excludes_other_jobs(settings_file, tmp_path):

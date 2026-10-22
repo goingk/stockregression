@@ -441,10 +441,10 @@ def run(data_dir: Path, result_id: str | None) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, help="现有本地 Store 目录；默认读 .local/settings.json")
+    parser.add_argument("--data-dir", type=Path, help="现有本地 Store 目录；默认使用当前主配置")
     parser.add_argument("--result-id", help="指定一个已保存、同 snapshot 的科学研究结果")
-    parser.add_argument("--json-out", type=Path, default=PROJECT_ROOT / "docs" / "159611-minute-data-acceptance.json")
-    parser.add_argument("--markdown-out", type=Path, default=PROJECT_ROOT / "docs" / "159611-minute-data-acceptance.md")
+    parser.add_argument("--json-out", type=Path, default=PROJECT_ROOT / ".local" / "minute-data-acceptance.json")
+    parser.add_argument("--markdown-out", type=Path, default=PROJECT_ROOT / ".local" / "minute-data-acceptance.md")
     args = parser.parse_args()
     data_dir = args.data_dir or Path(load_settings().data_dir)
     report = run(data_dir, args.result_id)

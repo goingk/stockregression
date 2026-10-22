@@ -344,7 +344,7 @@ class MarketDataService:
         return self.repository.dataset(symbol, timeframe) or result
 
     def bars(self, symbol: str, timeframe: str, *, start=None, end=None, version=None, limit=None,
-             materialize: bool = True) -> dict:
+             before=None, latest: bool = False, materialize: bool = True) -> dict:
         symbol, timeframe = normalize_symbol(symbol), normalize_timeframe(timeframe)
         if version is None and timeframe in DERIVED_SOURCES and materialize:
             self.ensure_timeframe(symbol, timeframe, start=start, end=end)
@@ -355,7 +355,15 @@ class MarketDataService:
             raise MarketDataError(
                 f"历史 {timeframe} 文件仅用于追溯；派生周期须由对应基础行情生成"
             )
-        frame = self.repository.bars(symbol, timeframe, start=start, end=end, version=version, limit=limit)
+        if latest:
+            frame = self.repository.read_frame(
+                symbol, timeframe, start=start, end=end, before=before,
+                version=version, limit=limit, descending=True,
+            ).sort_values("timestamp", kind="stable").reset_index(drop=True)
+        else:
+            frame = self.repository.bars(
+                symbol, timeframe, start=start, end=end, version=version, limit=limit,
+            )
         selected = int(version) if version is not None else int(dataset["current_version"])
         detail = self.repository.version_info(symbol, timeframe, selected) if selected != int(dataset["current_version"]) else None
         quality = anomaly_summary(frame, symbol=symbol, timeframe=timeframe, version=selected)

@@ -4,17 +4,16 @@
 
 ## 导入命令
 
-CLI 的股票代码与日线文件是两个必需的位置参数：
+CLI 要求明确指定证券、基础周期和文件路径：
 
 ```powershell
-uv run stockregression import-data 600000.SH .\daily.csv `
-  --minute-path .\minute.csv `
-  --actions-path .\actions.csv `
-  --calendar-path .\calendar.csv `
-  --label-convention end
+uv run stockregression data import-file 600000.SH --frequency 1day --path .\daily.csv `
+  --actions-path .\actions.csv --calendar-path .\calendar.csv
+uv run stockregression data import-file 600000.SH --frequency 1min --path .\minute.csv `
+  --calendar-path .\calendar.csv --label-convention end
 ```
 
-`symbol` 和 `daily_path` 不能写为 `--symbol` 或 `--daily-path`。文件扩展名为 `.parquet` 时按 Parquet 读取；其他扩展名按 CSV 读取。CLI、网页和 API 都在运行程序所在的本机读取该路径，不会上传到远端处理。
+文件扩展名为 `.parquet` 时按 Parquet 读取；其他扩展名按 CSV 读取。CLI、网页和 API 都在运行程序所在的本机读取该路径，不会上传到远端处理。
 
 `data import-file` 和 `data import-folder` 使用 `--import-mode merge|snapshot`。`merge` 默认保留历史并只写入新增或修订分片；`snapshot` 以本次全量文件为当前底座，缺失的旧日期会退出当前视图，旧版本仍可追溯。
 
@@ -22,7 +21,7 @@ uv run stockregression import-data 600000.SH .\daily.csv `
 
 示例假定分钟时间戳是结束标签，因此写了 `--label-convention end`；若供应方给的是开始标签，应改为 `start`。不确定时省略该选项，默认值 `auto` 会尝试校准，未核验的交易日按日线处理。请根据数据源说明选择标签，不要仅凭文件中时间看起来接近收盘就判断。
 
-新的 `data import-file` / `data import-folder` 不自动联网，也不读取其他周期。分钟文件缺少日线、真实交易日历或标签依据时仍可入库，但会标明待核验和不能严格回测的原因。需要回测时，应分别导入或显式同步日线、辅助资料和对应分钟周期。旧 `import-data` 命令由兼容层拆成独立的日线和 1 分钟任务。
+`data import-file` / `data import-folder` 不自动联网，也不读取其他周期。分钟文件缺少日线、真实交易日历或标签依据时仍可入库，但会标明待核验和不能严格回测的原因。需要回测时，应分别导入或显式同步日线、辅助资料和对应分钟周期。
 
 ## 日线
 
@@ -31,7 +30,7 @@ uv run stockregression import-data 600000.SH .\daily.csv `
 ETF 导入可通过网页类型选择，或 CLI `--etf-category stock|bond|crossborder|commodity|money` 覆盖证券清单识别结果，分别对应股票、债券、跨境、黄金/商品和货币 ETF。股票可忽略该选项。ETF OHLC 按 0.001 元精度、成交量按份提供；如果来源的成交量单位为手，须先正确转换，不能把手数直接当份数。
 
 ```powershell
-uv run --frozen stockregression import-data 518880.SH .\etf-daily.csv --calendar-path .\calendar.csv --actions-path .\etf-actions.csv --etf-category commodity
+uv run --frozen stockregression data import-file 518880.SH --frequency 1day --path .\etf-daily.csv --calendar-path .\calendar.csv --actions-path .\etf-actions.csv --etf-category commodity
 ```
 
 ETF 分红资料未核验的区间不能严格回测。可提供经核实的公司行动文件（确认无行动时使用带规范表头的空文件），切勿为了绕过核验而伪造空资料。
@@ -126,6 +125,6 @@ record_date,ex_date,pay_date,stock_date,cash_per_share,bonus_ratio,implemented,u
 
 对于分钟档案通过校验的交易日，最多允许整日缺 5 根且每个交易时段中连续缺失不超过 3 根；上午和下午首分钟必须存在。后端还会验证 OHLC 合法性、分钟成交量与日线总量，以及完整日的收盘、最高、最低价与日线是否一致。少量合格缺口只以前值补价格、成交量置零，并标记 `is_synthetic`；这种合成分钟不能发起交易。超过阈值、首分钟缺失、价格/成交量不一致或来源未校准时，数据仍可浏览和继续修补，但本次目标周期的质量报告会标为不完整，严格回测返回 `DATA_NOT_READY`。价格为 `0`、负值、空值、`NaN`、无穷值或高低价关系错误时，该记录直接隔离，不参与任何补价；读取与计算共用这一规则。旧格式快照兼容已移除。
 
-当前质量以本地合并后的真实记录及请求区间的核验结果为准，手动导入和接口同步的日期、行数分别列出。`diagnostics` 区分分钟保留率、原始有效交易分钟缺失、实际修复和集合竞价占位；100% 分钟保留率不代表所有分钟均为原始记录。旧接口失败、历史源的覆盖限制保留在 `source_events`，不再作为已被本地导入补齐后的当前缺口。不可变快照和完整历史结果仍保留原始内容，页面对旧结果做只读诊断投影。派生校验缓存随质量规则版本失效，不以旧摘要替代当前核验。
+当前质量以本地合并后的真实记录及请求区间的核验结果为准，手动导入和接口同步的日期、行数分别列出。`diagnostics` 区分分钟保留率、原始有效交易分钟缺失、实际修复和集合竞价占位；100% 分钟保留率不代表所有分钟均为原始记录。历史接口失败和来源覆盖限制保留在 `source_events`，不再作为已被本地导入补齐后的当前缺口。不可变快照和当前结果保留原始内容；派生校验缓存随质量规则版本失效，不以旧摘要替代当前核验。
 
 日线降级只提供每日 OHLC，不能重建盘中先后顺序或网格触发点。因此分钟覆盖率不足时，不能把这类日线降级回测当成分钟策略完整执行结果。

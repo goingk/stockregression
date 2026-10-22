@@ -4,11 +4,13 @@ import {
   ArrowRight, Database, Download, FileSearch, FileUp, FolderOpen, FolderUp,
   Archive, Merge, PackageCheck, RefreshCw, ShieldCheck, Upload, X,
 } from 'lucide-react'
-import { get, post, postForm } from '../api'
+import { ApiError, get, post, postForm } from '../api'
 import { Badge, Button, Card, Empty, ErrorBox, Field, Loading, PageHeader, SelectInput, Stat, TextInput, compact, dateText, useErrorMessage } from '../components'
 import { useTasks } from '../TaskCenter'
 import { useWorkspaces } from '../WorkbenchState'
 import { DataTaskReport } from '../DataTaskReport'
+import { LatestRequest } from '../requestState'
+import type { PreparationContext } from '../preparationContext'
 import type {
   Coverage, DataInventoryItem, DataInventoryResponse, DataPackageInfo,
   DataPreparationPlan, DataPreparationRequest, DataSourcesResponse, DataTimeframe,
@@ -27,15 +29,14 @@ const DATA_JOB_KINDS = new Set([
 const TERMINAL = new Set(['completed', 'partial', 'failed', 'cancelled'])
 const SUPPORTED_UPLOAD = /\.(csv|parquet)$/i
 
-type Settings = {
-  data_dir?: string
+type ConfigurationRead = {
   active_data_dir?: string
-  package_dir?: string | null
   active_package_dir?: string
-  market_cache_mb?: number
-  recent_minute_source?: 'sina' | 'tdx'
-  etf_daily_source?: 'baostock' | 'eastmoney'
+  revision?: string
+  pending_restart?: string[]
 }
+type PerformanceSettings = { cpu_budget_mode: 'auto' | 'custom'; cpu_budget?: number | null; download_workers: number; validation_workers: number; blas_threads: number; workspace_mb: number }
+type ScheduleDraft = { enabled: boolean; daily_time: string; weekly_day: string; weekly_time: string }
 type ScanItem = { relative_path: string; symbol?: string | null; size: number; duplicate?: boolean; error?: string | null }
 type ScanPreview = { folder: string; timeframe: string; items: ScanItem[]; target_count: number; file_count: number; invalid_count: number }
 type PackagePeriod = { file_count: number; bytes: number; rows: number; symbols: number; label_convention: string; first_time?: string | null; last_time?: string | null; schema_error_count: number }
@@ -112,11 +113,12 @@ function firstAvailableTimeframe(item: DataInventoryItem): DataTimeframe {
 }
 
 export default function DataManagementPage({
-  requestedReport, onReportHandled, preparation, onReturn,
+  requestedReport, onReportHandled, preparation, onPreparationJob, onReturn,
 }: {
   requestedReport?: string | null
   onReportHandled?: () => void
-  preparation?: DataPreparationRequest | null
+  preparation?: PreparationContext | null
+  onPreparationJob?: (jobId: string) => void
   onReturn?: () => void
 }) {
   const tasks = useTasks()
@@ -126,7 +128,7 @@ export default function DataManagementPage({
   const [inventory, setInventory] = useState<DataInventoryResponse | null>(null)
   const [packageInfo, setPackageInfo] = useState<DataPackageInfo | null>(null)
   const [sources, setSources] = useState<DataSourcesResponse | null>(null)
-  const [settings, setSettings] = useState<Settings>({})
+  const [configurationRead, setConfigurationRead] = useState<ConfigurationRead>({})
   const [query, setQuery] = useState('')
   const [assetType, setAssetType] = useState('')
   const [timeframe, setTimeframe] = useState<DataTimeframe | ''>('')
@@ -136,12 +138,31 @@ export default function DataManagementPage({
   const [selectedSymbol, setSelectedSymbol] = useState('')
   const [selectedTimeframe, setSelectedTimeframe] = useState<DataTimeframe>('1day')
   const [coverage, setCoverage] = useState<PeriodCoverage | null>(null)
-  const [loading, setLoading] = useState(true)
+  const [inventoryLoading, setInventoryLoading] = useState(true)
+  const [packageLoading, setPackageLoading] = useState(true)
+  const [sourcesLoading, setSourcesLoading] = useState(true)
+  const [configurationLoading, setConfigurationLoading] = useState(true)
+  const [coverageLoading, setCoverageLoading] = useState(false)
+  const [coverageRetryToken, setCoverageRetryToken] = useState(0)
+  const [inventoryError, setInventoryError] = useState('')
+  const [packageError, setPackageError] = useState('')
+  const [sourcesError, setSourcesError] = useState('')
+  const [configurationError, setConfigurationError] = useState('')
+  const [coverageError, setCoverageError] = useState('')
+  const [reportError, setReportError] = useState('')
+  const [reportRetryToken, setReportRetryToken] = useState(0)
   const [busy, setBusy] = useState('')
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [report, setReport] = useState<ReportRecord | null>(null)
   const lastDataRefresh = useRef('')
+  const inventoryRequest = useRef(new LatestRequest<string>())
+  const packageRequest = useRef(new LatestRequest<string>())
+  const sourcesRequest = useRef(new LatestRequest<string>())
+  const configurationRequest = useRef(new LatestRequest<string>())
+  const coverageRequest = useRef(new LatestRequest<string>())
+  const coverageSelection = useRef('')
+  const reportRequest = useRef(new LatestRequest<string>())
 
   const [syncSymbols, setSyncSymbols] = useState('')
   const [syncMode, setSyncMode] = useState('incremental')
@@ -182,50 +203,120 @@ export default function DataManagementPage({
   const [packageScan, setPackageScan] = useState<PackageScan | null>(null)
   const [preparationPlan, setPreparationPlan] = useState<DataPreparationPlan | null>(null)
   const [preparationBusy, setPreparationBusy] = useState(false)
+  const [scheduleDraft, setScheduleDraft] = useState<Partial<ScheduleDraft>>({})
+  const [dataDirDraft, setDataDirDraft] = useState<string | null>(null)
+  const [cacheMbDraft, setCacheMbDraft] = useState<number | null>(null)
+  const [performanceDraft, setPerformanceDraft] = useState<PerformanceSettings | null>(null)
+  const dataDirEdited = useRef(false)
 
   const loadInventory = useCallback(async () => {
-    setError('')
+    const params = new URLSearchParams({ limit: String(pageSize), offset: String(page * pageSize) })
+    if (query.trim()) params.set('q', query.trim())
+    if (assetType) params.set('asset_type', assetType)
+    if (timeframe) params.set('timeframe', timeframe)
+    if (status) params.set('status', status)
+    const ticket = inventoryRequest.current.begin(params.toString())
+    setInventoryLoading(true); setInventoryError('')
     try {
-      const params = new URLSearchParams({ limit: String(pageSize), offset: String(page * pageSize) })
-      if (query.trim()) params.set('q', query.trim())
-      if (assetType) params.set('asset_type', assetType)
-      if (timeframe) params.set('timeframe', timeframe)
-      if (status) params.set('status', status)
-      const [nextInventory, nextPackage, config, nextSources] = await Promise.all([
-        get<DataInventoryResponse>(`/data/inventory?${params}`),
-        get<DataPackageInfo>('/data/package'),
-        get<Settings>('/settings'),
-        get<DataSourcesResponse>('/data/sources'),
-      ])
+      const nextInventory = await get<DataInventoryResponse>(`/data/inventory?${params}`)
+      if (!inventoryRequest.current.isCurrent(ticket)) return
       setInventory(nextInventory)
-      setPackageInfo(nextPackage)
-      setSettings(config)
-      setSources(nextSources)
-      setPackageFolder(current => current || config.active_package_dir || config.package_dir || '')
       setSelectedSymbol(current => nextInventory.items.some(item => item.symbol === current) ? current : nextInventory.items[0]?.symbol || '')
-    } catch (cause) { setError(errorText(cause)) } finally { setLoading(false) }
-  }, [assetType, errorText, page, query, status, timeframe])
+    } catch (cause) {
+      if (inventoryRequest.current.isCurrent(ticket)) setInventoryError(errorText(cause))
+    } finally {
+      if (inventoryRequest.current.isCurrent(ticket)) setInventoryLoading(false)
+    }
+  }, [assetType, errorText, page, pageSize, query, status, timeframe])
+
+  const loadPackage = useCallback(async () => {
+    const ticket = packageRequest.current.begin('package')
+    setPackageLoading(true); setPackageError('')
+    try {
+      const value = await get<DataPackageInfo>('/data/package')
+      if (packageRequest.current.isCurrent(ticket)) setPackageInfo(value)
+    } catch (cause) {
+      if (packageRequest.current.isCurrent(ticket)) setPackageError(errorText(cause))
+    } finally {
+      if (packageRequest.current.isCurrent(ticket)) setPackageLoading(false)
+    }
+  }, [errorText])
+
+  const loadSources = useCallback(async () => {
+    const ticket = sourcesRequest.current.begin('sources')
+    setSourcesLoading(true); setSourcesError('')
+    try {
+      const value = await get<DataSourcesResponse>('/data/sources')
+      if (sourcesRequest.current.isCurrent(ticket)) setSources(value)
+    } catch (cause) {
+      if (sourcesRequest.current.isCurrent(ticket)) setSourcesError(errorText(cause))
+    } finally {
+      if (sourcesRequest.current.isCurrent(ticket)) setSourcesLoading(false)
+    }
+  }, [errorText])
+
+  const loadConfiguration = useCallback(async () => {
+    const ticket = configurationRequest.current.begin('configuration')
+    setConfigurationLoading(true); setConfigurationError('')
+    try {
+      const value = await get<ConfigurationRead>('/configuration')
+      if (!configurationRequest.current.isCurrent(ticket)) return
+      setConfigurationRead(value)
+      setPackageFolder(current => current || value.active_package_dir || '')
+    } catch (cause) {
+      if (configurationRequest.current.isCurrent(ticket)) setConfigurationError(errorText(cause))
+    } finally {
+      if (configurationRequest.current.isCurrent(ticket)) setConfigurationLoading(false)
+    }
+  }, [errorText])
 
   useEffect(() => { void loadInventory() }, [loadInventory])
+  useEffect(() => {
+    void Promise.allSettled([loadPackage(), loadSources(), loadConfiguration()])
+  }, [loadPackage, loadSources, loadConfiguration])
+  useEffect(() => {
+    const document = workspace.configuration
+    const paths = (document.paths ?? {}) as Record<string, unknown>
+    const marketData = (document.market_data ?? {}) as Record<string, unknown>
+    const runtime = (document.runtime ?? {}) as unknown as PerformanceSettings
+    if (!dataDirEdited.current) setDataDirDraft(typeof paths.data_dir === 'string' ? paths.data_dir : '')
+    setCacheMbDraft(current => current ?? Number(marketData.cache_mb ?? 256))
+    setPerformanceDraft(current => current ?? runtime)
+  }, [workspace.configuration])
   useEffect(() => { setPage(0) }, [assetType, query, status, timeframe])
   const selectedItem = useMemo(() => inventory?.items.find(item => item.symbol === selectedSymbol) || null, [inventory, selectedSymbol])
   const selectedPeriod = selectedItem?.periods[selectedTimeframe] || null
   useEffect(() => {
-    if (!selectedSymbol || !selectedItem?.periods[selectedTimeframe]) { setCoverage(null); return }
-    let active = true
+    coverageRequest.current.invalidate()
+    if (!selectedSymbol || !selectedItem?.periods[selectedTimeframe]) { setCoverage(null); setCoverageLoading(false); setCoverageError(''); return }
+    const coverageKey = selectedSymbol + ':' + selectedTimeframe
+    if (coverageSelection.current !== coverageKey) { coverageSelection.current = coverageKey; setCoverage(null) }
+    const ticket = coverageRequest.current.begin(coverageKey)
+    setCoverageLoading(true); setCoverageError('')
     get<PeriodCoverage>(`/data/coverage/${encodeURIComponent(selectedSymbol)}?timeframe=${selectedTimeframe}`)
-      .then(value => { if (active) setCoverage(value) })
-      .catch(cause => { if (active) { setCoverage(null); setError(errorText(cause)) } })
-    return () => { active = false }
-  }, [selectedSymbol, selectedTimeframe, selectedItem, errorText])
+      .then(value => { if (coverageRequest.current.isCurrent(ticket)) setCoverage(value) })
+      .catch(cause => {
+        if (!coverageRequest.current.isCurrent(ticket)) return
+        setCoverage(null); setCoverageError(errorText(cause))
+      })
+      .finally(() => { if (coverageRequest.current.isCurrent(ticket)) setCoverageLoading(false) })
+    return () => { coverageRequest.current.invalidate(ticket.key) }
+  }, [selectedSymbol, selectedTimeframe, selectedItem, errorText, coverageRetryToken])
   useEffect(() => {
-    if (!requestedReport) return
-    let active = true
+    reportRequest.current.invalidate()
+    if (!requestedReport) { setReport(null); setReportError(''); return }
+    const ticket = reportRequest.current.begin(requestedReport)
+    setReportError('')
     get<ReportRecord>(`/results/${encodeURIComponent(requestedReport)}`)
-      .then(value => { if (active) { setReport(value); onReportHandled?.() } })
-      .catch(cause => { if (active) setError(errorText(cause)) })
-    return () => { active = false }
-  }, [requestedReport, onReportHandled, errorText])
+      .then(value => { if (reportRequest.current.isCurrent(ticket)) { setReport(value); onReportHandled?.() } })
+      .catch(cause => {
+        if (!reportRequest.current.isCurrent(ticket)) return
+        setReportError(cause instanceof ApiError && cause.status === 404
+          ? '这条数据报告已经被清理或不存在。'
+          : errorText(cause))
+      })
+    return () => { reportRequest.current.invalidate(ticket.key) }
+  }, [requestedReport, onReportHandled, errorText, reportRetryToken])
 
   const completedDataJobs = tasks.jobs
     .filter(job => DATA_JOB_KINDS.has(job.kind) && TERMINAL.has(job.status))
@@ -233,8 +324,8 @@ export default function DataManagementPage({
   useEffect(() => {
     if (!completedDataJobs || completedDataJobs === lastDataRefresh.current) return
     lastDataRefresh.current = completedDataJobs
-    void loadInventory()
-  }, [completedDataJobs, loadInventory])
+    void Promise.allSettled([loadInventory(), loadPackage(), loadSources(), loadConfiguration()])
+  }, [completedDataJobs, loadConfiguration, loadInventory, loadPackage, loadSources])
 
   useEffect(() => {
     if (!selectedItem) return
@@ -251,24 +342,24 @@ export default function DataManagementPage({
   }, [initializeAll, selectedTimeframe, syncMinute, syncMode])
 
   const loadPlan = useCallback(async () => {
-    if (!preparation?.config) { setPreparationPlan(null); return }
+    if (!preparation?.request.config) { setPreparationPlan(null); return }
     setPreparationBusy(true); setError('')
     try {
-      setPreparationPlan(await post<DataPreparationPlan>('/data/preparation/plan', { config: preparation.config }))
+      setPreparationPlan(await post<DataPreparationPlan>('/data/preparation/plan', { config: preparation.request.config }))
     } catch (cause) { setError(errorText(cause)) } finally { setPreparationBusy(false) }
-  }, [errorText, preparation?.config])
+  }, [errorText, preparation?.request.config])
   useEffect(() => { void loadPlan() }, [loadPlan])
   useEffect(() => {
-    if (!preparation?.config || !completedDataJobs) return
+    if (!preparation?.request.config || !completedDataJobs) return
     void loadPlan()
-  }, [completedDataJobs, loadPlan, preparation?.config])
+  }, [completedDataJobs, loadPlan, preparation?.request.config])
 
   const run = async (label: string, action: () => Promise<unknown>, success: string) => {
     setBusy(label); setError(''); setNotice('')
     try {
       await tasks.run(label, action)
       setNotice(success)
-      await loadInventory()
+      await Promise.allSettled([loadInventory(), loadPackage(), loadSources(), loadConfiguration()])
     } catch (cause) { setError(errorText(cause)) } finally { setBusy('') }
   }
 
@@ -295,12 +386,52 @@ export default function DataManagementPage({
       const field = capability === 'recent_minute' ? 'recent_minute_source' : 'etf_daily_source'
       await workspace.saveConfiguration({ market_data: { [field]: source } })
       setNotice(`数据源已切换为 ${source}。`)
-      await loadInventory()
+      await Promise.allSettled([loadSources(), loadConfiguration()])
     } catch (cause) { setError(errorText(cause)) } finally { setBusy('') }
   }
 
   const probeSource = (source: string, capability: string, market = 'all') => {
     void run('探测数据源', () => post('/data/sources/probe', { source, capability, market }), `${source} 探测任务已提交；完成后刷新状态。`)
+  }
+
+  const configuredSchedule = (workspace.configuration.schedule ?? {}) as Partial<ScheduleDraft>
+  const scheduleValue = () => ({
+    enabled: scheduleDraft.enabled ?? configuredSchedule.enabled ?? false,
+    daily_time: scheduleDraft.daily_time ?? configuredSchedule.daily_time ?? '18:30',
+    weekly_day: scheduleDraft.weekly_day ?? configuredSchedule.weekly_day ?? 'SAT',
+    weekly_time: scheduleDraft.weekly_time ?? configuredSchedule.weekly_time ?? '10:00',
+  })
+  const saveSchedule = (install?: boolean) => void run('保存更新计划', async () => {
+    const schedule = scheduleValue()
+    await workspace.saveConfiguration({ schedule })
+    setScheduleDraft({})
+    if (install === true) return post<{ message?: string }>('/schedule/install')
+    if (install === false) return post<{ message?: string }>('/schedule/remove')
+    return { message: '更新计划已保存。' }
+  }, '更新计划已保存。')
+  const saveDataDirectory = () => {
+    const value = (dataDirDraft ?? '').trim()
+    if (!value) { setError('请填写下次启动的数据目录。'); return }
+    void run('保存数据目录', async () => {
+      await workspace.saveConfiguration({ paths: { data_dir: value } })
+      dataDirEdited.current = false
+      await loadConfiguration()
+      return { path: value }
+    }, '数据目录已保存，重启后生效；旧数据不会自动迁移。')
+  }
+  const saveCacheBudget = () => {
+    const value = Math.max(0, Math.round(Number(cacheMbDraft ?? 256)))
+    void run('保存缓存设置', async () => {
+      await workspace.saveConfiguration({ market_data: { cache_mb: value } })
+      return { value }
+    }, `行情与预览缓存上限已设为 ${value} MiB。`)
+  }
+  const savePerformance = () => {
+    if (!performanceDraft) { setError('计算资源设置尚未载入。'); return }
+    void run('保存计算资源', async () => {
+      await workspace.saveConfiguration({ runtime: performanceDraft })
+      return performanceDraft
+    }, '计算资源设置已保存，将在后续任务中生效。')
   }
 
   const submitImport = () => {
@@ -401,10 +532,11 @@ export default function DataManagementPage({
   }
 
   const submitPreparation = async () => {
-    if (!preparation?.config) return
+    if (!preparation?.request.config) return
     setBusy('准备数据'); setError(''); setNotice('')
     try {
-      await tasks.run('准备数据', () => post('/data/preparation', { config: preparation.config }))
+      const response = await tasks.run('准备数据', () => post<{ job_id?: string }>('/data/preparation', { config: preparation.request.config }))
+      if (response.job_id) onPreparationJob?.(response.job_id)
       setNotice('数据准备任务已提交；完成后会重新检查本次请求。')
     } catch (cause) { setError(errorText(cause)) } finally { setBusy('') }
   }
@@ -416,25 +548,40 @@ export default function DataManagementPage({
   }
 
   const totalPages = Math.max(1, Math.ceil((inventory?.count || 0) / pageSize))
+  const preparationJob = preparation?.preparationJobId
+    ? tasks.jobs.find(job => job.id === preparation.preparationJobId)
+    : undefined
+  const preparationJobDone = preparationJob ? TERMINAL.has(preparationJob.status) : false
+  const returnLabel = preparation?.origin === 'research' ? '返回参数研究' : preparation?.origin === 'backtest' ? '返回策略回测' : '返回原页面'
+  const refreshAll = useCallback(async () => {
+    await Promise.allSettled([loadInventory(), loadPackage(), loadSources(), loadConfiguration(), loadPlan()])
+  }, [loadConfiguration, loadInventory, loadPackage, loadPlan, loadSources])
 
   return <>
-    <PageHeader eyebrow="DATA PACKAGE" title="数据管理" description="当前数据包是唯一正式行情来源；导入、同步、聚合和公司行动资料都写入这里。" action={<div className="button-row"><Button variant="secondary" busy={busy === '刷新'} onClick={() => void run('刷新', loadInventory, '数据包目录已刷新。')}><RefreshCw size={15} />刷新</Button><Button variant="quiet" onClick={tasks.showHistory}><Database size={15} />任务记录</Button></div>} />
+    <PageHeader eyebrow="DATA PACKAGE" title="数据管理" description="当前数据包是唯一正式行情来源；同步、导入、聚合、来源、路径与运行设置都集中在这里。" action={<div className="button-row"><Button variant="secondary" busy={busy === '刷新'} onClick={() => void run('刷新', refreshAll, '数据包、来源与运行设置已刷新。')}><RefreshCw size={15} />刷新</Button><Button variant="quiet" onClick={tasks.showHistory}><Database size={15} />任务记录</Button></div>} />
     {error && <ErrorBox message={error} onClose={() => setError('')} />}
     {notice && <div className="notice success"><span>{notice}</span><button className="text-link" onClick={() => setNotice('')}>收起</button></div>}
+    {reportError && <ErrorBox message={reportError} onClose={() => setReportError('')} onRetry={requestedReport ? () => setReportRetryToken(token => token + 1) : undefined} />}
 
-    {preparation && <Card title="本次回测的数据准备" subtitle={periodText(preparation)} action={preparationPlan ? <Badge tone={preparationPlan.ready ? 'green' : 'amber'}>{preparationPlan.ready ? '已可用' : `${preparationPlan.gaps.length} 项缺口`}</Badge> : <Badge>检查中</Badge>}>
+    {preparation && <Card title="本次请求的数据准备" subtitle={periodText(preparation.request)} action={preparationPlan ? <Badge tone={preparationPlan.ready ? 'green' : 'amber'}>{preparationPlan.ready ? '原请求已可用' : `${preparationPlan.gaps.length} 项缺口`}</Badge> : <Badge>检查中</Badge>}>
+      <div className="result-meta"><span>来源：{preparation.origin === 'research' ? '参数研究' : '策略回测'}</span><span>请求指纹：{preparation.fingerprint}</span>{preparation.preparationJobId && <span>准备任务：{preparation.preparationJobId.slice(0, 12)} · {preparationJob?.status ?? '读取中'}</span>}</div>
       {preparationBusy ? <Loading label="读取本次请求所需数据…" /> : preparationPlan ? <>
         {preparationPlan.gaps.length > 0 && <div className="preparation-gaps">{preparationPlan.gaps.map((gap, index) => <p key={`${gap.kind}-${index}`}><Badge tone="amber">{gap.timeframe || gap.kind || '数据'}</Badge><span>{gap.message}</span></p>)}</div>}
         {preparationPlan.ready && (preparationPlan.warnings?.length ?? 0) > 0 && <div className="notice"><span>{preparationPlan.warnings?.join('；')}</span></div>}
         <div className="table-wrap"><table><thead><tr><th>顺序</th><th>处理事项</th><th>范围</th><th>说明</th></tr></thead><tbody>{preparationPlan.steps.map((step, index) => <tr key={`${step.kind}-${index}`}><td>{index + 1}</td><td>{step.kind === 'auxiliary' ? '日历与公司行动' : step.kind === 'validate' ? '校验并发布' : `${step.timeframe} 行情`}</td><td>{step.start ? `${step.start} → ${step.end}` : '当前数据包'}</td><td>{step.reason}</td></tr>)}</tbody></table></div>
-        <div className="button-row"><Button busy={busy === '准备数据'} disabled={preparationPlan.ready} onClick={() => void submitPreparation()}><Download size={15} />提交准备任务</Button>{preparationPlan.ready && onReturn && <Button variant="secondary" onClick={onReturn}>返回原页面<ArrowRight size={14} /></Button>}</div>
+        <div className="button-row"><Button busy={busy === '准备数据'} disabled={preparationPlan.ready} onClick={() => void submitPreparation()}><Download size={15} />提交准备任务</Button><Button variant="quiet" busy={preparationBusy} onClick={() => void loadPlan()}><RefreshCw size={14} />重新检查原请求</Button>{preparationPlan.ready && onReturn && <Button variant="secondary" onClick={onReturn}>{returnLabel}<ArrowRight size={14} /></Button>}{!preparationPlan.ready && onReturn && <Button variant="quiet" onClick={onReturn}>取消并{returnLabel.replace('返回', '返回')}</Button>}</div>
+        {preparationJobDone && !preparationPlan.ready && <p className="inline-warning">准备任务已结束，但原请求仍有缺口。请查看上方步骤和任务错误，再重新检查。</p>}
       </> : <Empty title="未载入准备配置" detail="从回测或研究的缺口提示进入时可查看完整准备步骤。" />}
     </Card>}
 
     <Card title="本地数据" subtitle="按证券查看各周期覆盖、文件与质量；筛选统计来自完整数据包目录。" action={packageInfo ? <Badge tone={packageInfo.status === 'ready' ? 'green' : packageInfo.status === 'missing' ? 'red' : 'amber'}>{packageInfo.status === 'ready' ? '数据包可用' : packageInfo.status === 'missing' ? '数据包不可读' : packageInfo.status === 'index_only' ? '索引已接入 · 待登记包清单' : packageInfo.status === 'empty' ? '空数据包' : '有待恢复事务'}</Badge> : null}>
-      <div className="package-summary"><div><small>数据包</small><strong>{packageInfo?.path || settings.active_package_dir || '未配置'}</strong></div><div><small>身份 / 版本</small><strong>{packageInfo?.package_id || '—'} · v{packageInfo?.package_version ?? 0}</strong></div><div><small>容量 / 文件</small><strong>{formatBytes(packageInfo?.bytes || 0)} · {packageInfo?.file_count ?? 0}</strong></div></div>
-      <div className="source-panel-head"><div><strong>在线数据源</strong><span>默认来源直接使用；可选来源检测通过后才能启用，失败会暂停 {sources?.cooldown_hours ?? 24} 小时并回退默认来源；默认与可选来源都失败时自动转同花顺。</span></div><Button variant="quiet" busy={busy === '刷新来源'} onClick={() => void run('刷新来源', loadInventory, '数据源状态已刷新。')}><RefreshCw size={14} />刷新状态</Button></div>
-      {!sources ? <Loading label="读取来源状态…" /> : <div className="source-grid">{sources.capabilities.map(capability => <div className="source-panel" key={capability.capability}>
+      {packageError && <ErrorBox message={'数据包信息读取失败：' + packageError} onRetry={() => void loadPackage()} />}
+      {packageLoading && packageInfo && <p className="inline-warning">正在刷新数据包信息，当前显示上次成功结果。</p>}
+      <div className="package-summary"><div><small>数据包</small><strong>{packageInfo?.path || configurationRead.active_package_dir || '未配置'}</strong></div><div><small>身份 / 版本</small><strong>{packageInfo?.package_id || '—'} · v{packageInfo?.package_version ?? 0}</strong></div><div><small>容量 / 文件</small><strong>{formatBytes(packageInfo?.bytes || 0)} · {packageInfo?.file_count ?? 0}</strong></div></div>
+      <div className="source-panel-head"><div><strong>在线数据源</strong><span>默认来源直接使用；可选来源检测通过后才能启用，失败会暂停 {sources?.cooldown_hours ?? 24} 小时并回退默认来源；默认与可选来源都失败时自动转同花顺。</span></div><Button variant="quiet" busy={sourcesLoading} onClick={() => void loadSources()}><RefreshCw size={14} />刷新状态</Button></div>
+      {sourcesError && <ErrorBox message={'数据源状态读取失败：' + sourcesError} onRetry={() => void loadSources()} />}
+      {sourcesLoading && sources && <p className="inline-warning">正在刷新来源状态，当前显示上次成功结果。</p>}
+      {!sources && sourcesLoading ? <Loading label="读取来源状态…" /> : sources ? <div className="source-grid">{sources.capabilities.map(capability => <div className="source-panel" key={capability.capability}>
         <div className="source-panel-head"><div><strong>{capability.label}</strong><span>{capability.description}</span></div><Badge tone={capability.routes.some(route => route.fallback) ? 'amber' : 'blue'}>{capability.routes.some(route => route.fallback) ? `${capability.configured} · 部分回退` : `当前 ${capability.configured}`}</Badge></div>
         <div className="source-options">{capability.sources.map(option => {
           return <div className="source-option" key={option.source}>
@@ -443,15 +590,19 @@ export default function DataManagementPage({
             <div className="button-row"><Button variant="quiet" busy={busy === '探测数据源'} onClick={() => probeSource(option.source, capability.capability)}>检测</Button>{option.role === 'fallback' ? <Badge tone="neutral">自动回退</Badge> : !option.selected && <Button variant="secondary" disabled={!option.selectable || busy === '切换来源'} onClick={() => void chooseSource(capability.capability, option.source)}>{option.selectable ? '启用' : '检测通过后启用'}</Button>}</div>
           </div>
         })}</div>
-      </div>)}</div>}
+      </div>)}</div> : !sourcesError ? <Empty title="暂无来源状态" detail="刷新后会显示来源检测与回退状态。" /> : null}
+      {inventoryError && <ErrorBox message={'数据目录读取失败：' + inventoryError} onRetry={() => void loadInventory()} />}
+      {inventoryLoading && inventory && <p className="inline-warning">正在刷新目录，当前显示上次成功结果。</p>}
       <div className="form-grid four"><Field label="搜索"><TextInput value={query} onChange={event => setQuery(event.target.value)} placeholder="代码或名称" /></Field><Field label="证券类型"><SelectInput value={assetType} onChange={event => setAssetType(event.target.value)}><option value="">股票与 ETF</option><option value="stock">股票</option><option value="etf">ETF</option></SelectInput></Field><Field label="周期"><SelectInput value={timeframe} onChange={event => setTimeframe(event.target.value as DataTimeframe | '')}><option value="">全部周期</option>{TIMEFRAMES.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</SelectInput></Field><Field label="状态"><SelectInput value={status} onChange={event => setStatus(event.target.value)}><option value="">全部状态</option><option value="ready">本次规则下可用</option><option value="partial">有缺口</option><option value="pending_validation">待核验</option><option value="missing">文件缺失</option></SelectInput></Field></div>
       <div className="stat-grid four"><Stat label="证券" value={inventory?.stats.symbols ?? 0} note={`共 ${inventory?.dataset_count ?? 0} 个标的周期`} tone="blue" /><Stat label="可用数据集" value={inventory?.stats.ready ?? 0} note="文件、质量与覆盖均已通过" tone="green" /><Stat label="待处理" value={inventory?.stats.pending ?? 0} note="待核验、缺口或缺失" tone={(inventory?.stats.pending || 0) ? 'amber' : 'neutral'} /><Stat label="行情行数" value={compact(inventory?.stats.rows ?? 0)} note={formatBytes(inventory?.stats.bytes || 0)} /></div>
-      {loading ? <Loading label="读取数据包目录…" /> : inventory?.items.length ? <div className="table-wrap inventory-table"><table><thead><tr><th>证券</th>{TIMEFRAMES.map(([name, label]) => <th key={name}>{label}</th>)}<th>最近更新</th></tr></thead><tbody>{inventory.items.map(item => <tr key={item.symbol} className={selectedSymbol === item.symbol ? 'selected-row' : ''} onClick={() => chooseSymbolPeriod(item, selectedItem?.periods[selectedTimeframe] ? selectedTimeframe : firstAvailableTimeframe(item))}><td><strong>{item.name}</strong><small>{item.symbol} · {item.asset_type === 'etf' ? 'ETF' : '股票'}</small></td>{TIMEFRAMES.map(([name]) => { const period = item.periods[name]; return <td key={name}>{period ? <button className="period-cell" onClick={event => { event.stopPropagation(); chooseSymbolPeriod(item, name) }}><Badge tone={statusTone(period.status)}>{statusLabel(period.status)}</Badge><small>{dateText(period.last_time)}</small></button> : <span className="period-empty">—</span>}</td>})}<td>{dateText(item.updated_at)}</td></tr>)}</tbody></table></div> : <Empty title="当前筛选没有本地数据" detail="可以从文件导入、数据包登记或线上初始化加入证券。" />}
+      {inventoryLoading && !inventory ? <Loading label="读取数据包目录…" /> : inventory?.items.length ? <div className="table-wrap inventory-table"><table><thead><tr><th>证券</th>{TIMEFRAMES.map(([name, label]) => <th key={name}>{label}</th>)}<th>最近更新</th></tr></thead><tbody>{inventory.items.map(item => <tr key={item.symbol} className={selectedSymbol === item.symbol ? 'selected-row' : ''} onClick={() => chooseSymbolPeriod(item, selectedItem?.periods[selectedTimeframe] ? selectedTimeframe : firstAvailableTimeframe(item))}><td><strong>{item.name}</strong><small>{item.symbol} · {item.asset_type === 'etf' ? 'ETF' : '股票'}</small></td>{TIMEFRAMES.map(([name]) => { const period = item.periods[name]; return <td key={name}>{period ? <button className="period-cell" onClick={event => { event.stopPropagation(); chooseSymbolPeriod(item, name) }}><Badge tone={statusTone(period.status)}>{statusLabel(period.status)}</Badge><small>{dateText(period.last_time)}</small></button> : <span className="period-empty">—</span>}</td>})}<td>{dateText(item.updated_at)}</td></tr>)}</tbody></table></div> : <Empty title="当前筛选没有本地数据" detail="可以从文件导入、数据包登记或线上初始化加入证券。" />}
       <div className="pagination-row"><span>第 {page + 1} / {totalPages} 页 · 共 {inventory?.count ?? 0} 个证券</span><div><Button variant="quiet" disabled={page <= 0} onClick={() => setPage(current => Math.max(0, current - 1))}>上一页</Button><Button variant="quiet" disabled={page + 1 >= totalPages} onClick={() => setPage(current => current + 1)}>下一页</Button></div></div>
     </Card>
 
     <Card title={selectedItem ? `${selectedItem.name} · ${selectedTimeframe}` : '数据详情'} subtitle="覆盖区间、来源、质量检查和下一步修复入口。" action={selectedPeriod ? <Badge tone={statusTone(selectedPeriod.status)}>{statusLabel(selectedPeriod.status)}</Badge> : null}>
       {!selectedItem || !selectedPeriod ? <Empty title="请选择证券和周期" detail="点击上表中的周期查看详细状态。" /> : <>
+        {coverageError && <ErrorBox message={'覆盖详情读取失败：' + coverageError} onRetry={() => setCoverageRetryToken(token => token + 1)} />}
+        {coverageLoading && coverage && <p className="inline-warning">正在刷新覆盖详情，当前显示上次成功结果。</p>}
         <div className="stat-grid four"><Stat label="首末时间" value={`${dateText(selectedPeriod.first_time)} → ${dateText(selectedPeriod.last_time)}`} note={`版本 ${selectedPeriod.current_version}`} /><Stat label="覆盖" value={{ complete: '完整', partial: '有缺口', unknown: '未知' }[selectedPeriod.coverage_status] || selectedPeriod.coverage_status} note={`已核验至 ${dateText(selectedPeriod.verified_through)}`} tone={selectedPeriod.coverage_status === 'complete' ? 'green' : 'amber'} /><Stat label="文件 / 质量" value={`${selectedPeriod.file_status === 'readable' ? '可读' : selectedPeriod.file_status === 'changed' ? '已变化' : '缺失'} / ${selectedPeriod.quality_status === 'passed' ? '通过' : selectedPeriod.quality_status === 'failed' ? '失败' : '待核验'}`} note={`${compact(selectedPeriod.row_count)} 行`} /><Stat label="合成记录" value={selectedPeriod.synthetic_rows} note="不能触发交易" tone={selectedPeriod.synthetic_rows ? 'amber' : 'green'} /></div>
         {coverage?.segments?.length ? <div className="table-wrap coverage-table compact-coverage"><table><thead><tr><th>检查区间</th><th>结果</th><th>预期 / 实际</th><th>缺口</th><th>检查时间</th></tr></thead><tbody>{coverage.segments.map((segment, index) => { const row = segment as Record<string, unknown>; return <tr key={String(row.start_time) + index}><td>{dateText(String(row.start_time))} → {dateText(String(row.end_time))}</td><td>{String(row.status ?? '—')}</td><td>{String(row.expected_rows ?? '—')} / {String(row.observed_rows ?? '—')}</td><td>{String(row.gap_count ?? 0)}</td><td>{dateText(String(row.checked_at))}</td></tr> })}</tbody></table></div> : <p className="inline-warning">该版本尚无检查区间报告。登记成功不等于质量已通过。</p>}
         <div className="button-row"><Badge tone={selectedPeriod.archive?.protected ? 'green' : 'amber'}>{selectedPeriod.archive?.protected ? '历史快照已保护' : '历史快照未保护'}</Badge><Badge tone="blue">增量文件 {selectedPeriod.increment_count || 0}</Badge>{selectedItem.periods['1day'] && <Badge>日线合规至 {dateText(selectedItem.periods['1day']?.verified_through)}</Badge>}{selectedItem.periods['1min'] && <Badge>1 分钟合规至 {dateText(selectedItem.periods['1min']?.verified_through)}</Badge>}</div><div className="button-row data-detail-actions"><Button variant="secondary" busy={busy === '校验'} onClick={() => void run('校验', () => post('/data/validate', { symbol: selectedItem.symbol, timeframe: selectedTimeframe }), '增量校验任务已提交。')}><ShieldCheck size={14} />增量校验</Button><Button variant="quiet" onClick={() => { setSyncSymbols(selectedItem.symbol); setSyncScope('selected'); document.getElementById('data-import-update')?.scrollIntoView({ behavior: 'smooth' }) }}>更新该周期</Button><Button variant="quiet" busy={busy === '保护历史快照'} disabled={!selectedPeriod.archive || selectedPeriod.archive.protected} onClick={archiveSelected}><Archive size={14} />保护历史快照</Button></div>
@@ -489,8 +640,34 @@ export default function DataManagementPage({
 
     <Card title="数据包索引" subtitle="正式行情读取 data/dataset 下登记的数据包；登记只更新索引，不复制 K 线。" action={<Badge tone="blue">唯一来源</Badge>}>
       <div className="form-grid one"><Field label="当前数据包目录"><TextInput readOnly value={packageFolder} /></Field></div>
-      <div className="button-row"><Button variant="secondary" busy={busy === '扫描数据包'} onClick={() => void scanPackage()}><FileSearch size={15} />扫描结构</Button><Button busy={busy === '登记数据包'} disabled={!packageFolder.trim()} onClick={registerPackage}><PackageCheck size={15} />重新登记当前数据包</Button>{preparationPlan?.ready && onReturn && <Button variant="quiet" onClick={onReturn}>返回回测<ArrowRight size={14} /></Button>}</div>
+      <div className="button-row"><Button variant="secondary" busy={busy === '扫描数据包'} onClick={() => void scanPackage()}><FileSearch size={15} />扫描结构</Button><Button busy={busy === '登记数据包'} disabled={!packageFolder.trim()} onClick={registerPackage}><PackageCheck size={15} />重新登记当前数据包</Button>{preparationPlan?.ready && onReturn && <Button variant="quiet" onClick={onReturn}>{returnLabel}<ArrowRight size={14} /></Button>}</div>
       {packageScan && <div className="scan-summary"><strong>{compact(packageScan.rows)} 行 · {formatBytes(packageScan.bytes)}</strong><span>{packageScan.errors.length} 个结构问题</span><div className="table-wrap scan-table"><table><thead><tr><th>周期</th><th>文件 / 标的</th><th>行数</th><th>标签</th><th>首末时间</th><th>问题</th></tr></thead><tbody>{Object.entries(packageScan.timeframes).map(([name, item]) => <tr key={name}><td>{name}</td><td>{item.file_count} / {item.symbols}</td><td>{compact(item.rows)}</td><td>{item.label_convention}</td><td>{dateText(item.first_time)} → {dateText(item.last_time)}</td><td>{item.schema_error_count || '—'}</td></tr>)}</tbody></table></div></div>}
+    </Card>
+
+    <Card title="本机运行设置" subtitle="数据目录、缓存、计算资源与系统更新计划；保存后按提示重启或在后续任务中生效。" action={<Badge tone={configurationRead.pending_restart?.length ? 'amber' : 'green'}>{configurationRead.pending_restart?.length ? `待重启 ${configurationRead.pending_restart.length} 项` : '配置已同步'}</Badge>}>
+      {configurationError && <ErrorBox message={'运行配置读取失败：' + configurationError} onRetry={() => void loadConfiguration()} />}
+      {configurationLoading && <p className='field-hint'>正在刷新运行配置，当前表单保留本页编辑值。</p>}
+      <div className='form-grid two'>
+        <Field label='当前活动数据目录'><TextInput readOnly value={configurationRead.active_data_dir ?? ''} /></Field>
+        <Field label='下次启动的数据目录' hint='保存不同目录后需重启；旧目录不会自动迁移。'><TextInput value={dataDirDraft ?? ''} onChange={event => { dataDirEdited.current = true; setDataDirDraft(event.target.value) }} /></Field>
+        <Field label='行情与预览缓存上限（MiB）' hint='0 表示关闭跨请求缓存；计算任务工作内存单独设置。'><TextInput type='number' min={0} max={16384} value={cacheMbDraft ?? 256} onChange={event => setCacheMbDraft(Number(event.target.value))} /></Field>
+        <div className='settings-save-row'><Button variant='secondary' busy={busy === '保存数据目录'} onClick={saveDataDirectory}>保存数据目录</Button><Button variant='quiet' busy={busy === '保存缓存设置'} onClick={saveCacheBudget}>保存缓存设置</Button></div>
+      </div>
+      <div className='form-grid four'>
+        <Field label='CPU 预算模式'><SelectInput value={performanceDraft?.cpu_budget_mode ?? 'auto'} onChange={event => setPerformanceDraft(current => current ? { ...current, cpu_budget_mode: event.target.value as 'auto' | 'custom' } : current)}><option value='auto'>自动</option><option value='custom'>手动</option></SelectInput></Field>
+        <Field label='下载并发'><TextInput type='number' min={1} max={4} value={performanceDraft?.download_workers ?? 4} onChange={event => setPerformanceDraft(current => current ? { ...current, download_workers: Number(event.target.value) } : current)} /></Field>
+        <Field label='校验并发'><TextInput type='number' min={1} max={4} value={performanceDraft?.validation_workers ?? 4} onChange={event => setPerformanceDraft(current => current ? { ...current, validation_workers: Number(event.target.value) } : current)} /></Field>
+        <Field label='BLAS 线程'><TextInput type='number' min={1} max={16} value={performanceDraft?.blas_threads ?? 8} onChange={event => setPerformanceDraft(current => current ? { ...current, blas_threads: Number(event.target.value) } : current)} /></Field>
+        <Field label='工作内存（MiB）'><TextInput type='number' min={256} max={65536} value={performanceDraft?.workspace_mb ?? 8192} onChange={event => setPerformanceDraft(current => current ? { ...current, workspace_mb: Number(event.target.value) } : current)} /></Field>
+        <div className='settings-save-row'><Button variant='secondary' busy={busy === '保存计算资源'} onClick={savePerformance}>保存计算资源</Button></div>
+      </div>
+      <div className='form-grid four'>
+        <Field label='自动更新计划'><SelectInput value={scheduleValue().enabled ? 'on' : 'off'} onChange={event => setScheduleDraft(current => ({ ...current, enabled: event.target.value === 'on' }))}><option value='off'>关闭</option><option value='on'>启用</option></SelectInput></Field>
+        <Field label='每日更新时间'><TextInput type='time' value={scheduleValue().daily_time} onChange={event => setScheduleDraft(current => ({ ...current, daily_time: event.target.value }))} /></Field>
+        <Field label='每周核对日'><SelectInput value={scheduleValue().weekly_day} onChange={event => setScheduleDraft(current => ({ ...current, weekly_day: event.target.value }))}>{['MON','TUE','WED','THU','FRI','SAT','SUN'].map(day => <option key={day} value={day}>{day}</option>)}</SelectInput></Field>
+        <Field label='每周核对时间'><TextInput type='time' value={scheduleValue().weekly_time} onChange={event => setScheduleDraft(current => ({ ...current, weekly_time: event.target.value }))} /></Field>
+      </div>
+      <div className='button-row'><Button variant='secondary' busy={busy === '保存更新计划'} onClick={() => saveSchedule()}>保存计划</Button><Button variant='quiet' busy={busy === '保存更新计划'} onClick={() => saveSchedule(true)}>保存并安装</Button><Button variant='quiet' busy={busy === '保存更新计划'} onClick={() => saveSchedule(false)}>移除系统计划</Button></div>
     </Card>
 
     {report && <div className="task-drawer-overlay" onMouseDown={event => { if (event.target === event.currentTarget) setReport(null) }}><section className="task-drawer report-drawer" role="dialog" aria-modal="true" aria-label="数据任务报告"><Card title="数据任务报告" subtitle={String(report.message ?? report.status ?? '')} action={<Button variant="quiet" onClick={() => setReport(null)}><X size={14} />关闭</Button>}>

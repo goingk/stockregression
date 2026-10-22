@@ -21,69 +21,34 @@ from stockregression.settings import CONFIG_SCHEMA_VERSION, load_settings
 def config_file(tmp_path, monkeypatch):
     target = tmp_path / "config" / "application.json"
     monkeypatch.setattr(settings_module, "SETTINGS_FILE", target)
-    monkeypatch.setattr(settings_module, "LEGACY_SETTINGS_FILE", tmp_path / ".local" / "settings.json")
     return target
 
 
-def old_flat_settings() -> dict:
-    return {
-        "port": 8123,
-        "data_dir": "data",
-        "package_dir": "data/dataset/etf",
-        "fee_defaults": {"commission_rate": .0007, "min_commission": .2},
-        "workbench_defaults": {
-            "grid": {"grid_mode": "geometric", "buy_step": .015, "sell_step": .02},
-            "position": {"initial_shares": 10000, "min_shares": 0, "max_shares": 30000, "buy_shares": 1200, "sell_shares": 1000},
-            "research": {
-                "protocol_version": 4, "strategy_version": 1, "ranking_mode": "fixed_mean",
-                "selection_target": "fixed", "max_drawdown": .3, "top_candidates": 100,
-                "granularity": {
-                    "buy_step": .0001, "sell_step": .0001, "sell_shares": 100,
-                    "buy_shares": 100, "min_shares": 500, "max_shares": 500,
-                },
-                "ranges": {
-                    "buy_step": {"low": .005, "high": .025, "step": .002},
-                    "sell_step": {"low": .005, "high": .025, "step": .002},
-                    "buy_shares": {"low": 800, "high": 1200, "step": 100},
-                    "sell_shares": {"low": 800, "high": 1200, "step": 100},
-                    "initial_shares": {"low": 10000, "high": 10000, "step": 1000},
-                    "min_shares": {"low": 0, "high": 2000, "step": 1000},
-                    "max_shares": {"low": 20000, "high": 22000, "step": 2000},
-                },
-            },
-        },
-    }
-
-
-def test_flat_migration_materialises_one_file_and_archives_exact_legacy_defaults(config_file):
-    legacy_file = settings_module.LEGACY_SETTINGS_FILE
-    legacy_file.parent.mkdir(parents=True)
-    legacy_file.write_text(json.dumps(old_flat_settings()), encoding="utf-8")
-
+def test_only_the_current_grouped_configuration_is_materialised(config_file):
     loaded = load_settings()
     document = current_configuration()
     assert config_file.exists()
-    assert document["config_schema_version"] == CONFIG_SCHEMA_VERSION
-    assert document["application"]["port"] == 8123
-    assert document["backtest"]["fees"] == {"commission_rate": .0007, "min_commission": .2}
-    archived = document["research"]["legacy"]["research_defaults"]
-    assert archived["strategy_version"] == 1
-    assert archived["protocol_version"] == 4
-    assert len(archived["ranges"]) == 7
-    assert archived["ranges"]["max_shares"] == {"low": 20000.0, "high": 22000.0, "step": 2000.0}
-    defaults = document["research"]["defaults"]
-    assert defaults["protocol_version"] == 5
-    assert defaults["strategy_version"] == 5
-    assert defaults["ranking_mode"] == "robust_j"
-    assert defaults["max_principal_drawdown"] == 0.2
-    assert defaults["training_window_mode"] == "same_price"
-    assert defaults["training_budget"] == 20_000
-    assert defaults["validation_budget"] == 100_000
-    assert defaults["reporting_budget"] == 1_000
+    assert document["config_schema_version"] == CONFIG_SCHEMA_VERSION == 5
+    assert set(document["research"]) == {"defaults"}
+    assert loaded.workbench_defaults.research.protocol_version == 5
     assert loaded.workbench_defaults.research.strategy_version == 5
-    for retired in ("mode", "n_trials", "max_drawdown", "bootstrap_reps", "outer_validation_days"):
-        assert retired not in defaults
-    assert document["market_data"]["network_timeout_seconds"] == 15
+
+
+def test_obsolete_flat_or_archived_configuration_is_rejected(config_file):
+    config_file.parent.mkdir(parents=True)
+    obsolete = {"port": 8123, "workbench_defaults": {"research": {"protocol_version": 4}}}
+    config_file.write_text(json.dumps(obsolete), encoding="utf-8")
+    before = config_file.read_bytes()
+    with pytest.raises(ValueError):
+        load_settings()
+    assert config_file.read_bytes() == before
+
+    current = settings_module.configuration_document(settings_module.Settings())
+    current["research"]["legacy"] = {"protocol_version": 4}
+    current.pop("config_revision", None)
+    config_file.write_text(json.dumps(current), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_settings()
 
 
 def test_patch_round_trips_zero_false_and_null_with_a_stable_revision(config_file):
@@ -132,7 +97,7 @@ def test_invalid_manually_edited_file_is_not_replaced_with_defaults(config_file)
     assert config_file.read_bytes() == before
 
 
-def test_configuration_api_conflict_and_legacy_write_gate(config_file, tmp_path):
+def test_configuration_api_conflict_and_removed_legacy_write_endpoint(config_file, tmp_path):
     app = create_app(str(tmp_path / "data"), start_jobs=False)
     with TestClient(app) as client:
         first = client.get("/api/v1/configuration").json()
@@ -150,7 +115,7 @@ def test_configuration_api_conflict_and_legacy_write_gate(config_file, tmp_path)
         })
         assert conflict.status_code == 409
         legacy = client.put("/api/v1/settings", json={"fee_defaults": {"commission_rate": 0}})
-        assert legacy.status_code == 428
+        assert legacy.status_code in {404, 405}
         schema = client.get("/api/v1/configuration/schema")
         assert schema.status_code == 200
         assert "market_data" in schema.json()["json_schema"]["properties"]
@@ -216,19 +181,3 @@ def test_stale_submission_revision_is_rejected_without_creating_a_job(config_fil
         })
         assert stale.status_code == 409
         assert stale.json()["detail"]["code"] == "CONFIG_REVISION_CONFLICT"
-
-
-def test_legacy_partial_market_data_save_preserves_and_synchronises_other_fields(config_file):
-    load_settings()
-    saved = settings_module.save_settings({
-        "market_data": {"daily_batch_size": 77},
-        "recent_minute_source": "tdx",
-    })
-    document = current_configuration()
-    assert saved.market_data.daily_batch_size == 77
-    assert saved.market_data.network_timeout_seconds == 15
-    assert saved.market_data.recent_minute_source == "tdx"
-    assert saved.recent_minute_source == "tdx"
-    assert document["market_data"]["daily_batch_size"] == 77
-    assert document["market_data"]["network_timeout_seconds"] == 15
-    assert document["market_data"]["recent_minute_source"] == "tdx"

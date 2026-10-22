@@ -112,21 +112,26 @@ def _cleanup_uploaded_input(store: Store, job_id: str):
     job = store.job(job_id) or {}
     payload = job.get("payload") or {}
     directories = payload.get("upload_dirs") or ([payload["upload_dir"]] if payload.get("upload_dir") else [])
-    allowed = [
-        (store.root / "imports").resolve(),
-        MarketDataService(store).repository.package.staging_dir.resolve(),
-    ]
+    import_root = (store.root / "imports").resolve()
+    staging_uploads = (
+        MarketDataService(store).repository.package.staging_dir / "uploads"
+    ).resolve()
     for relative in directories:
         path = Path(relative)
         target = path.resolve() if path.is_absolute() else (store.root / path).resolve()
-        if any(target.is_relative_to(root) for root in allowed) and target.is_dir():
+        owned = (
+            target != import_root and target.is_relative_to(import_root)
+        ) or (
+            target != staging_uploads and target.is_relative_to(staging_uploads)
+        )
+        if owned and target.is_dir():
             shutil.rmtree(target, ignore_errors=True)
 
 
 def _research_protocol_hash(config: OptimizationConfig) -> str:
     payload = config.model_dump(mode="json")
     payload.pop("configuration_revision", None)
-    from .research_v4.space import UNITS
+    from .research.space import UNITS
     payload["protocol_thresholds"] = {
         "protocol_version": 5,
         "result_schema_version": 2,
@@ -704,6 +709,7 @@ class JobManager:
                 if marked or current.get("status") != "running":
                     # The dead job must not keep holding its CPU lease.
                     _release_job_lease(store, job["id"])
+                    _cleanup_uploaded_input(store, job["id"])
             cursor = (page[-1]["created_at"], page[-1]["id"])
 
     def start(self):
@@ -733,6 +739,7 @@ class JobManager:
                             error="计算进程异常退出", message="进程中断",
                         )
                     _release_job_lease(store, job_id)
+                    _cleanup_uploaded_input(store, job_id)
                     continue
                 job = store.job(job_id) or {}
                 limit = _runtime_limit_seconds(job)
@@ -759,9 +766,16 @@ class JobManager:
                             claim_token=None, claimed_at=None,
                         )
                         _release_job_lease(store, job_id)
+                        _cleanup_uploaded_input(store, job_id)
             if len(self.active) >= self.workers:
                 continue
-            for job_id in store.claim_jobs(self.claim_token, self.workers):
+            cancelled_ids: list[str] = []
+            claimed_ids = store.claim_jobs(
+                self.claim_token, self.workers, cancelled_ids=cancelled_ids,
+            )
+            for cancelled_id in cancelled_ids:
+                _cleanup_uploaded_input(store, cancelled_id)
+            for job_id in claimed_ids:
                 # Batch workers spawn their own BaoStock/validation children.
                 # A daemonic parent is forbidden from creating those children.
                 process = context.Process(target=execute_job, args=(self.root, job_id), daemon=False)
@@ -773,6 +787,7 @@ class JobManager:
                     ):
                         _terminate_process_tree(process.pid)
                         process.join(timeout=1)
+                        _cleanup_uploaded_input(store, job_id)
                         continue
                     self.active[job_id] = process
                 except Exception as exc:
@@ -781,6 +796,7 @@ class JobManager:
                         status="failed", error="无法启动计算进程：" + str(exc),
                         message="进程启动失败", claim_token=None, claimed_at=None,
                     )
+                    _cleanup_uploaded_input(store, job_id)
 
     def stop(self):
         self.stop_event.set()
@@ -799,6 +815,7 @@ class JobManager:
                     status="cancelled", message="应用已退出；计算任务已停止",
                     claim_token=None, claimed_at=None,
                 )
+            _cleanup_uploaded_input(store, job_id)
             _release_job_lease(store, job_id)
 
 

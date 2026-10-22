@@ -146,7 +146,7 @@ ETF 文件保留原有路径。A 股使用同类布局。日线是每个市场�
 
 登记只读取 Parquet 元数据，不复制全部分钟 K 线。索引存在时打开证券目录只访问 SQLite；行情查询只打开目标文件并用 DuckDB 过滤所需区间。
 
-首次接入时执行一次全量登记即可写入每个物理文件的大小、修改时间和版本；该操作只读元数据，耗时与文件数量有关，不重写 K 线。旧格式行情可以使用 `data cleanup-legacy` 查看清单，确认后加 `--apply` 删除；清理保留结果、任务、配置、自选和当前数据包版本。
+首次接入时执行一次全量登记即可写入每个物理文件的大小、修改时间和版本；该操作只读元数据，耗时与文件数量有关，不重写 K 线。当前版本只读取登记后的数据包，已移除旧格式目录扫描和清理入口。
 
 ## 本地导入
 
@@ -260,7 +260,7 @@ uv run --frozen stockregression data aggregate --symbol 600000.SH --from 1day --
 | POST /api/v1/data/sources/probe | 提交来源探测任务，不写入行情 |
 | GET /api/v1/data/package | 数据包身份、版本、路径、容量和恢复状态 |
 | GET /api/v1/data/inventory | 按证券分组的服务器分页目录与完整统计 |
-| GET /api/v1/data/datasets | 兼容的按周期数据集列表 |
+| GET /api/v1/data/datasets | 按周期数据集列表 |
 | GET /api/v1/data/coverage/{symbol}?timeframe=1day | 覆盖、版本与质量 |
 | GET /api/v1/data/bars/{symbol}?frequency=1day | 数据包行情 |
 | POST /api/v1/data/import-package/scan | 预览 ETF、股票或混合数据包 |

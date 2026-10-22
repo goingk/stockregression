@@ -1,16 +1,25 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { EChartsOption } from 'echarts'
 import { Download, RefreshCw } from 'lucide-react'
-import { download, get } from '../api'
+import { ApiError, download, get } from '../api'
 import ChartView from '../ChartView'
 import Disclosure from '../Disclosure'
 import ResultsCurves from '../ResultsCurves'
+import { RESULT_PAGE_SIZE, barTimestampRange, bucketTradeMarkers, earliestBarTimestamp, groupTradeMarkers, mapTradesToBars, markerLabel, mergeBars, naiveStamp, periodReturnBaseline, periodReturns, resultsPageQuery } from '../resultsReview'
 import { resultShareUnit, savedGridParameters } from '../resultPresentation'
 import { Badge, Button, Card, Empty, ErrorBox, Loading, PageHeader, SelectInput, money, percent, useErrorMessage } from '../components'
 import { chartValue } from '../marketValues'
 import type { BacktestResult, ResultSummary, StrategyResult, Trade } from '../types'
+import { LatestRequest } from '../requestState'
+import type { ResultView } from '../navigation'
 
-type Props = { requestedResult: string | null; clearRequestedResult: () => void }
+type Props = {
+  selectedResultId: string | null
+  selectedCompareId: string | null
+  view: ResultView
+  onSelectionChange: (result: string | null, compare: string | null) => void
+  onViewChange: (view: ResultView) => void
+}
 const names: Record<string, string> = { grid: '网格策略', dca: '定期定额', buy_hold: '买入并持有', same_account_passive: '同账户被动持有', matched_funding_hold: '同资金被动持有' }
 const colors: Record<string, string> = { grid: '#2563eb', dca: '#d97706', buy_hold: '#64748b', same_account_passive: '#0d9488', matched_funding_hold: '#7c3aed' }
 const reasonNames: Record<string, string> = {
@@ -26,68 +35,93 @@ const metricLabels: Record<string, string> = { peak_principal_return: '峰值本
 const percentMetrics = ['peak_principal_return', 'max_principal_drawdown', 'matched_funding_hold_return']
 const countMetrics = ['trade_count', 'buy_count', 'sell_count']
 type Strategy = { key: string; name: string; value: StrategyResult }
+const BAR_PAGE_LIMIT = 1500
+const MAX_MARKERS = 240
 const tone = (key: string, value: number | null | undefined) => {
   if (value == null || !Number.isFinite(value)) return ''
   if (key === 'max_principal_drawdown') return 'loss'
   return percentMetrics.includes(key) ? value >= 0 ? 'gain' : 'loss' : ''
 }
-const timestampMs = (value: unknown) => {
-  const text = String(value ?? '').trim().replace(' ', 'T')
-  const parsed = Date.parse(text)
-  return Number.isFinite(parsed) ? parsed : Number.NaN
+const summaryLabel = (item: ResultSummary) => {
+  const created = item.created_at ? new Date(item.created_at).toLocaleString('zh-CN', { hour12: false }) : '时间未知'
+  return item.symbol + ' · ' + (item.title || '未命名结果') + ' · ' + created
 }
+const stampText = (value: string) => value.replace('T', ' ').slice(0, 16)
 
-function bucketIndex(timestamp: unknown, bucketTimes: number[], bucketLabels: string[], frequency: string) {
-  if (!bucketTimes.length) return -1
-  const target = timestampMs(timestamp)
-  if (!Number.isFinite(target)) return -1
-  const tradeDay = String(timestamp ?? '').slice(0, 10)
-  if (frequency === '1d') {
-    const sameDay = bucketLabels.findIndex((label) => label.slice(0, 10) === tradeDay)
-    if (sameDay >= 0) return sameDay
-  }
-  let low = 0
-  let high = bucketTimes.length
-  while (low < high) {
-    const middle = (low + high) >>> 1
-    if (bucketTimes[middle] < target) low = middle + 1
-    else high = middle
-  }
-  return Math.min(low, bucketTimes.length - 1)
-}
-
-/** v5 results no longer ship period returns, so they are rebuilt from the peak-principal equity curve. */
-function periodRows(strategies: Strategy[], period: 'year' | 'month') {
-  const all: Record<string, Record<string, number | null>> = {}
-  for (const strategy of strategies) {
-    const groups: Record<string, number[]> = {}
-    for (const point of strategy.value.equity ?? []) {
-      const curve = point.principal_curve
-      if (curve == null || !Number.isFinite(curve)) continue
-      const day = String(point.timestamp ?? '').slice(0, 10)
-      if (!day) continue
-      const key = period === 'year' ? day.slice(0, 4) : day.slice(0, 7)
-      ;(groups[key] ??= []).push(curve)
-    }
-    for (const [key, curves] of Object.entries(groups)) {
-      if (curves.length < 2) continue
-      ;(all[key] ??= {})[strategy.key] = curves[curves.length - 1] - curves[0]
-    }
-  }
-  return Object.entries(all).sort(([a], [b]) => b.localeCompare(a))
-}
-
-export default function ResultsPage({ requestedResult, clearRequestedResult }: Props) {
+export default function ResultsPage({ selectedResultId, selectedCompareId, view, onSelectionChange, onViewChange }: Props) {
   const [results, setResults] = useState<ResultSummary[]>([])
-  const [selectedId, setSelectedId] = useState('')
+  const [resultsOffset, setResultsOffset] = useState(0)
+  const [resultsHasMore, setResultsHasMore] = useState(false)
+  const [resultsLoading, setResultsLoading] = useState(true)
+  const [resultsLoadingMore, setResultsLoadingMore] = useState(false)
+  const selectedId = selectedResultId ?? ''
+  const compareId = selectedCompareId ?? ''
+  const setSelectedId = useCallback((value: string) => {
+    onSelectionChange(value || null, compareId || null)
+  }, [compareId, onSelectionChange])
+  const setCompareId = useCallback((value: string) => {
+    onSelectionChange(selectedId || null, value || null)
+  }, [onSelectionChange, selectedId])
   const [result, setResult] = useState<BacktestResult | null>(null)
+  const [resultLoading, setResultLoading] = useState(false)
+  const [resultError, setResultError] = useState('')
+  const [resultRetryToken, setResultRetryToken] = useState(0)
+  const [compareResult, setCompareResult] = useState<BacktestResult | null>(null)
+  const [compareLoading, setCompareLoading] = useState(false)
+  const [compareError, setCompareError] = useState('')
+  const [compareRetryToken, setCompareRetryToken] = useState(0)
   const [bars, setBars] = useState<Array<Record<string, unknown>>>([])
-  const [loading, setLoading] = useState(true)
   const [barsLoading, setBarsLoading] = useState(false)
-  const [unit, setUnit] = useState<'year' | 'month'>('year')
+  const [barsError, setBarsError] = useState('')
+  const [barsNotice, setBarsNotice] = useState('')
+  const [earlierBefore, setEarlierBefore] = useState('')
+  const [earlierLoading, setEarlierLoading] = useState(false)
   const [busy, setBusy] = useState('')
-  const [error, setError] = useState('')
+  const [resultsError, setResultsError] = useState('')
+  const [actionError, setActionError] = useState('')
   const err = useErrorMessage()
+  const resultsRequest = useRef(new LatestRequest<string>())
+  const resultRequest = useRef(new LatestRequest<string>())
+  const compareRequest = useRef(new LatestRequest<string>())
+  const resultSelection = useRef('')
+  const compareSelection = useRef('')
+  const autoSelected = useRef(false)
+  const barsRequest = useRef(0)
+  const loadResults = useCallback(async (offset: number, mode: 'replace' | 'append') => {
+    const ticket = resultsRequest.current.begin(`${offset}:${mode}`)
+    if (mode === 'replace') { setResultsLoading(true); setResultsOffset(0); setResultsError('') }
+    else setResultsLoadingMore(true)
+    try {
+      const list = await get<ResultSummary[]>(resultsPageQuery(offset))
+      if (!resultsRequest.current.isCurrent(ticket)) return
+      const backtests = (Array.isArray(list) ? list : []).filter((item) => item.kind === 'backtest')
+      setResults((current) => mode === 'replace'
+        ? backtests
+        : [...current, ...backtests.filter((item) => !current.some((existing) => existing.id === item.id))])
+      setResultsOffset(offset + backtests.length)
+      setResultsHasMore(backtests.length >= RESULT_PAGE_SIZE)
+      // An explicit URL selection is never replaced by the first history row.
+      if (!selectedResultId && !autoSelected.current && backtests[0]) {
+        autoSelected.current = true
+        onSelectionChange(backtests[0].id, selectedCompareId)
+      }
+    } catch (e) {
+      if (resultsRequest.current.isCurrent(ticket)) setResultsError(err(e))
+    } finally {
+      if (resultsRequest.current.isCurrent(ticket)) { setResultsLoading(false); setResultsLoadingMore(false) }
+    }
+  }, [err, onSelectionChange, selectedCompareId, selectedResultId])
+  const barsPath = useCallback((before?: string) => {
+    if (!result?.symbol || !result.config?.frequency) return ''
+    if (result.data_version_available === false) return ''
+    const params = new URLSearchParams({ frequency: result.config.frequency, limit: String(BAR_PAGE_LIMIT), latest: 'true' })
+    if (result.config.start_date) params.set('start_date', result.config.start_date)
+    const end = result.effective_end_date ?? result.config.end_date
+    if (end) params.set('end_date', end)
+    if (result.data_version) params.set('version', result.data_version)
+    if (before) params.set('before', before)
+    return '/data/bars/' + encodeURIComponent(result.symbol) + '?' + params.toString()
+  }, [result])
   const strategies: Strategy[] = useMemo(() => result ? Object.entries(result.strategies ?? {}).filter(([, value]) => value != null).map(([key, value]) => ({ key, name: value.return_basis === 'cost' ? '定投（成本收益）' : names[key] ?? key, value })) : [], [result])
   const [tradeStrategy, setTradeStrategy] = useState('grid')
   const reference = strategies.find((x) => x.key === tradeStrategy) ?? strategies[0]
@@ -96,63 +130,175 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
   const curvePeriod = equityFrequency === '1d' ? '每日收盘' : '回测时间点'
   const shareUnit = resultShareUnit(result?.symbol)
   const parameters = useMemo(() => savedGridParameters(result), [result])
+  const compareOptions = useMemo(() => results.filter(item => item.id !== selectedId), [results, selectedId])
+  const comparisonDifferences = useMemo(() => {
+    if (!result || !compareResult) return []
+    const left = result
+    const right = compareResult
+    const checks: Array<[string, unknown, unknown]> = [
+      ['标的', left.symbol, right.symbol],
+      ['频率', left.config?.frequency, right.config?.frequency],
+      ['区间', `${left.config?.start_date ?? ''}|${left.effective_end_date ?? left.config?.end_date ?? ''}`, `${right.config?.start_date ?? ''}|${right.effective_end_date ?? right.config?.end_date ?? ''}`],
+      ['佣金费率', left.config?.fees?.commission_rate, right.config?.fees?.commission_rate],
+      ['最低佣金', left.config?.fees?.min_commission, right.config?.fees?.min_commission],
+      ['滑点', left.config?.fees?.slippage_bps, right.config?.fees?.slippage_bps],
+      ['数据版本', left.data_version, right.data_version],
+      ['收益口径', left.accounting_basis ?? 'historical', right.accounting_basis ?? 'historical'],
+    ]
+    return checks.filter(([, a, b]) => JSON.stringify(a ?? null) !== JSON.stringify(b ?? null)).map(([label]) => label)
+  }, [result, compareResult])
+  const comparisonRows = useMemo(() => {
+    if (!result || !compareResult) return []
+    const format = (value: unknown) => value == null ? '—' : typeof value === 'number'
+      ? (Number.isInteger(value) ? String(value) : value.toFixed(6).replace(/0+$/, '').replace(/\.$/, ''))
+      : String(value)
+    const leftFees = result.config?.fees ?? {}
+    const rightFees = compareResult.config?.fees ?? {}
+    return [
+      ['标的', result.symbol, compareResult.symbol],
+      ['频率', result.config?.frequency, compareResult.config?.frequency],
+      ['开始日期', result.config?.start_date, compareResult.config?.start_date],
+      ['结束日期', result.effective_end_date ?? result.config?.end_date, compareResult.effective_end_date ?? compareResult.config?.end_date],
+      ['数据版本', result.data_version, compareResult.data_version],
+      ['收益口径', result.accounting_basis ?? '历史口径', compareResult.accounting_basis ?? '历史口径'],
+      ['佣金费率', leftFees.commission_rate, rightFees.commission_rate],
+      ['最低佣金', leftFees.min_commission, rightFees.min_commission],
+      ['滑点（bp）', leftFees.slippage_bps, rightFees.slippage_bps],
+      ['初始持股', result.config?.initial_shares, compareResult.config?.initial_shares],
+      ['每次买入', result.config?.buy_shares, compareResult.config?.buy_shares],
+      ['每次卖出', result.config?.sell_shares, compareResult.config?.sell_shares],
+    ].map(([label, left, right]) => ({ label: String(label), left: format(left), right: format(right) }))
+  }, [result, compareResult])
   const peakPrincipalBasis = result?.accounting_basis === 'peak_principal_v2' || (result?.accounting_basis == null && (result?.result_schema_version === 2 || result?.schema_version === 3))
   const externalTopups = result?.funding?.external_topups ?? result?.strategies?.grid?.metrics?.external_topups ?? result?.funding?.topups
   const matchedHoldInvested = result?.funding?.matched_funding_hold_invested ?? result?.strategies?.grid?.metrics?.matched_funding_hold_invested ?? result?.strategies?.matched_funding_hold?.metrics?.total_invested
-  const periodData = useMemo(() => periodRows(strategies, unit), [strategies, unit])
+  const periodBaseline = useMemo(() => periodReturnBaseline(result), [result])
+  const unit = view
+  const periodData = useMemo(() => periodReturns(strategies.map((strategy) => ({ key: strategy.key, equity: strategy.value.equity ?? [] })), unit, { baseline: periodBaseline }), [strategies, unit, periodBaseline])
+  const barsRange = useMemo(() => {
+    const range = barTimestampRange(bars)
+    if (!range.count) return ''
+    return '显示 ' + stampText(range.first) + ' 至 ' + stampText(range.last) + ' · ' + range.count + ' 根'
+  }, [bars])
+  const resultOptions = useMemo(() => {
+    const options = [...results]
+    if (selectedId && !options.some((item) => item.id === selectedId)) {
+      // The selected result may sit outside the loaded pages, for example when it was
+      // requested from the task center. It still belongs to the selector.
+      options.push({ id: selectedId, kind: 'backtest', symbol: result?.symbol ?? '', created_at: '', title: '来自链接的结果' })
+    }
+    return options
+  }, [results, selectedId, result])
 
   useEffect(() => {
-    let active = true
-    get<ResultSummary[]>('/results').then((list) => {
-      if (!active) return
-      const backtests = list.filter((item) => item.kind === 'backtest')
-      setResults(backtests)
-      setSelectedId((previous) => backtests.some((item) => item.id === previous) ? previous : backtests[0]?.id ?? '')
-    }).catch((e) => { if (active) setError(err(e)) }).finally(() => { if (active) setLoading(false) })
-    return () => { active = false }
-  }, [err])
+    void loadResults(0, 'replace')
+  }, [loadResults])
   useEffect(() => {
-    if (requestedResult) { setSelectedId(requestedResult); clearRequestedResult() }
-  }, [requestedResult, clearRequestedResult])
-
+    resultRequest.current.invalidate()
+    if (!selectedId) { setResult(null); setResultLoading(false); setResultError(''); return }
+    if (resultSelection.current !== selectedId) { resultSelection.current = selectedId; setResult(null) }
+    const ticket = resultRequest.current.begin(selectedId)
+    setResultLoading(true); setResultError('')
+    get<BacktestResult>('/results/' + encodeURIComponent(selectedId)).then((value) => {
+      if (resultRequest.current.isCurrent(ticket)) setResult(value)
+    }).catch((cause) => {
+      if (!resultRequest.current.isCurrent(ticket)) return
+      setResult(null)
+      setResultError(cause instanceof ApiError && cause.status === 404
+        ? '这条结果已经被清理或不存在，请从结果历史中重新选择。'
+        : '结果详情读取失败：' + err(cause))
+    }).finally(() => {
+      if (resultRequest.current.isCurrent(ticket)) setResultLoading(false)
+    })
+  }, [selectedId, err, resultRetryToken])
   useEffect(() => {
-    if (!selectedId) { setResult(null); return }
-    let active = true
-    setLoading(true); setResult(null); setError('')
-    get<BacktestResult>('/results/' + encodeURIComponent(selectedId)).then((value) => { if (active) setResult(value) }).catch((e) => { if (active) setError(err(e)) }).finally(() => { if (active) setLoading(false) })
-    return () => { active = false }
-  }, [selectedId, err])
+    compareRequest.current.invalidate()
+    if (!compareId || compareId === selectedId) { setCompareResult(null); setCompareLoading(false); setCompareError(''); return }
+    if (compareSelection.current !== compareId) { compareSelection.current = compareId; setCompareResult(null) }
+    const ticket = compareRequest.current.begin(compareId)
+    setCompareLoading(true); setCompareError('')
+    get<BacktestResult>('/results/' + encodeURIComponent(compareId)).then((value) => {
+      if (compareRequest.current.isCurrent(ticket)) setCompareResult(value)
+    }).catch((cause) => {
+      if (!compareRequest.current.isCurrent(ticket)) return
+      setCompareResult(null)
+      setCompareError(cause instanceof ApiError && cause.status === 404
+        ? '对照结果已经被清理或不存在，请重新选择。'
+        : '对照结果读取失败：' + err(cause))
+    }).finally(() => {
+      if (compareRequest.current.isCurrent(ticket)) setCompareLoading(false)
+    })
+  }, [compareId, selectedId, err, compareRetryToken])
   useEffect(() => {
-    if (!result?.symbol || !result.config?.start_date || !result.config?.frequency) { setBars([]); setBarsLoading(false); return }
-    if (result.data_version_available === false) { setBars([]); setBarsLoading(false); return }
+    const path = barsPath()
+    if (!path) { setBars([]); setBarsLoading(false); setEarlierBefore(''); return }
+    const seq = ++barsRequest.current
     let active = true
     setBars([])
     setBarsLoading(true)
-    const params = new URLSearchParams({ start_date: result.config.start_date, frequency: result.config.frequency, limit: '1500' })
-    if (result.data_version) params.set('version', result.data_version)
-    if (result.effective_end_date ?? result.config.end_date) params.set('end_date', (result.effective_end_date ?? result.config.end_date)!)
-    get<Array<Record<string, unknown>>>('/data/bars/' + encodeURIComponent(result.symbol) + '?' + params).then((data) => { if (active) setBars(data) }).catch((e) => { if (active) setError('K 线读取失败：' + err(e)) }).finally(() => { if (active) setBarsLoading(false) })
+    setBarsError('')
+    setBarsNotice('')
+    setEarlierBefore('')
+    get<Array<Record<string, unknown>>>(path).then((data) => {
+      if (!active || seq !== barsRequest.current) return
+      const rows = Array.isArray(data) ? data : []
+      setBars(rows)
+      setEarlierBefore(earliestBarTimestamp(rows))
+      const end = result?.effective_end_date ?? result?.config?.end_date
+      if (rows.length >= BAR_PAGE_LIMIT && end && barTimestampRange(rows).last.slice(0, 10) < end.slice(0, 10)) {
+        setBarsNotice('当前后端还没有支持 latest 参数，这里显示的是区间起始的 ' + rows.length + ' 根行情；后端支持后会自动改为实际结束之前最后 ' + BAR_PAGE_LIMIT + ' 根。')
+      }
+    }).catch((e) => { if (active && seq === barsRequest.current) setBarsError('K 线读取失败：' + err(e)) }).finally(() => { if (active && seq === barsRequest.current) setBarsLoading(false) })
     return () => { active = false }
-  }, [result, err])
+  }, [barsPath, err])
+
+  const loadEarlier = () => {
+    const path = barsPath(earlierBefore)
+    if (!path || !earlierBefore) return
+    const seq = ++barsRequest.current
+    setEarlierLoading(true)
+    setBarsError('')
+    setBarsNotice('')
+    get<Array<Record<string, unknown>>>(path).then((data) => {
+      if (seq !== barsRequest.current) return
+      const rows = Array.isArray(data) ? data : []
+      if (!rows.length) { setBarsNotice('这个区间之前没有更多行情了。'); return }
+      const earliest = earliestBarTimestamp(rows)
+      const bound = naiveStamp(earlierBefore)?.value ?? Number.NaN
+      const reached = naiveStamp(earliest)?.value ?? Number.NaN
+      if (!Number.isFinite(reached) || !Number.isFinite(bound) || reached >= bound) {
+        setBarsNotice('当前后端还没有支持 before / latest 翻页参数，无法加载更早的行情。')
+        return
+      }
+      setBars((current) => mergeBars(current, rows))
+      setEarlierBefore(earliest)
+    }).catch((e) => { if (seq === barsRequest.current) setBarsError('更早行情读取失败：' + err(e)) }).finally(() => { if (seq === barsRequest.current) setEarlierLoading(false) })
+  }
 
   const exportFile = async (kind: 'json' | 'equity' | 'trades') => {
     if (!selectedId) return
-    setBusy(kind); setError('')
+    setBusy(kind); setActionError('')
     try { await download('/results/' + encodeURIComponent(selectedId) + '/export?kind=' + kind, (result?.symbol ?? 'result') + '-' + kind + (kind === 'json' ? '.json' : '.csv')) }
-    catch (e) { setError(err(e)) } finally { setBusy('') }
+    catch (e) { setActionError(err(e)) } finally { setBusy('') }
   }
 
   const candleOption: EChartsOption = useMemo(() => {
     const rows = bars.map((b) => [String(b.timestamp ?? '').replace('T', ' ').slice(0, 16), chartValue(b.open), chartValue(b.close), chartValue(b.low), chartValue(b.high)])
     const labels = rows.map((row) => String(row[0]))
-    const bucketTimes = bars.map((bar) => timestampMs(bar.timestamp))
     const trades = (reference?.value.trades ?? []) as Trade[]
-    const markers = trades.flatMap((trade) => {
-      const index = bucketIndex(trade.timestamp, bucketTimes, labels, result?.config?.frequency ?? '')
-      if (index < 0) return []
-      const buy = String(trade.side).toLowerCase().includes('buy') || String(trade.side).includes('买')
-      return [{ name: trade.side, xAxis: index, yAxis: trade.price, value: buy ? '买' : '卖', itemStyle: { color: buy ? '#e11d48' : '#0d9488' }, label: { color: '#fff', fontSize: 10, fontWeight: 600 } }]
-    })
+    // A trade belongs to the bar that opened at its own time; trades outside the loaded
+    // window or inside a data gap are dropped instead of being clamped onto a bar.
+    const mapped = mapTradesToBars(trades, bars, result?.config?.frequency ?? '')
+    const markers = bucketTradeMarkers(groupTradeMarkers(mapped), MAX_MARKERS)
+      .filter((marker) => Number.isFinite(marker.price))
+      .map((marker) => ({
+        name: marker.side,
+        xAxis: marker.barIndex,
+        yAxis: marker.price,
+        value: markerLabel(marker),
+        itemStyle: { color: marker.side === 'buy' ? '#e11d48' : '#0d9488' },
+        label: { color: '#fff', fontSize: 10, fontWeight: 600 },
+      }))
     return {
       animation: false,
       grid: { left: 58, right: 22, top: 20, bottom: 54 },
@@ -177,17 +323,12 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
 
   return <div className='results-page'>
     <PageHeader eyebrow='PERFORMANCE REVIEW' title='结果分析' description='比较各策略的峰值本金收益、回撤和网格持仓，按同一日期核对表现。' action={<div className='button-row export-row'><Button variant='secondary' busy={busy === 'json'} disabled={!result} onClick={() => void exportFile('json')}><Download size={14} />JSON</Button><Button variant='secondary' busy={busy === 'equity'} disabled={!result} onClick={() => void exportFile('equity')}>净值 CSV</Button><Button variant='secondary' busy={busy === 'trades'} disabled={!result} onClick={() => void exportFile('trades')}>成交 CSV</Button></div>} />
-    {error && <ErrorBox message={error} onClose={() => setError('')} />}
+    {actionError && <ErrorBox message={actionError} onClose={() => setActionError('')} />}
     <div className='results-primary'>
-      <Card title='回测结果' className='results-overview' action={<div className='result-select'><SelectInput aria-label='选择回测结果' value={selectedId} onChange={(event) => setSelectedId(event.target.value)}><option value=''>选择结果</option>{results.map((item) => <option key={item.id} value={item.id}>{item.symbol} · {item.title} · {new Date(item.created_at).toLocaleString('zh-CN', { hour12: false })}</option>)}</SelectInput><Button variant='quiet' aria-label='刷新回测结果' onClick={() => {
-        setError(''); setLoading(true)
-        get<ResultSummary[]>('/results').then((list) => {
-          const backtests = list.filter((item) => item.kind === 'backtest')
-          setResults(backtests)
-          setSelectedId((previous) => backtests.some((item) => item.id === previous) ? previous : backtests[0]?.id ?? '')
-        }).catch((error) => setError(err(error))).finally(() => setLoading(false))
-      }}><RefreshCw size={14} /></Button></div>}>
-        {loading ? <Loading /> : !results.length ? <Empty title='尚无回测结果' detail='在“回测与研究”中运行回测后，结果会在这里出现。' /> : !result ? <Loading label='正在读取结果…' /> : <>
+      <Card title='回测结果' className='results-overview' action={<div className='result-select'><SelectInput aria-label='选择回测结果' value={selectedId} onChange={(event) => setSelectedId(event.target.value)}><option value=''>选择结果</option>{resultOptions.map((item) => <option key={item.id} value={item.id}>{summaryLabel(item)}</option>)}</SelectInput><Button variant='quiet' aria-label='刷新回测结果' busy={resultsLoading} onClick={() => { setResultsError(''); void loadResults(0, 'replace') }}><RefreshCw size={14} /></Button></div>}>
+        {resultsError && <ErrorBox message={'结果历史读取失败：' + resultsError} onClose={() => setResultsError('')} onRetry={() => void loadResults(0, 'replace')} />}
+        {resultsLoading && !results.length ? <Loading /> : !results.length && !selectedId ? <Empty title='尚无回测结果' detail='运行回测后，结果会在这里出现。' /> : resultError ? <ErrorBox message={resultError} onRetry={() => setResultRetryToken(token => token + 1)} /> : resultLoading && !result ? <Loading label='正在读取结果…' /> : !result ? <Empty title='请选择回测结果' detail='从上方历史中选择一条结果。' /> : <>
+          {resultLoading && <p className='inline-warning'>正在刷新结果详情，当前显示上次成功读取的内容。</p>}
           <div className='result-meta'><div><strong>{result.symbol}</strong><span>{result.config?.frequency ?? '—'} · {result.config?.start_date ?? '—'} 至 {result.effective_end_date ?? result.config?.end_date ?? '最新'}</span></div><div>{isDemoResult && <Badge tone='amber'>演示数据</Badge>}<Badge tone={result.data_version_available === false ? 'red' : 'blue'}>数据版本 {result.data_version ?? '未知'}</Badge></div></div>
           {result.data_version_warning && <p className='inline-warning'>{result.data_version_warning}</p>}
           {isDemoResult && <div className='demo-callout'>此结果基于本机生成的演示行情，不代表真实历史数据或投资结论。</div>}
@@ -215,7 +356,23 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
             </div>
           })}</div>
         </>}
+        {resultsHasMore && <div className='button-row'><span className='field-hint'>已加载 {results.length} 条 · 每页 {RESULT_PAGE_SIZE} 条</span><Button variant='secondary' busy={resultsLoadingMore} onClick={() => void loadResults(resultsOffset, 'append')}>加载更多历史结果</Button></div>}
       </Card>
+      {result && <Card title='A/B 已保存结果对照' className='results-comparison' subtitle='两侧独立读取；只比较已保存的表格数据，不叠加曲线，也不在日期、费用或数据版本不一致时给出名次。' action={<div className='result-select'><SelectInput aria-label='选择对照结果' value={compareId} onChange={event => setCompareId(event.target.value)}><option value=''>选择对照结果</option>{compareOptions.map(item => <option key={item.id} value={item.id}>{summaryLabel(item)}</option>)}</SelectInput>{compareId && <Button variant='quiet' onClick={() => setCompareId('')}>移除对照</Button>}</div>}>
+        {!compareId ? <p className='field-hint'>在右上角选择另一条已保存回测结果。对照读取失败不会影响当前结果。</p> : compareId === selectedId ? <p className='inline-warning'>A/B 对照需要两条不同的结果。</p> : compareError ? <ErrorBox message={compareError} onRetry={() => setCompareRetryToken(token => token + 1)} /> : compareLoading && !compareResult ? <Loading label='独立读取对照结果…' /> : compareResult ? <>
+          {compareLoading && <p className='inline-warning'>正在刷新对照结果，当前显示上次成功读取的内容。</p>}
+          <p className={comparisonDifferences.length ? 'inline-warning' : 'field-hint'}>{comparisonDifferences.length ? '两侧以下口径不同：' + comparisonDifferences.join('、') + '。数值并列展示，不据此排名。' : '两侧标的、区间、费用口径与数据版本一致，可按同一口径逐项核对。'}</p>
+          <div className='table-wrap'><table><thead><tr><th>项目</th><th>A · 当前</th><th>B · 对照</th></tr></thead><tbody>{comparisonRows.map(row => <tr key={row.label}><td>{row.label}</td><td>{row.left}</td><td>{row.right}</td></tr>)}</tbody></table></div>
+          <div className='table-wrap results-compare-metrics'><table><thead><tr><th>网格指标</th><th>A</th><th>B</th><th>差值（A − B）</th></tr></thead><tbody>{Object.entries(metricLabels).map(([key, label]) => {
+            const left = result.strategies?.grid?.metrics?.[key]
+            const right = compareResult.strategies?.grid?.metrics?.[key]
+            const difference = left == null || right == null || !Number.isFinite(left) || !Number.isFinite(right) ? null : left - right
+            const display = (value: number | null | undefined) => percentMetrics.includes(key) ? percent(value) : key === 'total_fees' ? money(value) : value == null || !Number.isFinite(value) ? '—' : String(value)
+            return <tr key={key}><td>{label}</td><td>{display(left)}</td><td>{display(right)}</td><td className={difference == null ? '' : difference >= 0 ? 'gain' : 'loss'}>{percentMetrics.includes(key) ? percent(difference) : difference == null ? '—' : String(difference)}</td></tr>
+          })}</tbody></table></div>
+          {comparisonDifferences.length > 0 && <p className='field-hint'>差值仅供核对，不表示更优：口径不一致时，收益率、回撤和费用不能直接排名。</p>}
+        </> : <Empty title='对照结果不可用' detail='可移除对照后重新选择。' />}
+      </Card>}
       {result && <>
         <Card title='本次网格参数' className='result-parameters' subtitle='来自此结果保存的配置与资金口径'>
           <dl className='result-parameter-list'>{parameters.map((parameter) => <div className='result-parameter' key={parameter.key}><dt>{parameter.label}</dt><dd>{parameter.value}</dd>{parameter.note && <small className='result-parameter-note'>{parameter.note}</small>}</div>)}</dl>
@@ -254,13 +411,18 @@ export default function ResultsPage({ requestedResult, clearRequestedResult }: P
         </tbody></table></div>
       </Disclosure>
       <Disclosure id='results-candles' title='K 线与成交标记' summary={(result.config?.frequency ?? '频率未知') + ' · ' + (reference?.name ?? '策略')}>
-        <Card title={result.symbol + ' K 线与交易'} subtitle={'K 线按时间汇总，买卖点映射到包含成交时刻的区间；标记取自 ' + (reference?.name ?? '策略') + ' 成交记录。'}>
-          {result.data_version_available === false ? <Empty title='原行情数据版本已清理' detail='历史结果、成交和净值仍可查看和导出；原 K 线与按原版本重算已停用。' /> : barsLoading ? <Loading label='读取 K 线…' /> : bars.length ? <ChartView option={candleOption} height={410} /> : <Empty title='当前区间没有可用 K 线' detail='成交和净值仍可查看；请确认该标的存在对应频率行情。' />}
+        <Card title={result.symbol + ' K 线与交易'} subtitle={'每根 K 线覆盖自身开盘到下一根 bar 开盘；窗口外或缺口内的成交不画标记。标记取自 ' + (reference?.name ?? '策略') + ' 成交记录。'} action={<div className='button-row'><span className='field-hint'>{barsRange}</span><Button variant='quiet' busy={earlierLoading} disabled={!earlierBefore || barsLoading} onClick={loadEarlier}>加载更早</Button></div>}>
+          {result.data_version_available === false ? <Empty title='原行情数据版本已清理' detail='历史结果、成交和净值仍可查看和导出；原 K 线与按原版本重算已停用。' /> : barsError ? <ErrorBox message={barsError} onClose={() => setBarsError('')} /> : barsLoading ? <Loading label='读取 K 线…' /> : bars.length ? <><ChartView option={candleOption} height={410} />{barsNotice && <p className='inline-warning'>{barsNotice}</p>}</> : <Empty title='当前区间没有可用 K 线' detail='成交和净值仍可查看；请确认该标的存在对应频率行情。' />}
         </Card>
       </Disclosure>
       <Disclosure id='results-period-returns' title='年 / 月收益' summary={unit === 'year' ? '年度分解' : '月度分解'}>
-        <Card subtitle={periodData.length ? '区间收益 = 期末峰值本金净值 − 期初峰值本金净值，按峰值本金口径分段累计。' : '当前结果没有峰值本金净值，无法计算区间收益。'} action={<div className='segmented'><button className={unit === 'year' ? 'selected' : ''} onClick={() => setUnit('year')}>年度</button><button className={unit === 'month' ? 'selected' : ''} onClick={() => setUnit('month')}>月度</button></div>}>
-          {periodData.length ? <div className='table-wrap'><table><thead><tr><th>区间</th>{strategies.map((strategy) => <th key={strategy.key}>{strategy.name}</th>)}</tr></thead><tbody>{periodData.map(([period, values]) => <tr key={period}><td>{period}</td>{strategies.map((strategy) => { const value = values[strategy.key]; return <td key={strategy.key} className={value == null ? '' : value >= 0 ? 'gain' : 'loss'}>{percent(value)}</td> })}</tr>)}</tbody></table></div> : <Empty title='后端未提供区间收益' detail='此结果的净值点没有峰值本金口径数据，无法计算年 / 月收益。' />}
+        <Card subtitle={periodData.length ? '区间收益 = 期末峰值本金净值 − 期初峰值本金净值：本期期初取上一期期末净值，首期取运行基准；各期相加等于整段收益。' : '当前结果没有峰值本金净值，无法计算区间收益。'} action={<div className='segmented'><button className={unit === 'year' ? 'selected' : ''} onClick={() => onViewChange('year')}>年度</button><button className={unit === 'month' ? 'selected' : ''} onClick={() => onViewChange('month')}>月度</button></div>}>
+          {periodData.length ? <div className='table-wrap'><table><thead><tr><th>区间</th>{strategies.map((strategy) => <th key={strategy.key}>{strategy.name}</th>)}</tr></thead><tbody>{periodData.map((row) => <tr key={row.period}><td>{row.period}</td>{strategies.map((strategy) => {
+            const value = row.values[strategy.key]
+            if (value === undefined) return <td key={strategy.key}>—</td>
+            if (value === null) return <td key={strategy.key}>不可计算</td>
+            return <td key={strategy.key} className={value >= 0 ? 'gain' : 'loss'}>{percent(value)}</td>
+          })}</tr>)}</tbody></table></div> : <Empty title='后端未提供区间收益' detail='此结果的净值点没有峰值本金口径数据，无法计算年 / 月收益。' />}
         </Card>
       </Disclosure>
       <Disclosure id='results-trades' title='成交记录' summary={(reference?.value.trades?.length ?? 0) + ' 笔 · ' + (reference?.name ?? '策略')}>

@@ -12,6 +12,8 @@ if (-not $needsBuild) {
     $builtTime = (Get-Item -LiteralPath $builtIndex).LastWriteTimeUtc
     $sourceFiles = @(Get-ChildItem -LiteralPath (Join-Path $frontendRoot 'src') -Recurse -File) + @(Get-Item -LiteralPath (Join-Path $frontendRoot 'package.json'), (Join-Path $frontendRoot 'package-lock.json'), (Join-Path $frontendRoot 'index.html'), (Join-Path $frontendRoot 'vite.config.ts'))
     $sourceFiles += @(Get-ChildItem -LiteralPath $frontendRoot -Filter 'tsconfig*.json' -File)
+    $sourceFiles += @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'src\stockregression') -Recurse -File -Filter '*.py')
+    $sourceFiles += @(Get-Item -LiteralPath (Join-Path $frontendRoot 'openapi.json'), (Join-Path $frontendRoot 'scripts\generate-api.mjs'), (Join-Path $PSScriptRoot 'scripts\export_openapi.py'))
     $needsBuild = @($sourceFiles | Where-Object { $_.LastWriteTimeUtc -gt $builtTime }).Count -gt 0
 }
 if ($needsBuild) {

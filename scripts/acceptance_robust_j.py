@@ -84,7 +84,7 @@ def render_markdown(payload: dict) -> str:
     lines += [
         summary,
         "",
-        "原始结果：[robust-j-acceptance.json](robust-j-acceptance.json)。",
+        "原始结果：[v5-acceptance.json](v5-acceptance.json)。",
         "",
         "## 覆盖的边界",
         "",
@@ -114,8 +114,8 @@ def main():
     parser.add_argument("--frequency", default="1d", choices=("1d", "1m"))
     parser.add_argument("--training-budget", type=int, default=100)
     parser.add_argument("--validation-budget", type=int, default=2000)
-    parser.add_argument("--output", default=str(ROOT / "docs" / "robust-j-acceptance.json"))
-    parser.add_argument("--markdown", default=str(ROOT / "docs" / "robust-j-acceptance.md"))
+    parser.add_argument("--output", default=str(ROOT / "docs" / "v5-acceptance.json"))
+    parser.add_argument("--markdown", default=str(ROOT / "docs" / "v5-acceptance.md"))
     args = parser.parse_args()
     settings = load_settings()
     store = Store(settings.data_dir)

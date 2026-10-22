@@ -13,14 +13,13 @@ from typing import Any, Literal
 from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .models import GRANULARITY_DEFAULTS, GRANULARITY_MINIMUMS, LEGACY_GRANULARITY_DEFAULTS, ROBUST_RANGE_DEFAULTS
+from .models import GRANULARITY_DEFAULTS, GRANULARITY_MINIMUMS, ROBUST_RANGE_DEFAULTS
 
 PROJECT_ROOT = Path(os.environ.get("STOCKREGRESSION_HOME", Path(__file__).resolve().parents[2])).resolve()
 PROJECT_CONFIG_FILE = PROJECT_ROOT / "config" / "application.json"
-LEGACY_SETTINGS_FILE = PROJECT_ROOT / ".local" / "settings.json"
 CONFIG_SCHEMA_VERSION = 5
-# ``SETTINGS_FILE`` remains the single test/CLI override point.  Its default is
-# now the project configuration file rather than the legacy hidden settings.
+# ``SETTINGS_FILE`` is the single test/CLI override point for the grouped
+# project configuration document.
 SETTINGS_FILE = PROJECT_CONFIG_FILE
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data"
 DEFAULT_DATASET_DIR = DEFAULT_DATA_DIR / "dataset"
@@ -72,20 +71,6 @@ class GridDefaults(_WorkbenchPreference):
     sell_step: float = Field(default=0.03, gt=0, le=1)
     lower_price: float | None = Field(default=None, gt=0)
     upper_price: float | None = Field(default=None, gt=0)
-
-    @model_validator(mode="before")
-    @classmethod
-    def migrate_single_spacing(cls, values):
-        if isinstance(values, dict) and "grid_step" in values:
-            values = dict(values)
-            legacy = values.pop("grid_step")
-            if values.get("grid_mode", "trailing") != "trailing":
-                values["buy_step"] = legacy
-                values["sell_step"] = legacy
-            else:
-                values.setdefault("buy_step", legacy)
-                values.setdefault("sell_step", legacy)
-        return values
 
     @model_validator(mode="after")
     def ordered_prices(self):
@@ -201,73 +186,6 @@ class ResearchDefaults(_WorkbenchPreference):
     stress_cost_multiplier: float = Field(default=2.0, gt=1, le=20)
     stress_region_count: int = Field(default=3, ge=0, le=50)
 
-    @model_validator(mode="before")
-    @classmethod
-    def migrate_protocol(cls, values):
-        if not isinstance(values, dict):
-            return values
-        values = dict(values)
-        if "max_principal_drawdown" not in values:
-            # The former unit-NAV threshold has a different denominator and is
-            # deliberately not promoted as an equivalent capital drawdown.
-            values["max_principal_drawdown"] = 0.2
-        # Only whole legacy research objects are migrated.  A current API
-        # patch that submits a retired control must fail validation instead of
-        # being silently accepted and discarded.
-        previous_protocol = values.get("protocol_version")
-        migrating_legacy = (
-            previous_protocol is not None
-            and str(previous_protocol).isdigit()
-            and int(previous_protocol) < 5
-        )
-        if migrating_legacy:
-            for key in (
-                "bootstrap_reps", "bootstrap_block_lengths", "significance_alpha",
-                "outer_validation_days", "mode", "n_trials", "local_search_budget",
-                "max_drawdown",
-            ):
-                values.pop(key, None)
-        versioned_defaults = {
-            "strategy_id": "geometric_robust_j", "protocol_version": 5,
-            "strategy_version": 5, "ranking_mode": "robust_j",
-            "max_shares_mode": "unlimited",
-            "neighborhood_fields": ["buy_step", "sell_step", "buy_shares", "sell_shares"],
-        }
-        if migrating_legacy:
-            values.update(versioned_defaults)
-        else:
-            for name, default in versioned_defaults.items():
-                values.setdefault(name, default)
-        saved_granularity = values.get("granularity")
-        if migrating_legacy:
-            values["granularity"] = {
-                name: (saved_granularity.get(name, default) if isinstance(saved_granularity, dict) else default)
-                for name, default in GRANULARITY_DEFAULTS.items()
-            }
-        saved_ranges = values.get("ranges")
-        if migrating_legacy:
-            values["ranges"] = {
-                name: {
-                    **(dict(saved_ranges.get(name) or default) if isinstance(saved_ranges, dict) else default),
-                    "step": None,
-                }
-                for name, default in ROBUST_RANGE_DEFAULTS.items()
-            }
-        saved_widths = values.get("fixed_half_widths")
-        if migrating_legacy:
-            values["fixed_half_widths"] = {
-                name: (saved_widths.get(name, default) if isinstance(saved_widths, dict) else default)
-                for name, default in {
-                    "buy_step": .001, "sell_step": .001,
-                    "sell_shares": 100, "buy_shares": 100,
-                }.items()
-            }
-        values.setdefault("reporting_budget", 1_000)
-        values.setdefault("total_evaluation_budget", None)
-        values.setdefault("max_runtime_seconds", 3_600)
-        values.setdefault("training_window_mode", "same_price")
-        return values
-
     @model_validator(mode="after")
     def valid_ranges(self):
         if set(self.ranges) != set(ROBUST_RANGE_DEFAULTS):
@@ -343,7 +261,7 @@ class PerformanceSettings(BaseModel):
 
     cpu_budget_mode: Literal["auto", "custom"] = "auto"
     cpu_budget: int | None = Field(default=None, ge=1, le=128)
-    download_workers: int = Field(default=4, ge=1, le=8)
+    download_workers: int = Field(default=4, ge=1, le=4)
     validation_workers: int = Field(default=4, ge=1, le=4)
     blas_threads: int = Field(default=8, ge=1, le=16)
     workspace_mb: int = Field(default=8192, ge=256, le=65536)
@@ -414,7 +332,6 @@ class Settings(BaseModel):
     etf_daily_source: Literal["baostock", "eastmoney"] = "baostock"
     market_data: MarketDataSettings = Field(default_factory=MarketDataSettings)
     ui: UiSettings = Field(default_factory=UiSettings)
-    research_legacy: dict = Field(default_factory=dict)
 
 
 class ApplicationSection(BaseModel):
@@ -441,14 +358,13 @@ class BacktestSection(BaseModel):
 class ResearchSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     defaults: ResearchDefaults = Field(default_factory=ResearchDefaults)
-    legacy: dict = Field(default_factory=dict)
 
 
 class ConfigurationDocument(BaseModel):
     """The complete validated project configuration file."""
 
     model_config = ConfigDict(extra="forbid")
-    config_schema_version: Literal[1, 2, 3, 4, 5] = CONFIG_SCHEMA_VERSION
+    config_schema_version: Literal[5] = CONFIG_SCHEMA_VERSION
     config_revision: str | None = None
     application: ApplicationSection = Field(default_factory=ApplicationSection)
     paths: PathsSection = Field(default_factory=lambda: PathsSection(data_dir=str(DEFAULT_DATA_DIR)))
@@ -476,7 +392,6 @@ def configuration_document(value: Settings, *, portable: bool = True) -> dict:
         },
         "research": {
             "defaults": value.workbench_defaults.research.model_dump(mode="json"),
-            "legacy": deepcopy(value.research_legacy),
         },
         "market_data": {
             **value.market_data.model_dump(mode="json"),
@@ -520,84 +435,16 @@ def settings_from_document(document: dict) -> Settings:
         etf_daily_source=validated.market_data.etf_daily_source,
         market_data=validated.market_data,
         ui=validated.ui,
-        research_legacy=deepcopy(validated.research.legacy),
     )
-
-
-def _flat_configuration_document(raw: dict) -> dict:
-    """Convert the former flat settings object without changing its values first."""
-    legacy = Settings.model_validate(raw)
-    document = configuration_document(legacy)
-    # ``configuration_document`` materialises the current schema.  Keep the
-    # source schema here so the migration pipeline can still archive the
-    # original research/backtest defaults before activating robust-J defaults.
-    document["config_schema_version"] = int(raw.get("config_schema_version", 1))
-    research_defaults = ((raw.get("workbench_defaults") or {}).get("research"))
-    if isinstance(research_defaults, dict):
-        # Settings validation normalises away fields from retired protocols.
-        # Restore the exact source document here so the v5 migration archive is
-        # an audit record of what the user actually had configured.
-        document.setdefault("research", {})["defaults"] = deepcopy(research_defaults)
-    return document
-
-
-def migrate_configuration_document(raw: dict) -> dict:
-    """Apply deterministic configuration migrations in memory.
-
-    Schema 5 starts a new research protocol.  Earlier research defaults and
-    statistics controls are archived under ``research.legacy`` so existing
-    historical records can still be identified without pretending that their
-    former unit-NAV metrics are equivalent to peak-principal metrics.
-    """
-    if not isinstance(raw, dict):
-        raise ValueError("配置文件根节点必须是对象")
-    version = int(raw.get("config_schema_version", 1))
-    # Schema v2 and later are always grouped documents.  In particular, a
-    # damaged/truncated v4 file must never fall through to the flat legacy
-    # adapter, where extra keys are ignored and defaults silently replace the
-    # user's file.
-    grouped = (
-        version >= 2
-        or "defaults" in (raw.get("research") or {})
-        or ("application" in raw and "workbench_defaults" not in raw)
-    )
-    document = deepcopy(raw) if grouped else _flat_configuration_document(raw)
-    if version > CONFIG_SCHEMA_VERSION:
-        raise ValueError(f"配置架构 {version} 高于当前程序支持的 {CONFIG_SCHEMA_VERSION}")
-    if version < CONFIG_SCHEMA_VERSION:
-        research = document.setdefault("research", {})
-        previous_defaults = deepcopy(research.get("defaults") or {})
-        previous_legacy = deepcopy(research.get("legacy") or {})
-        previous_statistics = deepcopy(document.pop("statistics", None))
-
-        # Keep every earlier archive.  Existing installations already carry a
-        # v1 archive in ``legacy``; moving that object into ``history`` avoids
-        # silently replacing it with the immediately preceding v4 defaults.
-        if previous_legacy:
-            history = list(previous_legacy.get("history") or [])
-            history.append({key: value for key, value in previous_legacy.items() if key != "history"})
-            previous_legacy = {**previous_legacy, "history": history}
-        previous_legacy["source"] = f"migration_v{version}"
-        previous_legacy["research_defaults"] = previous_defaults
-        if previous_statistics is not None:
-            previous_legacy["statistics"] = previous_statistics
-        research["legacy"] = previous_legacy
-
-        # ResearchDefaults owns the protocol upgrade.  It deliberately resets
-        # the old unit-NAV drawdown limit and carries forward budgets, ranges,
-        # weights and other still-valid search settings.
-        research["defaults"] = ResearchDefaults.model_validate(previous_defaults).model_dump(mode="python")
-        document["research"] = research
-        document["config_schema_version"] = CONFIG_SCHEMA_VERSION
-    document.pop("config_revision", None)
-    validated = ConfigurationDocument.model_validate(document).model_dump(mode="python", exclude_none=False)
-    return validated
 
 
 def read_configuration_document(path: Path | None = None) -> tuple[dict, str]:
     target = path or SETTINGS_FILE
     raw = json.loads(target.read_text(encoding="utf-8"))
-    document = migrate_configuration_document(raw)
+    if not isinstance(raw, dict):
+        raise ValueError("配置文件根节点必须是对象")
+    raw.pop("config_revision", None)
+    document = ConfigurationDocument.model_validate(raw).model_dump(mode="python", exclude_none=False)
     revision = configuration_revision(document)
     document["config_revision"] = revision
     return document, revision
@@ -639,99 +486,20 @@ def _write_configuration(settings: Settings) -> dict:
 
 def load_settings() -> Settings:
     target = SETTINGS_FILE
-    is_main_target = target.resolve() != LEGACY_SETTINGS_FILE.resolve()
     if target.exists():
         raw = json.loads(target.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("配置文件根节点必须是对象")
-        document = migrate_configuration_document(raw)
-        settings = settings_from_document(document)
-        if is_main_target and (
-            int(raw.get("config_schema_version", 1)) != CONFIG_SCHEMA_VERSION
-            or "defaults" not in (raw.get("research") or {})
-        ):
-            _resolve_settings_paths(settings)
-            with FileLock(str(target.with_suffix(".lock")), timeout=10):
-                _write_configuration(settings)
-    elif is_main_target and LEGACY_SETTINGS_FILE.exists():
-        legacy = json.loads(LEGACY_SETTINGS_FILE.read_text(encoding="utf-8"))
-        settings = settings_from_document(migrate_configuration_document(legacy))
-        _resolve_settings_paths(settings)
-        with FileLock(str(target.with_suffix(".lock")), timeout=10):
-            _write_configuration(settings)
+        raw.pop("config_revision", None)
+        settings = settings_from_document(ConfigurationDocument.model_validate(raw).model_dump(mode="python"))
     else:
         settings = Settings()
-        if is_main_target:
-            _resolve_settings_paths(settings)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with FileLock(str(target.with_suffix(".lock")), timeout=10):
-                if not target.exists():
-                    _write_configuration(settings)
-    return _resolve_settings_paths(settings)
-
-
-def save_settings(values: dict, *, base_revision: str | None = None) -> Settings:
-    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with FileLock(str(SETTINGS_FILE.with_suffix(".lock")), timeout=10):
-        previous_document = None
-        if SETTINGS_FILE.exists():
-            previous_document, current_revision = read_configuration_document(SETTINGS_FILE)
-            if base_revision is not None and base_revision != current_revision:
-                raise RuntimeError("CONFIG_REVISION_CONFLICT")
-        if previous_document is not None:
-            previous = settings_from_document(previous_document).model_dump()
-        elif SETTINGS_FILE.resolve() != LEGACY_SETTINGS_FILE.resolve() and LEGACY_SETTINGS_FILE.exists():
-            previous = settings_from_document(
-                migrate_configuration_document(json.loads(LEGACY_SETTINGS_FILE.read_text(encoding="utf-8")))
-            ).model_dump()
-        else:
-            previous = Settings().model_dump()
-        values = dict(values)
-        for key in ("schedule", "fee_defaults", "performance", "market_data", "ui"):
-            if key in values and isinstance(values[key], dict):
-                values[key] = {**previous[key], **values[key]}
-        # Older clients submit source and cache choices as flat settings
-        # fields.  Keep the grouped configuration coherent as well, so a
-        # partial legacy save cannot reset the other market-data settings to
-        # their defaults when the document is materialised.
-        market_data = dict(values.get("market_data") or previous["market_data"])
-        submitted_market_data = values.get("market_data") if isinstance(values.get("market_data"), dict) else {}
-        for scalar, grouped in (
-            ("market_cache_mb", "cache_mb"),
-            ("recent_minute_source", "recent_minute_source"),
-            ("etf_daily_source", "etf_daily_source"),
-        ):
-            if scalar in values:
-                market_data[grouped] = values[scalar]
-            elif grouped in submitted_market_data:
-                values[scalar] = submitted_market_data[grouped]
-        values["market_data"] = market_data
-        if isinstance(values.get("workbench_defaults"), dict):
-            merged_defaults = dict(previous["workbench_defaults"])
-            for group, patch in values["workbench_defaults"].items():
-                if isinstance(patch, dict) and isinstance(merged_defaults.get(group), dict):
-                    merged_group = {**merged_defaults[group], **patch}
-                    if group == "research" and isinstance(patch.get("ranges"), dict):
-                        merged_ranges = dict(merged_defaults[group]["ranges"])
-                        for name, range_patch in patch["ranges"].items():
-                            if isinstance(range_patch, dict) and isinstance(merged_ranges.get(name), dict):
-                                merged_ranges[name] = {**merged_ranges[name], **range_patch}
-                            else:
-                                merged_ranges[name] = range_patch
-                        merged_group["ranges"] = merged_ranges
-                    if group == "research" and isinstance(patch.get("granularity"), dict):
-                        merged_group["granularity"] = {
-                            **merged_defaults[group].get("granularity", GRANULARITY_DEFAULTS),
-                            **patch["granularity"],
-                        }
-                    merged_defaults[group] = merged_group
-                else:
-                    merged_defaults[group] = patch
-            values["workbench_defaults"] = merged_defaults
-        settings = Settings.model_validate({**previous, **values})
         _resolve_settings_paths(settings)
-        _write_configuration(settings)
-    return settings
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(target.with_suffix(".lock")), timeout=10):
+            if not target.exists():
+                _write_configuration(settings)
+    return _resolve_settings_paths(settings)
 
 
 def save_configuration_document(document: dict, *, base_revision: str | None = None) -> tuple[dict, Settings]:
@@ -744,7 +512,7 @@ def save_configuration_document(document: dict, *, base_revision: str | None = N
                 raise RuntimeError("CONFIG_REVISION_CONFLICT")
         candidate = deepcopy(document)
         candidate.pop("config_revision", None)
-        settings = settings_from_document(migrate_configuration_document(candidate))
+        settings = settings_from_document(candidate)
         _resolve_settings_paths(settings)
         written = _write_configuration(settings)
     return written, settings
