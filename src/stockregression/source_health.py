@@ -53,6 +53,10 @@ class SourceFailure(RuntimeError):
         self.capability = capability
         self.category = category
 
+    def __reduce__(self):
+        # ProcessPoolExecutor must reconstruct all routing fields, not just args[0].
+        return type(self), (self.source, self.capability, self.category, str(self))
+
 
 def market_for_symbol(symbol: str) -> str:
     return "etf" if str(symbol).split(".")[0].startswith(("1", "5")) else "stock"

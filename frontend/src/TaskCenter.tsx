@@ -3,7 +3,7 @@ import type { ReactNode } from 'react'
 import { AlertCircle, Bell, CheckCircle2, ChevronRight, LoaderCircle, RefreshCw, X } from 'lucide-react'
 import { get, post } from './api'
 import { Badge, Button, Empty, JobProgress } from './components'
-import { isActiveJob, mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds, taskLabel, taskStatusLabel } from './taskState'
+import { isActiveJob, mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds, taskLabel, taskStatusLabel, taskNoticeMessage } from './taskState'
 import type { Job } from './types'
 import { useWorkbenchDefaults } from './useWorkbenchDefaults'
 import { LatestRequest } from './requestState'
@@ -55,10 +55,10 @@ export function TaskProvider({ children, onOpenResult, filter, kind, onFilterCha
   const historyFilter = useRef('')
   const activeIds = useRef<Set<string>>(new Set())
 
-  const accept = useCallback((incoming: Job[]) => {
+  const accept = useCallback((incoming: Job[], source: 'live' | 'history' = 'live') => {
     if (!mounted.current) return
     const next = mergeJobSnapshots(jobsRef.current, incoming)
-    const changed = newlyNotifiableJobs(jobsRef.current, next, initialized.current)
+    const changed = newlyNotifiableJobs(jobsRef.current, next, initialized.current, source)
     jobsRef.current = next
     setJobs(next)
     setNotices(current => {
@@ -123,7 +123,7 @@ export function TaskProvider({ children, onOpenResult, filter, kind, onFilterCha
         kinds: page.kinds.length ? page.kinds : current.kinds,
       } : page)
       setHistoryOffset(offset)
-      accept(page.items)
+      accept(page.items, 'history')
       initialized.current = true
       setLoading(false)
     } catch (cause) {
@@ -228,7 +228,7 @@ export function TaskProvider({ children, onOpenResult, filter, kind, onFilterCha
     <div className="task-toasts" aria-label="任务通知">
       {notices.slice(-3).reverse().map(notice => <section className={`task-toast ${notice.error || notice.job?.status === 'failed' ? 'failed' : notice.job?.status === 'partial' ? 'partial' : ''}`} key={notice.id}>
         <div className="task-toast-head"><span className="task-toast-icon">{notice.submitting || (notice.job && isActiveJob(notice.job)) ? <LoaderCircle className="spin" size={17} /> : notice.error || notice.job?.status === 'failed' || notice.job?.status === 'partial' ? <AlertCircle size={17} /> : <CheckCircle2 size={17} />}</span><strong>{notice.label}</strong>{notice.job?.status === 'partial' && <Badge tone="amber">部分完成</Badge>}<button className="icon-button" onClick={() => removeNotice(notice.id)} aria-label="收起任务提示"><X size={15} /></button></div>
-        <div role="status" className="task-toast-message">{notice.error ?? (notice.submitting ? '正在提交…' : notice.job?.message || '操作完成')}</div>
+        <div role="status" className="task-toast-message">{notice.error ?? (notice.submitting ? '正在提交…' : notice.job ? taskNoticeMessage(notice.job) : '操作完成')}</div>
         {notice.job && <><JobProgress progress={notice.job.progress} status={notice.job.status} />{jobActions(notice.job)}</>}
       </section>)}
       {notices.length > 3 && <button className="task-overflow" onClick={showHistory}>另有 {notices.length - 3} 条任务通知 · 查看全部</button>}

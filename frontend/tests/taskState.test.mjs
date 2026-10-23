@@ -1,9 +1,24 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { isResearchJob, mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds, taskLabel } from '../src/taskState.ts'
+import { isResearchJob, mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds, taskLabel, taskNoticeMessage } from '../src/taskState.ts'
 
 const job = (id, status, values = {}) => ({ id, kind: 'backtest', status, progress: 0, message: '', ...values })
 const ids = (jobs) => jobs.map((entry) => entry.id)
+
+test('opening and paging history after live initialization never replays old failures', () => {
+  const active = job('tracked', 'running')
+  const oldFailures = [job('old-1', 'failed'), job('old-2', 'failed'), job('old-3', 'failed')]
+  const next = mergeJobSnapshots([active], oldFailures)
+  assert.deepEqual(newlyNotifiableJobs([active], next, true, 'history'), [])
+  const finished = mergeJobSnapshots(next, [{ ...active, status: 'completed' }])
+  assert.deepEqual(ids(newlyNotifiableJobs(next, finished, true, 'history')), ['tracked'])
+  assert.deepEqual(newlyNotifiableJobs(finished, finished, true, 'history'), [])
+})
+
+test('failed notices show the actual import or database error', () => {
+  assert.equal(taskNoticeMessage(job('import', 'failed', { message: '任务失败，查看原因后可重试', error: '行情缺少字段：timestamp' })), '行情缺少字段：timestamp')
+  assert.equal(taskNoticeMessage(job('sync', 'running', { message: '1124/2762' })), '1124/2762')
+})
 
 test('research completion jobs are treated as research tasks and labelled as such', () => {
   assert.equal(isResearchJob({ kind: 'research_completion' }), true)

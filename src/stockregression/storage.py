@@ -736,16 +736,11 @@ class Store:
 
     @contextmanager
     def db(self):
+        from .sqlite_catalog import catalog_connection
+
         sqlite_timeout = int(self.market_settings.sqlite_timeout_seconds)
-        connection = sqlite3.connect(self.db_path, timeout=sqlite_timeout)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute(f"PRAGMA busy_timeout={sqlite_timeout * 1000}")
-        try:
+        with catalog_connection(self.db_path, sqlite_timeout) as connection:
             yield connection
-            connection.commit()
-        finally:
-            connection.close()
 
     def put_instrument(self, symbol: str, name: str = "", **metadata):
         from .rules import instrument_terms

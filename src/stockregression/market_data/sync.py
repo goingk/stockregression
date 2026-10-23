@@ -7,6 +7,7 @@ import threading
 from concurrent.futures import (
     FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, as_completed, wait,
 )
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import redirect_stdout
 
 import pandas as pd
@@ -259,6 +260,7 @@ class MarketDataSyncService:
         downloaded = 0
         written = 0
         worker_count = self._worker_count(workers)
+        process_pool_healthy = True
 
         def report(message: str) -> None:
             progress((downloaded + written) / (2 * max(1, total)), message)
@@ -287,7 +289,7 @@ class MarketDataSyncService:
                 self.store.sync_item(run_key, symbol, status="running", mode=mode)
             prepared = []
             executor = None
-            if len(active) > 1 and worker_count >= 4:
+            if len(active) > 1 and worker_count >= 4 and process_pool_healthy:
                 executor = ProcessPoolExecutor(
                     max_workers=min(2, worker_count),
                     mp_context=multiprocessing.get_context("spawn"),
@@ -318,7 +320,14 @@ class MarketDataSyncService:
                         symbol = futures[future]
                         downloaded += 1
                         try:
-                            value = future.result()
+                            try:
+                                value = future.result()
+                            except BrokenProcessPool:
+                                # A dead worker must not turn every queued symbol
+                                # into a failure. Retry only the unfinished read,
+                                # then use threads for subsequent batches.
+                                process_pool_healthy = False
+                                value = self._prepare_daily(symbol, mode, start, end, cancelled)
                             if value.get("skipped"):
                                 skipped.append(value)
                                 self.store.sync_item(

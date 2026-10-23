@@ -58,16 +58,20 @@ def filename_candidates(path: Path) -> list[str]:
 
 
 def _promote_time_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    result = frame.copy()
+    result = frame.copy().rename(columns={key: value for key, value in ALIASES.items() if key in frame and value not in frame})
     if "timestamp" not in result and "date" in result:
         result["timestamp"] = result.date
-    if "timestamp" not in result and isinstance(result.index, pd.MultiIndex):
-        result = result.reset_index()
-    if "timestamp" not in result and isinstance(result.index, pd.DatetimeIndex):
-        result = result.reset_index()
-    result = result.rename(columns={key: value for key, value in ALIASES.items() if key in result and value not in result})
-    if "timestamp" not in result and "index" in result and pd.api.types.is_datetime64_any_dtype(result["index"]):
-        result = result.rename(columns={"index": "timestamp"})
+    if "timestamp" not in result:
+        # Parquet preserves named datetime indexes. Read the clock directly
+        # instead of assuming reset_index() creates a column named "index".
+        for level in range(result.index.nlevels):
+            values = result.index.get_level_values(level)
+            name = result.index.names[level]
+            if pd.api.types.is_datetime64_any_dtype(values.dtype) or name in {
+                "date", "timestamp", "datetime", "day", "dt", "time", "trade_time", "trade_date", "日期", "时间",
+            }:
+                result["timestamp"] = values
+                break
     return result
 
 

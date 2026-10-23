@@ -1280,7 +1280,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         response_model=MarketDataPackageInfoResponse,
     )
     def data_package():
-        return json_safe(MarketDataService(store).package_info())
+        try:
+            return json_safe(MarketDataService(store).package_info())
+        except MarketDataError as exc:
+            raise HTTPException(409, {"code": "PACKAGE_NOT_READY", "message": str(exc)}) from exc
 
     @app.get("/api/v1/data/inventory")
     def data_inventory(
@@ -1685,8 +1688,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
                 materialize=False,
             ))
         except MarketDataError as exc:
-            return {"symbol": normalize_symbol(symbol), "frequency": normalize_timeframe(frequency),
-                    "bars": [], "warnings": [str(exc)], "quality_flags": [str(exc)], "diagnostics": {}, "source_events": []}
+            raise HTTPException(409, {"code": "MARKET_DATA_UNAVAILABLE", "message": str(exc)}) from exc
         except (ValueError, TypeError) as exc:
             raise HTTPException(422, str(exc)) from exc
 

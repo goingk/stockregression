@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,12 +78,22 @@ def auxiliary_relative_path(symbol: str, kind: str) -> str:
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".writing")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str),
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".writing")
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+        for attempt in range(5):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.02 * 2 ** attempt)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 class PackageLayout:
@@ -105,6 +116,9 @@ class PackageLayout:
         self.transactions_dir = self.control / "transactions"
         self.locks_dir = self.control / "locks"
         self.manifest_path = self.control / "manifest.json"
+        self._transaction_lock = FileLock(
+            str(self.control / "transactions.lock"), timeout=self.lock_timeout,
+        )
         self._manifest_cache: dict[str, Any] | None = None
         self._manifest_cache_key: tuple[int, int] | None = None
         for path in (
@@ -437,12 +451,16 @@ class PackageLayout:
         _atomic_json(path, {"id": transaction_id, "status": "prepared", **payload})
         return transaction_id, path
 
+    def transaction_guard(self):
+        """Serialize publication and recovery across threads and processes."""
+        return self._transaction_lock
+
     def update_transaction(self, path: Path, values: dict[str, Any]) -> None:
-        payload = {}
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            payload = {"id": path.stem}
+        # A vanished transaction was completed elsewhere. Never resurrect it
+        # without its dataset identity, even when the read fails transiently.
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("kind") != "dataset":
+            raise ValueError(f"事务记录缺少数据集身份：{path.name}")
         payload.update(values)
         _atomic_json(path, payload)
 

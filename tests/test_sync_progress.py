@@ -50,6 +50,46 @@ def assert_progress(values):
     assert values[-1] == pytest.approx(1)
 
 
+def test_broken_process_pool_retries_unfinished_downloads_and_uses_threads(service, monkeypatch):
+    from concurrent.futures import Future
+    from concurrent.futures.process import BrokenProcessPool
+    from stockregression.market_data import sync as sync_module
+
+    sync = MarketDataSyncService(service)
+    downloads, commits, pools, values = [], [], [], []
+
+    class BrokenPool:
+        def __init__(self, **kwargs):
+            pools.append(self)
+
+        def submit(self, *args, **kwargs):
+            future = Future()
+            future.set_exception(BrokenProcessPool("worker exited"))
+            return future
+
+        def shutdown(self, **kwargs):
+            pass
+
+    def prepare(symbol, *_):
+        downloads.append(symbol)
+        return prepared(symbol)
+
+    def commit(symbol, *_args, **_kwargs):
+        commits.append(symbol)
+        return {"symbol": symbol, "last_time": "2026-01-06"}
+
+    monkeypatch.setattr(sync_module, "ProcessPoolExecutor", BrokenPool)
+    monkeypatch.setattr(sync, "_worker_count", lambda _: 4)
+    monkeypatch.setattr(sync, "_prepare_daily", prepare)
+    monkeypatch.setattr(service, "_commit_frame", commit)
+    result = run_daily(sync, SYMBOLS, lambda value, _: values.append(value))
+    assert result["status"] == "completed"
+    assert result["failures"] == []
+    assert len(pools) == 1, "remaining batches must not create another broken process pool"
+    assert sorted(downloads) == sorted(commits) == sorted(SYMBOLS)
+    assert_progress(values)
+
+
 def test_daily_download_reports_progress_before_first_commit(service, monkeypatch):
     sync = MarketDataSyncService(service)
     values, commit_progress = [], []

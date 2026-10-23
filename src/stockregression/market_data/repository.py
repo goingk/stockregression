@@ -9,6 +9,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -99,6 +100,14 @@ def _time_text(value: Any) -> str:
     return stamp.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _serialized_package(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        with self.package.transaction_guard():
+            return method(self, *args, **kwargs)
+    return guarded
+
+
 class MarketDataRepository:
     """Immutable Parquet partitions with transactional version manifests."""
 
@@ -156,8 +165,9 @@ class MarketDataRepository:
                 "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('generation',?)",
                 (package_manifest["generation"],),
             )
-        self._seed_manifest_from_index()
-        self._recover_package_transactions()
+        with self.package.transaction_guard():
+            self._seed_manifest_from_index()
+            self._recover_package_transactions()
 
     def attach_package(self, package_dir: str | Path) -> None:
         previous_id = self.meta("package_id")
@@ -214,16 +224,10 @@ class MarketDataRepository:
 
     @contextmanager
     def _connect(self):
-        connection = sqlite3.connect(self.db_path, timeout=self.sqlite_timeout)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=NORMAL")
-        connection.execute(f"PRAGMA busy_timeout={self.sqlite_timeout * 1000}")
-        try:
+        from ..sqlite_catalog import catalog_connection
+
+        with catalog_connection(self.db_path, self.sqlite_timeout, synchronous="NORMAL") as connection:
             yield connection
-            connection.commit()
-        finally:
-            connection.close()
 
     connection = _connect
 
@@ -428,17 +432,40 @@ class MarketDataRepository:
             "pending_recovery": len(pending),
         }
 
+    @_serialized_package
     def _recover_package_transactions(self) -> None:
         for transaction in self.package.pending_transactions():
             try:
                 payload = json.loads(transaction.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+            except FileNotFoundError:
                 continue
+            except (OSError, ValueError) as exc:
+                raise MarketDataError(f"事务记录不可读：{transaction.name}: {exc}") from exc
+            if (
+                isinstance(payload, dict)
+                and set(payload) <= {"id", "status"}
+                and payload.get("status") == "needs_rebuild"
+            ):
+                # Earlier recovery could resurrect a just-completed transaction
+                # with no dataset fields. Validate published shards and rebuild
+                # from immutable manifests before retaining the damaged record.
+                self.rebuild_index()
+                quarantine = self.package.control / "quarantine" / "transactions"
+                quarantine.mkdir(parents=True, exist_ok=True)
+                destination = quarantine / transaction.name
+                if destination.exists():
+                    destination = quarantine / f"{transaction.stem}-{uuid.uuid4().hex}.json"
+                os.replace(transaction, destination)
+                continue
+            if not isinstance(payload, dict):
+                raise MarketDataError(f"事务记录格式无效：{transaction.name}")
             if payload.get("kind") == "dataset":
                 symbol = str(payload.get("symbol") or "")
                 timeframe = normalize_timeframe(str(payload.get("timeframe") or "1day"))
                 adjustment = str(payload.get("adjustment") or "none")
                 expected_version = int(payload.get("version") or 0)
+                if not symbol or not payload.get("timeframe") or expected_version <= 0:
+                    raise MarketDataError(f"事务记录缺少标的、周期或有效版本：{transaction.name}")
                 with self._connect() as db:
                     dataset = self._dataset_row(db, symbol, timeframe, adjustment)
                     indexed_version = int(dataset["current_version"] or 0) if dataset else 0
@@ -456,7 +483,7 @@ class MarketDataRepository:
                 else:
                     self.package.update_transaction(transaction, {"status": "needs_rebuild"})
                 continue
-            raise MarketDataError(f"不支持的旧文件事务：{transaction.name}")
+            raise MarketDataError(f"事务记录缺少或使用未知类型 kind：{transaction.name}")
 
     def _seed_manifest_from_index(self) -> None:
         """Reconcile the published package heads and the rebuildable SQLite index."""
@@ -578,6 +605,7 @@ class MarketDataRepository:
             payload, expected_version=int(head.get("version") or 0),
         )
 
+    @_serialized_package
     def rebuild_index(
         self, *, symbols: Sequence[str] | None = None,
         timeframes: Sequence[str] | None = None,
@@ -656,11 +684,14 @@ class MarketDataRepository:
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             previous_versions = {}
+            previous_datasets = {}
             for symbol, timeframe, adjustment in current_keys:
                 row = self._dataset_row(db, symbol, timeframe, adjustment)
                 previous_versions[(symbol, timeframe, adjustment)] = (
                     int(row["current_version"]) if row else 0
                 )
+                if row:
+                    previous_datasets[(symbol, timeframe, adjustment)] = dict(row)
             if not wanted_symbols and not wanted_timeframes:
                 for table in ("parquet_shards", "parquet_versions",
                               "parquet_datasets", "parquet_derived"):
@@ -750,6 +781,8 @@ class MarketDataRepository:
                 row_count = int(value.get("row_count") or 0)
                 synthetic = int(value.get("synthetic_rows") or 0)
                 new_version = int(value["version"])
+                previous = previous_datasets.get((symbol, timeframe, adjustment))
+                updated_at = utc_now()
                 if previous_versions.get((symbol, timeframe, adjustment), 0) != new_version:
                     # The package manifest is authoritative during recovery. If
                     # it advanced while SQLite did not, old quality conclusions
@@ -762,6 +795,16 @@ class MarketDataRepository:
                         "DELETE FROM parquet_coverage WHERE symbol=? AND timeframe=? AND adjustment=?",
                         (symbol, timeframe, adjustment),
                     )
+                elif previous:
+                    # Revalidation and later metadata updates belong to this
+                    # exact data version. Immutable publication manifests only
+                    # contain its initial quality state; do not roll it back.
+                    value = {**value, **{
+                        key: previous[key] for key in (
+                            "status", "reason", "completed_through", "pending_rows", "created_at",
+                        )
+                    }, "metadata": _load(previous["metadata"], {})}
+                    updated_at = previous["updated_at"]
                 db.execute(
                     """INSERT INTO parquet_datasets(
                        symbol,timeframe,adjustment,current_version,first_time,last_time,
@@ -776,7 +819,7 @@ class MarketDataRepository:
                         synthetic, int(value.get("pending_rows") or 0),
                         value.get("status") or "pending_validation", value.get("reason"),
                         _json(value.get("metadata") or {}),
-                        value.get("created_at") or utc_now(), utc_now(),
+                        value.get("created_at") or utc_now(), updated_at,
                     ),
                 )
             db.execute(
@@ -802,6 +845,7 @@ class MarketDataRepository:
             "package_id": package["package_id"], "generation": package["generation"],
         }
 
+    @_serialized_package
     def save_basic_info(self, symbol: str, metadata: dict) -> Path:
         self._assert_writable()
         asset = asset_type_for_symbol(symbol)
@@ -2387,6 +2431,7 @@ class MarketDataRepository:
             "layout": "time_partitioned",
         }
 
+    @_serialized_package
     def commit_bars(
         self, symbol: str, timeframe: str, frame: pd.DataFrame, *,
         adjustment: str = "none", source: str = "import", file_name: str | None = None,
@@ -2780,6 +2825,7 @@ class MarketDataRepository:
         ]
         return item
 
+    @_serialized_package
     def save_auxiliary(
         self, symbol: str, kind: str, payload: Any, *,
         version: str = "local", verified: bool = False,

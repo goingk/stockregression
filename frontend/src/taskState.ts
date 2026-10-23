@@ -30,11 +30,19 @@ export function submissionJobIds(response: unknown): string[] {
   return [...new Set([value.job_id, ...(Array.isArray(value.job_ids) ? value.job_ids : [])].filter((id): id is string => typeof id === 'string' && Boolean(id)))]
 }
 
-export function newlyNotifiableJobs(previous: Job[], current: Job[], initialized: boolean): Job[] {
+export function newlyNotifiableJobs(previous: Job[], current: Job[], initialized: boolean, source: 'live' | 'history' = 'live'): Job[] {
   const known = new Map(previous.map(job => [job.id, job]))
   return current.filter(job => {
     const before = known.get(job.id)
+    if (source === 'history') return before ? isActiveJob(before) && !isActiveJob(job) : isActiveJob(job)
     if (!initialized) return isActiveJob(job)
     return !before || before.status !== job.status
   })
+}
+
+export function taskNoticeMessage(job: Pick<Job, 'status' | 'message' | 'error'>): string {
+  if (job.status === 'failed' && job.error != null) {
+    return typeof job.error === 'string' ? job.error : JSON.stringify(job.error)
+  }
+  return job.message || '操作完成'
 }
