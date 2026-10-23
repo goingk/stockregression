@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from datetime import date
 
@@ -520,7 +521,7 @@ def test_one_minute_repair_fetches_one_tail_window(tmp_path, monkeypatch):
     assert result["source"] == "sina"
 
 
-def test_daily_sync_commits_many_symbols_in_one_shared_file_batch(tmp_path, monkeypatch):
+def test_daily_sync_commits_many_symbols_as_independent_year_shards(tmp_path, monkeypatch):
     service = MarketDataService(Store(tmp_path / "data"))
     first_day = pd.DatetimeIndex(["2026-01-05"])
     two_days = pd.DatetimeIndex(["2026-01-05", "2026-01-06"])
@@ -547,12 +548,14 @@ def test_daily_sync_commits_many_symbols_in_one_shared_file_batch(tmp_path, monk
     assert result["status"] in {"completed", "partial"}
     assert result["batches"] == 1 and result["batch_size"] == 128
     assert {item["symbol"] for item in result["symbols"]} == {"600000.SH", "000001.SZ"}
-    assert len(pd.read_parquet(service.repository.package_file_path("600000.SH", "1day"))) == 2
+    assert len(service.repository.active_rows("600000.SH", "1day")) == 2
     assert len(service.repository.active_rows("600000.SH", "1day")) == 2
     assert len(service.repository.active_rows("000001.SZ", "1day")) == 2
     for symbol, version in before.items():
         assert service.repository.dataset(symbol, "1day")["current_version"] > version
-    assert len(list((service.repository.package.increments_dir).rglob("*.parquet"))) == 2
+    published = json.loads(service.repository.package.manifest_path.read_text(encoding="utf-8"))
+    assert published["shard_count"] == 2
+    assert len(list(service.repository.package.partitions_dir.rglob("*.parquet"))) == 4
 
 
 def test_market_data_api_imports_and_defaults_sync_to_base_timeframes(tmp_path):
@@ -575,7 +578,7 @@ def test_market_data_api_imports_and_defaults_sync_to_base_timeframes(tmp_path):
         execute_job(str(root), job_id)
         datasets = client.get("/api/v1/data/datasets?timeframe=1day").json()["items"]
         bars = client.get("/api/v1/data/bars/600000.SH?frequency=1day").json()
-        assert len(datasets) == 1 and datasets[0]["storage"] == "parquet-source"
+        assert len(datasets) == 1 and datasets[0]["storage"] == "parquet"
         assert len(bars) == 2
         assert client.get("/api/v1/data/coverage/600000.SH?timeframe=1min").status_code == 400
 

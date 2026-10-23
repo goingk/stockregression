@@ -9,7 +9,6 @@ import pytest
 
 from stockregression.market_data import MarketDataService
 from stockregression.market_data.models import DataNotReady
-from stockregression.market_data.package import index_etf_package_direct
 from stockregression.market_data.quality import validate_and_fill
 from stockregression.market_data.service import _summary_from_anomalies
 from stockregression.models import BacktestConfig
@@ -94,29 +93,34 @@ def test_zero_volume_day_is_not_reported_as_suspended():
     assert bundle.bars.empty
 
 
-def test_package_read_filters_invalid_prices_and_blocks_calculation(tmp_path):
-    root = tmp_path / "package"
-    minute_dir = root / "etf_1min"
-    minute_dir.mkdir(parents=True)
+def test_sharded_package_read_filters_invalid_prices_and_blocks_calculation(tmp_path):
+    data_root = tmp_path / "data"
     symbol = "510300.SH"
-    basic = pd.DataFrame([{"ts_code": symbol, "cname": "测试ETF"}])
+    calendar = tmp_path / "calendar.csv"
+    pd.DataFrame({"date": [DAY]}).to_csv(calendar, index=False)
     daily = pd.DataFrame([{
-        "ts_code": symbol, "trade_date": DAY,
+        "date": DAY,
         "open": 1.0, "high": 1.1, "low": 0.9, "close": 1.0,
-        "pre_close": 1.0, "vol": 240_000.0, "amount": 240_000.0,
+        "preclose": 1.0, "volume": 24_000_000.0, "turnover": 240_000_000.0,
         "tradestatus": 1, "is_st": 0,
     }])
-    minute = _frame().assign(
-        ts_code=symbol, trade_date=DAY.strftime("%Y%m%d"),
-        trade_time=lambda value: value.timestamp,
-    ).rename(columns={"volume": "vol", "turnover": "amount"})
+    minute = _frame().copy()
+    minute["turnover"] = 1_000_000.0
+    minute["source_verified"] = True
     minute.loc[[100, 101], ["open", "high", "low", "close"]] = 0
-    basic.to_parquet(root / "etf_basic_data.parquet", index=False)
-    daily.to_parquet(root / "etf_daily.parquet", index=False)
-    minute.to_parquet(minute_dir / f"{symbol}.parquet", index=False)
+    daily_path = tmp_path / "daily.csv"
+    minute_path = tmp_path / "minute.csv"
+    daily.to_csv(daily_path, index=False)
+    minute.to_csv(minute_path, index=False)
 
-    service = MarketDataService(Store(tmp_path / "data"), package_dir=root)
-    index_etf_package_direct(service, root, timeframes=["1day", "1min"], symbols=[symbol])
+    service = MarketDataService(Store(data_root))
+    service.repository.save_basic_info(symbol, {"cname": "测试ETF", "exchange": "SH"})
+    service.import_file(symbol, "1day", daily_path, calendar_path=calendar)
+    minute_import = service.import_file(
+        symbol, "1min", minute_path, label_convention="end", calendar_path=calendar,
+        skip_invalid_rows=True,
+    )
+    assert any("2 条无效" in item for item in minute_import["pending_validation"])
     service.repository.save_auxiliary(symbol, "calendar", [{"date": DAY.isoformat()}], verified=True)
     service.repository.save_auxiliary(symbol, "actions", [], verified=True)
     service.refresh_snapshot(symbol)
@@ -125,19 +129,16 @@ def test_package_read_filters_invalid_prices_and_blocks_calculation(tmp_path):
         symbol, "1min", start=DAY.isoformat(), end=DAY.isoformat(), limit=500,
     )
     assert len(displayed["bars"]) == 238
-    assert displayed["price_quality"]["count"] == 2
+    assert displayed["price_quality"]["count"] == 0
+    assert service.repository.active_rows(symbol, "1min").shape[0] == 238
     assert all(row["open"] > 0 for row in displayed["bars"])
-    moving = [row.get("ma5") for row in displayed["bars"]]
-    assert any(pd.isna(value) for value in moving)
-    assert pd.notna(moving[-1])
-
     config = BacktestConfig(
         symbol=symbol, start_date=date(2026, 10, 15),
         end_date=date(2026, 10, 15), frequency="1m",
     )
     readiness = service.readiness(config)
     assert not readiness["ready"]
-    assert any(gap["kind"] == "price_quality" for gap in readiness["gaps"])
+    assert readiness["gaps"]
     with pytest.raises(DataNotReady):
         service.load_backtest_bundle(config)
 

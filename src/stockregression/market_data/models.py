@@ -66,9 +66,8 @@ class FileImportResult:
     fingerprint: str | None = None
     import_mode: str = "merge"
     changed_dates: list[str] = field(default_factory=list)
-    increment_count: int = 0
+    shard_count: int = 0
     layout: str | None = None
-    compaction: dict[str, Any] | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
@@ -80,7 +79,6 @@ class FileImportResult:
             "gap_count": self.gap_count, "pending_validation": self.pending_validation,
             "message": self.message, "fingerprint": self.fingerprint,
             "import_mode": self.import_mode, "changed_dates": self.changed_dates,
-            "increment_count": self.increment_count, "layout": self.layout,
-            "compaction": self.compaction,
+            "shard_count": self.shard_count, "layout": self.layout,
             "metrics": self.metrics,
         }

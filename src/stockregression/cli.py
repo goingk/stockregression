@@ -15,7 +15,12 @@ from .schedule import configure_schedule
 from .settings import PROJECT_ROOT, load_settings
 from .storage import Store
 from .market_data.package import scan_etf_package
-from .market_data.maintenance import preview_reset, rebuild_state, reset_market_storage
+from .market_data.maintenance import rebuild_state
+from .market_data.migration import (
+    cleanup_verified, migrate_package, preflight, verify_package,
+    verify_source_independent,
+)
+from .market_data.repository import MarketDataRepository
 
 app = typer.Typer(help="本地 A 股及 ETF 行情与网格研究台", no_args_is_help=True)
 schedule_app = typer.Typer(help="安装、移除或查看 Windows 补数计划")
@@ -194,38 +199,88 @@ def data_import_etf_package(
     })
 
 
-@data_app.command("rebuild-parquet")
-def data_rebuild_parquet(
-    folder: Path = typer.Option(..., "--folder"),
+@data_app.command("migrate-package")
+def data_migrate_package(
+    source: Path = typer.Option(Path("D:/ETF"), "--source"),
+    target: Path | None = typer.Option(None, "--target"),
     dry_run: bool = typer.Option(False, "--dry-run"),
-    reset: bool = typer.Option(False, "--reset"),
-    resume: bool = typer.Option(False, "--resume"),
-    workers: int = typer.Option(4, "--workers", min=1, max=4),
+    apply: bool = typer.Option(False, "--apply"),
+    delete_source: bool = typer.Option(False, "--delete-source"),
+    delete_replaced: bool = typer.Option(False, "--delete-replaced"),
+    migration_id: str | None = typer.Option(
+        None, "--migration-id",
+        help="清理时指定已验收迁移；与 --apply 一起使用时恢复该迁移的完整暂存包",
+    ),
 ):
-    """清理旧行情并从 ETF 数据包建立新的 Parquet 行情库。"""
+    """迁移旧数据包到 schema 2 年/月分片布局；默认只做预检。"""
     settings = load_settings()
-    root = Path(settings.data_dir)
-    if dry_run:
-        typer.echo(json.dumps({
-            "reset": preview_reset(root), "package": scan_etf_package(folder),
-        }, ensure_ascii=False, indent=2, default=str))
-        return
-    if not reset and not resume:
-        raise typer.BadParameter("必须指定 --reset 或 --resume")
-    if reset:
-        if resume:
-            raise typer.BadParameter("--reset 与 --resume 不能同时使用")
-        reset_market_storage(root, source_folder=folder)
+    package_dir = Path(target or settings.package_dir or (Path(settings.data_dir) / "dataset" / "etf")).resolve()
+    data_root = Path(settings.data_dir).resolve()
+    if delete_source or delete_replaced:
+        if apply or dry_run:
+            raise typer.BadParameter("清理必须在迁移并全量校验后单独执行")
+        resolved_id = migration_id
+        if not resolved_id:
+            manifest_path = package_dir / ".stockregression" / "manifest.json"
+            try:
+                resolved_id = json.loads(manifest_path.read_text(encoding="utf-8")).get("migration_id")
+            except (OSError, ValueError):
+                resolved_id = None
+        if not resolved_id:
+            raise typer.BadParameter("清理时需要 --migration-id")
+        result = cleanup_verified(
+            data_root, package_dir, resolved_id,
+            delete_source=delete_source, delete_replaced=delete_replaced,
+        )
     else:
-        state = rebuild_state(Store(root))
-        if not state:
-            raise typer.BadParameter("没有可恢复的 Parquet 重建，请先执行 --reset")
-        folder = Path(state.get("source", folder))
-    _run("market_index_package", {
-        "folder": str(folder), "format": "etf", "timeframes": None,
-        "symbols": None, "label_convention": "auto", "resume": True,
-        "workers": workers, "skip_invalid_rows": False,
-    })
+        if dry_run and apply:
+            raise typer.BadParameter("--dry-run 与 --apply 不能同时使用")
+        if migration_id and not apply:
+            raise typer.BadParameter("恢复暂存包时需要同时指定 --apply")
+        result = migrate_package(
+            data_root, source, package_dir, apply=apply,
+            resume_migration_id=migration_id,
+            progress=lambda message: typer.echo(message, err=True),
+        )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+
+
+@data_app.command("rebuild-index")
+def data_rebuild_index(
+    package_dir: Path | None = typer.Option(None, "--package"),
+    timeframe: list[str] = typer.Option(None, "--timeframe"),
+    symbol: list[str] = typer.Option(None, "--symbol"),
+):
+    """只从 schema 2 数据包清单重建 SQLite 行情索引。"""
+    settings = load_settings()
+    target = Path(package_dir or settings.package_dir or (Path(settings.data_dir) / "dataset" / "etf"))
+    repository = MarketDataRepository(settings.data_dir, package_dir=target)
+    result = repository.rebuild_index(symbols=symbol or None, timeframes=timeframe or None)
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+
+
+@data_app.command("verify-package")
+def data_verify_package(
+    package_dir: Path | None = typer.Option(None, "--package"),
+    full: bool = typer.Option(False, "--full"),
+    source_unavailable: bool = typer.Option(False, "--source-unavailable"),
+):
+    """验证包清单、活跃索引和分片；--full 会校验所有 SHA-256。"""
+    if source_unavailable and not full:
+        raise typer.BadParameter("--source-unavailable 需要同时指定 --full")
+    settings = load_settings()
+    target = Path(package_dir or settings.package_dir or (Path(settings.data_dir) / "dataset" / "etf"))
+    if source_unavailable:
+        result = verify_source_independent(
+            settings.data_dir, target, full=True,
+            progress=lambda message: typer.echo(message, err=True),
+        )
+    else:
+        result = verify_package(
+            settings.data_dir, target, full=full,
+            progress=lambda message: typer.echo(message, err=True),
+        )
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
 
 @data_app.command("sync")

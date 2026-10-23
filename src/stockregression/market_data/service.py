@@ -629,8 +629,7 @@ class MarketDataService:
             "seconds": round(time.perf_counter() - started_at, 4),
             "rows_read": int(result.get("rows_read") or 0),
             "bytes_written": int(result.get("bytes") or 0),
-            "base_rewrites": 1 if result.get("layout") == "immutable-base" else 0,
-            "increment_files": int(result.get("increment_count") or 0),
+            "written_shards": int(result.get("shard_count") or 0),
             "validated_days": int(ledger.get("checked_days") or 0),
         }
         self.store.put_instrument(symbol, **{key: value for key, value in metadata.items() if key not in {"symbol", "name"}})
@@ -647,8 +646,8 @@ class MarketDataService:
                      + (f"；合规截至 {ledger.get('verified_through')}" if ledger.get("verified_through") else "")),
             fingerprint=fingerprint,
             import_mode=import_mode, changed_dates=changed_dates,
-            increment_count=int(result.get("increment_count") or result.get("file_count") or 0),
-            layout=result.get("layout"), compaction=result.get("compaction"),
+            shard_count=int(result.get("shard_count") or 0),
+            layout=result.get("layout"),
             metrics=metrics,
         ).as_dict()
 
@@ -1001,7 +1000,17 @@ class MarketDataService:
                         "reason": str(exc),
                     })
             if prepared:
-                committed = self.repository.commit_daily_batch(prepared)
+                committed = []
+                for item in prepared:
+                    outcome = self.repository.commit_bars(
+                        item["symbol"], "1day", item["frame"],
+                        source=item["source"], file_name=item["file_name"],
+                        fingerprint=item["fingerprint"], params_hash=item["params_hash"],
+                        report=item["report"], metadata=item["metadata"],
+                        advance_completed=True, import_mode="merge",
+                    )
+                    outcome["message"] = "已发布规范日线分片"
+                    committed.append(outcome)
                 by_symbol = {item["symbol"]: item for item in prepared}
                 for item in committed:
                     prepared_item = by_symbol[item["symbol"]]

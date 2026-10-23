@@ -23,6 +23,10 @@ def load_native_bundle(service, config: BacktestConfig, version: str | None = No
     if "1day" not in versions:
         raise DataQualityError("该版本没有日线，无法进行回测")
     daily_version = int(versions["1day"]["version"])
+    _reject_reported_price_anomalies(
+        service.repository, config.symbol, "1day", daily_version,
+        start=config.start_date, end=config.end_date, context="日线",
+    )
     daily = service.repository.bars(config.symbol, "1day", version=daily_version)
     if daily.empty:
         raise DataQualityError("本地版本没有日线")
@@ -63,6 +67,10 @@ def load_native_bundle(service, config: BacktestConfig, version: str | None = No
         )
     if target not in MINUTE_TIMEFRAMES or target not in versions:
         raise DataQualityError(f"当前版本没有 {target} 行情")
+    _reject_reported_price_anomalies(
+        service.repository, config.symbol, target, int(versions[target]["version"]),
+        start=start, end=end, context=target,
+    )
     minute = service.repository.bars(
         config.symbol, target, start=start, end=end + pd.Timedelta(days=1),
         version=int(versions[target]["version"]),
@@ -97,6 +105,43 @@ def _reject_invalid_prices(frame, symbol, timeframe, version, *, start, end, con
             ),
         }],
     )
+
+
+def _reject_reported_price_anomalies(
+    repository, symbol, timeframe, version, *, start, end, context,
+):
+    """Keep rejected source prices attached to the exact immutable data version."""
+    detail = repository.version_info(symbol, timeframe, version)
+    if not detail:
+        return
+    report = detail.get("report") or {}
+    metadata = detail.get("metadata") or {}
+    validation = metadata.get("validation") or {}
+    reported = report.get("price_anomalies") or validation.get("price_anomalies") or []
+    lower = pd.Timestamp(start).normalize() if start is not None else None
+    upper = pd.Timestamp(end).normalize() + pd.Timedelta(days=1) if end is not None else None
+    matching = []
+    for row in reported:
+        try:
+            stamp = pd.Timestamp(row.get("timestamp") or row.get("date"))
+        except (TypeError, ValueError):
+            continue
+        if lower is not None and stamp < lower:
+            continue
+        if upper is not None and stamp >= upper:
+            continue
+        matching.append({
+            **row, "symbol": symbol, "timeframe": timeframe,
+            "version": int(version), "timestamp": stamp.isoformat(),
+        })
+    if matching:
+        raise DataNotReady(
+            f"{context}存在 {len(matching)} 条已隔离的无效价格记录，当前版本不能用于计算",
+            gaps=[{
+                "kind": "price_quality", "timeframe": timeframe,
+                "anomalies": matching[:50],
+            }],
+        )
 
 
 def _calendar(service, symbol, daily, version=None):

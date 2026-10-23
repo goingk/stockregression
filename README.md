@@ -64,7 +64,16 @@ uv run --frozen stockregression serve --open-browser
 .\sync-market.ps1 -Mode daily -Fresh
 ```
 
-预检不会创建行情任务。当前 ETF 数据包保留原有 Parquet 布局并直接作为历史底座；后续新增和修订写入 `.stockregression/increments/`，不重写历史文件。系统只读取这一套数据包，不再回退到旧 `manifests/`、`parquet/` 或 `package/`。
+预检不会创建行情任务。正式 ETF 数据使用 schema 2 年/月分片目录，SQLite 只保存可重建索引。导入、同步、修订和按需聚合都发布不可变分片，并由数据集版本清单确定当前可见文件；同一包搬迁不改变身份，旧代际任务快照不会自动读取新数据。
+
+旧版整包迁移、校验和索引维护命令：
+
+```powershell
+uv run stockregression data migrate-package --source D:\ETF --target .\data\dataset\etf --dry-run
+uv run stockregression data migrate-package --source D:\ETF --target .\data\dataset\etf --apply
+uv run stockregression data verify-package --full
+uv run stockregression data rebuild-index
+```
 
 正式任务在开始逐标的下载前显示目标数量和可用空间。日线、1 分钟状态、合规截止日期和逐日校验结果分别持久化；瞬时网络错误最多重试一次，协议错误直接报告并回退，可取消、恢复、仅重试失败项。纯追加只写新增日期所属分片，历史修订只重验相关交易日。
 
@@ -74,7 +83,7 @@ uv run --frozen stockregression serve --open-browser
 uv run --frozen stockregression data sync --frequency 1day --scope market --mode history --start 2015-01-01 --resume
 uv run --frozen stockregression data sync --frequency 1day --scope market --mode incremental --resume
 uv run --frozen stockregression data sync --frequency 1min --mode repair --symbol 600000.SH --start 2026-09-28 --end 2026-10-16
-uv run --frozen stockregression data sync --frequency 15min --scope watchlist --mode incremental --resume
+uv run --frozen stockregression data sync --frequency 1min --scope watchlist --mode incremental --resume
 uv run --frozen stockregression data probe --source tdx --capability recent_minute --market all
 uv run --frozen stockregression data probe --source eastmoney --capability etf_daily --market etf
 ```

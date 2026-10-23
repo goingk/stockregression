@@ -952,6 +952,26 @@ class Store:
                 row = db.execute("SELECT s.manifest FROM snapshots s JOIN active_snapshots a USING(version) WHERE a.symbol=?", (symbol,)).fetchone()
         if row:
             manifest = json.loads(row[0])
+            if version is not None and manifest.get("market_data"):
+                try:
+                    from .market_data.repository import MarketDataRepository
+                    repository = MarketDataRepository(self.root)
+                    package = repository.package.manifest()
+                    if (
+                        manifest.get("package_id") != package.get("package_id")
+                        or manifest.get("generation") != package.get("generation")
+                    ):
+                        return None
+                    for timeframe, info in (manifest.get("market_versions") or {}).items():
+                        dataset_manifest = repository.package.load_dataset_manifest(
+                            symbol, timeframe, "none", int(info.get("version") or 0)
+                        )
+                        if dataset_manifest is None:
+                            return None
+                except (OSError, ValueError, KeyError, TypeError):
+                    # A saved result remains viewable even when its exact source
+                    # generation has been retired; it simply cannot be rerun.
+                    return None
             if version is None and manifest.get("market_data"):
                 from .market_data.repository import MarketDataRepository
                 live = MarketDataRepository(self.root).active_manifest(symbol)
@@ -979,6 +999,8 @@ class Store:
 
     def new_job_info(self, kind: str, payload: dict, dedupe_key: str | None = None) -> tuple[str, bool]:
         """Create a job and report whether this call created a new row."""
+        if (self.root / ".market-data-migration.lock").exists():
+            raise RuntimeError("行情数据迁移期间暂停提交任务，请稍后重试")
         job_id = uuid.uuid4().hex
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")

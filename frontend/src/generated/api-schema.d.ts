@@ -1575,6 +1575,65 @@ export interface components {
              */
             import_mode: "merge" | "snapshot";
         };
+        /** MarketDataPackageInfoResponse */
+        MarketDataPackageInfoResponse: {
+            /** Package Id */
+            package_id?: string | null;
+            /** Generation */
+            generation?: string | null;
+            /**
+             * Package Version
+             * @default 0
+             */
+            package_version: number;
+            /** Schema Version */
+            schema_version?: number | null;
+            /**
+             * Storage Layout
+             * @default time_partitioned
+             */
+            storage_layout: string;
+            /** Index Status */
+            index_status: string;
+            /** Path */
+            path: string;
+            /** Status */
+            status: string;
+            /** Readable */
+            readable: boolean;
+            /**
+             * Manifest Ready
+             * @default false
+             */
+            manifest_ready: boolean;
+            /**
+             * Shard Count
+             * @default 0
+             */
+            shard_count: number;
+            /**
+             * Shard Bytes
+             * @default 0
+             */
+            shard_bytes: number;
+            /**
+             * Bytes
+             * @default 0
+             */
+            bytes: number;
+            /**
+             * File Count
+             * @default 0
+             */
+            file_count: number;
+            /** Updated At */
+            updated_at?: string | null;
+            /**
+             * Pending Recovery
+             * @default 0
+             */
+            pending_recovery: number;
+        };
         /** MarketDataSettings */
         MarketDataSettings: {
             /**
@@ -2964,7 +3023,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["MarketDataPackageInfoResponse"];
                 };
             };
         };

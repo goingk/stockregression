@@ -8,38 +8,33 @@
 
 行情由 `stockregression.market_data` 管理。系统维护一个当前数据包，作为唯一的正式行情来源。行情浏览、回测、预览和参数研究都读取该数据包；线上增量、历史补齐、手动导入和本地聚合也都写回该数据包。
 
-## 基础底座、增量覆盖与合规截止
+## 统一分片、版本与合规截止
 
-正式更新的基础周期只有 `1day` 和 `1min`。已有 Parquet 文件保持原布局，作为历史底座直接读取；后续新增和修订写入当前数据包 `.stockregression/increments/` 下的不可变分片。分钟分片按月、日线及周期分片按年生成，查询时按时间合并底座和覆盖文件。旧版本继续引用原文件，因此增量更新不会重写历史底座。
+正式基础行情只有 `1day` 和 `1min`，全部使用按时间分区的不可变 Parquet 文件。日线按年，分钟线按月；写入只重建受影响的完整时间分区，其他分片保持不变。包清单只引用当前数据集版本，独立版本清单保留历史文件引用。SQLite 以单一 `parquet_shards` 表保存所有版本的分片引用，是可重建索引；发布依据始终是数据包清单。增量仅表示更新方式，更新后生成受影响周期的新完整分片。旧索引表在首次启动时事务迁移，保留所有历史版本引用；行情文件、包身份和代际不变。
 
-导入支持两种模式：`merge` 合并新增和重叠修订，`snapshot` 以新文件为准替换当前可见底座并清除现有覆盖。全量替换只撤销内容变化的交易日校验结果，未变化的日线摘要继续复用。重复导入先检查文件内容指纹；文件大小和修改时间只用于发现变化。
+导入支持两种模式：`merge` 保留未涉及日期并合并新增或修订；`snapshot` 以完整输入替换当前视图，撤销输入中缺失的日期。两个模式都保留已经发布的旧版本。完全相同的重复导入不会增加行情版本。普通 CSV 和 Parquet 导入、线上同步、历史修订及聚合统一写入规范分片。
 
 `5min/15min/30min/60min` 只能由 `1min` 聚合，`1week/1month` 只能由 `1day` 聚合。旧粗周期文件只用于追溯，新查询会在需要时生成并持久化派生缓存；基础数据修订会使相关范围失效。基础数据缺失时返回补齐指引，不从旧粗周期文件兜底。
 
-每个标的分别保存日线和 1 分钟的连续合规截止日期。校验结果按交易日保存，绑定行情摘要、规则版本、交易日历、日线依赖和公司行动依赖。纯追加只校验新增日期，历史修订只撤销并重验受影响日期；已合规区间再次校验不读取 K 线。原始外部文件可通过 `/api/v1/data/archive`、`data archive` 或页面按钮复制到 `.stockregression/archives/`。归档前不要直接覆盖原始文件。
+每个标的分别保存日线和 1 分钟的连续合规截止日期。校验结果按交易日保存，绑定行情摘要、规则版本、交易日历、日线依赖和公司行动依赖。纯追加只校验新增日期，历史修订只撤销并重验受影响日期；已合规区间再次校验不读取 K 线。完整年/月分片发布后不可变，历史清单直接引用旧分片；不再另存“本体”或“增量覆盖层”，也不需要复制一套归档行情。
 
 所有导入、同步、读取、聚合和回测共用同一套价格校验。OHLC 必须是有限正数，成交量和成交额不能为负，最高价、最低价与开收盘价必须满足顺序关系。异常记录在读取时隔离并写入质量报告，形成不可自动填充的缺口；浏览请求仍可取得该区间内其余有效 K 线，回测、研究和参数聚合遇到未解决异常会返回 `DATA_NOT_READY`。零成交量不是停牌，也不会被推断为停牌。
 
-SQLite 中的 `catalog.sqlite` 保存可重建索引、任务、配置和结果索引。它不是行情正文。迁移后即使索引损坏，也可以通过数据包登记恢复目录。
+SQLite 中的 `catalog.sqlite` 保存行情可重建索引、任务、配置、自选和结果索引。重建时只替换行情表，业务记录保持不变。分片清单缺失时会明确报错，不通过扫描目录猜测当前版本。
 
 ## 数据包
 
-活动 ETF 数据包固定为应用数据目录下的 `data/dataset/etf/`；股票数据包预留为 `data/dataset/stock/`，两者使用相同的 Parquet 布局。当前活动数据包由 `config/application.json` 的 `paths.package_dir` 指定，相对路径按项目根目录解析；应用不会回退到旧 `package/`、`manifests/` 或 `parquet/` 快照。`data/` 下的其他子目录保存索引、任务、结果和日志，行情正文只放在 `data/dataset/<asset>/`。
+活动 ETF 数据包固定为应用数据目录下的 `data/dataset/etf/`；股票包可使用相同布局。当前活动包由 `config/application.json` 的 `paths.package_dir` 指定，相对路径按项目根目录解析。正式读取只支持 schema 2 清单；旧整包布局只由一次性迁移命令读取，不保留运行时兼容分支。`data/` 下另存索引、迁移报告、导入、结果和日志。
 
 ETF 数据包目录为 `data/dataset/etf/`，股票数据包目录为 `data/dataset/stock/`。两者分别使用以下布局：
 
 ```text
 data/dataset/etf/
   etf_basic_data.parquet
-  etf_daily.parquet
-  etf_1min/<代码>.parquet
-  etf_5min/<代码>.parquet
-  etf_15min/<代码>.parquet
-  etf_30min/<代码>.parquet
-  etf_60min/<代码>.parquet
-  etf_1week/<代码>.parquet
-  etf_1month/<代码>.parquet
-
+  partitions/
+    1day/symbol=<代码>/adjustment=none/year=YYYY/<sha256>.parquet
+    1min/symbol=<代码>/adjustment=none/month=YYYY-MM/<sha256>.parquet
+    <派生周期>/...                       # 按需生成并缓存
   auxiliary/
     calendars/SH.parquet
     calendars/SZ.parquet
@@ -47,23 +42,18 @@ data/dataset/etf/
 
   .stockregression/
     manifest.json
+    datasets/<周期>/<代码>/<复权口径>/v<版本>.json
+    versions/                              # 迁移后任务快照
     quality/
     history/
+    quarantine/unsupported-symbols/
     staging/
     transactions/
     locks/
 
 data/dataset/stock/
   stock_basic_data.parquet
-  stock_daily.parquet
-  stock_1min/<代码>.parquet
-  stock_5min/<代码>.parquet
-  stock_15min/<代码>.parquet
-  stock_30min/<代码>.parquet
-  stock_60min/<代码>.parquet
-  stock_1week/<代码>.parquet
-  stock_1month/<代码>.parquet
-
+  partitions/                              # 与 ETF 相同的年/月分片规则
   auxiliary/
     calendars/SH.parquet
     calendars/SZ.parquet
@@ -78,7 +68,7 @@ data/dataset/stock/
     locks/
 ```
 
-ETF 文件保留原有路径。A 股使用同类布局。日线是每个市场类型一个集中文件，分钟、周线和月线按标的拆文件。
+每个行情分片只归属一个证券、周期、复权口径和时间桶；文件名由内容摘要确定。相同包搬迁保留 `package_id` 和 `generation`，迁移建立新的 generation，使旧行情快照明确不可用于重跑。
 
 数据包清单保存稳定身份 `package_id` 和单调递增的 `package_version`。文件引用保存相对路径，因此整个目录可以搬移。
 
@@ -88,15 +78,15 @@ ETF 文件保留原有路径。A 股使用同类布局。日线是每个市场�
 
 1. 识别证券、周期、时间标签和单位。
 2. 规范化字段并与包内当前记录比较。
-3. 生成暂存文件和变更报告。
-4. 备份会被替换的物理文件。
-5. 原子替换正式文件。
-6. 发布包内清单和数据库索引。
-7. 计算本次范围的质量状态。
+3. 锁定证券、周期和复权口径，生成受影响时间桶的完整暂存分片。
+4. 校验分片并按内容摘要原子安装。
+5. 写不可变数据集版本清单，并原子更新包级当前引用。
+6. 事务更新 SQLite 索引并撤销受影响的质量结论、使派生数据失效。
+7. 完成事务日志；索引晚于已发布清单时，启动恢复会按清单修复。
 
 重复导入相同内容不会产生新行情版本。低优先级派生记录不能覆盖更高优先级的经验证记录。同等优先级的数据修订允许更新，并记录新增、修正、未变化和冲突数量。
 
-日线集中文件按批提交：同一批最多 128 个证券完成下载后只重写一次集中文件。下载仍可并行。使用 DuckDB/Arrow 合并，保留其他证券和未知源列。
+日线下载仍可并行，但每个证券分别提交自己的年分片，不再争写共享日线大文件。分钟及分钟派生分片也分别按月提交。
 
 ## 时间、单位与来源
 
@@ -118,35 +108,41 @@ ETF 文件保留原有路径。A 股使用同类布局。日线是每个市场�
 
 ## 文件版本与恢复
 
-增量更新前，旧物理文件复制到 `.stockregression/history/files/`。同一份旧文件只保存一次。集中日线被替换后：
+旧分片不可变。新版本只引用未变分片和已替换时间桶的新分片，已提交任务继续读取自己的数据集版本。
 
-- 所有相关证券的旧快照继续指向旧物理文件。
-- 所有相关证券的当前引用切换到新物理文件。
-- 只有自身内容变化的证券更新内容时间；其他证券只更新物理文件版本引用。
-- 读取和写入同一物理文件时共享文件锁。
-
-提交日志位于 `.stockregression/transactions/`。启动时：
-
-- 清单尚未发布的未完成事务，从包内历史文件恢复旧目标文件。
-- 已发布但索引尚未更新的记录标记为需要重建索引。
-- 已完成且索引一致的记录清理日志。
-
-外部程序改动正式文件后，大小、修改时间或内容摘要不一致会使质量状态失效；重新登记并校验后才能再次显示为就绪。
+提交日志位于 `.stockregression/transactions/`。清单发布前失败不会改变当前引用；清单发布后 SQLite 更新失败，启动时会根据已发布清单补齐索引。孤立的内容分片不会被自动认作当前行情。`data verify-package --full` 会校验所有活跃分片的 SHA-256、Parquet 行数和时间范围。
 
 ## 登记与索引
 
-“登记并连接”是幂等操作：
+“从清单重建索引”是幂等操作：
 
 - 只更新指定的证券、周期和文件。
 - 不删除同周期其他证券、其他周期或历史版本。
 - 文件未变化时保留现有版本和校验结果。
-- 文件变化时发布新版本并要求重新核验。
-- 缺少文件时标记为缺失，历史快照仍保留。
-- 支持 `etf_*` 和 `stock_*` 两种布局。
+- 仅从 schema 2 包清单读取已发布的分片引用。
+- 保留每个数据集的历史版本引用和未变化的质量记录。
+- 重建行情表时保留任务、结果、自选和配置业务表。
 
-登记只读取 Parquet 元数据，不复制全部分钟 K 线。索引存在时打开证券目录只访问 SQLite；行情查询只打开目标文件并用 DuckDB 过滤所需区间。
+目录列表使用 SQLite 索引；行情查询按证券、周期、版本及时间范围选择分片，再由一次 DuckDB 读取合并所需字段和时间过滤。
 
-首次接入时执行一次全量登记即可写入每个物理文件的大小、修改时间和版本；该操作只读元数据，耗时与文件数量有关，不重写 K 线。当前版本只读取登记后的数据包，已移除旧格式目录扫描和清理入口。
+迁移和索引维护命令：
+
+```powershell
+uv run stockregression data migrate-package --source D:\ETF --target .\data\dataset\etf --dry-run
+uv run stockregression data migrate-package --source D:\ETF --target .\data\dataset\etf --apply
+uv run stockregression data verify-package --full
+uv run stockregression data rebuild-index
+```
+
+如果迁移在目录切换阶段失败，且 `migration.json` 显示 `status=failed`、`rolled_back=true` 并保留 `stage_path`，可用同一个迁移编号恢复已校验的暂存包：
+
+```powershell
+uv run stockregression data migrate-package --source D:\ETF --target .\data\dataset\etf --apply --migration-id <编号>
+```
+
+恢复会重新核对冻结基线并验证暂存清单；基线变化或暂存文件缺失时会停止，不会重用不完整数据。
+
+清理迁移源或旧目标前，必须先用 `data verify-package --full --source-unavailable` 验证源目录不可用时仍能完成服务冒烟检查，再通过 `data migrate-package --delete-source --delete-replaced --migration-id <编号>` 清理。
 
 ## 本地导入
 
@@ -154,7 +150,7 @@ ETF 文件保留原有路径。A 股使用同类布局。日线是每个市场�
 
 ```powershell
 uv run --frozen stockregression data import-file --frequency 1day --path .\imports\1day\600000.parquet --calendar-path .\calendar.csv
-uv run --frozen stockregression data import-file --frequency 15min --path .\imports\15min\600000.csv --calendar-path .\calendar.csv --label-convention end
+uv run --frozen stockregression data import-file 600000.SH --frequency 1min --path .\imports\1min\600000.csv --calendar-path .\calendar.csv --label-convention end
 ```
 
 CSV 自动识别 UTF-8、UTF-8 BOM 和 GB18030；Parquet 的多层时间索引会提升为列。没有日历或公司行动文件时，数据先发布为可浏览状态，质量状态保持待核验。
@@ -258,13 +254,13 @@ uv run --frozen stockregression data aggregate --symbol 600000.SH --from 1day --
 | GET /api/v1/data/frequencies | 周期与来源能力 |
 | GET /api/v1/data/sources | 来源选择、最近探测、冷却与失败原因；只读缓存 |
 | POST /api/v1/data/sources/probe | 提交来源探测任务，不写入行情 |
-| GET /api/v1/data/package | 数据包身份、版本、路径、容量和恢复状态 |
+| GET /api/v1/data/package | 包身份、generation、schema、分片容量和索引状态 |
 | GET /api/v1/data/inventory | 按证券分组的服务器分页目录与完整统计 |
 | GET /api/v1/data/datasets | 按周期数据集列表 |
 | GET /api/v1/data/coverage/{symbol}?timeframe=1day | 覆盖、版本与质量 |
 | GET /api/v1/data/bars/{symbol}?frequency=1day | 数据包行情 |
 | POST /api/v1/data/import-package/scan | 预览 ETF、股票或混合数据包 |
-| POST /api/v1/data/import-package | 幂等登记数据包并建立索引 |
+| POST /api/v1/data/import-package | 从 schema 2 清单幂等重建行情索引 |
 | POST /api/v1/data/import-batch/scan | 预览普通文件夹 |
 | POST /api/v1/data/import-batch | 批量导入并写回数据包 |
 | POST /api/v1/data/sync | 指定周期同步；`initialize` 显式扩大新证券范围 |

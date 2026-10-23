@@ -286,7 +286,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/MarketDataPackageInfoResponse"
+                }
               }
             }
           }
@@ -4158,6 +4160,118 @@
         },
         "type": "object",
         "title": "MarketBatchRequest"
+      },
+      "MarketDataPackageInfoResponse": {
+        "properties": {
+          "package_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Package Id"
+          },
+          "generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation"
+          },
+          "package_version": {
+            "type": "integer",
+            "title": "Package Version",
+            "default": 0
+          },
+          "schema_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schema Version"
+          },
+          "storage_layout": {
+            "type": "string",
+            "title": "Storage Layout",
+            "default": "time_partitioned"
+          },
+          "index_status": {
+            "type": "string",
+            "title": "Index Status"
+          },
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "readable": {
+            "type": "boolean",
+            "title": "Readable"
+          },
+          "manifest_ready": {
+            "type": "boolean",
+            "title": "Manifest Ready",
+            "default": false
+          },
+          "shard_count": {
+            "type": "integer",
+            "title": "Shard Count",
+            "default": 0
+          },
+          "shard_bytes": {
+            "type": "integer",
+            "title": "Shard Bytes",
+            "default": 0
+          },
+          "bytes": {
+            "type": "integer",
+            "title": "Bytes",
+            "default": 0
+          },
+          "file_count": {
+            "type": "integer",
+            "title": "File Count",
+            "default": 0
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "pending_recovery": {
+            "type": "integer",
+            "title": "Pending Recovery",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "index_status",
+          "path",
+          "status",
+          "readable"
+        ],
+        "title": "MarketDataPackageInfoResponse"
       },
       "MarketDataSettings": {
         "properties": {

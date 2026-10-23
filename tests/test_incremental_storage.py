@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
@@ -8,6 +10,7 @@ from stockregression.api import create_app
 from stockregression.jobs import execute_job
 from stockregression.market_data import MarketDataService
 from stockregression.market_data.models import MarketDataError
+from stockregression.market_data.repository import MarketDataRepository
 from stockregression.storage import Store
 
 
@@ -38,7 +41,7 @@ def _calendar(root, days):
     return path
 
 
-def test_append_keeps_base_bytes_and_reuses_validation(tmp_path):
+def test_append_keeps_immutable_prior_shards_and_reuses_validation(tmp_path):
     service = MarketDataService(Store(tmp_path / "data"))
     days = pd.DatetimeIndex(["2026-01-05", "2026-01-06"])
     calendar = _calendar(tmp_path, days.insert(2, pd.Timestamp("2026-01-07")))
@@ -46,8 +49,10 @@ def test_append_keeps_base_bytes_and_reuses_validation(tmp_path):
         "600000.SH", "1day", _write_daily(tmp_path, "first.csv", days),
         calendar_path=calendar,
     )
-    base = service.repository.package_file_path("600000.SH", "1day")
-    before = base.read_bytes()
+    package = service.repository.package_dir
+    before_manifest = json.loads((package / ".stockregression" / "manifest.json").read_text(encoding="utf-8"))
+    before_dataset = json.loads((package / before_manifest["datasets"]["600000.SH|1day|none"]["manifest"]).read_text(encoding="utf-8"))
+    before_shards = {row["path"]: (package / row["path"]).read_bytes() for row in before_dataset["shards"]}
     original_checked = {
         row["trade_date"]: row["checked_at"]
         for row in service.repository.day_validations("600000.SH", "1day")
@@ -60,8 +65,11 @@ def test_append_keeps_base_bytes_and_reuses_validation(tmp_path):
     )
 
     assert second["version"] == first["version"] + 1
-    assert second["increment_count"] == 1
-    assert base.read_bytes() == before
+    assert second["shard_count"] == 1
+    assert all((package / path).read_bytes() == data for path, data in before_shards.items())
+    after_manifest = json.loads((package / ".stockregression" / "manifest.json").read_text(encoding="utf-8"))
+    after_dataset = json.loads((package / after_manifest["datasets"]["600000.SH|1day|none"]["manifest"]).read_text(encoding="utf-8"))
+    assert after_dataset["shards"]
     assert len(service.repository.bars("600000.SH", "1day", version=1)) == 2
     assert len(service.repository.active_rows("600000.SH", "1day")) == 3
     current_checked = {
@@ -116,6 +124,27 @@ def test_snapshot_replaces_view_but_preserves_previous_version(tmp_path):
     assert service.repository.day_validations("600000.SH", "1day")[0]["trade_date"] == "2026-01-05"
 
 
+def test_published_manifest_recovers_when_sqlite_commit_is_interrupted(tmp_path, monkeypatch):
+    data_root = tmp_path / "data"
+    service = MarketDataService(Store(data_root))
+    days = pd.DatetimeIndex(["2026-01-05"])
+    calendar = _calendar(tmp_path, days)
+    source = _write_daily(tmp_path, "daily.csv", days)
+
+    def fail_after_manifest(*_args, **_kwargs):
+        raise RuntimeError("injected interruption after package manifest publish")
+
+    monkeypatch.setattr(service.repository, "_copy_version_shards", fail_after_manifest)
+    with pytest.raises(RuntimeError, match="after package manifest publish"):
+        service.import_file("600000.SH", "1day", source, calendar_path=calendar)
+
+    assert service.repository.package.pending_transactions()
+    recovered = MarketDataRepository(data_root)
+    assert recovered.active_rows("600000.SH", "1day").shape[0] == 1
+    assert recovered.package.pending_transactions() == []
+    assert recovered.package_info()["index_status"] == "ready"
+
+
 def test_validation_skips_kline_read_when_version_is_already_compliant(tmp_path, monkeypatch):
     service = MarketDataService(Store(tmp_path / "data"))
     days = pd.DatetimeIndex(["2026-01-05", "2026-01-06"])
@@ -134,7 +163,7 @@ def test_validation_skips_kline_read_when_version_is_already_compliant(tmp_path,
     assert result["verified_through"] == "2026-01-06"
 
 
-def test_archive_is_content_deduplicated_and_keeps_source_unchanged(tmp_path):
+def test_immutable_shards_do_not_need_duplicate_archive_copies(tmp_path):
     service = MarketDataService(Store(tmp_path / "data"))
     days = pd.DatetimeIndex(["2026-01-05"])
     calendar = _calendar(tmp_path, days)
@@ -142,23 +171,17 @@ def test_archive_is_content_deduplicated_and_keeps_source_unchanged(tmp_path):
         "600000.SH", "1day", _write_daily(tmp_path, "daily.csv", days),
         calendar_path=calendar,
     )
-    source = service.repository.package_file_path("600000.SH", "1day")
-    original = source.read_bytes()
-
     first = service.repository.archive_dataset("600000.SH", "1day")
     second = service.repository.archive_dataset("600000.SH", "1day")
     archives = list((service.repository.package_dir / ".stockregression" / "archives").rglob("*.parquet"))
 
-    assert first["copied"] == 1 and second["reused"] == 1
-    assert len(archives) == 1 and archives[0].read_bytes() == original
-    assert source.read_bytes() == original
+    assert first["copied"] == 0 and second["reused"] == 0
+    assert archives == []
+    assert first["archived"] is True
     assert service.repository.archive_status("600000.SH", "1day")["protected"] is True
 
 
-def test_compaction_keeps_current_rows_and_clears_overlays(tmp_path, monkeypatch):
-    import stockregression.market_data.repository as repository_module
-
-    monkeypatch.setattr(repository_module, "COMPACTION_THRESHOLD", 2)
+def test_year_shards_remain_separate_without_cross_year_compaction(tmp_path):
     service = MarketDataService(Store(tmp_path / "data"))
     first_days = pd.DatetimeIndex(["2025-12-30"])
     days = pd.DatetimeIndex(["2025-12-30", "2026-12-30", "2027-12-30"])
@@ -174,7 +197,7 @@ def test_compaction_keeps_current_rows_and_clears_overlays(tmp_path, monkeypatch
         )
 
     dataset = service.repository.dataset("600000.SH", "1day")
-    assert dataset["increment_count"] == 1
+    assert dataset["shard_count"] == 3
     assert dataset["row_count"] == 3
     assert service.repository.active_rows("600000.SH", "1day").timestamp.dt.date.nunique() == 3
 

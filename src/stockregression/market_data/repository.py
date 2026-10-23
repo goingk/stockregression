@@ -21,16 +21,12 @@ from filelock import FileLock
 
 from .cache import cached
 from .models import DataVersionNotFound, MarketDataError
-from .package_layout import (
-    PackageLayout, asset_type_for_symbol, auxiliary_relative_path,
-    package_file_relative_path, resolve_package_root,
-)
+from .package_layout import PackageLayout, asset_type_for_symbol, auxiliary_relative_path, resolve_package_root
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe
 from ..price_validation import details_to_rows, price_issue_details, split_invalid_prices
 
 
 PARSER_VERSION = "market-data-v3-price-validation"
-COMPACTION_THRESHOLD = 8
 VALIDATION_RULES_VERSION = 5
 PRICE_FIELDS = ("open", "high", "low", "close", "volume", "turnover")
 TIMEFRAMES = ("1min", "5min", "15min", "30min", "60min", "1day", "1week", "1month")
@@ -129,10 +125,19 @@ class MarketDataRepository:
             resolve_package_root(selected_package or self.root / "package"),
             market_settings=self.market_settings,
         )
+        # Validate the on-disk manifest before changing any index state. In
+        # particular, schema-1 packages must never trigger the old path-change
+        # index reset before the migration command has frozen the active refs.
+        package_manifest = self.package.manifest()
         self.package_dir = self.package.root
         self.market_dir = self.package_dir
         self.staging_dir = self.package.staging_dir
-        if previous_package and Path(previous_package).resolve() != self.package_dir:
+        previous_id = self.meta("package_id")
+        previous_generation = self.meta("generation")
+        if previous_id and (
+            previous_id != package_manifest["package_id"]
+            or (previous_generation and previous_generation != package_manifest["generation"])
+        ):
             self._clear_market_index()
         with self._connect() as db:
             db.execute(
@@ -145,18 +150,28 @@ class MarketDataRepository:
             )
             db.execute(
                 "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('package_id',?)",
-                (self.package.manifest()["package_id"],),
+                (package_manifest["package_id"],),
+            )
+            db.execute(
+                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('generation',?)",
+                (package_manifest["generation"],),
             )
         self._seed_manifest_from_index()
         self._recover_package_transactions()
 
     def attach_package(self, package_dir: str | Path) -> None:
-        previous = self.package_dir
-        self.package = PackageLayout(resolve_package_root(package_dir))
+        previous_id = self.meta("package_id")
+        previous_generation = self.meta("generation")
+        package = PackageLayout(resolve_package_root(package_dir))
+        manifest = package.manifest()
+        self.package = package
         self.package_dir = self.package.root
         self.market_dir = self.package_dir
         self.staging_dir = self.package.staging_dir
-        if previous != self.package_dir:
+        if previous_id and (
+            previous_id != manifest["package_id"]
+            or (previous_generation and previous_generation != manifest["generation"])
+        ):
             self._clear_market_index()
         with self._connect() as db:
             db.execute(
@@ -169,7 +184,11 @@ class MarketDataRepository:
             )
             db.execute(
                 "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('package_id',?)",
-                (self.package.manifest()["package_id"],),
+                (manifest["package_id"],),
+            )
+            db.execute(
+                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('generation',?)",
+                (manifest["generation"],),
             )
 
     def _clear_market_index(self) -> None:
@@ -181,9 +200,9 @@ class MarketDataRepository:
                 ).fetchall()
             }
             for table in (
-                "parquet_day_validation", "parquet_increments", "parquet_source_archives",
+                "parquet_day_validation", "parquet_shards", "parquet_source_archives",
                 "parquet_derived", "parquet_coverage", "parquet_imports",
-                "parquet_auxiliary_history", "parquet_files", "parquet_versions",
+                "parquet_auxiliary_history", "parquet_versions",
                 "parquet_datasets",
             ):
                 if table in tables:
@@ -238,27 +257,6 @@ class MarketDataRepository:
                 report TEXT NOT NULL DEFAULT '{}',
                 PRIMARY KEY(symbol,timeframe,adjustment,version)
             );
-            CREATE TABLE IF NOT EXISTS parquet_files(
-                symbol TEXT NOT NULL, timeframe TEXT NOT NULL, adjustment TEXT NOT NULL,
-                version INTEGER NOT NULL, partition_key TEXT NOT NULL,
-                path TEXT NOT NULL, sha256 TEXT NOT NULL, row_count INTEGER NOT NULL,
-                first_time TEXT, last_time TEXT, size INTEGER NOT NULL,
-                schema_version TEXT NOT NULL,
-                PRIMARY KEY(symbol,timeframe,adjustment,version,partition_key)
-            );
-            CREATE INDEX IF NOT EXISTS parquet_files_version
-                ON parquet_files(symbol,timeframe,adjustment,version);
-            CREATE TABLE IF NOT EXISTS parquet_increments(
-                symbol TEXT NOT NULL, timeframe TEXT NOT NULL, adjustment TEXT NOT NULL,
-                version INTEGER NOT NULL, sequence INTEGER NOT NULL,
-                period_key TEXT NOT NULL, period_start TEXT NOT NULL, period_end TEXT NOT NULL,
-                path TEXT NOT NULL, sha256 TEXT NOT NULL, row_count INTEGER NOT NULL,
-                first_time TEXT, last_time TEXT, size INTEGER NOT NULL,
-                schema_version TEXT NOT NULL,
-                PRIMARY KEY(symbol,timeframe,adjustment,version,period_key)
-            );
-            CREATE INDEX IF NOT EXISTS parquet_increments_version
-                ON parquet_increments(symbol,timeframe,adjustment,version,sequence);
             CREATE TABLE IF NOT EXISTS parquet_day_validation(
                 symbol TEXT NOT NULL, timeframe TEXT NOT NULL, adjustment TEXT NOT NULL,
                 trade_date TEXT NOT NULL, status TEXT NOT NULL,
@@ -312,6 +310,9 @@ class MarketDataRepository:
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
             );
         """)
+        from .shard_index import initialize_shard_index
+
+        initialize_shard_index(db)
         archive_columns = {
             row[1] for row in db.execute("PRAGMA table_info(parquet_source_archives)")
         }
@@ -349,6 +350,12 @@ class MarketDataRepository:
                 (key, value),
             )
 
+    def _assert_writable(self) -> None:
+        if (self.root / ".market-data-migration.lock").exists():
+            raise MarketDataError("行情数据迁移期间暂停写入，请稍后重试")
+        if self.package.pending_transactions():
+            raise MarketDataError("数据包有待恢复事务，请重启服务恢复索引后再写入")
+
     @property
     def source_package(self) -> Path | None:
         return self.package_dir if self.package_dir.is_dir() else None
@@ -359,46 +366,64 @@ class MarketDataRepository:
 
     def package_info(self) -> dict:
         manifest = self.package.manifest()
-        files = manifest.get("files", {})
-        sizes = {
-            str(path): int(entry.get("size") or 0)
-            for path, entry in files.items()
-            if entry.get("size") is not None
-        }
-        current = 0
+        heads = manifest.get("datasets") or {}
         with self._connect() as db:
-            rows = db.execute(
-                """SELECT DISTINCT path,size FROM (
-                       SELECT path,size FROM parquet_files
-                       UNION ALL SELECT path,size FROM parquet_increments
-                   )"""
+            indexed = db.execute(
+                "SELECT symbol,timeframe,adjustment,current_version FROM parquet_datasets"
             ).fetchall()
-        for row in rows:
-            relative = self.package.relative(row["path"])
-            sizes.setdefault(relative, int(row["size"] or 0))
-        current = sum(size for size in sizes.values() if size > 0)
+            raw_rows = db.execute(
+                """SELECT s.path,MAX(s.size) size FROM parquet_shards s
+                   JOIN parquet_datasets d ON d.symbol=s.symbol AND d.timeframe=s.timeframe
+                    AND d.adjustment=s.adjustment AND d.current_version=s.version
+                   WHERE s.timeframe IN ('1day','1min') GROUP BY s.path"""
+            ).fetchall()
+            package_id = db.execute(
+                "SELECT value FROM parquet_meta WHERE key='package_id'"
+            ).fetchone()
+            generation = db.execute(
+                "SELECT value FROM parquet_meta WHERE key='generation'"
+            ).fetchone()
+        indexed_heads = {
+            self.package.dataset_key(row["symbol"], row["timeframe"], row["adjustment"]):
+                int(row["current_version"])
+            for row in indexed
+        }
+        expected_heads = {
+            key: int(value.get("version") or 0) for key, value in heads.items()
+        }
+        index_ready = (
+            str(package_id[0] if package_id else "") == str(manifest.get("package_id"))
+            and str(generation[0] if generation else "") == str(manifest.get("generation"))
+            and all(indexed_heads.get(key) == version for key, version in expected_heads.items())
+            and all(key in expected_heads for key in indexed_heads)
+        )
+        unique_sizes = {str(row["path"]): int(row["size"] or 0) for row in raw_rows}
+        shard_count = len(unique_sizes)
+        shard_bytes = sum(unique_sizes.values())
         readable = self.package_dir.is_dir()
         pending = self.package.pending_transactions()
-        manifest_files = bool(manifest.get("files"))
-        index_only = bool(
-            manifest.get("index_only")
-            or any(entry.get("index_only") for entry in manifest.get("files", {}).values())
+        manifest_ready = bool(heads)
+        status = (
+            "recovery_required" if pending else
+            "ready" if readable and index_ready and manifest_ready else
+            "index_stale" if readable and manifest_ready else
+            "empty" if readable else "missing"
         )
         return {
             "package_id": manifest.get("package_id"),
+            "generation": manifest.get("generation"),
             "package_version": manifest.get("package_version", 0),
             "schema_version": manifest.get("schema_version"),
+            "storage_layout": manifest.get("storage_layout", "time_partitioned"),
+            "index_status": "ready" if index_ready else "stale",
             "path": str(self.package_dir),
-            "status": (
-                "recovery_required" if pending else
-                "index_only" if readable and index_only else
-                "empty" if readable and not rows and not manifest_files else
-                "ready" if readable else "missing"
-            ),
+            "status": status,
             "readable": readable,
-            "manifest_ready": manifest_files,
-            "bytes": current,
-            "file_count": len(set(sizes) | {str(path) for path in files}),
+            "manifest_ready": manifest_ready,
+            "shard_count": shard_count,
+            "shard_bytes": shard_bytes,
+            "bytes": shard_bytes,
+            "file_count": shard_count,
             "updated_at": manifest.get("updated_at"),
             "pending_recovery": len(pending),
         }
@@ -409,89 +434,376 @@ class MarketDataRepository:
                 payload = json.loads(transaction.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            target = self.package.absolute(str(payload.get("target") or ""))
-            version = int(payload.get("version") or 0)
-            manifest_entry = self.package.manifest().get("files", {}).get(
-                str(payload.get("target") or "")
-            ) or {}
-            published = int(manifest_entry.get("version") or 0) >= version > 0
-            if published and target.is_file():
+            if payload.get("kind") == "dataset":
+                symbol = str(payload.get("symbol") or "")
+                timeframe = normalize_timeframe(str(payload.get("timeframe") or "1day"))
+                adjustment = str(payload.get("adjustment") or "none")
+                expected_version = int(payload.get("version") or 0)
                 with self._connect() as db:
-                    dataset = self._dataset_row(
-                        db, payload.get("symbol"), payload.get("timeframe"), "none"
-                    )
-                    files = self._current_files(
-                        db, payload.get("symbol"), payload.get("timeframe"), "none",
-                        int(dataset["current_version"]) if dataset else 0,
-                    )
-                indexed = any(
-                    self.package.relative(row.get("path", "")) == payload.get("target")
-                    and int(row.get("size") or -1) == target.stat().st_size
-                    for row in files
+                    dataset = self._dataset_row(db, symbol, timeframe, adjustment)
+                    indexed_version = int(dataset["current_version"] or 0) if dataset else 0
+                head = self.package.manifest().get("datasets", {}).get(
+                    self.package.dataset_key(symbol, timeframe, adjustment), {}
                 )
-                if indexed:
+                published_version = int(head.get("version") or 0)
+                if indexed_version >= expected_version and published_version >= expected_version:
+                    self.package.finish_transaction(transaction)
+                elif indexed_version < expected_version and published_version < expected_version:
+                    # The SQLite commit did not happen. Installed content
+                    # addressed shards remain harmless orphans until explicit
+                    # garbage collection can prove they are unreferenced.
                     self.package.finish_transaction(transaction)
                 else:
-                    self.package.update_transaction(transaction, {"status": "needs_index"})
+                    self.package.update_transaction(transaction, {"status": "needs_rebuild"})
                 continue
-            backup_value = payload.get("backup")
-            if not published and backup_value:
-                backup = self.package.absolute(backup_value)
-                if backup.is_file():
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = target.with_name(target.name + ".recovering")
-                    shutil.copy2(backup, temporary)
-                    os.replace(temporary, target)
-                    with self._connect() as db:
-                        db.execute(
-                            """UPDATE parquet_files SET path=?,sha256=?,size=?
-                               WHERE symbol=? AND timeframe=? AND adjustment=? AND path=?""",
-                            (
-                                payload.get("target"),
-                                f"stat:{target.stat().st_size}:{target.stat().st_mtime_ns}",
-                                target.stat().st_size,
-                                payload.get("symbol"), payload.get("timeframe"), "none",
-                                backup_value,
-                            ),
-                        )
-                    self.package.finish_transaction(transaction)
-                    continue
-            if payload.get("status") == "installed" and not target.exists() and backup_value:
-                self.package.update_transaction(transaction, {"status": "blocked_missing_file"})
+            raise MarketDataError(f"不支持的旧文件事务：{transaction.name}")
 
     def _seed_manifest_from_index(self) -> None:
-        """Adopt a pre-existing index without copying or rewriting package files."""
+        """Reconcile the published package heads and the rebuildable SQLite index."""
         manifest = self.package.manifest()
-        if manifest.get("files"):
-            return
         with self._connect() as db:
-            rows = db.execute(
-                """SELECT f.path,f.schema_version,MAX(f.version) version
-                   FROM parquet_files f JOIN parquet_datasets d
-                   ON d.symbol=f.symbol AND d.timeframe=f.timeframe
-                   AND d.adjustment=f.adjustment AND d.current_version=f.version
-                   GROUP BY f.path,f.schema_version"""
+            datasets = db.execute(
+                "SELECT * FROM parquet_datasets WHERE current_version>0 "
+                "ORDER BY timeframe,symbol,adjustment"
             ).fetchall()
-        files = {}
-        for row in rows:
-            path = self._absolute_source_path(row["path"])
-            relative = self.package.relative(path)
-            if relative.startswith("../") or relative == ".":
+        database_versions = {
+            self.package.dataset_key(row["symbol"], row["timeframe"], row["adjustment"]):
+                int(row["current_version"])
+            for row in datasets
+        }
+        package_ahead = []
+        for row in datasets:
+            key = self.package.dataset_key(
+                str(row["symbol"]), str(row["timeframe"]), str(row["adjustment"])
+            )
+            head = manifest.get("datasets", {}).get(key) or {}
+            version = int(row["current_version"])
+            if int(head.get("version") or 0) > version:
+                package_ahead.append((str(row["symbol"]), str(row["timeframe"])))
                 continue
-            files[relative] = {
-                "version": int(row["version"] or 0),
-                "schema_version": row["schema_version"],
-                "adopted_from_index": True,
-                "index_only": True,
-                "updated_at": utc_now(),
-            }
-        if files:
-            manifest["files"] = files
-            manifest["index_only"] = True
-            manifest["package_version"] = int(manifest.get("package_version", 0)) + 1
-            self.package.publish(manifest)
+            manifest_path = self.package.absolute(str(head.get("manifest") or ""))
+            if int(head.get("version") or 0) != version or not manifest_path.is_file():
+                self._publish_dataset_manifest(
+                    str(row["symbol"]), str(row["timeframe"]),
+                    str(row["adjustment"]), version,
+                )
+        for key, head in manifest.get("datasets", {}).items():
+            if int(head.get("version") or 0) <= database_versions.get(str(key), 0):
+                continue
+            try:
+                symbol, timeframe, _adjustment = str(key).split("|", 2)
+            except ValueError as exc:
+                raise MarketDataError(f"包清单中的数据集键无效：{key}") from exc
+            package_ahead.append((symbol, timeframe))
+        if package_ahead:
+            symbols = sorted({symbol for symbol, _ in package_ahead})
+            timeframes = sorted({timeframe for _, timeframe in package_ahead})
+            self.rebuild_index(symbols=symbols, timeframes=timeframes)
+
+    def _manifest_shards(self, shards: Sequence[dict]) -> list[dict]:
+        normalized = []
+        for row in shards:
+            path = self._absolute_source_path(str(row["path"])).resolve()
+            relative = self.package.relative(path)
+            if Path(relative).is_absolute() or relative.startswith("../"):
+                raise MarketDataError(f"活跃行情分片不属于当前数据包：{path}")
+            if not path.is_file():
+                raise MarketDataError(f"活跃行情分片缺失：{path}")
+            normalized.append({
+                "partition_key": row.get("period_key", row.get("partition_key")),
+                "period_start": row.get("period_start"),
+                "period_end": row.get("period_end"),
+                "path": relative,
+                "sha256": row.get("sha256"),
+                "size": int(row.get("size") or path.stat().st_size),
+                "row_count": int(row.get("row_count") or 0),
+                "first_time": row.get("first_time"),
+                "last_time": row.get("last_time"),
+                "schema_version": row.get("schema_version"),
+            })
+        normalized.sort(key=lambda item: (
+            str(item.get("period_start") or item.get("first_time") or ""),
+            str(item["path"]),
+        ))
+        return normalized
+
+    def _publish_dataset_manifest(
+        self, symbol: str, timeframe: str, adjustment: str, version: int,
+    ) -> dict:
+        """Publish the active SQLite view as immutable package metadata."""
+        with self._connect() as db:
+            dataset = self._dataset_row(db, symbol, timeframe, adjustment)
+            if not dataset or int(dataset["current_version"]) != int(version):
+                raise MarketDataError(
+                    f"索引版本已变化，不能发布 {symbol} {timeframe} v{version}"
+                )
+            version_row = db.execute(
+                "SELECT * FROM parquet_versions WHERE symbol=? AND timeframe=? "
+                "AND adjustment=? AND version=?",
+                (symbol, timeframe, adjustment, int(version)),
+            ).fetchone()
+            if not version_row:
+                raise MarketDataError(f"行情版本记录缺失：{symbol} {timeframe} v{version}")
+            shards = self._current_shards(db, symbol, timeframe, adjustment, int(version))
+            derived = db.execute(
+                "SELECT * FROM parquet_derived WHERE symbol=? AND timeframe=? "
+                "AND adjustment=? AND target_timeframe=?",
+                (symbol, timeframe, adjustment, timeframe),
+            ).fetchone()
+        payload = {
+            "symbol": symbol,
+            "timeframe": normalize_timeframe(timeframe),
+            "adjustment": adjustment,
+            "version": int(version),
+            "row_count": int(version_row["row_count"]),
+            "first_time": version_row["first_time"],
+            "last_time": version_row["last_time"],
+            "status": version_row["status"],
+            "source": version_row["source"],
+            "created_at": version_row["created_at"],
+            "report": _load(version_row["report"], {}),
+            "completed_through": dataset["completed_through"],
+            "raw_rows": int(dataset["raw_rows"] or 0),
+            "synthetic_rows": int(dataset["synthetic_rows"] or 0),
+            "pending_rows": int(dataset["pending_rows"] or 0),
+            "reason": dataset["reason"],
+            "metadata": _load(dataset["metadata"], {}),
+            "shards": self._manifest_shards(shards),
+            "derived": dict(derived) if derived else None,
+        }
+        head = self.package.manifest().get("datasets", {}).get(
+            self.package.dataset_key(symbol, timeframe, adjustment), {}
+        )
+        return self.package.publish_dataset(
+            payload, expected_version=int(head.get("version") or 0),
+        )
+
+    def rebuild_index(
+        self, *, symbols: Sequence[str] | None = None,
+        timeframes: Sequence[str] | None = None,
+    ) -> dict:
+        """Rebuild market tables from published schema-2 dataset manifests."""
+        package = self.package.manifest()
+        if int(package.get("schema_version") or 0) != 2:
+            raise MarketDataError("只支持从 schema 2 分片包重建索引")
+        wanted_symbols = set(symbols or ())
+        wanted_timeframes = {normalize_timeframe(value) for value in timeframes or ()}
+        heads = package.get("datasets") or {}
+        selected = []
+        for key, head in sorted(heads.items()):
+            try:
+                symbol, timeframe, adjustment = str(key).split("|", 2)
+                timeframe = normalize_timeframe(timeframe)
+            except (ValueError, TypeError) as exc:
+                raise MarketDataError(f"包清单中的数据集键无效：{key}") from exc
+            if wanted_symbols and symbol not in wanted_symbols:
+                continue
+            if wanted_timeframes and timeframe not in wanted_timeframes:
+                continue
+            selected.append((key, symbol, timeframe, adjustment, dict(head)))
+        if not selected:
+            return {"status": "completed", "datasets": 0, "versions": 0, "shards": 0}
+
+        prepared: list[tuple[str, str, str, int, dict, list[dict]]] = []
+        for key, symbol, timeframe, adjustment, head in selected:
+            relative = str(head.get("manifest") or "")
+            if not relative:
+                raise MarketDataError(f"包清单缺少数据集版本清单引用：{key}")
+            current_path = self.package.absolute(relative)
+            if not current_path.is_file():
+                raise MarketDataError(f"数据集版本清单缺失：{current_path}")
+            history_paths = sorted(
+                current_path.parent.glob("v*.json"),
+                key=lambda path: int(path.stem[1:]) if path.stem[1:].isdigit() else -1,
+            )
+            versions = []
+            for path in history_paths:
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    raise MarketDataError(f"数据集版本清单不可读：{path}: {exc}") from exc
+                if (
+                    value.get("schema_version") != 2
+                    or value.get("package_id") != package.get("package_id")
+                    or value.get("generation") != package.get("generation")
+                    or value.get("symbol") != symbol
+                    or normalize_timeframe(value.get("timeframe")) != timeframe
+                    or value.get("adjustment", "none") != adjustment
+                ):
+                    continue
+                version = int(value.get("version") or 0)
+                shards = list(value.get("shards") or [])
+                for shard in shards:
+                    shard_path = str(shard.get("path") or "").replace("\\", "/")
+                    if not shard_path.startswith("partitions/"):
+                        raise MarketDataError(f"分片路径不在 partitions 下：{shard_path}")
+                    absolute = self.package.absolute(shard_path)
+                    if not absolute.is_file():
+                        raise MarketDataError(f"分片文件缺失：{absolute}")
+                    if int(shard.get("size") or -1) != absolute.stat().st_size:
+                        raise MarketDataError(f"分片大小与清单不符：{absolute}")
+                versions.append((version, value, shards))
+            if not versions:
+                raise MarketDataError(f"没有可用的数据集版本：{key}")
+            if max(item[0] for item in versions) != int(head.get("version") or 0):
+                raise MarketDataError(f"包级清单版本与数据集清单不一致：{key}")
+            prepared.extend(
+                (symbol, timeframe, adjustment, version, value, shards)
+                for version, value, shards in versions
+            )
+
+        current_keys = {(item[1], item[2], item[3]) for item in selected}
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous_versions = {}
+            for symbol, timeframe, adjustment in current_keys:
+                row = self._dataset_row(db, symbol, timeframe, adjustment)
+                previous_versions[(symbol, timeframe, adjustment)] = (
+                    int(row["current_version"]) if row else 0
+                )
+            if not wanted_symbols and not wanted_timeframes:
+                for table in ("parquet_shards", "parquet_versions",
+                              "parquet_datasets", "parquet_derived"):
+                    db.execute(f"DELETE FROM {table}")
+            else:
+                for symbol, timeframe, adjustment in current_keys:
+                    db.execute(
+                        "DELETE FROM parquet_shards WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+                    db.execute(
+                        "DELETE FROM parquet_versions WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+                    db.execute(
+                        "DELETE FROM parquet_datasets WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+                    db.execute(
+                        "DELETE FROM parquet_derived WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+            version_count = 0
+            shard_count = 0
+            latest_by_key = {}
+            for symbol, timeframe, adjustment, version, value, shards in prepared:
+                created_at = str(value.get("created_at") or utc_now())
+                row_count = int(value.get("row_count") or 0)
+                synthetic = int(value.get("synthetic_rows") or 0)
+                pending = int(value.get("pending_rows") or 0)
+                status = str(value.get("status") or "pending_validation")
+                byte_count = sum(int(shard.get("size") or 0) for shard in shards)
+                db.execute(
+                    """INSERT INTO parquet_versions(
+                       symbol,timeframe,adjustment,version,created_at,row_count,raw_rows,
+                       synthetic_rows,pending_rows,first_time,last_time,status,source,
+                       file_count,bytes,report) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        symbol, timeframe, adjustment, version, created_at, row_count,
+                        int(value.get("raw_rows") or max(0, row_count - synthetic)),
+                        synthetic, pending, value.get("first_time"), value.get("last_time"),
+                        status, value.get("source"), len(shards), byte_count,
+                        _json(value.get("report") or {}),
+                    ),
+                )
+                for sequence, shard in enumerate(shards, start=1):
+                    key = str(shard.get("partition_key") or "")
+                    start = shard.get("period_start") or shard.get("first_time")
+                    end = shard.get("period_end") or shard.get("last_time")
+                    if not key or not start or not end:
+                        raise MarketDataError(
+                            f"分片缺少周期边界：{shard.get('path')}"
+                        )
+                    db.execute(
+                        """INSERT INTO parquet_shards(
+                           symbol,timeframe,adjustment,version,sequence,period_key,
+                           period_start,period_end,path,sha256,row_count,first_time,
+                           last_time,size,schema_version)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            symbol, timeframe, adjustment, version, sequence, key,
+                            str(start), str(end), shard["path"], shard.get("sha256") or "",
+                            int(shard.get("row_count") or 0), shard.get("first_time"),
+                            shard.get("last_time"), int(shard.get("size") or 0),
+                            shard.get("schema_version") or PARQUET_SCHEMA_VERSION,
+                        ),
+                    )
+                derived = value.get("derived")
+                if derived:
+                    db.execute(
+                        """INSERT OR REPLACE INTO parquet_derived(
+                           symbol,timeframe,adjustment,source_timeframe,target_timeframe,
+                           source_version,start_time,end_time,stale,updated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            symbol, timeframe, adjustment,
+                            derived.get("source_timeframe", "1min"), timeframe,
+                            int(derived.get("source_version") or 0),
+                            derived.get("start_time"), derived.get("end_time"),
+                            int(derived.get("stale") or 0), utc_now(),
+                        ),
+                    )
+                latest_by_key[(symbol, timeframe, adjustment)] = value
+                version_count += 1
+                shard_count += len(shards)
+            for (symbol, timeframe, adjustment), value in latest_by_key.items():
+                row_count = int(value.get("row_count") or 0)
+                synthetic = int(value.get("synthetic_rows") or 0)
+                new_version = int(value["version"])
+                if previous_versions.get((symbol, timeframe, adjustment), 0) != new_version:
+                    # The package manifest is authoritative during recovery. If
+                    # it advanced while SQLite did not, old quality conclusions
+                    # cannot be carried onto the newly restored market view.
+                    db.execute(
+                        "DELETE FROM parquet_day_validation WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+                    db.execute(
+                        "DELETE FROM parquet_coverage WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+                db.execute(
+                    """INSERT INTO parquet_datasets(
+                       symbol,timeframe,adjustment,current_version,first_time,last_time,
+                       completed_through,row_count,raw_rows,synthetic_rows,pending_rows,
+                       status,reason,metadata,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        symbol, timeframe, adjustment, new_version,
+                        value.get("first_time"), value.get("last_time"),
+                        value.get("completed_through") or value.get("last_time"),
+                        row_count, int(value.get("raw_rows") or max(0, row_count - synthetic)),
+                        synthetic, int(value.get("pending_rows") or 0),
+                        value.get("status") or "pending_validation", value.get("reason"),
+                        _json(value.get("metadata") or {}),
+                        value.get("created_at") or utc_now(), utc_now(),
+                    ),
+                )
+            db.execute(
+                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('package_id',?)",
+                (str(package["package_id"]),),
+            )
+            db.execute(
+                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('generation',?)",
+                (str(package["generation"]),),
+            )
+            db.execute(
+                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('package_dir',?)",
+                (str(self.package_dir),),
+            )
+            db.execute(
+                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('source_package_dir',?)",
+                (str(self.package_dir),),
+            )
+            db.commit()
+        return {
+            "status": "completed", "datasets": len(latest_by_key),
+            "versions": version_count, "shards": shard_count,
+            "package_id": package["package_id"], "generation": package["generation"],
+        }
 
     def save_basic_info(self, symbol: str, metadata: dict) -> Path:
+        self._assert_writable()
         asset = asset_type_for_symbol(symbol)
         path = self.package_dir / f"{asset}_basic_data.parquet"
         scalar_metadata = {
@@ -538,27 +850,23 @@ class MarketDataRepository:
 
     def _absolute_source_path(self, path: str) -> Path:
         candidate = Path(path)
-        if candidate.is_absolute():
-            return candidate
-        package_candidate = self.package_dir / candidate
-        if package_candidate.exists():
-            return package_candidate
-        return self.root / candidate
+        resolved = (candidate if candidate.is_absolute() else self.package_dir / candidate).resolve()
+        try:
+            resolved.relative_to(self.package_dir.resolve())
+        except ValueError as exc:
+            raise MarketDataError(f"行情分片引用逃出当前数据包：{path}") from exc
+        return resolved
 
     def lock(self, symbol: str, timeframe: str, adjustment: str = "none") -> FileLock:
-        # A shared daily file is the real contention boundary. Locking only by
-        # security allowed two writers to merge different symbols into stale
-        # copies and lose one another's rows.
         return self.package.lock_for(
-            "file:" + package_file_relative_path(symbol, normalize_timeframe(timeframe))
+            "dataset:" + PackageLayout.dataset_key(
+                symbol, normalize_timeframe(timeframe), adjustment
+            )
         )
 
     def file_lock(self, path: str | Path) -> FileLock:
         relative = self.package.relative(path)
         return self.package.lock_for("file:" + relative)
-
-    def package_file_path(self, symbol: str, timeframe: str) -> Path:
-        return self.package_dir / package_file_relative_path(symbol, timeframe)
 
     @staticmethod
     def _dataset_row(db, symbol, timeframe, adjustment):
@@ -567,27 +875,25 @@ class MarketDataRepository:
             (symbol, timeframe, adjustment),
         ).fetchone()
 
-    def _current_files(self, db, symbol, timeframe, adjustment, version: int) -> list[dict]:
-        if version <= 0:
-            return []
-        rows = db.execute(
-            """SELECT * FROM parquet_files
-               WHERE symbol=? AND timeframe=? AND adjustment=? AND version=?
-               ORDER BY first_time,partition_key""",
-            (symbol, timeframe, adjustment, version),
-        ).fetchall()
-        return [dict(row) for row in rows]
-
-    def _current_increments(
+    def _current_shards(
         self, db, symbol, timeframe, adjustment, version: int,
+        *, start=None, end=None, before=None,
     ) -> list[dict]:
         if version <= 0:
             return []
+        clauses = ["symbol=?", "timeframe=?", "adjustment=?", "version=?"]
+        params: list[Any] = [symbol, timeframe, adjustment, version]
+        upper = end if end is not None else before
+        if start is not None:
+            clauses.append("datetime(period_end)>datetime(?)")
+            params.append(_time_text(start))
+        if upper is not None:
+            clauses.append("datetime(period_start)<datetime(?)")
+            params.append(_time_text(upper))
         rows = db.execute(
-            """SELECT * FROM parquet_increments
-               WHERE symbol=? AND timeframe=? AND adjustment=? AND version=?
-               ORDER BY sequence,period_start""",
-            (symbol, timeframe, adjustment, version),
+            "SELECT * FROM parquet_shards WHERE " + " AND ".join(clauses)
+            + " ORDER BY sequence,period_start",
+            params,
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -604,39 +910,17 @@ class MarketDataRepository:
             key = f"year={value.year:04d}"
         return key, start.isoformat(), end.isoformat()
 
-    @staticmethod
-    def _period_windows(increments: Sequence[dict]) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
-        return [
-            (pd.Timestamp(row["period_start"]), pd.Timestamp(row["period_end"]))
-            for row in increments
-        ]
-
-    def _copy_version_files(
-        self, db, symbol: str, timeframe: str, adjustment: str,
-        source_version: int, target_version: int,
-    ) -> None:
-        db.execute(
-            """INSERT INTO parquet_files(
-               symbol,timeframe,adjustment,version,partition_key,path,sha256,
-               row_count,first_time,last_time,size,schema_version)
-               SELECT symbol,timeframe,adjustment,?,partition_key,path,sha256,
-                      row_count,first_time,last_time,size,schema_version
-               FROM parquet_files
-               WHERE symbol=? AND timeframe=? AND adjustment=? AND version=?""",
-            (target_version, symbol, timeframe, adjustment, source_version),
-        )
-
-    def _copy_current_increments(
+    def _copy_version_shards(
         self, db, symbol: str, timeframe: str, adjustment: str,
         source_version: int, target_version: int, skip_periods: set[str] | None = None,
     ) -> None:
-        rows = self._current_increments(db, symbol, timeframe, adjustment, source_version)
+        rows = self._current_shards(db, symbol, timeframe, adjustment, source_version)
         skip_periods = skip_periods or set()
         for row in rows:
             if row["period_key"] in skip_periods:
                 continue
             db.execute(
-                """INSERT INTO parquet_increments(
+                """INSERT INTO parquet_shards(
                    symbol,timeframe,adjustment,version,sequence,period_key,
                    period_start,period_end,path,sha256,row_count,first_time,
                    last_time,size,schema_version)
@@ -703,15 +987,13 @@ class MarketDataRepository:
             combined = MarketDataRepository._prepare_frame(combined)
         return combined, inserted, updated, unchanged, conflicts
 
-    def _write_increment_file(
+    def _write_period_shard(
         self, symbol: str, timeframe: str, adjustment: str,
         period_key: str, frame: pd.DataFrame,
     ) -> dict:
-        period = "month" if period_key.startswith("month=") else "year"
         bucket = period_key.split("=", 1)[1]
         return self._write_partition(
             symbol, timeframe, adjustment, bucket, frame,
-            period=period, base_dir=self.package.increments_dir,
         )
 
     def dataset(self, symbol: str, timeframe: str, adjustment: str = "none") -> dict | None:
@@ -726,8 +1008,7 @@ class MarketDataRepository:
                    AND adjustment=? AND target_timeframe=?""",
                 (symbol, timeframe, adjustment, timeframe),
             ).fetchone()
-            files = self._current_files(db, symbol, timeframe, adjustment, int(item["current_version"]))
-            increments = self._current_increments(
+            shards = self._current_shards(
                 db, symbol, timeframe, adjustment, int(item["current_version"])
             )
             coverage_rows = db.execute(
@@ -738,46 +1019,29 @@ class MarketDataRepository:
             ).fetchall()
             history = db.execute(
                 """SELECT COALESCE(SUM(size),0) FROM (
-                       SELECT path,MAX(size) size FROM (
-                           SELECT path,size FROM parquet_files
-                           WHERE symbol=? AND timeframe=? AND adjustment=?
-                           UNION ALL
-                           SELECT path,size FROM parquet_increments
-                           WHERE symbol=? AND timeframe=? AND adjustment=?
-                       ) GROUP BY path
+                       SELECT path,MAX(size) size FROM parquet_shards
+                       WHERE symbol=? AND timeframe=? AND adjustment=? GROUP BY path
                    )""",
-                (symbol, timeframe, adjustment, symbol, timeframe, adjustment),
+                (symbol, timeframe, adjustment),
             ).fetchone()[0]
         item["metadata"] = _load(item.get("metadata"), {})
         item["timeframe"] = timeframe
         item["version"] = int(item["current_version"])
-        file_errors = []
-        missing_files = 0
-        changed_files = 0
-        manifest_files = self.package.manifest().get("files", {})
-        for row in files:
-            path = self._absolute_source_path(str(row.get("path", "")))
-            if not path.is_file():
-                file_errors.append(str(path))
-                missing_files += 1
-                continue
-            metadata = manifest_files.get(self.package.relative(path), {})
-            expected_size = int(row.get("size") or 0)
-            if metadata.get("size") is not None and expected_size and path.stat().st_size != expected_size:
-                file_errors.append(f"文件内容摘要已变化：{path}")
-                changed_files += 1
-            elif metadata.get("mtime_ns") and int(metadata["mtime_ns"]) != path.stat().st_mtime_ns:
-                file_errors.append(f"文件修改时间已变化：{path}")
-                changed_files += 1
-        for row in increments:
-            path = self._absolute_source_path(str(row.get("path", "")))
-            if not path.is_file():
-                file_errors.append(str(path))
-                missing_files += 1
-            elif int(row.get("size") or 0) and path.stat().st_size != int(row["size"]):
-                file_errors.append(f"增量文件大小已变化：{path}")
-                changed_files += 1
-        item["file_status"] = "missing" if missing_files else "changed" if changed_files else "readable"
+        file_errors: list[str] = []
+        manifest = self.package.manifest()
+        head = manifest.get("datasets", {}).get(
+            self.package.dataset_key(symbol, timeframe, adjustment), {}
+        )
+        if int(head.get("version") or 0) != int(item["current_version"]):
+            item["file_status"] = "changed"
+            file_errors.append("SQLite 索引与包级清单版本不一致")
+        else:
+            # File existence and content are checked when a query opens the
+            # selected shard; listing relies on the manifest-backed index.
+            item["file_status"] = "readable"
+        item["file_errors"] = file_errors
+        item["missing_files"] = 0
+        item["changed_files"] = len(file_errors)
         latest_coverage = coverage_rows[-1] if coverage_rows else None
         coverage_report = _load(latest_coverage["report"], {}) if latest_coverage else {}
         coverage_value = str(
@@ -858,16 +1122,13 @@ class MarketDataRepository:
             effective_status = "pending_validation"
         item["status"] = effective_status
         item["ready"] = effective_status == "ready"
-        source_rows = [row for row in files if self._is_package_source(row)]
-        item["storage"] = "parquet-source" if source_rows else "parquet"
-        item["storage_path"] = (
-            str(self._absolute_source_path(source_rows[0]["path"]))
-            if source_rows else str(self.market_dir / timeframe / f"symbol={symbol}")
+        item["storage"] = "parquet"
+        item["storage_path"] = str(
+            self.package.partitions_dir / timeframe / f"symbol={symbol}"
         )
-        item["file_count"] = len(files) + len(increments)
-        item["base_file_count"] = len(files)
-        item["increment_count"] = len(increments)
-        item["current_bytes"] = sum(int(row["size"]) for row in [*files, *increments])
+        item["file_count"] = len(shards)
+        item["shard_count"] = len(shards)
+        item["current_bytes"] = sum(int(row["size"]) for row in shards)
         item["history_bytes"] = int(history or 0)
         item["derived"] = dict(derived) if derived else None
         item["derived_stale"] = bool(derived["stale"]) if derived else False
@@ -875,11 +1136,6 @@ class MarketDataRepository:
         item["file_errors"] = file_errors
         item["archive"] = self.archive_status(symbol, timeframe, adjustment)
         return item
-
-    @staticmethod
-    def _is_package_source(row: dict) -> bool:
-        schema = str(row.get("schema_version", ""))
-        return schema.startswith(("etf-source", "stock-source", "package-source"))
 
     def datasets(
         self, timeframe: str | None = None, query: str = "", status: str | None = None,
@@ -965,12 +1221,8 @@ class MarketDataRepository:
                 """SELECT symbol,timeframe,adjustment,status,report,start_time,end_time
                    FROM parquet_coverage ORDER BY end_time DESC,checked_at DESC"""
             ).fetchall()
-            file_rows = db.execute(
-                """SELECT symbol,timeframe,adjustment,version,path,size FROM parquet_files
-                   ORDER BY version"""
-            ).fetchall()
-            increment_rows = db.execute(
-                """SELECT symbol,timeframe,adjustment,version,path,size FROM parquet_increments
+            shard_rows = db.execute(
+                """SELECT symbol,timeframe,adjustment,version,path,size FROM parquet_shards
                    ORDER BY version"""
             ).fetchall()
             instrument_rows = db.execute("SELECT * FROM instruments").fetchall()
@@ -988,14 +1240,9 @@ class MarketDataRepository:
             coverage_map.setdefault(
                 (row["symbol"], row["timeframe"], row["adjustment"]), []
             ).append(dict(row))
-        file_map: dict[tuple[str, str, str], list[dict]] = {}
-        for row in file_rows:
-            file_map.setdefault(
-                (row["symbol"], row["timeframe"], row["adjustment"]), []
-            ).append(dict(row))
-        increment_map: dict[tuple[str, str, str], list[dict]] = {}
-        for row in increment_rows:
-            increment_map.setdefault(
+        shard_map: dict[tuple[str, str, str], list[dict]] = {}
+        for row in shard_rows:
+            shard_map.setdefault(
                 (row["symbol"], row["timeframe"], row["adjustment"]), []
             ).append(dict(row))
         validation_map: dict[tuple[str, str, str], list[dict]] = {}
@@ -1008,7 +1255,7 @@ class MarketDataRepository:
             payload = _load(row["payload"], [])
             calendar_by_symbol[row["symbol"]] = (self._calendar_dates(payload), bool(payload))
         calendar_by_market = self._calendar_dates_by_market()
-        manifest_files = self.package.manifest().get("files", {})
+        manifest_heads = self.package.manifest().get("datasets", {})
         selected_rows = [dict(row) for row in rows if not timeframe or row["timeframe"] == timeframe]
         symbols_all = sorted({row["symbol"] for row in selected_rows})
         dataset_summaries = []
@@ -1026,29 +1273,16 @@ class MarketDataRepository:
                 last_day = pd.Timestamp(row["last_time"]).normalize()
                 fully_covered = any(left <= first_day and right >= last_day for left, right in intervals)
                 coverage_status = "complete" if fully_covered else "partial" if intervals else "unknown"
-            current_files = [item for item in file_map.get(key, []) if int(item.get("version") or 0) == int(row["current_version"] or 0)]
-            current_increments = [
-                item for item in increment_map.get(key, [])
+            current_shards = [
+                item for item in shard_map.get(key, [])
                 if int(item.get("version") or 0) == int(row["current_version"] or 0)
             ]
-            file_status = "readable"
-            for item in current_files:
-                path = self._absolute_source_path(item["path"])
-                if not path.is_file():
-                    file_status = "missing"
-                    break
-                metadata = manifest_files.get(self.package.relative(path), {})
-                if metadata.get("size") is not None and int(item.get("size") or 0) and path.stat().st_size != int(item["size"]):
-                    file_status = "changed"
-                elif metadata.get("mtime_ns") and int(metadata["mtime_ns"]) != path.stat().st_mtime_ns:
-                    file_status = "changed"
-            for item in current_increments:
-                path = self._absolute_source_path(item["path"])
-                if not path.is_file():
-                    file_status = "missing"
-                    break
-                if int(item.get("size") or 0) and path.stat().st_size != int(item["size"]):
-                    file_status = "changed"
+            head = manifest_heads.get(self.package.dataset_key(*key)) or {}
+            file_status = (
+                "readable"
+                if int(head.get("version") or 0) == int(row["current_version"] or 0)
+                else "changed"
+            )
             stored = str(row.get("status") or "pending_validation")
             stored_calendar = calendar_by_symbol.get(row["symbol"])
             if stored_calendar is not None:
@@ -1093,7 +1327,7 @@ class MarketDataRepository:
                 "verified_from": compliance.get("verified_from"),
                 "verified_through": compliance.get("verified_through"),
                 "validation": compliance,
-                "increment_count": len(current_increments),
+                "shard_count": len(current_shards),
             })
         if status:
             dataset_summaries = [row for row in dataset_summaries if row["status"] == status]
@@ -1124,7 +1358,7 @@ class MarketDataRepository:
                     "ready": row["ready"], "reason": row.get("reason"),
                     "updated_at": row.get("updated_at"), "metadata": metadata,
                     "validation": row.get("validation"),
-                    "increment_count": row.get("increment_count", 0),
+                    "shard_count": row.get("shard_count", 0),
                 }
             base = instruments.get(symbol, {})
             metadata = next((item["metadata"] for item in periods.values()), {})
@@ -1137,10 +1371,7 @@ class MarketDataRepository:
             })
         bytes_by_path = {}
         for row in dataset_summaries:
-            for item in file_map.get((row["symbol"], row["timeframe"], row["adjustment"]), []):
-                if int(item.get("version") or 0) == int(row["current_version"] or 0):
-                    bytes_by_path[self.package.relative(item["path"])] = int(item.get("size") or 0)
-            for item in increment_map.get((row["symbol"], row["timeframe"], row["adjustment"]), []):
+            for item in shard_map.get((row["symbol"], row["timeframe"], row["adjustment"]), []):
                 if int(item.get("version") or 0) == int(row["current_version"] or 0):
                     bytes_by_path[self.package.relative(item["path"])] = int(item.get("size") or 0)
         return {
@@ -1169,25 +1400,17 @@ class MarketDataRepository:
                    WHERE symbol=? AND timeframe=? AND adjustment=? AND version=?""",
                 (symbol, timeframe, adjustment, int(version)),
             ).fetchone()
-            files = self._current_files(db, symbol, timeframe, adjustment, int(version)) if row else []
         if not row:
             return None
         item = dict(row)
         item["report"] = _load(item.get("report"), {})
-        item["storage"] = "parquet-source"
-        manifest_files = self.package.manifest().get("files", {})
+        item["storage"] = "parquet"
         file_status = "readable"
-        for file_row in files:
-            path = self._absolute_source_path(file_row["path"])
-            if not path.is_file():
-                file_status = "missing"
-                break
-            metadata = manifest_files.get(self.package.relative(path), {})
-            if metadata and (
-                int(file_row.get("size") or 0) != path.stat().st_size
-                or (metadata.get("mtime_ns") and int(metadata["mtime_ns"]) != path.stat().st_mtime_ns)
-            ):
-                file_status = "changed"
+        dataset_manifest = self.package.load_dataset_manifest(
+            symbol, timeframe, adjustment, int(version)
+        )
+        if dataset_manifest is None:
+            file_status = "changed"
         item["file_status"] = file_status
         return item
 
@@ -1204,7 +1427,6 @@ class MarketDataRepository:
         self, paths: Sequence[str], *, start=None, end=None, before=None,
         fields: Sequence[str] | None = None, limit: int | None = None,
         descending: bool = False,
-        exclude_periods: Sequence[tuple[pd.Timestamp, pd.Timestamp]] = (),
     ) -> pd.DataFrame:
         columns = self._canonical_fields(fields)
         if not paths:
@@ -1218,287 +1440,94 @@ class MarketDataRepository:
                 relation = relation.filter(f"timestamp < TIMESTAMP '{_time_text(before)}'")
             if end is not None:
                 relation = relation.filter(f"timestamp < TIMESTAMP '{_time_text(end)}'")
-            for period_start, period_end in exclude_periods:
-                relation = relation.filter(
-                    "NOT (timestamp >= TIMESTAMP '" + _time_text(period_start)
-                    + "' AND timestamp < TIMESTAMP '" + _time_text(period_end) + "')"
-                )
             relation = relation.order("timestamp DESC" if descending else "timestamp ASC")
             if limit is not None:
-                cushion = 64 if descending else 0
-                relation = relation.limit(int(limit) + cushion)
+                relation = relation.limit(int(limit))
             relation = relation.project(", ".join(columns))
             return self._frame_for_consumer(relation.df())
-
-    def _read_source_files(
-        self,
-        files: Sequence[dict],
-        *,
-        symbol: str,
-        timeframe: str,
-        start=None,
-        end=None,
-        before=None,
-        fields: Sequence[str] | None = None,
-        limit: int | None = None,
-        descending: bool = False,
-        exclude_periods: Sequence[tuple[pd.Timestamp, pd.Timestamp]] = (),
-    ) -> pd.DataFrame:
-        """Read package files in place and expose canonical bar columns."""
-        from .reader import normalize_frame
-
-        columns = self._canonical_fields(fields)
-        source_kind = str(files[0].get("schema_version", ""))
-        path = self._absolute_source_path(files[0]["path"])
-        if not path.is_file():
-            raise MarketDataError("行情源文件不存在：" + str(path))
-        is_daily = timeframe == "1day" or source_kind.endswith("source-daily")
-        time_column = "trade_date" if is_daily else "trade_time"
-        relative = self.package.relative(path)
-        file_metadata = self.package.file_metadata(relative)
-        with duckdb.connect() as connection:
-            relation = connection.read_parquet(str(path))
-            if start is not None:
-                relation = relation.filter(
-                    f"{time_column} >= TIMESTAMP '{_time_text(start)}'"
-                )
-            if before is not None:
-                relation = relation.filter(
-                    f"{time_column} < TIMESTAMP '{_time_text(before)}'"
-                )
-            if end is not None:
-                relation = relation.filter(
-                    f"{time_column} < TIMESTAMP '{_time_text(end)}'"
-                )
-            if is_daily:
-                relation = relation.filter(f"ts_code = '{symbol}'")
-            for period_start, period_end in exclude_periods:
-                relation = relation.filter(
-                    "NOT (" + time_column + " >= TIMESTAMP '" + _time_text(period_start)
-                    + "' AND " + time_column + " < TIMESTAMP '" + _time_text(period_end) + "')"
-                )
-            relation = relation.order(
-                time_column + (" DESC" if descending and limit is not None else " ASC")
-            )
-            if limit is not None and descending:
-                relation = relation.limit(int(limit) + 64)
-            raw = relation.df()
-        if raw.empty:
-            return pd.DataFrame(columns=list(columns))
-        if "preclose" not in raw and "pre_close" in raw:
-            raw["preclose"] = raw["pre_close"]
-        raw["timestamp"] = pd.to_datetime(raw[time_column])
-        raw_flags = raw.get("source_verified")
-        raw_synthetic = raw.get("is_synthetic")
-        raw_auction = raw.get("is_auction_placeholder")
-        raw_stamps = pd.to_datetime(raw[time_column], errors="coerce")
-
-        def flag_lookup(values):
-            if values is None:
-                return {}
-            series = pd.Series(values, index=raw.index)
-            return {
-                pd.Timestamp(stamp): value
-                for stamp, value in zip(raw_stamps, series)
-                if pd.notna(stamp)
-            }
-
-        flag_by_stamp = flag_lookup(raw_flags)
-        synthetic_by_stamp = flag_lookup(raw_synthetic)
-        auction_by_stamp = flag_lookup(raw_auction)
-        label_convention = str(file_metadata.get("label_convention") or "end")
-        normalized, _ = normalize_frame(
-            raw, timeframe, label_convention=label_convention,
-            source=str(file_metadata.get("source") or "package"),
-            skip_invalid_rows=True,
-        )
-        normalize_anomalies = normalized.attrs.get("price_anomaly_rows") or []
-        if is_daily:
-            volume_multiplier = float(file_metadata.get("volume_multiplier", 100.0))
-            turnover_multiplier = float(file_metadata.get("turnover_multiplier", 1000.0))
-            normalized["volume"] = pd.to_numeric(
-                normalized.volume, errors="coerce"
-            ) * volume_multiplier
-            normalized["turnover"] = pd.to_numeric(
-                normalized.turnover, errors="coerce"
-            ) * turnover_multiplier
-            if "tradestatus" in raw:
-                normalized["tradestatus"] = pd.to_numeric(
-                    raw["tradestatus"], errors="coerce"
-                ).fillna(1).to_numpy()
-            else:
-                normalized["tradestatus"] = (
-                    pd.to_numeric(normalized.volume, errors="coerce") > 0
-                ).astype(int)
-        if raw_flags is not None:
-            normalized["source_verified"] = normalized.timestamp.map(
-                flag_by_stamp
-            ).map(lambda value: bool(value) if pd.notna(value) else False).astype(bool)
-        else:
-            normalized["source_verified"] = bool(
-                file_metadata.get("source_verified", False)
-            )
-        if raw_synthetic is not None:
-            normalized["is_synthetic"] = normalized.timestamp.map(
-                synthetic_by_stamp
-            ).map(lambda value: bool(value) if pd.notna(value) else False).astype(bool)
-        if raw_auction is not None:
-            normalized["is_auction_placeholder"] = normalized.timestamp.map(
-                auction_by_stamp
-            ).map(lambda value: bool(value) if pd.notna(value) else False).astype(bool)
-        if start is not None:
-            normalized = normalized[normalized.timestamp >= pd.Timestamp(start)]
-        if before is not None:
-            normalized = normalized[normalized.timestamp < pd.Timestamp(before)]
-        if end is not None:
-            normalized = normalized[normalized.timestamp < pd.Timestamp(end)]
-        normalized = normalized.sort_values("timestamp", kind="stable")
-        if limit is not None:
-            normalized = (
-                normalized.tail(int(limit))
-                if descending else normalized.head(int(limit))
-            )
-        for field, default in (
-            ("symbol", symbol), ("timeframe", timeframe), ("adjustment", "none"),
-            ("metadata", "{}"),
-        ):
-            if field not in normalized:
-                normalized[field] = default
-        for field in columns:
-            if field in normalized:
-                continue
-            if field in BOOLEAN_FIELDS:
-                normalized[field] = False
-            elif field == "is_st":
-                normalized[field] = pd.Series(pd.NA, index=normalized.index, dtype="boolean")
-            elif field in {"source", "metadata"}:
-                normalized[field] = "package" if field == "source" else "{}"
-            else:
-                normalized[field] = np.nan
-        result = self._frame_for_consumer(normalized[list(columns)])
-        if normalize_anomalies:
-            existing = result.attrs.get("price_anomaly_rows") or []
-            merged_rows = {str(row.get("timestamp")): row for row in [*existing, *normalize_anomalies]}
-            result.attrs["price_anomaly_rows"] = sorted(
-                merged_rows.values(), key=lambda row: str(row.get("timestamp") or "")
-            )
-            result.attrs["blocked_timestamps"] = sorted(
-                str(row["timestamp"]) for row in merged_rows.values() if row.get("timestamp")
-            )
-        return result
 
     def _read_version(
         self, symbol: str, timeframe: str, adjustment: str, version: int, *,
         start=None, end=None, before=None, fields: Sequence[str] | None = None,
-        limit: int | None = None, descending: bool = False, file_lock: bool = True,
+        limit: int | None = None, descending: bool = False,
         years: Iterable[int] | None = None, use_cache: bool = True,
     ) -> pd.DataFrame:
         with self._connect() as db:
-            files = self._current_files(db, symbol, timeframe, adjustment, version)
-            increments = self._current_increments(
-                db, symbol, timeframe, adjustment, version
+            shards = self._current_shards(
+                db, symbol, timeframe, adjustment, version,
+                start=start, end=end, before=before,
             )
-        if not files and not increments:
-            return pd.DataFrame(columns=list(self._canonical_fields(fields)))
+        try:
+            dataset_manifest = self.package.load_dataset_manifest(
+                symbol, timeframe, adjustment, int(version)
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise MarketDataError(
+                f"数据集版本清单不可用：{symbol} {timeframe} v{version}: {exc}"
+            ) from exc
+        if dataset_manifest is None:
+            raise DataVersionNotFound(
+                f"DATA_VERSION_NOT_FOUND: {symbol} {timeframe} 版本 {version} 不在当前数据代际中"
+            )
+        published_paths = {
+            str(item.get("path") or "").replace("\\", "/")
+            for item in dataset_manifest.get("shards", [])
+        }
+        index_paths = {
+            self.package.relative(self._absolute_source_path(row["path"]).resolve())
+            for row in shards
+        }
+        if not index_paths.issubset(published_paths):
+            raise MarketDataError(
+                f"行情索引引用未发布的分片：{symbol} {timeframe} v{version}"
+            )
+        if (start is None and end is None and before is None and years is None
+                and index_paths != published_paths):
+            raise MarketDataError(
+                f"行情索引与数据集清单不一致：{symbol} {timeframe} v{version}"
+            )
         if years is not None:
-            wanted = {str(int(year)) for year in years}
-            files = [
-                row for row in files
-                if self._is_package_source(row)
-                or str(row["partition_key"]).split("=")[-1] in wanted
-            ]
-            increments = [
-                row for row in increments
+            wanted = {int(year) for year in years}
+            shards = [
+                row for row in shards
                 if any(
-                    pd.Timestamp(row["period_start"]).year <= int(year) <= pd.Timestamp(row["period_end"]).year
+                    pd.Timestamp(row["period_start"]) < pd.Timestamp(year + 1, 1, 1)
+                    and pd.Timestamp(row["period_end"]) > pd.Timestamp(year, 1, 1)
                     for year in wanted
                 )
             ]
-        if not files and not increments:
+        if limit is not None and descending and not start and not end:
+            recent = sorted(shards, key=lambda row: str(row["period_start"]), reverse=True)
+            shards = []
+            selected_rows = 0
+            for row in recent:
+                shards.append(row)
+                selected_rows += int(row.get("row_count") or 0)
+                if selected_rows >= int(limit):
+                    break
+        if not shards:
             return pd.DataFrame(columns=list(self._canonical_fields(fields)))
         columns = self._canonical_fields(fields)
-        source_files = [row for row in files if self._is_package_source(row)]
-        managed_files = [row for row in files if not self._is_package_source(row)]
-        excluded = self._period_windows(increments)
-        file_key = []
-        for row in [*files, *increments]:
-            if self._is_package_source(row):
-                path = self._absolute_source_path(row["path"])
-                try:
-                    stat = path.stat()
-                    file_key.append((str(path), stat.st_size, stat.st_mtime_ns))
-                except OSError:
-                    file_key.append((str(path), None, None))
-            else:
-                file_key.append(row["path"])
+        partition_files = shards
+        file_key = tuple(str(row["path"]) for row in partition_files)
         key = (
             str(self.root), self.generation, symbol, timeframe, adjustment, int(version),
             _time_text(start) if start is not None else None,
             _time_text(end) if end is not None else None,
             _time_text(before) if before is not None else None,
-            tuple(columns), limit, bool(descending),
-            tuple(file_key),
+            tuple(columns), limit, bool(descending), file_key,
         )
 
         def load():
-            frames: list[pd.DataFrame] = []
-            if source_files:
-                path = self._absolute_source_path(source_files[0]["path"])
-                if file_lock:
-                    guard = self.file_lock(path)
-                else:
-                    class _NoLock:
-                        def __enter__(self): return self
-                        def __exit__(self, *_): return False
-                    guard = _NoLock()
-                with guard:
-                    frames.append(self._read_source_files(
-                        source_files, symbol=symbol, timeframe=timeframe,
-                        start=start, end=end, before=before, fields=columns,
-                        limit=limit, descending=descending,
-                        exclude_periods=excluded,
-                    ))
-            if managed_files:
-                frames.append(self._read_paths(
-                    [row["path"] for row in managed_files],
-                    start=start, end=end, before=before, fields=columns,
-                    limit=limit, descending=descending,
-                    exclude_periods=excluded,
-                ))
-            for increment in increments:
-                frames.append(self._read_paths(
-                    [increment["path"]], start=start, end=end, before=before,
-                    fields=columns, limit=limit, descending=descending,
-                ))
-            anomaly_parts = [
-                row
-                for part in frames
-                for row in (part.attrs.get("price_anomaly_rows") or [])
-            ]
-            parts = [frame for frame in frames if frame is not None and not frame.empty]
-            if not parts:
-                empty = pd.DataFrame(columns=list(columns))
-                if anomaly_parts:
-                    unique = {str(row.get("timestamp")): row for row in anomaly_parts}
-                    empty.attrs["price_anomaly_rows"] = sorted(
-                        unique.values(), key=lambda row: str(row.get("timestamp") or "")
-                    )
-                return empty
-            merged = self._prepare_frame(pd.concat(parts, ignore_index=True, sort=False))
-            merged = self._frame_for_consumer(merged[list(columns)])
-            if limit is not None:
-                merged = (
-                    merged.tail(int(limit)) if descending else merged.head(int(limit))
-                )
-            if anomaly_parts:
-                unique = {str(row.get("timestamp")): row for row in anomaly_parts}
-                merged.attrs["price_anomaly_rows"] = sorted(
-                    unique.values(), key=lambda row: str(row.get("timestamp") or "")
-                )
-                merged.attrs["blocked_timestamps"] = sorted(
-                    str(row["timestamp"]) for row in unique.values() if row.get("timestamp")
-                )
-            return merged
+            for row in partition_files:
+                path = self._absolute_source_path(row["path"])
+                if not path.is_file():
+                    raise MarketDataError("当前行情分片不存在：" + str(path))
+            result = self._read_paths(
+                [row["path"] for row in partition_files], start=start, end=end,
+                before=before, fields=columns, limit=limit, descending=descending,
+            )
+            return result.sort_values("timestamp", kind="stable").reset_index(drop=True)
 
         return cached(key, load) if use_cache else load()
 
@@ -1507,7 +1536,8 @@ class MarketDataRepository:
         start=None, end=None, limit: int | None = None,
     ) -> pd.DataFrame:
         timeframe = normalize_timeframe(timeframe)
-        dataset = self.dataset(symbol, timeframe, adjustment)
+        with self._connect() as db:
+            dataset = self._dataset_row(db, symbol, timeframe, adjustment)
         if not dataset:
             return pd.DataFrame()
         exclusive_end = (
@@ -1557,11 +1587,13 @@ class MarketDataRepository:
         self, symbol: str, timeframe: str, *, before=None, limit: int = 600,
         adjustment: str = "none", fields: Sequence[str] | None = None,
     ) -> pd.DataFrame:
-        dataset = self.dataset(symbol, normalize_timeframe(timeframe), adjustment)
+        timeframe = normalize_timeframe(timeframe)
+        with self._connect() as db:
+            dataset = self._dataset_row(db, symbol, timeframe, adjustment)
         if not dataset:
             return pd.DataFrame()
         frame = self._read_version(
-            symbol, normalize_timeframe(timeframe), adjustment, int(dataset["current_version"]),
+            symbol, timeframe, adjustment, int(dataset["current_version"]),
             before=before, fields=fields, limit=limit, descending=True,
         )
         return frame.sort_values("timestamp", kind="stable").reset_index(drop=True)
@@ -1573,7 +1605,8 @@ class MarketDataRepository:
         descending: bool = False, use_cache: bool = True,
     ) -> pd.DataFrame:
         timeframe = normalize_timeframe(timeframe)
-        dataset = self.dataset(symbol, timeframe, adjustment)
+        with self._connect() as db:
+            dataset = self._dataset_row(db, symbol, timeframe, adjustment)
         if not dataset:
             if version is not None:
                 raise DataVersionNotFound(
@@ -1675,12 +1708,10 @@ class MarketDataRepository:
 
     def _write_partition(
         self, symbol: str, timeframe: str, adjustment: str, year: int | str, frame: pd.DataFrame,
-        *, prepared: bool = False, period: str = "year", base_dir: str | Path | None = None,
+        *, prepared: bool = False,
     ) -> dict:
         result = frame if prepared else self._prepare_frame(frame)
-        if period == "all":
-            period_key = f"snapshot={uuid.uuid4().hex[:12]}"
-        elif period == "month":
+        if timeframe in MINUTE_TIMEFRAMES:
             month_text = str(year)
             result = result[
                 result.timestamp.dt.strftime("%Y-%m") == month_text
@@ -1739,11 +1770,7 @@ class MarketDataRepository:
                 write_statistics=True, row_group_size=16384, version="2.6",
             )
             digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
-            root = Path(base_dir) if base_dir is not None else self.market_dir
-            folder = (
-                root / timeframe / f"symbol={symbol}" /
-                f"adjustment={adjustment}" / period_key
-            )
+            folder = self.package.partitions_dir / timeframe / f"symbol={symbol}" / f"adjustment={adjustment}" / period_key
             folder.mkdir(parents=True, exist_ok=True)
             target = folder / f"{digest[:24]}.parquet"
             if target.exists():
@@ -1762,574 +1789,22 @@ class MarketDataRepository:
             "size": size, "schema_version": PARQUET_SCHEMA_VERSION,
         }
 
-    def _backup_and_point_old_version(
-        self, symbol: str, timeframe: str, adjustment: str,
-        version: int, files: Sequence[dict],
-    ) -> Path | None:
-        if not files:
-            return None
-        source = self._absolute_source_path(files[0]["path"])
-        if not source.is_file():
-            raise MarketDataError("待更新的行情源文件不存在：" + str(source))
-        backup_folder = self.package.history_dir / "files"
-        backup_folder.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256(
-            f"{source}|{source.stat().st_size}|{source.stat().st_mtime_ns}".encode()
-        ).hexdigest()[:20]
-        backup = backup_folder / f"{digest}.parquet"
-        if not backup.exists():
-            temporary = backup.with_name(backup.name + ".writing")
-            shutil.copy2(source, temporary)
-            os.replace(temporary, backup)
-        with self._connect() as db:
-            db.execute(
-                """UPDATE parquet_files SET path=?,sha256=?,size=?
-                   WHERE symbol=? AND timeframe=? AND adjustment=? AND version=?""",
-                (
-                    self.package.relative(backup),
-                    f"stat:{backup.stat().st_size}:{backup.stat().st_mtime_ns}",
-                    backup.stat().st_size,
-                    symbol, timeframe, adjustment, version,
-                ),
-            )
-        return backup
-
-    def _write_source_data(
-        self, symbol: str, timeframe: str, adjustment: str, version: int,
-        frame: pd.DataFrame, old_files: Sequence[dict],
-    ) -> dict:
-        """Atomically merge one security into its package Parquet file."""
-        source = (
-            self._absolute_source_path(old_files[0]["path"])
-            if old_files and self._is_package_source(old_files[0])
-            else self.package_file_path(symbol, timeframe)
-        )
-        source.parent.mkdir(parents=True, exist_ok=True)
-        transaction_id, transaction_path = self.package.begin_transaction({
-            "target": self.package.relative(source),
-            "version": int(version),
-            "symbol": symbol,
-            "timeframe": timeframe,
-        })
-        backup = None
-        if old_files and self._is_package_source(old_files[0]):
-            backup = self._backup_and_point_old_version(
-                symbol, timeframe, adjustment, max(0, int(version) - 1), old_files,
-            )
-            if backup is not None:
-                self.package.update_transaction(transaction_path, {
-                    "status": "backed_up",
-                    "backup": self.package.relative(backup),
-                })
-        result = self._prepare_frame(frame).sort_values(
-            "timestamp", kind="stable"
-        ).reset_index(drop=True)
-        temporary = source.with_name(source.name + ".writing")
-        completed = False
-        try:
-            if timeframe == "1day":
-                new_rows = pd.DataFrame({
-                    "ts_code": symbol,
-                    "trade_date": result.timestamp.dt.normalize(),
-                    "open": result.open, "high": result.high, "low": result.low,
-                    "close": result.close,
-                    "pre_close": result.preclose,
-                    "change": result.close - result.preclose,
-                    "pct_chg": (
-                        (result.close - result.preclose) /
-                        result.preclose.replace(0, np.nan) * 100
-                    ),
-                    "vol": result.volume / 100.0,
-                    "amount": result.turnover / 1000.0,
-                    "adj_factor": result.adj_factor,
-                    "exchange": symbol.rsplit(".", 1)[-1],
-                    "tradestatus": result.tradestatus,
-                    "is_st": result.is_st,
-                    "source": result.source,
-                    "source_verified": result.source_verified,
-                    "is_synthetic": result.is_synthetic,
-                    "is_auction_placeholder": result.is_auction_placeholder,
-                    "opening_auction_volume": result.opening_auction_volume,
-                })
-                with duckdb.connect() as connection:
-                    connection.register("incoming_daily", new_rows)
-                    source_sql = str(source).replace("'", "''") if source.exists() else None
-                    if source_sql:
-                        query = (
-                            "SELECT * FROM read_parquet(?) WHERE ts_code <> ? "
-                            "UNION ALL BY NAME SELECT * FROM incoming_daily "
-                            "ORDER BY ts_code, trade_date"
-                        )
-                        connection.execute(
-                            "COPY (" + query + ") TO '" + str(temporary).replace("'", "''") +
-                            "' (FORMAT PARQUET, COMPRESSION ZSTD)",
-                            [str(source), symbol],
-                        )
-                    else:
-                        connection.execute(
-                            "COPY (SELECT * FROM incoming_daily ORDER BY trade_date) TO '" +
-                            str(temporary).replace("'", "''") +
-                            "' (FORMAT PARQUET, COMPRESSION ZSTD)"
-                        )
-            else:
-                output = pd.DataFrame({
-                    "ts_code": symbol,
-                    "trade_time": result.timestamp,
-                    "trade_date": result.timestamp.dt.normalize(),
-                    "open": result.open, "high": result.high, "low": result.low,
-                    "close": result.close, "vol": result.volume,
-                    "amount": result.turnover, "adj_factor": result.adj_factor,
-                    "preclose": result.preclose,
-                    "tradestatus": result.tradestatus,
-                    "is_st": result.is_st,
-                    "source": result.source,
-                    "source_verified": result.source_verified,
-                    "is_synthetic": result.is_synthetic,
-                    "is_auction_placeholder": result.is_auction_placeholder,
-                    "opening_auction_volume": result.opening_auction_volume,
-                })
-                output.to_parquet(temporary, compression="zstd", index=False)
-            last_error = None
-            for attempt in range(6):
-                try:
-                    os.replace(temporary, source)
-                    last_error = None
-                    break
-                except PermissionError as exc:
-                    last_error = exc
-                    time.sleep(0.15 * (attempt + 1))
-            if last_error is not None:
-                raise last_error
-            relative = self.package.relative(source)
-            self.package.update_transaction(transaction_path, {
-                "status": "installed",
-                "new_sha256": f"stat:{source.stat().st_size}:{source.stat().st_mtime_ns}",
-            })
-            if backup is not None and timeframe == "1day":
-                self._propagate_shared_file_version(
-                    symbol, timeframe, relative, backup, int(version), source
-                )
-            asset = asset_type_for_symbol(symbol)
-            self.package.set_file_metadata(relative, {
-                "schema_version": f"{asset}-source-daily" if timeframe == "1day" else f"{asset}-source-minute",
-                "label_convention": "end" if bool(result.source_verified.all()) else "auto",
-                "volume_multiplier": 100.0 if timeframe == "1day" else 1.0,
-                "turnover_multiplier": 1000.0 if timeframe == "1day" else 1.0,
-                "source_verified": bool(result.source_verified.all()),
-                "parser_version": PARSER_VERSION,
-                "version": int(version),
-                "row_count": len(result) if not source.exists() else None,
-            })
-            self.package.record_file(
-                relative,
-                version=int(version),
-                row_count=int(len(result)),
-                sha256=f"stat:{source.stat().st_size}:{source.stat().st_mtime_ns}",
-            )
-            completed = True
-        finally:
-            temporary.unlink(missing_ok=True)
-        signature = f"stat:{source.stat().st_size}:{source.stat().st_mtime_ns}"
-        asset = asset_type_for_symbol(symbol)
-        return {
-            "partition_key": f"source={asset}_{timeframe}",
-            "path": self.package.relative(source),
-            "sha256": signature,
-            "row_count": len(result),
-            "first_time": _time_text(result.timestamp.min()),
-            "last_time": _time_text(result.timestamp.max()),
-            "size": source.stat().st_size,
-            "schema_version": (
-                f"{asset}-source-daily" if timeframe == "1day" else f"{asset}-source-minute"
-            ),
-            "_transaction_path": str(transaction_path) if completed else None,
-        }
-
-    def _propagate_shared_file_version(
-        self, symbol: str, timeframe: str, relative: str, backup: Path,
-        incoming_version: int, source: Path,
-    ) -> None:
-        """Freeze every old dataset reference and point current ones at a new shared file."""
-        backup_relative = self.package.relative(backup)
-        size = source.stat().st_size
-        signature = f"stat:{size}:{source.stat().st_mtime_ns}"
-        now = utc_now()
-        with self._connect() as db:
-            datasets = db.execute(
-                "SELECT * FROM parquet_datasets WHERE timeframe=? AND symbol<>?",
-                (timeframe, symbol),
-            ).fetchall()
-            for dataset in datasets:
-                current = int(dataset["current_version"] or 0)
-                files = self._current_files(
-                    db, dataset["symbol"], timeframe, dataset["adjustment"], current
-                )
-                if not files or not any(str(row.get("path")) == relative for row in files):
-                    continue
-                db.execute(
-                    """UPDATE parquet_files SET path=?,sha256=?,size=?
-                       WHERE symbol=? AND timeframe=? AND adjustment=? AND path=? AND version<=?""",
-                    (
-                        backup_relative,
-                        f"stat:{backup.stat().st_size}:{backup.stat().st_mtime_ns}",
-                        backup.stat().st_size,
-                        dataset["symbol"], timeframe, dataset["adjustment"],
-                        relative, current,
-                    ),
-                )
-                next_version = current + 1
-                exists = db.execute(
-                    """SELECT 1 FROM parquet_versions WHERE symbol=? AND timeframe=?
-                       AND adjustment=? AND version=?""",
-                    (dataset["symbol"], timeframe, dataset["adjustment"], next_version),
-                ).fetchone()
-                if exists:
-                    continue
-                original = db.execute(
-                    """SELECT * FROM parquet_versions WHERE symbol=? AND timeframe=?
-                       AND adjustment=? AND version=?""",
-                    (dataset["symbol"], timeframe, dataset["adjustment"], current),
-                ).fetchone()
-                if original:
-                    values = dict(original)
-                    values["version"] = next_version
-                    values["created_at"] = now
-                    db.execute(
-                        """INSERT INTO parquet_versions(
-                           symbol,timeframe,adjustment,version,created_at,row_count,raw_rows,
-                           synthetic_rows,pending_rows,first_time,last_time,status,source,
-                           file_count,bytes,report
-                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            values["symbol"], values["timeframe"], values["adjustment"],
-                            next_version, values["created_at"], values["row_count"],
-                            values["raw_rows"], values["synthetic_rows"], values["pending_rows"],
-                            values["first_time"], values["last_time"], values["status"],
-                            values["source"], values["file_count"], size, values["report"],
-                        ),
-                    )
-                for item in files:
-                    db.execute(
-                        """INSERT OR REPLACE INTO parquet_files(
-                           symbol,timeframe,adjustment,version,partition_key,path,sha256,
-                           row_count,first_time,last_time,size,schema_version
-                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            dataset["symbol"], timeframe, dataset["adjustment"], next_version,
-                            item["partition_key"], relative, signature, item["row_count"],
-                            item["first_time"], item["last_time"], size, item["schema_version"],
-                        ),
-                    )
-                db.execute(
-                    "UPDATE parquet_datasets SET current_version=? WHERE symbol=? AND timeframe=? AND adjustment=?",
-                    (next_version, dataset["symbol"], timeframe, dataset["adjustment"]),
-                )
-
     def commit_daily_batch(self, prepared: Sequence[dict]) -> list[dict]:
-        """Merge one daily download batch into each shared daily file once."""
-        grouped: dict[str, list[dict]] = {}
+        """Commit daily rows per symbol through the canonical shard publisher."""
+        results = []
         for item in prepared:
-            symbol = item["symbol"]
-            existing = self.dataset(symbol, "1day")
-            path = (
-                self._absolute_source_path(existing["storage_path"])
-                if existing and existing.get("storage") == "parquet-source"
-                else self.package_file_path(symbol, "1day")
-            )
-            grouped.setdefault(self.package.relative(path), []).append(item)
-        results: list[dict] = []
-        for relative, items in grouped.items():
-            results.extend(self._commit_daily_file_batch(relative, items))
+            results.append(self.commit_bars(
+                item["symbol"], "1day", item["frame"],
+                source=item.get("source", "import"),
+                file_name=item.get("file_name"),
+                fingerprint=item.get("fingerprint"),
+                params_hash=item.get("params_hash"),
+                report=item.get("report") or {},
+                metadata=item.get("metadata") or {},
+                advance_completed=True,
+                import_mode="merge",
+            ))
         return results
-
-    def _commit_daily_file_batch(self, relative: str, prepared: Sequence[dict]) -> list[dict]:
-        source = self.package.absolute(relative)
-        source.parent.mkdir(parents=True, exist_ok=True)
-        with self.file_lock(source):
-            changes = []
-            for item in prepared:
-                symbol = item["symbol"]
-                with self._connect() as db:
-                    row = self._dataset_row(db, symbol, "1day", "none")
-                    dataset = dict(row) if row else None
-                    current_version = int(dataset["current_version"]) if dataset else 0
-                    old_files = self._current_files(
-                        db, symbol, "1day", "none", current_version
-                    )
-                existing = (
-                    self._read_version(
-                        symbol, "1day", "none", current_version,
-                        use_cache=False, file_lock=False,
-                    ) if old_files else pd.DataFrame()
-                )
-                existing_by_ts = {
-                    pd.Timestamp(row["timestamp"]): row
-                    for row in existing.to_dict("records")
-                }
-                frame = self._prepare_frame(item["frame"])
-                inserted, updated, unchanged, conflicts = [], [], 0, []
-                if not existing_by_ts:
-                    combined = frame.copy()
-                    inserted = frame.to_dict("records")
-                else:
-                    for incoming in frame.to_dict("records"):
-                        stamp = pd.Timestamp(incoming["timestamp"])
-                        old = existing_by_ts.get(stamp)
-                        if old is None:
-                            inserted.append(incoming)
-                            continue
-                        if self._same_market_row(old, incoming):
-                            unchanged += 1
-                            continue
-                        if self._quality_rank(
-                            incoming.get("source"), incoming.get("source_verified"),
-                            incoming.get("is_synthetic"),
-                        ) < self._quality_rank(
-                            old.get("source"), old.get("source_verified"), old.get("is_synthetic")
-                        ):
-                            unchanged += 1
-                            conflicts.append({"timestamp": _time_text(stamp)})
-                            continue
-                        updated.append(incoming)
-                    for incoming in [*inserted, *updated]:
-                        existing_by_ts[pd.Timestamp(incoming["timestamp"])] = incoming
-                    combined = self._prepare_frame(pd.DataFrame(existing_by_ts.values()))
-                changed = len(inserted) + len(updated)
-                pending_after = int(combined.source_verified.eq(False).sum()) if "source_verified" in combined else 0
-                pending_flags = bool(item["report"].get("pending_validation"))
-                status = "pending_validation" if pending_after or pending_flags else "ready"
-                if item["report"].get("gaps"):
-                    status = "partial"
-                old_status = dataset.get("status") if dataset else None
-                semantic = changed > 0 or dataset is None or status != old_status
-                version = current_version + 1 if semantic else current_version
-                changes.append({
-                    **item, "dataset": dataset, "old_files": old_files,
-                    "current_version": current_version, "version": version,
-                    "combined": combined, "inserted": len(inserted),
-                    "updated": len(updated), "unchanged": unchanged,
-                    "conflicts": conflicts, "status": status,
-                    "pending": pending_after, "semantic": semantic,
-                })
-            changing = [item for item in changes if item["semantic"] and item["combined"].shape[0]]
-            if changing:
-                incoming = pd.concat(
-                    [self._daily_source_frame(item["combined"], item["symbol"]) for item in changing],
-                    ignore_index=True,
-                )
-                backup = None
-                if source.is_file():
-                    backup = self._backup_daily_file(source)
-                temporary = source.with_name(source.name + ".writing")
-                symbols = [item["symbol"] for item in changing]
-                if source.is_file():
-                    placeholders = ",".join("?" for _ in symbols)
-                    with duckdb.connect() as connection:
-                        connection.register("incoming_daily_batch", incoming)
-                        connection.execute(
-                            "COPY (SELECT * FROM read_parquet(?) WHERE ts_code NOT IN (" + placeholders +
-                            ") UNION ALL BY NAME SELECT * FROM incoming_daily_batch ORDER BY ts_code,trade_date) TO '" +
-                            str(temporary).replace("'", "''") +
-                            "' (FORMAT PARQUET, COMPRESSION ZSTD)",
-                            [str(source), *symbols],
-                        )
-                else:
-                    incoming.sort_values(["ts_code", "trade_date"], kind="stable").to_parquet(
-                        temporary, compression="zstd", index=False
-                    )
-                os.replace(temporary, source)
-                self.package.record_file(
-                    relative, sha256=f"stat:{source.stat().st_size}:{source.stat().st_mtime_ns}",
-                    metadata={"schema_version": source.name.split("_", 1)[0] + "-source-daily",
-                              "label_convention": "end", "volume_multiplier": 100.0,
-                              "turnover_multiplier": 1000.0, "batch_size": len(changing)},
-                )
-                self._publish_daily_batch_db(relative, source, changes, changing, backup)
-            else:
-                self._refresh_unchanged_daily_results(changes)
-        return [
-            {
-                "symbol": item["symbol"], "timeframe": "1day", "status": item["status"],
-                "version": item["version"], "rows_read": int(item["combined"].shape[0]),
-                "inserted": item["inserted"], "updated": item["updated"],
-                "unchanged": item["unchanged"], "conflicts": item.get("conflicts", []),
-                "first_time": _time_text(item["combined"].timestamp.min()),
-                "last_time": _time_text(item["combined"].timestamp.max()),
-                "message": f"新增 {item['inserted']} 行，修正 {item['updated']} 行，未变化 {item['unchanged']} 行",
-            }
-            for item in changes
-        ]
-
-    def _backup_daily_file(self, source: Path) -> Path:
-        digest = hashlib.sha256(
-            f"{source}|{source.stat().st_size}|{source.stat().st_mtime_ns}".encode()
-        ).hexdigest()[:20]
-        backup = self.package.history_dir / "files" / f"{digest}.parquet"
-        backup.parent.mkdir(parents=True, exist_ok=True)
-        if not backup.exists():
-            temporary = backup.with_name(backup.name + ".writing")
-            shutil.copy2(source, temporary)
-            os.replace(temporary, backup)
-        return backup
-
-    @staticmethod
-    def _daily_source_frame(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
-        result = frame.sort_values("timestamp", kind="stable").reset_index(drop=True)
-        return pd.DataFrame({
-            "ts_code": symbol, "trade_date": result.timestamp.dt.normalize(),
-            "open": result.open, "high": result.high, "low": result.low,
-            "close": result.close, "pre_close": result.preclose,
-            "change": result.close - result.preclose,
-            "pct_chg": (result.close - result.preclose) / result.preclose.replace(0, np.nan) * 100,
-            "vol": result.volume / 100.0, "amount": result.turnover / 1000.0,
-            "adj_factor": result.adj_factor, "exchange": symbol.rsplit(".", 1)[-1],
-            "tradestatus": result.tradestatus, "is_st": result.is_st,
-            "source": result.source, "source_verified": result.source_verified,
-            "is_synthetic": result.is_synthetic,
-            "is_auction_placeholder": result.is_auction_placeholder,
-            "opening_auction_volume": result.opening_auction_volume,
-        })
-
-    def _publish_daily_batch_db(self, relative, source, changes, changing, backup):
-        signature = f"stat:{source.stat().st_size}:{source.stat().st_mtime_ns}"
-        now = utc_now()
-        changing_symbols = {item["symbol"] for item in changing}
-        with self._connect() as db:
-            users = db.execute(
-                """SELECT d.* FROM parquet_datasets d JOIN parquet_files f
-                   ON f.symbol=d.symbol AND f.timeframe=d.timeframe
-                   AND f.adjustment=d.adjustment AND f.version=d.current_version
-                   WHERE d.timeframe='1day' AND f.path=?""",
-                (relative,),
-            ).fetchall()
-            file_rows = db.execute(
-                """SELECT f.* FROM parquet_files f JOIN parquet_datasets d
-                   ON d.symbol=f.symbol AND d.timeframe=f.timeframe
-                   AND d.adjustment=f.adjustment AND d.current_version=f.version
-                   WHERE d.timeframe='1day' AND f.path=?""",
-                (relative,),
-            ).fetchall()
-            user_files: dict[tuple[str, str, int], list[dict]] = {}
-            for file_row in file_rows:
-                user_files.setdefault(
-                    (file_row["symbol"], file_row["adjustment"], int(file_row["version"])),
-                    [],
-                ).append(dict(file_row))
-            db.execute("BEGIN IMMEDIATE")
-            if backup is not None:
-                db.execute(
-                    "UPDATE parquet_files SET path=?,sha256=?,size=? WHERE path=?",
-                    (self.package.relative(backup),
-                     f"stat:{backup.stat().st_size}:{backup.stat().st_mtime_ns}",
-                     backup.stat().st_size, relative),
-                )
-            for user in users:
-                symbol = user["symbol"]
-                if symbol in changing_symbols:
-                    continue
-                current_version = int(user["current_version"] or 0)
-                old_files = user_files.get((symbol, user["adjustment"], current_version), [])
-                if not old_files:
-                    continue
-                next_version = current_version + 1
-                original = db.execute(
-                    "SELECT * FROM parquet_versions WHERE symbol=? AND timeframe='1day' AND adjustment='none' AND version=?",
-                    (symbol, current_version),
-                ).fetchone()
-                if original and not db.execute(
-                    "SELECT 1 FROM parquet_versions WHERE symbol=? AND timeframe='1day' AND adjustment='none' AND version=?",
-                    (symbol, next_version),
-                ).fetchone():
-                    values = dict(original)
-                    db.execute(
-                        """INSERT INTO parquet_versions(
-                           symbol,timeframe,adjustment,version,created_at,row_count,raw_rows,
-                           synthetic_rows,pending_rows,first_time,last_time,status,source,
-                           file_count,bytes,report) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (values["symbol"], "1day", "none", next_version, now, values["row_count"],
-                         values["raw_rows"], values["synthetic_rows"], values["pending_rows"],
-                         values["first_time"], values["last_time"], values["status"],
-                         values["source"], 1, source.stat().st_size, values["report"]),
-                    )
-                    for old in old_files:
-                        db.execute(
-                            """INSERT OR REPLACE INTO parquet_files(
-                               symbol,timeframe,adjustment,version,partition_key,path,sha256,
-                               row_count,first_time,last_time,size,schema_version
-                               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (symbol, "1day", "none", next_version,
-                             old["partition_key"], relative, signature, old["row_count"],
-                             old["first_time"], old["last_time"], source.stat().st_size,
-                             old["schema_version"]),
-                        )
-                    db.execute(
-                        "UPDATE parquet_datasets SET current_version=? WHERE symbol=? AND timeframe='1day' AND adjustment='none'",
-                        (next_version, symbol),
-                    )
-                    for item in changes:
-                        if item["symbol"] == symbol:
-                            item["version"] = next_version
-            for item in changing:
-                combined = item["combined"]
-                first_time = _time_text(combined.timestamp.min())
-                last_time = _time_text(combined.timestamp.max())
-                row_count = len(combined)
-                synthetic = int(combined.is_synthetic.sum()) if "is_synthetic" in combined else 0
-                item_metadata = {**(_load(item["dataset"]["metadata"], {}) if item["dataset"] else {}), **item["metadata"]}
-                db.execute(
-                    """INSERT OR REPLACE INTO parquet_versions(
-                       symbol,timeframe,adjustment,version,created_at,row_count,raw_rows,
-                       synthetic_rows,pending_rows,first_time,last_time,status,source,
-                       file_count,bytes,report) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (item["symbol"], "1day", "none", item["version"], now, row_count,
-                     row_count - synthetic, synthetic, item["pending"], first_time, last_time,
-                     item["status"], item["source"], 1, source.stat().st_size,
-                     _json(item["report"])),
-                )
-                db.execute(
-                    """INSERT OR REPLACE INTO parquet_files(
-                       symbol,timeframe,adjustment,version,partition_key,path,sha256,
-                       row_count,first_time,last_time,size,schema_version
-                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (item["symbol"], "1day", "none", item["version"],
-                     f"source={asset_type_for_symbol(item['symbol'])}_1day", relative, signature,
-                     row_count, first_time, last_time, source.stat().st_size,
-                     f"{asset_type_for_symbol(item['symbol'])}-source-daily"),
-                )
-                if item["dataset"]:
-                    db.execute(
-                        """UPDATE parquet_datasets SET current_version=?,first_time=?,last_time=?,
-                           completed_through=?,row_count=?,raw_rows=?,synthetic_rows=?,pending_rows=?,
-                           status=?,reason=?,metadata=?,updated_at=?
-                           WHERE symbol=? AND timeframe='1day' AND adjustment='none'""",
-                        (item["version"], first_time, last_time, last_time, row_count,
-                         row_count - synthetic, synthetic, item["pending"], item["status"],
-                         item["report"].get("reason"), _json(item_metadata), now, item["symbol"]),
-                    )
-                else:
-                    db.execute(
-                        """INSERT INTO parquet_datasets(
-                           symbol,timeframe,adjustment,current_version,first_time,last_time,
-                           completed_through,row_count,raw_rows,synthetic_rows,pending_rows,
-                           status,reason,metadata,created_at,updated_at
-                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (item["symbol"], "1day", "none", item["version"], first_time,
-                         last_time, last_time, row_count, row_count - synthetic, synthetic,
-                         item["pending"], item["status"], item["report"].get("reason"),
-                         _json(item_metadata), now, now),
-                    )
-                db.execute(
-                    """INSERT OR REPLACE INTO parquet_imports(
-                       symbol,timeframe,adjustment,fingerprint,params_hash,parser_version,
-                       file_name,status,rows_read,inserted,updated,unchanged,synthetic_rows,
-                       version,report,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (item["symbol"], "1day", "none", item["fingerprint"],
-                     item["params_hash"], PARSER_VERSION, f"sync:{item['source']}",
-                     "completed", len(item["frame"]), item["inserted"], item["updated"],
-                     item["unchanged"], synthetic, item["version"],
-                     _json({**item["report"], "conflicts": item["conflicts"]}), now),
-                )
-            db.commit()
 
     def _refresh_unchanged_daily_results(self, changes):
         for item in changes:
@@ -2350,7 +1825,7 @@ class MarketDataRepository:
         for field in (
             "open", "high", "low", "close", "volume", "turnover", "preclose",
             "tradestatus", "is_st", "source_verified", "is_synthetic",
-            "is_auction_placeholder",
+            "is_auction_placeholder", "opening_auction_volume", "adj_factor", "source",
         ):
             left, right = old.get(field), new.get(field)
             left_null = left is None or (not isinstance(left, (bool, str)) and pd.isna(left))
@@ -2373,32 +1848,27 @@ class MarketDataRepository:
                 return False
         return True
 
-    def _commit_incremental_bars(
+    def _commit_merge_bars(
         self, symbol: str, timeframe: str, frame: pd.DataFrame, **kwargs,
     ) -> dict:
         with self.lock(symbol, timeframe, kwargs.get("adjustment", "none")):
-            return self._commit_incremental_bars_unlocked(
+            return self._commit_merge_bars_unlocked(
                 symbol, timeframe, frame, **kwargs
             )
 
-    def _commit_incremental_bars_unlocked(
+    def _commit_merge_bars_unlocked(
         self, symbol: str, timeframe: str, frame: pd.DataFrame, *,
         adjustment: str, source: str, file_name: str | None,
         fingerprint: str | None, params_hash: str, report: dict,
         metadata: dict, completed_through: str | None,
-        advance_completed: bool, derived: dict | None,
+        advance_completed: bool, derived: dict | None, replace_range: bool = False,
     ) -> dict:
-        """Publish additions and corrections without rewriting historical base files."""
+        """Publish additions and corrections as complete time-bucket shards."""
         with self._connect() as db:
             dataset_row = self._dataset_row(db, symbol, timeframe, adjustment)
-            if not dataset_row:
-                raise MarketDataError("增量写入需要已有行情底座")
-            dataset = dict(dataset_row)
-            current_version = int(dataset["current_version"])
-            base_files = self._current_files(
-                db, symbol, timeframe, adjustment, current_version
-            )
-            increments = self._current_increments(db, symbol, timeframe, adjustment, current_version)
+            dataset = dict(dataset_row) if dataset_row else None
+            current_version = int(dataset["current_version"]) if dataset else 0
+            current_shards = self._current_shards(db, symbol, timeframe, adjustment, current_version)
 
         periods: dict[str, tuple[str, str]] = {}
         for stamp in frame.timestamp:
@@ -2407,10 +1877,15 @@ class MarketDataRepository:
         ordered = sorted(periods.items())
         read_start = pd.Timestamp(min(value[0] for _, value in ordered))
         read_end = pd.Timestamp(max(value[1] for _, value in ordered)) - pd.Timedelta(nanoseconds=1)
-        existing = self._read_version(
-            symbol, timeframe, adjustment, current_version,
-            start=read_start, end=read_end + pd.Timedelta(nanoseconds=1),
-            use_cache=False, file_lock=False,
+        # A first import has no published version yet.  Version zero is an
+        # empty baseline, not a readable historical snapshot.
+        existing = (
+            self._read_version(
+                symbol, timeframe, adjustment, current_version,
+                start=read_start, end=read_end + pd.Timedelta(nanoseconds=1),
+                use_cache=False,
+            )
+            if current_version > 0 else pd.DataFrame()
         )
         existing_by_period: dict[str, pd.DataFrame] = {}
         if not existing.empty:
@@ -2427,10 +1902,17 @@ class MarketDataRepository:
         conflicts: list[dict] = []
         changed_dates: set[str] = set()
         row_delta = 0
+        all_removed = 0
         synthetic_delta = 0
         pending_delta = 0
-        new_first = pd.Timestamp(dataset["first_time"]) if dataset.get("first_time") else None
-        new_last = pd.Timestamp(dataset["last_time"]) if dataset.get("last_time") else None
+        new_first = (
+            pd.Timestamp(dataset["first_time"])
+            if dataset and dataset.get("first_time") else None
+        )
+        new_last = (
+            pd.Timestamp(dataset["last_time"])
+            if dataset and dataset.get("last_time") else None
+        )
         for key, (start, end) in ordered:
             incoming = frame[
                 (frame.timestamp >= pd.Timestamp(start))
@@ -2439,6 +1921,12 @@ class MarketDataRepository:
             if incoming.empty:
                 continue
             current = existing_by_period.get(key, pd.DataFrame())
+            original_current = current
+            if replace_range and not current.empty:
+                incoming_days = set(incoming.timestamp.dt.normalize())
+                current = current[
+                    ~current.timestamp.dt.normalize().isin(incoming_days)
+                ].copy()
             if timeframe in {"1week", "1month"} and not current.empty:
                 period_name = "W-FRI" if timeframe == "1week" else "M"
                 incoming_periods = set(incoming.timestamp.dt.to_period(period_name))
@@ -2455,11 +1943,12 @@ class MarketDataRepository:
             all_inserted += len(inserted)
             all_updated += len(updated)
             changed_periods[key] = combined
-            row_delta += len(combined) - len(current)
-            old_synthetic = int(current.is_synthetic.sum()) if "is_synthetic" in current else 0
+            row_delta += len(combined) - len(original_current)
+            all_removed += max(0, len(original_current) - len(current))
+            old_synthetic = int(original_current.is_synthetic.sum()) if "is_synthetic" in original_current else 0
             new_synthetic = int(combined.is_synthetic.sum()) if "is_synthetic" in combined else 0
             synthetic_delta += new_synthetic - old_synthetic
-            old_pending = int(current.source_verified.eq(False).sum()) if "source_verified" in current else 0
+            old_pending = int(original_current.source_verified.eq(False).sum()) if "source_verified" in original_current else 0
             new_pending = int(combined.source_verified.eq(False).sum()) if "source_verified" in combined else 0
             pending_delta += new_pending - old_pending
             for row in [*inserted, *updated]:
@@ -2472,43 +1961,71 @@ class MarketDataRepository:
                 "symbol": symbol, "timeframe": timeframe, "version": current_version,
                 "rows_read": len(frame), "inserted": 0, "updated": 0,
                 "unchanged": unchanged, "removed": 0, "synthetic": 0,
-                "status": dataset.get("status"), "conflicts": conflicts,
-                "file_count": len(increments), "bytes": 0, "changed_dates": [],
+                "status": (dataset or {}).get("status"), "conflicts": conflicts,
+                "file_count": len(current_shards), "shard_count": 0, "bytes": 0, "changed_dates": [],
             }
 
         version = current_version + 1
         now = utc_now()
         written: list[dict] = []
         skip_periods = set(changed_periods)
-        for index, (key, combined) in enumerate(sorted(changed_periods.items()), start=1):
-            written_file = self._write_increment_file(symbol, timeframe, adjustment, key, combined)
-            _, start, end = self._storage_period(timeframe, combined.timestamp.iloc[0])
-            written.append({
-                **written_file, "period_key": key, "period_start": start,
-                "period_end": end, "sequence": int(index),
-            })
+        transaction_path = self.package.begin_transaction({
+            "kind": "dataset", "status": "writing_shards",
+            "symbol": symbol, "timeframe": timeframe, "adjustment": adjustment,
+            "base_version": current_version, "version": version,
+        })[1]
+        try:
+            for index, (key, combined) in enumerate(sorted(changed_periods.items()), start=1):
+                written_file = self._write_period_shard(symbol, timeframe, adjustment, key, combined)
+                _, start, end = self._storage_period(timeframe, combined.timestamp.iloc[0])
+                written.append({
+                    **written_file, "period_key": key, "period_start": start,
+                    "period_end": end, "sequence": int(index),
+                })
+        except Exception:
+            self.package.finish_transaction(transaction_path)
+            raise
+        self.package.update_transaction(transaction_path, {
+            "status": "shards_installed", "shards": [row["path"] for row in written],
+        })
 
-        kept_increments = [
-            row for row in increments if row["period_key"] not in skip_periods
+        kept_shards = [
+            row for row in current_shards if row["period_key"] not in skip_periods
         ]
         total_bytes = (
-            sum(int(row.get("size") or 0) for row in [*base_files, *kept_increments])
+            sum(int(row.get("size") or 0) for row in kept_shards)
             + sum(int(row["size"]) for row in written)
         )
 
-        row_count = max(0, int(dataset.get("row_count") or 0) + row_delta)
-        synthetic_rows = max(0, int(dataset.get("synthetic_rows") or 0) + synthetic_delta)
-        pending_after = max(0, int(dataset.get("pending_rows") or 0) + pending_delta)
+        row_count = max(0, int((dataset or {}).get("row_count") or 0) + row_delta)
+        synthetic_rows = max(0, int((dataset or {}).get("synthetic_rows") or 0) + synthetic_delta)
+        pending_after = max(0, int((dataset or {}).get("pending_rows") or 0) + pending_delta)
         status = "pending_validation" if pending_after or report.get("pending_validation") else "ready"
         if report.get("gaps"):
             status = "partial"
         completed_value = (
             completed_through if completed_through is not None
             else _time_text(new_last) if advance_completed and new_last is not None
-            else dataset.get("completed_through")
+            else (dataset or {}).get("completed_through")
         )
-        item_metadata = {**_load(dataset.get("metadata"), {}), **(metadata or {}),
-                         "layout": "base+increments"}
+        item_metadata = {
+            **_load((dataset or {}).get("metadata"), {}), **(metadata or {}),
+            "layout": "time_partitioned",
+        }
+        published_payload = {
+            "symbol": symbol, "timeframe": timeframe, "adjustment": adjustment,
+            "version": version, "row_count": row_count,
+            "first_time": _time_text(new_first), "last_time": _time_text(new_last),
+            "completed_through": completed_value, "status": status,
+            "reason": report.get("reason"), "source": source, "created_at": now,
+            "report": report, "raw_rows": max(0, row_count - synthetic_rows),
+            "synthetic_rows": synthetic_rows, "pending_rows": pending_after,
+            "metadata": item_metadata,
+            "shards": self._manifest_shards([*kept_shards, *written]),
+            "derived": derived,
+        }
+        self.package.publish_dataset(published_payload, expected_version=current_version)
+        self.package.update_transaction(transaction_path, {"status": "manifest_published"})
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
@@ -2521,21 +2038,18 @@ class MarketDataRepository:
                     symbol, timeframe, adjustment, version, now, row_count,
                     max(0, row_count - synthetic_rows), synthetic_rows,
                     pending_after, _time_text(new_first), _time_text(new_last), status,
-                    source, len(base_files) + len(kept_increments) + len(written),
+                    source, len(kept_shards) + len(written),
                     total_bytes,
                     _json(report),
                 ),
             )
-            self._copy_version_files(
-                db, symbol, timeframe, adjustment, current_version, version
-            )
-            self._copy_current_increments(
+            self._copy_version_shards(
                 db, symbol, timeframe, adjustment, current_version, version,
                 skip_periods=skip_periods,
             )
             for row in written:
                 db.execute(
-                    """INSERT INTO parquet_increments(
+                    """INSERT INTO parquet_shards(
                        symbol,timeframe,adjustment,version,sequence,period_key,
                        period_start,period_end,path,sha256,row_count,first_time,
                        last_time,size,schema_version)
@@ -2548,18 +2062,33 @@ class MarketDataRepository:
                         row["schema_version"],
                     ),
                 )
-            db.execute(
-                """UPDATE parquet_datasets SET current_version=?,first_time=?,last_time=?,
-                   completed_through=?,row_count=?,raw_rows=?,synthetic_rows=?,pending_rows=?,
-                   status=?,reason=?,metadata=?,updated_at=?
-                   WHERE symbol=? AND timeframe=? AND adjustment=?""",
-                (
-                    version, _time_text(new_first), _time_text(new_last),
-                    completed_value, row_count, max(0, row_count - synthetic_rows),
-                    synthetic_rows, pending_after, status, report.get("reason"),
-                    _json(item_metadata), now, symbol, timeframe, adjustment,
-                ),
-            )
+            if dataset:
+                db.execute(
+                    """UPDATE parquet_datasets SET current_version=?,first_time=?,last_time=?,
+                       completed_through=?,row_count=?,raw_rows=?,synthetic_rows=?,pending_rows=?,
+                       status=?,reason=?,metadata=?,updated_at=?
+                       WHERE symbol=? AND timeframe=? AND adjustment=?""",
+                    (
+                        version, _time_text(new_first), _time_text(new_last),
+                        completed_value, row_count, max(0, row_count - synthetic_rows),
+                        synthetic_rows, pending_after, status, report.get("reason"),
+                        _json(item_metadata), now, symbol, timeframe, adjustment,
+                    ),
+                )
+            else:
+                db.execute(
+                    """INSERT INTO parquet_datasets(
+                       symbol,timeframe,adjustment,current_version,first_time,last_time,
+                       completed_through,row_count,raw_rows,synthetic_rows,pending_rows,
+                       status,reason,metadata,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        symbol, timeframe, adjustment, version, _time_text(new_first),
+                        _time_text(new_last), completed_value, row_count,
+                        max(0, row_count - synthetic_rows), synthetic_rows, pending_after,
+                        status, report.get("reason"), _json(item_metadata), now, now,
+                    ),
+                )
             if fingerprint:
                 db.execute(
                     """INSERT OR REPLACE INTO parquet_imports(
@@ -2585,22 +2114,28 @@ class MarketDataRepository:
                         derived.get("start_time"), derived.get("end_time"), now,
                     ),
                 )
+            for changed_day in sorted(changed_dates):
+                db.execute(
+                    "DELETE FROM parquet_day_validation WHERE symbol=? AND timeframe=? "
+                    "AND adjustment=? AND trade_date=?",
+                    (symbol, timeframe, adjustment, changed_day),
+                )
+            db.execute(
+                "UPDATE parquet_derived SET stale=1,updated_at=? WHERE symbol=? "
+                "AND adjustment=? AND source_timeframe=? AND source_version<?",
+                (now, symbol, adjustment, timeframe, version),
+            )
             db.commit()
-        self.invalidate_day_validations(
-            symbol, timeframe, sorted(changed_dates), adjustment=adjustment,
-        )
-        self._mark_derived_stale(symbol, adjustment, timeframe, version)
-        compaction = self._compact_dataset_if_needed(
-            symbol, timeframe, adjustment, version
-        )
+        self.package.update_transaction(transaction_path, {"status": "database_committed"})
+        self.package.finish_transaction(transaction_path)
         return {
             "symbol": symbol, "timeframe": timeframe, "version": version,
             "rows_read": len(frame), "inserted": all_inserted, "updated": all_updated,
-            "unchanged": unchanged, "removed": 0, "synthetic": int(frame.is_synthetic.sum()),
+            "unchanged": unchanged, "removed": all_removed, "synthetic": int(frame.is_synthetic.sum()),
             "status": status, "conflicts": conflicts, "file_count": len(written),
             "bytes": sum(int(row["size"]) for row in written),
-            "changed_dates": sorted(changed_dates), "increment_count": len(written),
-            "compaction": compaction,
+            "changed_dates": sorted(changed_dates), "shard_count": len(written),
+            "layout": "time_partitioned",
         }
 
     def _commit_snapshot_bars(
@@ -2616,62 +2151,104 @@ class MarketDataRepository:
         metadata: dict, completed_through: str | None,
         advance_completed: bool, derived: dict | None,
     ) -> dict:
-        """Replace the visible base with an immutable snapshot, dropping overlays."""
+        """Publish a complete input snapshot and withdraw omitted time buckets."""
         with self._connect() as db:
             dataset_row = self._dataset_row(db, symbol, timeframe, adjustment)
             dataset = dict(dataset_row) if dataset_row else None
             current_version = int(dataset["current_version"]) if dataset else 0
-            current_files = self._current_files(
+            current_file_count = len(self._current_shards(
                 db, symbol, timeframe, adjustment, current_version
-            ) if dataset else []
-            old_days = {
-                pd.Timestamp(row["trade_date"]).normalize()
-                for row in db.execute(
-                    """SELECT trade_date FROM parquet_day_validation
-                       WHERE symbol=? AND timeframe=? AND adjustment=?""",
-                    (symbol, timeframe, adjustment),
-                ).fetchall()
-            }
-        incoming_days = set(frame.timestamp.dt.normalize().unique())
-        new_hashes = self._frame_day_hashes(frame)
-        changed_days = (
-            {pd.Timestamp(day).normalize() for day in incoming_days}
-            if dataset is None and not old_days else
-            {pd.Timestamp(day).normalize() for day in old_days - incoming_days}
-        )
-        with self._connect() as db:
-            records = db.execute(
-                """SELECT trade_date,source_hash FROM parquet_day_validation
-                   WHERE symbol=? AND timeframe=? AND adjustment=?""",
-                (symbol, timeframe, adjustment),
-            ).fetchall()
-        for record in records:
-            day = pd.Timestamp(record["trade_date"]).normalize()
-            if new_hashes.get(day) != record["source_hash"]:
-                changed_days.add(day)
-        validated_days = {
-            pd.Timestamp(record["trade_date"]).normalize() for record in records
-        }
-        changed_days.update(
-            pd.Timestamp(day).normalize() for day in incoming_days - validated_days
-        )
-
-        if any(self._is_package_source(row) for row in current_files):
-            # The old version must keep its own bytes before an external file is
-            # replaced by the new snapshot.
-            self._backup_and_point_old_version(
-                symbol, timeframe, adjustment, current_version, current_files,
+            ))
+        old_rows: dict[pd.Timestamp, dict] = {}
+        if current_version > 0:
+            current = self._read_version(
+                symbol, timeframe, adjustment, current_version,
+                use_cache=False,
             )
-
+            old_rows = {
+                pd.Timestamp(row["timestamp"]): row
+                for row in current.to_dict("records")
+            }
+            new_rows = {
+                pd.Timestamp(row["timestamp"]): row
+                for row in frame.to_dict("records")
+            }
+            identical = (
+                len(old_rows) == len(new_rows)
+                and old_rows.keys() == new_rows.keys()
+                and all(self._same_market_row(old_rows[key], new_rows[key]) for key in old_rows)
+            )
+            if identical:
+                if fingerprint:
+                    with self._connect() as db:
+                        db.execute(
+                            """INSERT OR REPLACE INTO parquet_imports(
+                               symbol,timeframe,adjustment,fingerprint,params_hash,parser_version,
+                               file_name,status,rows_read,inserted,updated,unchanged,synthetic_rows,
+                               version,report,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (
+                                symbol, timeframe, adjustment, fingerprint, params_hash,
+                                PARSER_VERSION, file_name, "completed", len(frame), 0, 0,
+                                len(frame), int(frame.is_synthetic.sum()), current_version,
+                                _json(report), utc_now(),
+                            ),
+                        )
+                return {
+                    "symbol": symbol, "timeframe": timeframe, "version": current_version,
+                    "rows_read": len(frame), "inserted": 0, "updated": 0,
+                    "unchanged": len(frame), "removed": 0,
+                    "synthetic": int(frame.is_synthetic.sum()),
+                    "status": dataset.get("status"), "conflicts": [],
+                    "file_count": current_file_count, "shard_count": 0, "bytes": 0,
+                    "changed_dates": [], "layout": "time_partitioned",
+                }
+        new_rows = {
+            pd.Timestamp(row["timestamp"]): row
+            for row in frame.to_dict("records")
+        }
+        changed_timestamps = {
+            stamp for stamp in old_rows.keys() | new_rows.keys()
+            if stamp not in old_rows or stamp not in new_rows
+            or not self._same_market_row(old_rows[stamp], new_rows[stamp])
+        }
+        changed_days = {stamp.normalize() for stamp in changed_timestamps}
+        changed_day_values = sorted(str(day.date()) for day in changed_days)
         version = current_version + 1
         now = utc_now()
-        base = self._write_partition(
-            symbol, timeframe, adjustment, 0, frame,
-            period="all", base_dir=self.package.bases_dir,
-        )
+        bounds: dict[str, tuple[str, str]] = {}
+        for stamp in frame.timestamp:
+            key, start, end = self._storage_period(timeframe, stamp)
+            bounds[key] = (start, end)
+        transaction_path = self.package.begin_transaction({
+            "kind": "dataset", "status": "writing_shards",
+            "symbol": symbol, "timeframe": timeframe, "adjustment": adjustment,
+            "base_version": current_version, "version": version,
+            "changed_dates": changed_day_values,
+        })[1]
+        written = []
+        try:
+            for sequence, (key, (start, end)) in enumerate(sorted(bounds.items()), start=1):
+                lower, upper = pd.Timestamp(start), pd.Timestamp(end)
+                part = frame[(frame.timestamp >= lower) & (frame.timestamp < upper)]
+                if part.empty:
+                    continue
+                item = self._write_period_shard(symbol, timeframe, adjustment, key, part)
+                written.append({
+                    **item, "period_key": key, "period_start": start,
+                    "period_end": end, "sequence": sequence,
+                })
+        except Exception:
+            self.package.finish_transaction(transaction_path)
+            raise
+        if not written:
+            self.package.finish_transaction(transaction_path)
+            raise MarketDataError("完整快照没有可发布的时间分片")
+        self.package.update_transaction(transaction_path, {
+            "status": "shards_installed", "shards": [row["path"] for row in written],
+        })
         synthetic_rows = int(frame.is_synthetic.sum())
-        pending_after = int(frame.source_verified.eq(False).sum())
-        status = "pending_validation" if pending_after or report.get("pending_validation") else "ready"
+        pending_rows = int(frame.source_verified.eq(False).sum())
+        status = "pending_validation" if pending_rows or report.get("pending_validation") else "ready"
         if report.get("gaps"):
             status = "partial"
         first_time = frame.timestamp.min()
@@ -2679,33 +2256,55 @@ class MarketDataRepository:
         completed_value = completed_through if completed_through is not None else (
             _time_text(last_time) if advance_completed else (dataset or {}).get("completed_through")
         )
-        item_metadata = {**((dataset or {}).get("metadata") and _load(dataset["metadata"], {}) or {}),
-                         **(metadata or {}), "layout": "immutable-base"}
+        item_metadata = {
+            **_load((dataset or {}).get("metadata"), {}), **(metadata or {}),
+            "layout": "time_partitioned", "import_mode": "snapshot",
+        }
+        self.package.publish_dataset({
+            "symbol": symbol, "timeframe": timeframe, "adjustment": adjustment,
+            "version": version, "row_count": len(frame),
+            "first_time": _time_text(first_time), "last_time": _time_text(last_time),
+            "completed_through": completed_value, "status": status,
+            "reason": report.get("reason"), "source": source, "created_at": now,
+            "report": report, "raw_rows": len(frame) - synthetic_rows,
+            "synthetic_rows": synthetic_rows, "pending_rows": pending_rows,
+            "metadata": item_metadata, "shards": self._manifest_shards(written),
+            "derived": derived,
+        }, expected_version=current_version)
+        self.package.update_transaction(transaction_path, {"status": "manifest_published"})
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
             db.execute(
-                """INSERT OR REPLACE INTO parquet_versions(
+                """INSERT INTO parquet_versions(
                    symbol,timeframe,adjustment,version,created_at,row_count,raw_rows,
                    synthetic_rows,pending_rows,first_time,last_time,status,source,
                    file_count,bytes,report) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     symbol, timeframe, adjustment, version, now, len(frame),
-                    len(frame) - synthetic_rows, synthetic_rows, pending_after,
+                    len(frame) - synthetic_rows, synthetic_rows, pending_rows,
                     _time_text(first_time), _time_text(last_time), status, source,
-                    1, int(base["size"]), _json(report),
+                    len(written), sum(int(row["size"]) for row in written), _json(report),
                 ),
             )
-            db.execute(
-                """INSERT INTO parquet_files(
-                   symbol,timeframe,adjustment,version,partition_key,path,sha256,
-                   row_count,first_time,last_time,size,schema_version)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    symbol, timeframe, adjustment, version, base["partition_key"],
-                    base["path"], base["sha256"], base["row_count"],
-                    base["first_time"], base["last_time"], base["size"],
-                    base["schema_version"],
-                ),
+            for row in written:
+                db.execute(
+                    """INSERT INTO parquet_shards(
+                       symbol,timeframe,adjustment,version,sequence,period_key,
+                       period_start,period_end,path,sha256,row_count,first_time,
+                       last_time,size,schema_version)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        symbol, timeframe, adjustment, version, row["sequence"],
+                        row["period_key"], row["period_start"], row["period_end"],
+                        row["path"], row["sha256"], row["row_count"],
+                        row["first_time"], row["last_time"], row["size"],
+                        row["schema_version"],
+                    ),
+                )
+            dataset_values = (
+                _time_text(first_time), _time_text(last_time), completed_value,
+                len(frame), len(frame) - synthetic_rows, synthetic_rows, pending_rows,
+                status, report.get("reason"), _json(item_metadata), now,
             )
             if dataset:
                 db.execute(
@@ -2713,12 +2312,7 @@ class MarketDataRepository:
                        completed_through=?,row_count=?,raw_rows=?,synthetic_rows=?,pending_rows=?,
                        status=?,reason=?,metadata=?,updated_at=?
                        WHERE symbol=? AND timeframe=? AND adjustment=?""",
-                    (
-                        version, _time_text(first_time), _time_text(last_time),
-                        completed_value, len(frame), len(frame) - synthetic_rows,
-                        synthetic_rows, pending_after, status, report.get("reason"),
-                        _json(item_metadata), now, symbol, timeframe, adjustment,
-                    ),
+                    (version, *dataset_values, symbol, timeframe, adjustment),
                 )
             else:
                 db.execute(
@@ -2728,10 +2322,11 @@ class MarketDataRepository:
                        status,reason,metadata,created_at,updated_at)
                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
-                        symbol, timeframe, adjustment, version, _time_text(first_time),
-                        _time_text(last_time), completed_value, len(frame),
-                        len(frame) - synthetic_rows, synthetic_rows, pending_after, status,
-                        report.get("reason"), _json(item_metadata), now, now,
+                        symbol, timeframe, adjustment, version,
+                        _time_text(first_time), _time_text(last_time), completed_value,
+                        len(frame), len(frame) - synthetic_rows, synthetic_rows,
+                        pending_rows, status, report.get("reason"), _json(item_metadata),
+                        now, now,
                     ),
                 )
             if fingerprint:
@@ -2746,39 +2341,51 @@ class MarketDataRepository:
                         0, 0, synthetic_rows, version, _json(report), now,
                     ),
                 )
+            if derived:
+                db.execute(
+                    """INSERT OR REPLACE INTO parquet_derived(
+                       symbol,timeframe,adjustment,source_timeframe,target_timeframe,
+                       source_version,start_time,end_time,stale,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,0,?)""",
+                    (
+                        symbol, timeframe, adjustment, derived["source_timeframe"],
+                        timeframe, int(derived["source_version"]), derived.get("start_time"),
+                        derived.get("end_time"), now,
+                    ),
+                )
+            for start in range(0, len(changed_day_values), 400):
+                changed_chunk = changed_day_values[start:start + 400]
+                if not changed_chunk:
+                    continue
+                placeholders = ",".join("?" for _ in changed_chunk)
+                db.execute(
+                    "DELETE FROM parquet_day_validation WHERE symbol=? AND timeframe=? "
+                    "AND adjustment=? AND trade_date IN (" + placeholders + ")",
+                    (symbol, timeframe, adjustment, *changed_chunk),
+                )
+            for changed_day in changed_day_values:
+                db.execute(
+                    "DELETE FROM parquet_coverage WHERE symbol=? AND timeframe=? "
+                    "AND adjustment=? AND date(start_time)<=? AND date(end_time)>=?",
+                    (symbol, timeframe, adjustment, changed_day, changed_day),
+                )
+            db.execute(
+                "UPDATE parquet_derived SET stale=1,updated_at=? WHERE symbol=? "
+                "AND adjustment=? AND source_timeframe=? AND source_version<?",
+                (now, symbol, adjustment, timeframe, version),
+            )
             db.commit()
-        self.invalidate_day_validations(
-            symbol, timeframe,
-            sorted(str(day.date()) for day in changed_days), adjustment=adjustment,
-        )
-        self._mark_derived_stale(symbol, adjustment, timeframe, version)
+        self.package.update_transaction(transaction_path, {"status": "database_committed"})
+        self.package.finish_transaction(transaction_path)
         return {
             "symbol": symbol, "timeframe": timeframe, "version": version,
             "rows_read": len(frame), "inserted": len(frame), "updated": 0,
             "unchanged": 0, "removed": 0, "synthetic": synthetic_rows,
-            "status": status, "conflicts": [], "file_count": 1,
-            "bytes": int(base["size"]), "changed_dates": sorted(
-                str(day.date()) for day in changed_days
-            ), "layout": "immutable-base",
+            "status": status, "conflicts": [], "file_count": len(written), "shard_count": len(written),
+            "bytes": sum(int(row["size"]) for row in written),
+            "changed_dates": sorted(str(day.date()) for day in changed_days),
+            "layout": "time_partitioned",
         }
-
-    @staticmethod
-    def _frame_day_hashes(frame: pd.DataFrame) -> dict[pd.Timestamp, str]:
-        fields = [
-            field for field in (
-                "timestamp", "open", "high", "low", "close", "volume", "turnover",
-                "preclose", "tradestatus", "is_st", "source", "source_verified",
-                "is_synthetic", "is_auction_placeholder",
-            ) if field in frame
-        ]
-        result = {}
-        for day, part in frame.groupby(frame.timestamp.dt.normalize(), sort=True):
-            canonical = part[fields].sort_values("timestamp").reset_index(drop=True)
-            digest = hashlib.sha256(
-                pd.util.hash_pandas_object(canonical, index=False).values.tobytes()
-            ).hexdigest()
-            result[pd.Timestamp(day).normalize()] = digest
-        return result
 
     def commit_bars(
         self, symbol: str, timeframe: str, frame: pd.DataFrame, *,
@@ -2789,17 +2396,19 @@ class MarketDataRepository:
         replace_range: bool = False, advance_completed: bool = True,
         import_mode: str = "merge",
     ) -> dict:
+        """Publish merged or replacement input as immutable time-bucket shards."""
         timeframe = normalize_timeframe(timeframe)
+        self._assert_writable()
         frame = self._prepare_frame(frame)
         if frame.empty:
             raise MarketDataError("没有可提交的行情记录")
-        params_hash = params_hash or hashlib.sha256(f"{source}|{adjustment}".encode()).hexdigest()
-        report = report or {}
-        metadata = metadata or {}
-        with self._connect() as db:
-            existing_dataset = self._dataset_row(db, symbol, timeframe, adjustment)
         if import_mode not in {"merge", "snapshot"}:
             raise MarketDataError("import_mode 应为 merge 或 snapshot")
+        params_hash = params_hash or hashlib.sha256(
+            f"{source}|{adjustment}".encode()
+        ).hexdigest()
+        report = report or {}
+        metadata = metadata or {}
         if import_mode == "snapshot":
             return self._commit_snapshot_bars(
                 symbol, timeframe, frame, adjustment=adjustment, source=source,
@@ -2807,262 +2416,13 @@ class MarketDataRepository:
                 report=report, metadata=metadata, completed_through=completed_through,
                 advance_completed=advance_completed, derived=derived,
             )
-        if existing_dataset is not None and not replace_range:
-            return self._commit_incremental_bars(
-                symbol, timeframe, frame, adjustment=adjustment, source=source,
-                file_name=file_name, fingerprint=fingerprint, params_hash=params_hash,
-                report=report, metadata=metadata, completed_through=completed_through,
-                advance_completed=advance_completed, derived=derived,
-            )
-        with self.lock(symbol, timeframe, adjustment):
-            with self._connect() as db:
-                dataset_row = self._dataset_row(db, symbol, timeframe, adjustment)
-                dataset = dict(dataset_row) if dataset_row else None
-                current_version = int(dataset["current_version"]) if dataset else 0
-                old_files = self._current_files(db, symbol, timeframe, adjustment, current_version)
-            incoming_years = {int(year) for year in frame.timestamp.dt.year.unique()}
-            affected_years = set(incoming_years)
-            if timeframe in {"1week", "1month"}:
-                for year in incoming_years:
-                    affected_years.update((year - 1, year, year + 1))
-            existing = pd.DataFrame()
-            if old_files and affected_years:
-                existing = self._read_version(
-                    symbol, timeframe, adjustment, current_version,
-                    years=affected_years, use_cache=False, file_lock=False,
-                )
-            existing_by_ts: dict[pd.Timestamp, dict] = {}
-            if not existing.empty:
-                for row in existing.to_dict("records"):
-                    existing_by_ts[pd.Timestamp(row["timestamp"])] = row
-            removals: set[pd.Timestamp] = set()
-            incoming_days = set(frame.timestamp.dt.normalize())
-            if replace_range:
-                removals.update(
-                    stamp for stamp in existing_by_ts
-                    if pd.Timestamp(stamp).normalize() in incoming_days
-                )
-            if timeframe in {"1week", "1month"} and not replace_range:
-                period_name = "W-FRI" if timeframe == "1week" else "M"
-                incoming_periods = set(frame.timestamp.dt.to_period(period_name))
-                incoming_timestamps = set(frame.timestamp)
-                for stamp in existing_by_ts:
-                    if stamp in incoming_timestamps:
-                        continue
-                    if pd.Timestamp(stamp).to_period(period_name) in incoming_periods:
-                        removals.add(stamp)
-            inserted: list[dict] = []
-            updated: list[dict] = []
-            unchanged = 0
-            conflicts: list[dict] = []
-            new_dataset = dataset is None
-            if new_dataset and not existing_by_ts:
-                # First import needs no per-row Python dictionary copies. This
-                # path is used by the million-row ETF minute files.
-                combined = frame.copy()
-            else:
-                frame_records = frame.to_dict("records")
-                for row in frame_records:
-                    stamp = pd.Timestamp(row["timestamp"])
-                    old = existing_by_ts.get(stamp)
-                    if old is None:
-                        inserted.append(row)
-                        continue
-                    if self._same_market_row(old, row):
-                        unchanged += 1
-                        continue
-                    old_rank = self._quality_rank(
-                        old.get("source"), old.get("source_verified"), old.get("is_synthetic")
-                    )
-                    new_rank = self._quality_rank(
-                        row.get("source"), row.get("source_verified"), row.get("is_synthetic")
-                    )
-                    if new_rank < old_rank:
-                        unchanged += 1
-                        conflicts.append({
-                            "timestamp": _time_text(stamp),
-                            "reason": "较低优先级记录不能覆盖已核验或原始行情",
-                        })
-                        continue
-                    updated.append(row)
-                for stamp in removals:
-                    existing_by_ts.pop(stamp, None)
-                for row in [*inserted, *updated]:
-                    existing_by_ts[pd.Timestamp(row["timestamp"])] = row
-                combined = pd.DataFrame(existing_by_ts.values())
-                if not combined.empty:
-                    combined = self._prepare_frame(combined)
-            removed_count = len(removals)
-            changed = len(frame) if new_dataset else len(inserted) + len(updated) + removed_count
-            old_status = dataset.get("status") if dataset else None
-            pending_flags = bool(report.get("pending_validation"))
-            gaps = bool(report.get("gaps"))
-            if new_dataset:
-                pending_after = (
-                    int(combined["source_verified"].eq(False).sum())
-                    if not combined.empty and "source_verified" in combined else 0
-                )
-                synthetic_rows = (
-                    int(combined["is_synthetic"].sum()) if not combined.empty else 0
-                )
-            elif changed > 0:
-                previous_pending = int(dataset.get("pending_rows") or 0)
-                previous_synthetic = int(dataset.get("synthetic_rows") or 0)
-                old_pending = (
-                    int(existing["source_verified"].eq(False).sum())
-                    if not existing.empty and "source_verified" in existing else 0
-                )
-                old_synthetic = (
-                    int(existing["is_synthetic"].sum()) if not existing.empty else 0
-                )
-                new_pending = (
-                    int(combined["source_verified"].eq(False).sum())
-                    if not combined.empty and "source_verified" in combined else 0
-                )
-                new_synthetic = (
-                    int(combined["is_synthetic"].sum()) if not combined.empty else 0
-                )
-                pending_after = max(0, previous_pending - old_pending + new_pending)
-                synthetic_rows = max(0, previous_synthetic - old_synthetic + new_synthetic)
-            else:
-                pending_after = int(dataset.get("pending_rows") or 0)
-                synthetic_rows = int(dataset.get("synthetic_rows") or 0)
-            status = "pending_validation" if pending_after or pending_flags else "ready"
-            if gaps:
-                status = "partial"
-            now = utc_now()
-            semantic_change = changed > 0 or new_dataset or status != old_status
-            version = current_version + 1 if semantic_change else current_version
-            files = list(old_files)
-            if semantic_change and changed > 0:
-                files = [
-                    self._write_source_data(
-                        symbol, timeframe, adjustment, version,
-                        combined, old_files,
-                    )
-                ]
-            if not files and semantic_change:
-                raise MarketDataError("行情提交后没有可发布的分区")
-            first_time = min(
-                (row["first_time"] for row in files if row.get("first_time")), default=None
-            )
-            last_time = max(
-                (row["last_time"] for row in files if row.get("last_time")), default=None
-            )
-            row_count = sum(int(row["row_count"]) for row in files)
-            raw_rows = row_count - synthetic_rows
-            completed_value = (
-                completed_through if completed_through is not None
-                else last_time if advance_completed
-                else (dataset.get("completed_through") if dataset else None)
-            )
-            item_metadata = {**(_load(dataset["metadata"], {}) if dataset else {}), **metadata}
-            with self._connect() as db:
-                db.execute("BEGIN IMMEDIATE")
-                if semantic_change:
-                    db.execute(
-                        """INSERT OR REPLACE INTO parquet_versions(
-                           symbol,timeframe,adjustment,version,created_at,row_count,raw_rows,
-                           synthetic_rows,pending_rows,first_time,last_time,status,source,
-                           file_count,bytes,report
-                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            symbol, timeframe, adjustment, version, now, row_count, raw_rows,
-                            synthetic_rows, pending_after, first_time, last_time, status, source,
-                            len(files), sum(int(row["size"]) for row in files), _json(report),
-                        ),
-                    )
-                    db.execute(
-                        """DELETE FROM parquet_files WHERE symbol=? AND timeframe=?
-                           AND adjustment=? AND version=?""",
-                        (symbol, timeframe, adjustment, version),
-                    )
-                    for row in files:
-                        db.execute(
-                            """INSERT INTO parquet_files(
-                               symbol,timeframe,adjustment,version,partition_key,path,sha256,
-                               row_count,first_time,last_time,size,schema_version
-                               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (
-                                symbol, timeframe, adjustment, version, row["partition_key"],
-                                row["path"], row["sha256"], row["row_count"], row["first_time"],
-                                row["last_time"], row["size"], row["schema_version"],
-                            ),
-                        )
-                if dataset:
-                    db.execute(
-                        """UPDATE parquet_datasets SET current_version=?,first_time=?,last_time=?,
-                           completed_through=?,row_count=?,raw_rows=?,synthetic_rows=?,pending_rows=?,
-                           status=?,reason=?,metadata=?,updated_at=?
-                           WHERE symbol=? AND timeframe=? AND adjustment=?""",
-                        (
-                            version, first_time, last_time, completed_value, row_count, raw_rows,
-                            synthetic_rows, pending_after, status, report.get("reason"),
-                            _json(item_metadata), now, symbol, timeframe, adjustment,
-                        ),
-                    )
-                else:
-                    db.execute(
-                        """INSERT INTO parquet_datasets(
-                           symbol,timeframe,adjustment,current_version,first_time,last_time,
-                           completed_through,row_count,raw_rows,synthetic_rows,pending_rows,
-                           status,reason,metadata,created_at,updated_at
-                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            symbol, timeframe, adjustment, version, first_time, last_time,
-                            completed_value, row_count, raw_rows, synthetic_rows, pending_after,
-                            status, report.get("reason"), _json(item_metadata), now, now,
-                        ),
-                    )
-                if fingerprint:
-                    db.execute(
-                        """INSERT OR REPLACE INTO parquet_imports(
-                           symbol,timeframe,adjustment,fingerprint,params_hash,parser_version,
-                           file_name,status,rows_read,inserted,updated,unchanged,synthetic_rows,
-                           version,report,updated_at
-                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            symbol, timeframe, adjustment, fingerprint, params_hash, PARSER_VERSION,
-                            file_name, "completed", len(frame),
-                            len(frame) if new_dataset else len(inserted),
-                            len(updated), unchanged,
-                            int(frame["is_synthetic"].sum()) if "is_synthetic" in frame else 0,
-                            version, _json({**report, "conflicts": conflicts}), now,
-                        ),
-                    )
-                if derived:
-                    db.execute(
-                        """INSERT OR REPLACE INTO parquet_derived(
-                           symbol,timeframe,adjustment,source_timeframe,target_timeframe,
-                           source_version,start_time,end_time,stale,updated_at
-                           ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            symbol, timeframe, adjustment, derived["source_timeframe"], timeframe,
-                            int(derived["source_version"]), derived.get("start_time"),
-                            derived.get("end_time"), 0, now,
-                        ),
-                    )
-                if changed:
-                    db.execute(
-                        """UPDATE parquet_derived SET stale=1 WHERE symbol=? AND adjustment=?
-                           AND source_timeframe=? AND source_version<?""",
-                        (symbol, adjustment, timeframe, version),
-                    )
-                db.commit()
-            if changed:
-                self._mark_derived_stale(symbol, adjustment, timeframe, version)
-            transaction_path = files[0].get("_transaction_path") if len(files) == 1 else None
-            if transaction_path:
-                self.package.finish_transaction(Path(transaction_path))
-        return {
-            "symbol": symbol, "timeframe": timeframe, "version": version,
-            "rows_read": len(frame),
-            "inserted": len(frame) if new_dataset else len(inserted),
-            "updated": len(updated), "unchanged": unchanged, "removed": removed_count,
-            "synthetic": int(frame["is_synthetic"].sum()) if "is_synthetic" in frame else 0,
-            "status": status, "conflicts": conflicts, "file_count": len(files),
-            "bytes": sum(int(row["size"]) for row in files),
-        }
+        return self._commit_merge_bars(
+            symbol, timeframe, frame, adjustment=adjustment, source=source,
+            file_name=file_name, fingerprint=fingerprint, params_hash=params_hash,
+            report=report, metadata=metadata, completed_through=completed_through,
+            advance_completed=advance_completed, derived=derived,
+            replace_range=replace_range,
+        )
 
     def _mark_derived_stale(self, symbol, adjustment, source_timeframe, source_version):
         with self._connect() as db:
@@ -3162,28 +2522,6 @@ class MarketDataRepository:
             item["report"] = _load(item.get("report"), {})
             output.append(item)
         return output
-
-    def changed_source_validation_days(
-        self, symbol: str, timeframe: str, file_row: dict,
-        adjustment: str = "none",
-    ) -> list[str]:
-        """Compare a replaced source file with persisted per-day hashes."""
-        records = self.day_validations(symbol, timeframe, adjustment=adjustment)
-        if not records:
-            return []
-        try:
-            frame = self._read_source_files(
-                [file_row], symbol=symbol, timeframe=timeframe,
-            )
-        except Exception:
-            return sorted({str(row["trade_date"])[:10] for row in records})
-        new_hashes = self._frame_day_hashes(frame)
-        changed = []
-        for row in records:
-            day = pd.Timestamp(row["trade_date"]).normalize()
-            if new_hashes.get(day) != row.get("source_hash"):
-                changed.append(str(day.date()))
-        return changed
 
     def trading_days(self, symbol: str, start, end) -> pd.DatetimeIndex:
         """Combine auxiliary dates with the package's actual daily trading series.
@@ -3336,31 +2674,11 @@ class MarketDataRepository:
     ) -> dict:
         with self._connect() as db:
             dataset = self._dataset_row(db, symbol, timeframe, adjustment)
-            files = self._current_files(
-                db, symbol, timeframe, adjustment,
-                int(dataset["current_version"]) if dataset else 0,
-            )
-            archives = db.execute(
-                "SELECT * FROM parquet_source_archives"
-            ).fetchall()
-        lookup = {Path(row["source_path"]).resolve(): dict(row) for row in archives}
-        sources = []
-        for row in files:
-            if not self._is_package_source(row):
-                continue
-            path = self._absolute_source_path(row["path"]).resolve()
-            record = lookup.get(path)
-            sources.append({
-                "path": str(path),
-                "size": path.stat().st_size if path.is_file() else int(row.get("size") or 0),
-                "archived": bool(record and self.package.absolute(record["archive_path"]).is_file()),
-                "archive_path": record.get("archive_path") if record else None,
-                "archived_at": record.get("archived_at") if record else None,
-            })
+            version = int(dataset["current_version"]) if dataset else 0
+            shards = self._current_shards(db, symbol, timeframe, adjustment, version)
         return {
             "symbol": symbol, "timeframe": timeframe,
-            "protected": bool(files) and (not sources or all(item["archived"] for item in sources)),
-            "sources": sources,
+            "protected": bool(shards), "sources": [],
         }
 
     def archive_dataset(
@@ -3369,198 +2687,29 @@ class MarketDataRepository:
     ) -> dict:
         with self._connect() as db:
             dataset = self._dataset_row(db, symbol, timeframe, adjustment)
-            files = self._current_files(
-                db, symbol, timeframe, adjustment,
-                int(dataset["current_version"]) if dataset else 0,
-            )
-        copied = reused = 0
-        total_bytes = 0
-        for index, row in enumerate(files, start=1):
-            if cancelled():
-                raise InterruptedError("任务已取消")
-            if not self._is_package_source(row):
-                continue
-            source = self._absolute_source_path(row["path"]).resolve()
-            if not source.is_file():
-                raise MarketDataError("行情源文件不存在：" + str(source))
-            with self._connect() as db:
-                existing = db.execute(
-                    "SELECT * FROM parquet_source_archives WHERE source_path=?",
-                    (str(source),),
-                ).fetchone()
-            source_stat = source.stat()
-            if (
-                existing and int(existing["size"]) == source_stat.st_size
-                and int(existing["source_mtime_ns"] or 0) == source_stat.st_mtime_ns
-            ):
-                archive_path = self.package.absolute(existing["archive_path"])
-                if archive_path.is_file():
-                    reused += 1
-                    total_bytes += int(existing["copied_bytes"] or 0)
-                    progress(index / max(1, len(files)), f"复用历史快照 {source.name}")
-                    continue
-            digest = hashlib.sha256()
-            temporary = self.staging_dir / f"archive-{uuid.uuid4().hex}.writing"
-            copied_bytes = 0
-            try:
-                with source.open("rb") as reader, temporary.open("wb") as writer:
-                    while chunk := reader.read(4 * 1024 * 1024):
-                        digest.update(chunk)
-                        writer.write(chunk)
-                        copied_bytes += len(chunk)
-                sha256 = digest.hexdigest()
-                folder = self.package.archives_dir / sha256[:2]
-                folder.mkdir(parents=True, exist_ok=True)
-                target = folder / f"{sha256}{source.suffix.lower() or '.parquet'}"
-                if target.exists():
-                    temporary.unlink(missing_ok=True)
-                else:
-                    os.replace(temporary, target)
-                relative = self.package.relative(target)
-                with self._connect() as db:
-                    db.execute(
-                        """INSERT OR REPLACE INTO parquet_source_archives(
-                           source_path,source_sha256,archive_path,size,source_mtime_ns,
-                           copied_bytes,archived_at)
-                           VALUES(?,?,?,?,?,?,?)""",
-                        (str(source), sha256, relative, source_stat.st_size,
-                         source_stat.st_mtime_ns, copied_bytes, utc_now()),
-                    )
-                copied += 1
-                total_bytes += copied_bytes
-                progress(index / max(1, len(files)), f"已保护历史快照 {source.name}")
-            finally:
-                temporary.unlink(missing_ok=True)
+            version = int(dataset["current_version"]) if dataset else 0
+            shards = self._current_shards(db, symbol, timeframe, adjustment, version)
+        if cancelled():
+            raise InterruptedError("任务已取消")
         return {
             "symbol": symbol, "timeframe": timeframe,
-            "archived": bool(files), "copied": copied, "reused": reused,
-            "bytes": total_bytes, "status": "completed",
+            "archived": bool(shards), "copied": 0, "reused": 0,
+            "bytes": 0, "status": "completed",
+            "reason": "内容摘要分片不可变，无需另存副本",
         }
 
     def compact_dataset(
         self, symbol: str, timeframe: str, adjustment: str = "none",
     ) -> dict:
-        timeframe = normalize_timeframe(timeframe)
-        # Compaction runs inside the dataset writer lock. ``dataset()`` asks
-        # validation_state() to read the shared source file and would try to
-        # acquire that same non-reentrant file lock.
-        with self._connect() as db:
-            dataset_row = self._dataset_row(db, symbol, timeframe, adjustment)
-        if not dataset_row:
+        """Canonical time buckets are complete shards and are not span-compacted."""
+        dataset = self.dataset(symbol, normalize_timeframe(timeframe), adjustment)
+        if not dataset:
             raise MarketDataError("没有可整理的行情")
-        dataset = dict(dataset_row)
-        version = int(dataset["current_version"])
-        with self._connect() as db:
-            increments = self._current_increments(db, symbol, timeframe, adjustment, version)
-            current_files = self._current_files(
-                db, symbol, timeframe, adjustment, version
-            )
-        if not increments:
-            return {"status": "skipped", "reason": "没有增量分片", "version": version}
-        frames = {
-            row["period_key"]: self._read_paths(
-                [row["path"]], fields=self._canonical_fields(None)
-            )
-            for row in increments
-        }
-        groups: list[list[dict]] = []
-        for row in increments:
-            if not groups:
-                groups.append([row])
-                continue
-            previous = groups[-1][-1]
-            if pd.Timestamp(row["period_start"]) <= pd.Timestamp(previous["period_end"]):
-                groups[-1].append(row)
-            else:
-                groups.append([row])
-        compacted: list[dict] = []
-        for sequence, group in enumerate(groups, start=1):
-            if len(group) == 1:
-                row = group[0]
-                compacted.append({**row, "sequence": sequence})
-                continue
-            parts = [frames[row["period_key"]] for row in group if not frames[row["period_key"]].empty]
-            if not parts:
-                continue
-            frame = self._prepare_frame(pd.concat(parts, ignore_index=True, sort=False))
-            written = self._write_partition(
-                symbol, timeframe, adjustment, 0, frame,
-                period="all", base_dir=self.package.increments_dir,
-            )
-            compacted.append({
-                **written, "period_key": f"span={sequence}",
-                "period_start": group[0]["period_start"],
-                "period_end": group[-1]["period_end"], "sequence": sequence,
-            })
-        new_version = version + 1
-        now = utc_now()
-        total_bytes = (
-            sum(int(row.get("size") or 0) for row in current_files)
-            + sum(int(row["size"]) for row in compacted)
-        )
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            db.execute(
-                """INSERT INTO parquet_versions(
-                   symbol,timeframe,adjustment,version,created_at,row_count,raw_rows,
-                   synthetic_rows,pending_rows,first_time,last_time,status,source,
-                   file_count,bytes,report) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    symbol, timeframe, adjustment, new_version, now,
-                    int(dataset.get("row_count") or 0),
-                    int(dataset.get("raw_rows") or 0),
-                    int(dataset.get("synthetic_rows") or 0),
-                    int(dataset.get("pending_rows") or 0),
-                    dataset.get("first_time"), dataset.get("last_time"),
-                    dataset.get("status", "partial"), "compact",
-                    len(current_files) + len(compacted), total_bytes, "{}",
-                ),
-            )
-            self._copy_version_files(
-                db, symbol, timeframe, adjustment, version, new_version
-            )
-            for row in compacted:
-                db.execute(
-                    """INSERT INTO parquet_increments(
-                       symbol,timeframe,adjustment,version,sequence,period_key,
-                       period_start,period_end,path,sha256,row_count,first_time,
-                       last_time,size,schema_version)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        symbol, timeframe, adjustment, new_version, row["sequence"],
-                        row["period_key"], row["period_start"], row["period_end"],
-                        row["path"], row["sha256"], row["row_count"], row["first_time"],
-                        row["last_time"], row["size"], row["schema_version"],
-                    ),
-                )
-            db.execute(
-                """UPDATE parquet_datasets SET current_version=?,metadata=?,updated_at=?
-                   WHERE symbol=? AND timeframe=? AND adjustment=?""",
-                (
-                    new_version,
-                    _json({**_load(dataset.get("metadata"), {}), "layout": "compacted"}),
-                    now, symbol, timeframe, adjustment,
-                ),
-            )
-            db.commit()
         return {
-            "status": "completed", "version": new_version, "files": len(compacted),
-            "bytes": sum(int(row["size"]) for row in compacted),
-            "increment_count": len(increments),
+            "status": "skipped",
+            "reason": "规范年/月分片不跨周期合并",
+            "version": int(dataset["current_version"]),
         }
-
-    def _compact_dataset_if_needed(
-        self, symbol: str, timeframe: str, adjustment: str, version: int,
-    ) -> dict | None:
-        with self._connect() as db:
-            count = db.execute(
-                """SELECT count(*) FROM parquet_increments
-                   WHERE symbol=? AND timeframe=? AND adjustment=? AND version=?""",
-                (symbol, timeframe, adjustment, version),
-            ).fetchone()[0]
-        if int(count) < COMPACTION_THRESHOLD:
-            return None
-        return self.compact_dataset(symbol, timeframe, adjustment)
 
     def save_coverage(
         self, symbol: str, timeframe: str, adjustment: str, start, end, report: dict,
@@ -3635,6 +2784,7 @@ class MarketDataRepository:
         self, symbol: str, kind: str, payload: Any, *,
         version: str = "local", verified: bool = False,
     ) -> str:
+        self._assert_writable()
         # Calendars are shared by exchange, so different securities must use
         # the same lock for the entire read/merge/replace operation.
         path = self.package.absolute(auxiliary_relative_path(symbol, kind))
@@ -3779,29 +2929,11 @@ class MarketDataRepository:
             return 0
         if timeframe == "1day":
             return int(dataset.get("row_count") or 0)
-        with self._connect() as db:
-            files = self._current_files(
-                db, symbol, timeframe, adjustment, int(dataset["current_version"])
-            )
-            increments = self._current_increments(
-                db, symbol, timeframe, adjustment, int(dataset["current_version"])
-            )
-        source = next((row for row in files if self._is_package_source(row)), None)
-        if not source or increments:
-            frame = self._read_version(
-                symbol, timeframe, adjustment, int(dataset["current_version"]),
-                fields=("timestamp",), use_cache=False,
-            )
-            return int(frame.timestamp.dt.normalize().nunique()) if not frame.empty else 0
-        path = self._absolute_source_path(source["path"])
-        if not path.is_file():
-            return 0
-        with duckdb.connect() as connection:
-            row = connection.execute(
-                "SELECT count(DISTINCT CAST(trade_date AS DATE)) FROM read_parquet(?)",
-                [str(path)],
-            ).fetchone()
-        return int(row[0] or 0) if row else 0
+        frame = self._read_version(
+            symbol, timeframe, adjustment, int(dataset["current_version"]),
+            fields=("timestamp",), use_cache=False,
+        )
+        return int(frame.timestamp.dt.normalize().nunique()) if not frame.empty else 0
 
     def coverage_covers(
         self, symbol: str, timeframe: str, start, end, adjustment: str = "none",

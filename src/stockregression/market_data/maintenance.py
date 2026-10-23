@@ -68,7 +68,7 @@ def preview_reset(root: str | Path) -> dict:
         }
         counts = {}
         for table in (
-            "parquet_datasets", "parquet_versions", "parquet_files",
+            "parquet_datasets", "parquet_versions", "parquet_shards",
             "parquet_imports", "parquet_coverage", "parquet_derived",
             "parquet_auxiliary_history", "snapshots", "active_snapshots",
             "market_auxiliary", "sync_items",
@@ -140,8 +140,8 @@ def reset_market_storage(
                 path.unlink(missing_ok=True)
         with store.db() as db:
             for table in (
-                "parquet_day_validation", "parquet_increments", "parquet_source_archives",
-                "parquet_files", "parquet_versions", "parquet_datasets",
+                "parquet_day_validation", "parquet_shards", "parquet_source_archives",
+                "parquet_versions", "parquet_datasets",
                 "parquet_imports", "parquet_coverage", "parquet_derived",
                 "parquet_auxiliary_history", "snapshots", "active_snapshots",
                 "market_auxiliary", "sync_items",

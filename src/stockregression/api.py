@@ -145,6 +145,25 @@ class MarketPackageRequest(BaseModel):
     skip_invalid_rows: bool = False
 
 
+class MarketDataPackageInfoResponse(BaseModel):
+    package_id: str | None = None
+    generation: str | None = None
+    package_version: int = 0
+    schema_version: int | None = None
+    storage_layout: str = "time_partitioned"
+    index_status: str
+    path: str
+    status: str
+    readable: bool
+    manifest_ready: bool = False
+    shard_count: int = 0
+    shard_bytes: int = 0
+    bytes: int = 0
+    file_count: int = 0
+    updated_at: str | None = None
+    pending_recovery: int = 0
+
+
 class MarketValidateRequest(BaseModel):
     symbol: str
     timeframe: str | None = None
@@ -1256,7 +1275,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     def data_frequencies():
         return {"timeframes": MarketDataService(store).frequency_catalog()}
 
-    @app.get("/api/v1/data/package")
+    @app.get(
+        "/api/v1/data/package",
+        response_model=MarketDataPackageInfoResponse,
+    )
     def data_package():
         return json_safe(MarketDataService(store).package_info())
 

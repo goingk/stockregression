@@ -113,16 +113,30 @@ def _cleanup_uploaded_input(store: Store, job_id: str):
     payload = job.get("payload") or {}
     directories = payload.get("upload_dirs") or ([payload["upload_dir"]] if payload.get("upload_dir") else [])
     import_root = (store.root / "imports").resolve()
+    # Resolve the package actually attached to this catalog. Global settings
+    # may point to another data root; cleanup must not initialize a repository.
+    with store.db() as db:
+        has_meta = db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='parquet_meta'"
+        ).fetchone()
+        package = db.execute(
+            "SELECT value FROM parquet_meta WHERE key='package_dir'"
+        ).fetchone() if has_meta else None
+    package_root = Path(package[0]) if package else None
+    if package_root is not None and not package_root.is_absolute():
+        package_root = store.root / package_root
     staging_uploads = (
-        MarketDataService(store).repository.package.staging_dir / "uploads"
-    ).resolve()
+        (package_root / ".stockregression" / "staging" / "uploads").resolve()
+        if package_root is not None else None
+    )
     for relative in directories:
         path = Path(relative)
         target = path.resolve() if path.is_absolute() else (store.root / path).resolve()
         owned = (
             target != import_root and target.is_relative_to(import_root)
         ) or (
-            target != staging_uploads and target.is_relative_to(staging_uploads)
+            staging_uploads is not None
+            and target != staging_uploads and target.is_relative_to(staging_uploads)
         )
         if owned and target.is_dir():
             shutil.rmtree(target, ignore_errors=True)

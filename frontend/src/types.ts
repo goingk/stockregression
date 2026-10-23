@@ -104,7 +104,7 @@ export interface DataPeriodSummary {
     failed?: string[]
     calendar_available?: boolean
   }
-  increment_count?: number
+  shard_count?: number
   archive?: {
     protected: boolean
     sources: Array<{ path: string; size: number; archived: boolean; archive_path?: string | null; archived_at?: string | null }>
@@ -130,13 +130,18 @@ export interface DataInventoryResponse {
 }
 
 export interface DataPackageInfo {
-  package_id: string
+  package_id: string | null
+  generation: string | null
   package_version: number
-  schema_version: number
+  schema_version: number | null
+  storage_layout: string
+  index_status: string
   path: string
   status: string
   readable: boolean
   manifest_ready?: boolean
+  shard_count: number
+  shard_bytes: number
   bytes: number
   file_count: number
   updated_at?: string | null

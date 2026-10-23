@@ -14,30 +14,26 @@ from filelock import FileLock
 from .timeframes import normalize_timeframe
 
 
-PACKAGE_SCHEMA_VERSION = 1
+PACKAGE_SCHEMA_VERSION = 2
 ETF_PREFIXES = {"15", "16", "50", "51", "52", "56", "58"}
-MINUTE_TIMEFRAMES = {"1min", "5min", "15min", "30min", "60min"}
 _MANIFEST_THREAD_LOCK = threading.RLock()
-_ASSETS = ("etf", "stock")
 
 
 def is_package_root(path: str | Path) -> bool:
-    """Return whether a directory contains a market-data package."""
+    """Return whether a directory contains a published schema-2 package."""
     root = Path(path)
-    if not root.is_dir():
+    manifest_path = root / ".stockregression" / "manifest.json"
+    if not root.is_dir() or not manifest_path.is_file():
         return False
-    if (root / ".stockregression" / "manifest.json").is_file():
-        return True
-    for asset in _ASSETS:
-        if (root / f"{asset}_basic_data.parquet").is_file():
-            return True
-        if (root / f"{asset}_daily.parquet").is_file():
-            return True
-        for timeframe in MINUTE_TIMEFRAMES:
-            folder = root / f"{asset}_{timeframe}"
-            if folder.is_dir() and next(iter(folder.glob("*.parquet")), None) is not None:
-                return True
-    return False
+    try:
+        value = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        int(value.get("schema_version") or 0) == PACKAGE_SCHEMA_VERSION
+        and bool(value.get("package_id")) and bool(value.get("generation"))
+        and isinstance(value.get("datasets"), dict)
+    )
 
 
 def resolve_package_root(value: str | Path) -> Path:
@@ -72,14 +68,6 @@ def asset_type_for_symbol(symbol: str) -> str:
     return "etf" if code[:2] in ETF_PREFIXES else "stock"
 
 
-def package_file_relative_path(symbol: str, timeframe: str) -> str:
-    timeframe = normalize_timeframe(timeframe)
-    asset = asset_type_for_symbol(symbol)
-    if timeframe == "1day":
-        return f"{asset}_daily.parquet"
-    return f"{asset}_{timeframe}/{symbol}.parquet"
-
-
 def auxiliary_relative_path(symbol: str, kind: str) -> str:
     if kind == "calendar":
         suffix = ".SZ" if str(symbol).endswith(".SZ") else ".SH"
@@ -109,11 +97,10 @@ class PackageLayout:
         self._root_text = os.path.normcase(os.path.normpath(str(self.root)))
         self.control = self.root / ".stockregression"
         self.versions_dir = self.control / "versions"
+        self.datasets_dir = self.control / "datasets"
         self.quality_dir = self.control / "quality"
         self.history_dir = self.control / "history"
-        self.archives_dir = self.control / "archives"
-        self.bases_dir = self.control / "bases"
-        self.increments_dir = self.control / "increments"
+        self.partitions_dir = self.root / "partitions"
         self.staging_dir = self.control / "staging"
         self.transactions_dir = self.control / "transactions"
         self.locks_dir = self.control / "locks"
@@ -124,11 +111,10 @@ class PackageLayout:
             self.root,
             self.control,
             self.versions_dir,
+            self.datasets_dir,
             self.quality_dir,
             self.history_dir,
-            self.archives_dir,
-            self.bases_dir,
-            self.increments_dir,
+            self.partitions_dir,
             self.staging_dir,
             self.transactions_dir,
             self.locks_dir,
@@ -185,15 +171,147 @@ class PackageLayout:
                 "schema_version": PACKAGE_SCHEMA_VERSION,
                 "package_id": "pkg-" + uuid.uuid4().hex[:24],
                 "package_version": 0,
+                "generation": uuid.uuid4().hex,
                 "created_at": now,
                 "updated_at": now,
                 "files": {},
                 "auxiliary": {},
+                "datasets": {},
+                "storage_layout": "time_partitioned",
+                "partition_root": "partitions",
+                "partition_scheme": {"1day": "year", "1min": "month"},
             }
+        schema_version = int(current.get("schema_version", 0) or 0)
+        if schema_version not in {PACKAGE_SCHEMA_VERSION}:
+            raise ValueError(
+                f"不支持的数据包清单版本 {schema_version}；请使用 data migrate-package 迁移到分片包"
+            )
+        current.setdefault("generation", uuid.uuid4().hex)
         current.setdefault("files", {})
         current.setdefault("auxiliary", {})
+        current.setdefault("datasets", {})
         current.setdefault("package_version", 0)
         return current
+
+    @staticmethod
+    def dataset_key(symbol: str, timeframe: str, adjustment: str = "none") -> str:
+        return f"{symbol}|{normalize_timeframe(timeframe)}|{adjustment}"
+
+    def dataset_manifest_relative_path(
+        self, symbol: str, timeframe: str, adjustment: str, version: int,
+    ) -> str:
+        safe_symbol = "".join(c for c in str(symbol) if c.isalnum() or c in ".-_ ")
+        safe_adjustment = "".join(c for c in str(adjustment) if c.isalnum() or c in "-_ ")
+        return (
+            f".stockregression/datasets/{normalize_timeframe(timeframe)}/"
+            f"{safe_symbol}/{safe_adjustment}/v{int(version)}.json"
+        )
+
+    def publish_dataset(self, payload: dict[str, Any], *, expected_version: int) -> dict[str, Any]:
+        """Publish one immutable dataset manifest, then atomically advance its package head."""
+        symbol = str(payload["symbol"])
+        timeframe = normalize_timeframe(str(payload["timeframe"]))
+        adjustment = str(payload.get("adjustment") or "none")
+        version = int(payload["version"])
+        relative = self.dataset_manifest_relative_path(
+            symbol, timeframe, adjustment, version
+        )
+        manifest_path = self.absolute(relative)
+        with self._manifest_guard():
+            package = self._fresh_manifest(self._load_manifest())
+            key = self.dataset_key(symbol, timeframe, adjustment)
+            current = dict(package["datasets"].get(key) or {})
+            current_version = int(current.get("version") or 0)
+            if current_version != int(expected_version):
+                if current_version == version and current.get("manifest") == relative:
+                    return package
+                raise ValueError(
+                    f"数据集清单版本冲突：{symbol} {timeframe}，"
+                    f"预期 {expected_version}，当前 {current_version}"
+                )
+            value = {
+                **payload,
+                "schema_version": PACKAGE_SCHEMA_VERSION,
+                "package_id": package["package_id"],
+                "generation": package["generation"],
+                "updated_at": utc_now(),
+            }
+            if manifest_path.exists():
+                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+                comparable_existing = {key: item for key, item in existing.items() if key != "updated_at"}
+                comparable_value = {key: item for key, item in value.items() if key != "updated_at"}
+                if comparable_existing != comparable_value:
+                    raise ValueError(f"不可变数据集清单已存在但内容不同：{relative}")
+                value = existing
+            else:
+                _atomic_json(manifest_path, value)
+            base_timeframe = timeframe in {"1day", "1min"}
+            old_bytes = int(current.get("shard_bytes") or 0) if base_timeframe else 0
+            old_count = int(current.get("shard_count") or 0) if base_timeframe else 0
+            shard_bytes = (
+                sum(int(row.get("size") or 0) for row in value.get("shards", []))
+                if base_timeframe else 0
+            )
+            shard_count = len(value.get("shards", [])) if base_timeframe else 0
+            package["datasets"][key] = {
+                "version": version,
+                "manifest": relative,
+                "row_count": int(value.get("row_count") or 0),
+                "first_time": value.get("first_time"),
+                "last_time": value.get("last_time"),
+                "status": value.get("status", "pending_validation"),
+                "derived": value.get("derived"),
+                "shard_count": shard_count,
+                "shard_bytes": shard_bytes,
+            }
+            package["package_version"] = int(package.get("package_version", 0)) + 1
+            package["shard_count"] = max(
+                0, int(package.get("shard_count") or 0) - old_count + shard_count
+            )
+            package["shard_bytes"] = max(
+                0, int(package.get("shard_bytes") or 0) - old_bytes + shard_bytes
+            )
+            package["storage_layout"] = "time_partitioned"
+            package["partition_root"] = "partitions"
+            package["schema_version"] = PACKAGE_SCHEMA_VERSION
+            package["updated_at"] = utc_now()
+            _atomic_json(self.manifest_path, package)
+            return self._remember_manifest(package)
+
+    def load_dataset_manifest(self, symbol: str, timeframe: str, adjustment: str, version: int | None = None) -> dict[str, Any] | None:
+        package = self.manifest()
+        head = package.get("datasets", {}).get(
+            self.dataset_key(symbol, timeframe, adjustment)
+        )
+        if not head or (version is not None and int(head.get("version", -1)) != int(version)):
+            relative = self.dataset_manifest_relative_path(
+                symbol, timeframe, adjustment, int(version or -1)
+            )
+            path = self.absolute(relative)
+            if version is None or not path.is_file():
+                return None
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                value.get("package_id") != package.get("package_id")
+                or value.get("generation") != package.get("generation")
+                or value.get("symbol") != symbol
+                or normalize_timeframe(value.get("timeframe")) != normalize_timeframe(timeframe)
+                or value.get("adjustment", "none") != adjustment
+                or int(value.get("version", -1)) != int(version)
+            ):
+                raise ValueError(f"历史数据集清单身份或版本不匹配：{path}")
+            return value
+        path = self.absolute(str(head["manifest"]))
+        if not path.is_file():
+            raise ValueError(f"数据集清单丢失：{path}")
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            value.get("package_id") != package.get("package_id")
+            or value.get("generation") != package.get("generation")
+            or int(value.get("version", -1)) != int(head.get("version", -2))
+        ):
+            raise ValueError(f"数据集清单身份或版本不匹配：{path}")
+        return value
 
     def manifest(self) -> dict[str, Any]:
         with self._manifest_guard():
