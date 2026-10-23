@@ -938,6 +938,20 @@ class Store:
             db.execute("INSERT OR REPLACE INTO active_snapshots VALUES(?,?)", (symbol, version))
         return self.snapshot(symbol, version)
 
+    def remember_market_snapshots(self, manifests: list[dict]) -> None:
+        """Register a frozen cohort in one transaction without changing active heads.
+
+        Callers create these manifests from one repository instance. Keeping the
+        metadata inside each version hash freezes trading terms as well as bars.
+        """
+        records = []
+        for manifest in manifests:
+            if not manifest.get("market_data") or not manifest.get("version"):
+                raise ValueError("只能登记有效的行情快照")
+            records.append((manifest["version"], normalize_symbol(manifest["symbol"]), manifest.get("created_at") or now_iso(), dumps(manifest)))
+        with self.db() as db:
+            db.executemany("INSERT OR IGNORE INTO snapshots VALUES(?,?,?,?)", records)
+
     def snapshot(self, symbol: str, version: str | None = None, *, persist: bool = True) -> dict | None:
         symbol = normalize_symbol(symbol)
         with self.db() as db:

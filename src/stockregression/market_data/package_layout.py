@@ -221,7 +221,11 @@ class PackageLayout:
             f"{safe_symbol}/{safe_adjustment}/v{int(version)}.json"
         )
 
-    def publish_dataset(self, payload: dict[str, Any], *, expected_version: int) -> dict[str, Any]:
+    def publish_dataset(
+        self, payload: dict[str, Any], *, expected_version: int,
+        pending_updates: list[dict[str, Any]] | None = None,
+        dependent_pending_updates: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> dict[str, Any]:
         """Publish one immutable dataset manifest, then atomically advance its package head."""
         symbol = str(payload["symbol"])
         timeframe = normalize_timeframe(str(payload["timeframe"]))
@@ -267,6 +271,48 @@ class PackageLayout:
                 if base_timeframe else 0
             )
             shard_count = len(value.get("shards", [])) if base_timeframe else 0
+            quality_reference = dict(current.get("quality_archive") or {})
+            if quality_reference and pending_updates:
+                existing_updates = list(quality_reference.get("pending_updates") or [])
+                for update in pending_updates:
+                    dates = sorted({str(value)[:10] for value in update.get("dates") or [] if value})
+                    if not dates:
+                        continue
+                    existing_updates.append({
+                        "dates": dates,
+                        "reason": str(update.get("reason") or "行情修订"),
+                    })
+                quality_reference["pending_updates"] = existing_updates
+            for dependent, updates in (dependent_pending_updates or {}).items():
+                dependent_key = self.dataset_key(symbol, dependent, adjustment)
+                dependent_head = dict(package["datasets"].get(dependent_key) or {})
+                dependent_reference = dict(
+                    dependent_head.get("quality_archive") or {}
+                )
+                if not dependent_reference:
+                    continue
+                dependent_first = str(dependent_head.get("first_time") or "")[:10]
+                dependent_last = str(dependent_head.get("last_time") or "")[:10]
+                existing_updates = list(
+                    dependent_reference.get("pending_updates") or []
+                )
+                for update in updates:
+                    dates = sorted({
+                        str(value)[:10] for value in update.get("dates") or []
+                        if value
+                        and (not dependent_first or str(value)[:10] >= dependent_first)
+                        and (not dependent_last or str(value)[:10] <= dependent_last)
+                    })
+                    if dates:
+                        existing_updates.append({
+                            "dates": dates,
+                            "reason": str(
+                                update.get("reason") or "日线依赖修订"
+                            ),
+                        })
+                dependent_reference["pending_updates"] = existing_updates
+                dependent_head["quality_archive"] = dependent_reference
+                package["datasets"][dependent_key] = dependent_head
             package["datasets"][key] = {
                 "version": version,
                 "manifest": relative,
@@ -277,6 +323,10 @@ class PackageLayout:
                 "derived": value.get("derived"),
                 "shard_count": shard_count,
                 "shard_bytes": shard_bytes,
+                # A data update keeps the last archive reference so unchanged
+                # days remain reusable.  The archive's data_version makes the
+                # revision visibly stale until changed days are revalidated.
+                "quality_archive": quality_reference or None,
             }
             package["package_version"] = int(package.get("package_version", 0)) + 1
             package["shard_count"] = max(
@@ -287,6 +337,63 @@ class PackageLayout:
             )
             package["storage_layout"] = "time_partitioned"
             package["partition_root"] = "partitions"
+            package["schema_version"] = PACKAGE_SCHEMA_VERSION
+            package["updated_at"] = utc_now()
+            _atomic_json(self.manifest_path, package)
+            return self._remember_manifest(package)
+
+    def publish_quality_archive(
+        self,
+        symbol: str,
+        timeframe: str,
+        adjustment: str,
+        reference: dict[str, Any],
+        *,
+        expected_data_version: int,
+        expected_revision: int,
+    ) -> dict[str, Any]:
+        """Publish a full coverage archive revision without changing market data.
+
+        Market bars and the archive reference are reconciled through the same
+        package head.  The monthly archive files themselves are immutable and
+        content addressed; only this small reference advances.
+        """
+        timeframe = normalize_timeframe(timeframe)
+        key = self.dataset_key(symbol, timeframe, adjustment)
+        relative = str(reference.get("path") or "").replace("\\", "/")
+        path = self.absolute(relative)
+        if not path.is_file():
+            raise ValueError(f"覆盖档案文件不存在：{relative}")
+        with self._manifest_guard():
+            package = self._fresh_manifest(self._load_manifest())
+            current = dict(package["datasets"].get(key) or {})
+            if not current:
+                raise ValueError(f"覆盖档案没有对应的数据集：{key}")
+            if int(current.get("version") or 0) != int(expected_data_version):
+                raise ValueError(
+                    f"覆盖档案的数据版本冲突：{key}，预期 {expected_data_version}，"
+                    f"当前 {current.get('version')}"
+                )
+            previous = dict(current.get("quality_archive") or {})
+            current_revision = int(previous.get("revision") or 0)
+            if current_revision != int(expected_revision):
+                if (
+                    current_revision == int(reference.get("revision") or 0)
+                    and previous.get("path") == reference.get("path")
+                    and previous.get("sha256") == reference.get("sha256")
+                    and int(previous.get("data_version") or 0) == int(reference.get("data_version") or 0)
+                ):
+                    return package
+                raise ValueError(
+                    f"覆盖档案修订冲突：{key}，预期 {expected_revision}，"
+                    f"当前 {current_revision}"
+                )
+            current["quality_archive"] = {
+                **reference,
+                "updated_at": utc_now(),
+            }
+            package["datasets"][key] = current
+            package["package_version"] = int(package.get("package_version", 0)) + 1
             package["schema_version"] = PACKAGE_SCHEMA_VERSION
             package["updated_at"] = utc_now()
             _atomic_json(self.manifest_path, package)

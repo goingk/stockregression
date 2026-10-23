@@ -25,6 +25,7 @@ from ..price_validation import (
     details_to_rows, price_issue_details,
 )
 from ..rules import instrument_terms
+from ..snapshot_quality import frozen_quality_state
 from ..storage import Store
 from .models import DataNotReady, FileImportResult, MarketDataError
 from .quality import validate_and_fill
@@ -34,7 +35,11 @@ from .reader import (
 )
 from .repository import MarketDataRepository, PARSER_VERSION
 from .timeframes import MINUTE_TIMEFRAMES, TIMEFRAMES, normalize_timeframe, timeframe_spec
-from .validation import validate_incremental
+from .coverage_index import CoverageArchive
+from .validation import (
+    VALIDATION_RULES_VERSION, _read_daily_dependencies,
+    validate_incremental, validation_targets,
+)
 
 
 BASE_TIMEFRAMES = ("1day", "1min")
@@ -92,15 +97,60 @@ def _raise_price_not_ready(
 
 def _validate_month_worker(
     root: str, package_dir: str | None, symbol: str, timeframe: str,
-    adjustment: str, mode: str, start: str, end: str,
+    adjustment: str, mode: str, start: str, end: str, dates: tuple[str, ...],
+    preloaded_months: dict[str, pd.DataFrame] | None = None,
+    preloaded_daily: pd.DataFrame | None = None,
 ):
     """Validate one independent month without sharing pandas or SQLite state."""
     service = MarketDataService(Store(root), package_dir=package_dir)
     with blas_thread_limit(1):
-        return validate_incremental(
+        result, read_calls = _counted_validate_incremental(
             service, symbol, timeframe, mode=mode, start=start, end=end,
-            progress=lambda *_: None, cancelled=lambda: False,
+            dates=dates, force_dates=True, adjustment=adjustment,
+            preloaded_months=preloaded_months,
+            preloaded_daily=preloaded_daily,
+            persist_results=False,
+            persist_archive=False, progress=lambda *_: None, cancelled=lambda: False,
         )
+        result["_market_data_read_calls"] = read_calls
+        return result
+
+
+def _counted_validate_incremental(service, symbol, timeframe, **kwargs):
+    result = validate_incremental(service, symbol, timeframe, **kwargs)
+    read_calls = int(result.get("market_data_read_calls") or 0) + int(
+        result.get("daily_dependency_read_calls") or 0
+    )
+    shard_reads = int(result.get("market_data_shard_reads") or 0) + int(
+        result.get("daily_dependency_shard_reads") or 0
+    )
+    result["market_data_read_calls"] = read_calls
+    result["market_shard_reads"] = shard_reads
+    return result, read_calls
+
+
+def _preload_storage_periods(repository, timeframe: str, frame: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    if frame.empty or "timestamp" not in frame:
+        return {}
+    stamps = pd.to_datetime(frame["timestamp"], errors="coerce")
+    output = {}
+    blocked = pd.to_datetime(
+        frame.attrs.get("blocked_timestamps", []), errors="coerce",
+    )
+    for period_key, indices in frame.assign(_period=[
+        repository._storage_period(timeframe, stamp)[0] for stamp in stamps
+    ]).groupby("_period", sort=False).groups.items():
+        part = frame.loc[indices].copy()
+        if "_coverage_data_version" in frame.attrs:
+            part.attrs["_coverage_data_version"] = frame.attrs["_coverage_data_version"]
+        lower = pd.Timestamp(part.timestamp.min()).normalize()
+        upper = pd.Timestamp(part.timestamp.max()).normalize()
+        part.attrs["blocked_timestamps"] = [
+            stamp.isoformat() for stamp in blocked
+            if pd.notna(stamp) and lower <= stamp.normalize() <= upper
+        ]
+        output[str(period_key)] = part
+    return output
 
 
 class MarketDataService:
@@ -118,7 +168,8 @@ class MarketDataService:
             market_settings=self.settings.market_data,
         )
 
-    def frequency_catalog(self) -> list[dict]:
+    @staticmethod
+    def frequency_catalog() -> list[dict]:
         sources = {
             "1min": ["local", "sina", "tdx"],
             "5min": ["aggregate:1min"],
@@ -168,64 +219,198 @@ class MarketDataService:
         if not daily and not minute:
             raise MarketDataError(f"{symbol} 尚无本地 Parquet 行情")
         primary = daily or minute
+        archive = CoverageArchive(self.repository)
+        archive_heads = {
+            timeframe: archive.validation_head(symbol, timeframe)
+            for timeframe in ("1day", "1min")
+        }
+        archived_rows = {
+            timeframe: archive.rows(symbol, timeframe) if item else []
+            for timeframe, item in (("1day", daily), ("1min", minute))
+        }
+        pending_state = hashlib.sha256(repr(tuple(
+            (timeframe,
+             bool(archive_heads[timeframe]),
+             tuple((archive_heads[timeframe] or {}).get("_invalid_months") or []),
+             tuple((row.get("trade_date"), row.get("scanned"), row.get("status"),
+                    row.get("dirty_reason"), row.get("rules_version"))
+                   for row in archived_rows[timeframe]),
+             tuple(sorted(str(day.date()) for day in archive.pending_dates(archive_heads[timeframe]))))
+            for timeframe in ("1day", "1min")
+        )).encode("utf-8")).hexdigest()[:16]
         cache_key = (
             f"market-coverage:{self.repository.package_id}:{self.repository.generation}:"
             f"{symbol}:{(daily or {}).get('current_version')}:{(minute or {}).get('current_version')}:"
             f"{primary.get('status')}:{(daily or {}).get('verified_through')}:"
-            f"{(minute or {}).get('verified_through')}:q{QUALITY_RULES_VERSION}:p{PRICE_VALIDATION_VERSION}"
+            f"{(minute or {}).get('verified_through')}:"
+            f"a{((daily or {}).get('archive') or {}).get('revision')}:"
+            f"a{((minute or {}).get('archive') or {}).get('revision')}:"
+            f"s{pending_state}:"
+            f"q{QUALITY_RULES_VERSION}:p{PRICE_VALIDATION_VERSION}"
         )
         cached_coverage = self.store.state(cache_key)
         if isinstance(cached_coverage, dict) and cached_coverage.get("price_validation_version") == PRICE_VALIDATION_VERSION:
             return cached_coverage
-        quality_fields = ("timestamp", "open", "high", "low", "close", "volume")
-        daily_frame = (
-            self.repository.read_frame(symbol, "1day", fields=quality_fields)
-            if daily else pd.DataFrame()
-        )
-        minute_frame = (
-            self.repository.read_frame(symbol, "1min", fields=quality_fields)
-            if minute else pd.DataFrame()
-        )
-        daily_quality = anomaly_summary(
-            daily_frame, symbol=symbol, timeframe="1day",
-            version=(daily or {}).get("current_version"),
-        )
-        minute_quality = anomaly_summary(
-            minute_frame, symbol=symbol, timeframe="1min",
-            version=(minute or {}).get("current_version"),
-        )
+        def archived(timeframe: str, item: dict | None) -> list[dict[str, Any]]:
+            if not item:
+                return []
+            head = archive_heads[timeframe]
+            invalid_months = set((head or {}).get("_invalid_months") or [])
+            output = []
+            for original in archived_rows[timeframe]:
+                row = dict(original)
+                month = str(pd.Timestamp(row["trade_date"]).to_period("M"))
+                if head is None or month in invalid_months:
+                    row["dirty_reason"] = "档案月份文件异常"
+                    row["status"] = "unknown"
+                    row["scanned"] = False
+                output.append(row)
+            return output
+
+        def price_quality(rows: list[dict[str, Any]], timeframe: str, item: dict | None) -> dict[str, Any]:
+            samples = []
+            timestamps = []
+            for row in rows:
+                report = row.get("report") or {}
+                for anomaly in report.get("price_anomalies") or []:
+                    timestamp = anomaly.get("timestamp") or anomaly.get("date")
+                    if not timestamp:
+                        continue
+                    timestamps.append(pd.Timestamp(timestamp))
+                    samples.append({
+                        **anomaly, "symbol": symbol, "timeframe": timeframe,
+                        "version": (item or {}).get("current_version"),
+                        "timestamp": str(timestamp),
+                        "reason": anomaly.get("reason") or anomaly.get("quality_reason") or "价格无效",
+                    })
+            count = max(
+                sum(int(row.get("blocked_rows") or 0) for row in rows),
+                len(samples),
+            )
+            pending_dates = archive.pending_dates(archive_heads.get(timeframe))
+            head = archive_heads.get(timeframe)
+            pending = bool(item and not rows) or head is None or bool(
+                (head or {}).get("_invalid_months")
+            ) or bool(pending_dates) or any(
+                not row.get("scanned") or row.get("dirty_reason")
+                or int(row.get("rules_version") or 0) < VALIDATION_RULES_VERSION
+                or str(row.get("status") or "unknown") == "unknown"
+                for row in rows
+            )
+            return {
+                "rule_version": PRICE_VALIDATION_VERSION,
+                "status": "failed" if count else "pending" if pending else "passed", "count": count,
+                "days": len({stamp.normalize() for stamp in timestamps}),
+                "first_time": min(timestamps).isoformat() if timestamps else None,
+                "last_time": max(timestamps).isoformat() if timestamps else None,
+                "samples": samples[:200],
+            }
+
+        daily_rows = archived("1day", daily)
+        minute_rows = archived("1min", minute)
+        daily_quality = price_quality(daily_rows, "1day", daily)
+        minute_quality = price_quality(minute_rows, "1min", minute)
+        quality_by_day = {
+            pd.Timestamp(row["trade_date"]).normalize(): (timeframe, row)
+            for timeframe, rows in (("1day", daily_rows), ("1min", minute_rows))
+            for row in rows
+        }
         days = []
-        for segment in (daily or primary).get("segments", []):
-            report = segment.get("report") or {}
+        for day, (timeframe, row) in sorted(quality_by_day.items()):
+            report = row.get("report") or {}
+            missing = sum(int(gap.get("missing") or 0) for gap in row.get("gaps") or [])
+            auction = int(row.get("auction_placeholders") or 0)
+            status = str(row.get("status") or "unknown")
+            if (not row.get("scanned") or row.get("dirty_reason")
+                    or int(row.get("rules_version") or 0) < VALIDATION_RULES_VERSION
+                    or status == "unknown"):
+                status = "pending"
+            if pd.Timestamp(row["trade_date"]).normalize() in archive.pending_dates(archive_heads.get(timeframe)):
+                status = "pending"
+            reason = report.get("reason") or (
+                "待重新检查：" + str(row.get("dirty_reason"))
+                if row.get("dirty_reason") else "档案结论可用"
+            )
+            if status == "suspended":
+                mode = "suspended"
+            elif report.get("no_trades"):
+                mode = "no_trades"
+            elif row.get("blocked_rows"):
+                mode = "price_invalid"
+            else:
+                mode = "minute" if timeframe == "1min" else "daily"
             days.append({
-                "date": str(segment.get("start_time", ""))[:10], "mode": "daily" if daily else "minute",
-                "missing_minutes": report.get("missing_rows", 0), "missing_data_minutes": report.get("unfillable", 0),
-                "auction_placeholders": 0, "reason": f"检查至 {str(segment.get('end_time', ''))[:10]}",
+                "date": str(day.date()), "mode": mode,
+                "missing_minutes": missing,
+                "missing_data_minutes": max(0, missing - auction),
+                "auction_placeholders": auction,
+                "reason": reason, "status": status,
+                "archive_scanned": bool(row.get("scanned")),
             })
-        anomaly_by_day: dict[str, dict[str, Any]] = {}
-        for timeframe, quality in (("1day", daily_quality), ("1min", minute_quality)):
-            for item in quality.get("samples", []):
-                day = str(item.get("timestamp") or "")[:10]
-                if not day:
+        for timeframe, item in (("1day", daily), ("1min", minute)):
+            represented = set(quality_by_day)
+            for pending_day in archive.pending_dates(archive_heads.get(timeframe)):
+                pending_day = pd.Timestamp(pending_day).normalize()
+                if pending_day in represented:
                     continue
-                current = anomaly_by_day.setdefault(day, {"count": 0, "reasons": set(), "timeframes": set()})
-                current["count"] += 1
-                current["reasons"].add(str(item.get("reason") or "价格无效"))
-                current["timeframes"].add(timeframe)
-        for day, item in sorted(anomaly_by_day.items()):
-            days.append({
-                "date": day, "mode": "price_invalid",
-                "missing_minutes": 0, "missing_data_minutes": int(item["count"]),
-                "auction_placeholders": 0,
-                "reason": "无效价格：" + "；".join(sorted(item["reasons"])),
-            })
+                days.append({
+                    "date": str(pending_day.date()),
+                    "mode": "minute" if timeframe == "1min" else "daily",
+                    "missing_minutes": 0, "missing_data_minutes": 0,
+                    "auction_placeholders": 0,
+                    "reason": "等待覆盖档案重新扫描", "status": "pending",
+                    "archive_scanned": False,
+                })
+                represented.add(pending_day)
+        days.sort(key=lambda item: item["date"])
         bytes_used = 0
         for timeframe in ("1day", "1min"):
             dataset = self.repository.dataset(symbol, timeframe)
             if dataset:
                 bytes_used += int(dataset.get("current_bytes") or 0)
-        daily_days = int(daily_frame.timestamp.dt.normalize().nunique()) if not daily_frame.empty else 0
-        minute_days = int(minute_frame.timestamp.dt.normalize().nunique()) if not minute_frame.empty else 0
+        def day_count(timeframe: str, item: dict | None, rows: list[dict[str, Any]]) -> tuple[int, bool]:
+            scanned_days = {
+                pd.Timestamp(row["trade_date"]).normalize()
+                for row in rows if row.get("scanned")
+            }
+            if scanned_days:
+                return len(scanned_days), True
+            if item is None:
+                return 0, True
+            # Legacy packages have no day archive. A current version report can
+            # still provide an exact count when its range and row count match
+            # the complete dataset metadata.
+            current_version = int(item.get("current_version") or 0)
+            version = next((entry for entry in item.get("versions") or []
+                            if int(entry.get("version") or 0) == current_version), None)
+            report = (version or {}).get("report") or {}
+            first, last = item.get("first_time"), item.get("last_time")
+            if (
+                version is not None
+                and version.get("status") in {"ready", "complete"}
+                and str(version.get("first_time") or "") == str(first or "")
+                and str(version.get("last_time") or "") == str(last or "")
+                and int(version.get("row_count") or 0) == int(item.get("row_count") or 0)
+                and report.get("observed_days") is not None
+            ):
+                try:
+                    observed = int(report["observed_days"])
+                    if observed >= 0:
+                        return observed, True
+                except (TypeError, ValueError):
+                    pass
+            # A nonempty dataset wholly contained in one calendar date proves
+            # its observed-day count without implying anything about quality.
+            if int(item.get("row_count") or 0) > 0 and first and last:
+                try:
+                    if pd.Timestamp(first).normalize() == pd.Timestamp(last).normalize():
+                        return 1, True
+                except (TypeError, ValueError):
+                    pass
+            return 0, False
+
+        daily_days, daily_days_known = day_count("1day", daily, daily_rows)
+        minute_days, minute_days_known = day_count("1min", minute, minute_rows)
         price_anomaly_count = daily_quality["count"] + minute_quality["count"]
         warnings = [primary.get("reason")] if primary.get("reason") else []
         if price_anomaly_count:
@@ -234,11 +419,19 @@ class MarketDataService:
             )
         diagnostics = {
             "schema_version": 1,
-            "status": "failed" if price_anomaly_count else "complete" if primary.get("status") == "ready" else "partial",
+            "status": "failed" if price_anomaly_count else "complete" if (
+                primary.get("status") == "ready"
+                and daily_quality["status"] != "pending"
+                and minute_quality["status"] != "pending"
+            ) else "partial",
             "requested_frequency": "1m" if minute else "1d", "minute_quality_applicable": bool(minute),
             "daily_days": daily_days, "minute_days": minute_days,
+            "daily_days_known": daily_days_known,
+            "minute_days_known": minute_days_known,
+            "total_days_known": daily_days_known,
             "total_days": daily_days, "minute_ratio": 1 if minute and minute.get("status") == "ready" else 0,
-            "synthetic_bars": (minute or {}).get("synthetic_rows", 0), "auction_placeholders": 0,
+            "synthetic_bars": (minute or {}).get("synthetic_rows", 0),
+            "auction_placeholders": sum(int(row.get("auction_placeholders") or 0) for row in minute_rows),
             "price_anomaly_count": price_anomaly_count,
             "price_quality": {"daily": daily_quality, "minute": minute_quality},
             "current_warnings": warnings,
@@ -251,10 +444,23 @@ class MarketDataService:
             "is_demo": False, "bytes": bytes_used, "storage": primary.get("storage", "parquet"),
             "minute_days": diagnostics["minute_days"], "daily_days": diagnostics["daily_days"],
             "total_days": diagnostics["total_days"], "minute_ratio": diagnostics["minute_ratio"],
-            "synthetic_bars": diagnostics["synthetic_bars"], "auction_placeholders": 0,
+            "minute_days_known": diagnostics["minute_days_known"],
+            "daily_days_known": diagnostics["daily_days_known"],
+            "total_days_known": diagnostics["total_days_known"],
+            "synthetic_bars": diagnostics["synthetic_bars"],
+            "auction_placeholders": diagnostics["auction_placeholders"],
+            "archive_hit": bool(daily_rows or minute_rows),
+            "archive_revisions": {
+                "1day": int(((daily or {}).get("archive") or {}).get("revision") or 0),
+                "1min": int(((minute or {}).get("archive") or {}).get("revision") or 0),
+            },
             "price_anomaly_count": price_anomaly_count,
             "price_validation_version": PRICE_VALIDATION_VERSION,
         }
+        # The cache lookup above is only useful if the rebuilt projection is
+        # stored. Without this write every coverage page reread both complete
+        # parquet series and reran price diagnostics.
+        self.store.state(cache_key, result)
         return result
 
     def ensure_timeframe(
@@ -422,8 +628,14 @@ class MarketDataService:
             pd.Timestamp(upper).normalize() + pd.Timedelta(days=1)
             if upper is not None and before is None else upper
         )
-        daily = self.repository.last_bars(symbol, "1day", before=daily_upper, limit=1)
-        quote = daily.iloc[-1].to_dict() if not daily.empty else None
+        if timeframe == "1day" and not frame.empty:
+            # The requested candles already are the daily series. Reusing its
+            # latest row avoids a second DuckDB scan that could not share the
+            # cache because the two reads use different limits.
+            quote = frame.iloc[-1].to_dict()
+        else:
+            daily = self.repository.last_bars(symbol, "1day", before=daily_upper, limit=1)
+            quote = daily.iloc[-1].to_dict() if not daily.empty else None
         warnings = []
         if dataset["status"] != "ready":
             warnings.append(dataset.get("reason") or f"{timeframe} 数据有待核验事项")
@@ -508,6 +720,7 @@ class MarketDataService:
         source, adjustment, etf_category, calendar_path, actions_path, progress, cancelled,
         encoding=None, batches=1, derived=None,
         coverage_start=None, coverage_end=None,
+        validation_start=None, validation_end=None,
         source_metadata: dict | None = None,
         calendar_frame: pd.DataFrame | None = None,
         import_mode: str = "merge",
@@ -561,6 +774,8 @@ class MarketDataService:
         if cancelled():
             raise InterruptedError("任务已取消")
         progress(0.65, "合并本地记录并提交数据库版本")
+        archive = CoverageArchive(self.repository)
+        had_archive = archive.trusted_head(symbol, timeframe, adjustment) is not None
         instrument = self.store.instrument(symbol) or instrument_terms(symbol, {"name": symbol})
         metadata = {**instrument, **(source_metadata or {}), "is_demo": False, "imported": True, "encoding": encoding, "batches": batches,
                     "validation": validation.report}
@@ -582,7 +797,9 @@ class MarketDataService:
                 and any("尚未结束" in item for item in validation.pending)
             ),
             import_mode=import_mode,
+            include_preloaded=True,
         )
+        preloaded_months = result.pop("_preloaded_months", None)
         self.repository.save_coverage(
             symbol, timeframe, adjustment, min(validation.frame.timestamp.min(), pd.Timestamp(coverage_start) if coverage_start is not None else validation.frame.timestamp.min()),
             max(validation.frame.timestamp.max(), pd.Timestamp(coverage_end) if coverage_end is not None else validation.frame.timestamp.max()), validation.report,
@@ -605,23 +822,37 @@ class MarketDataService:
             ).dropna().normalize().astype(str).unique()) if current_calendar else []
             auxiliary_changed = auxiliary_changed or old_dates != new_dates
             self.repository.save_auxiliary(symbol, "calendar", calendar_frame[["date"]].to_dict("records"), version=fingerprint, verified=True)
-        if auxiliary_changed:
-            self.repository.invalidate_all_validations(symbol, adjustment)
         changed_dates = list(result.get("changed_dates") or [])
-        if not changed_dates:
-            changed_dates = sorted({
-                str(pd.Timestamp(value).date()) for value in validation.frame.timestamp
-            })
         if timeframe == "1day":
             for minute_timeframe in MINUTE_TIMEFRAMES:
                 self.repository.invalidate_day_validations(
                     symbol, minute_timeframe, changed_dates, adjustment=adjustment
                 )
-        validation_start = min(pd.Timestamp(value) for value in changed_dates) if changed_dates else validation.frame.timestamp.min()
-        validation_end = max(pd.Timestamp(value) for value in changed_dates) if changed_dates else validation.frame.timestamp.max()
+        current_dataset = self.repository.dataset(symbol, timeframe, adjustment) or {}
+        calendar_dates = pd.DatetimeIndex(pd.to_datetime(
+            calendar.get("date"), errors="coerce"
+        ).dropna()).normalize() if calendar is not None and not calendar.empty and "date" in calendar else pd.DatetimeIndex([])
+        if not had_archive:
+            task_start = current_dataset.get("first_time") or validation.frame.timestamp.min()
+            task_end = current_dataset.get("last_time") or validation.frame.timestamp.max()
+            if len(calendar_dates):
+                task_end = max(pd.Timestamp(task_end), calendar_dates.max().normalize())
+        else:
+            task_start = (
+                pd.Timestamp(validation_start).normalize() if validation_start is not None
+                else current_dataset.get("first_time") or validation.frame.timestamp.min()
+            )
+            task_end = (
+                pd.Timestamp(validation_end).normalize() if validation_end is not None
+                else current_dataset.get("last_time") or validation.frame.timestamp.max()
+            )
+            if validation_end is None and len(calendar_dates):
+                task_end = max(pd.Timestamp(task_end), calendar_dates.max().normalize())
         ledger = validate_incremental(
             self, symbol, timeframe, mode="incremental",
-            start=validation_start, end=validation_end,
+            start=task_start, end=task_end,
+            adjustment=adjustment,
+            preloaded_months=preloaded_months,
             progress=lambda fraction, message: progress(0.8 + 0.15 * fraction, message),
             cancelled=cancelled,
         )
@@ -631,6 +862,10 @@ class MarketDataService:
             "bytes_written": int(result.get("bytes") or 0),
             "written_shards": int(result.get("shard_count") or 0),
             "validated_days": int(ledger.get("checked_days") or 0),
+            "reused_days": int(ledger.get("reused_days") or 0),
+            "archive_hit": bool(ledger.get("archive_hit")),
+            "scanned_months": int(ledger.get("scanned_months") or 0),
+            "scanned_shards": int(ledger.get("scanned_shards") or ledger.get("scanned_months") or 0),
         }
         self.store.put_instrument(symbol, **{key: value for key, value in metadata.items() if key not in {"symbol", "name"}})
         self.repository.save_basic_info(symbol, metadata)
@@ -1068,7 +1303,7 @@ class MarketDataService:
     def revalidate(
         self, symbol: str, timeframe: str, *, adjustment="none",
         label_convention: str | None = None, mode: str = "incremental",
-        start=None, end=None,
+        start=None, end=None, dates=None,
         progress: Callable[[float, str], None] = lambda *_: None,
         cancelled: Callable[[], bool] = lambda: False,
     ) -> dict:
@@ -1082,73 +1317,49 @@ class MarketDataService:
             raise MarketDataError("校验模式应为 incremental 或 full")
         requested_start = start or dataset.get("first_time")
         requested_end = end or dataset.get("last_time")
+        if end is None:
+            saved_calendar = self.repository.auxiliary(symbol, "calendar")
+            calendar_dates = self.repository._calendar_dates(
+                (saved_calendar or {}).get("payload") or []
+            )
+            if len(calendar_dates):
+                requested_end = max(
+                    pd.Timestamp(requested_end), calendar_dates.max().normalize()
+                )
         anomaly_cache_key = (
             f"validation-anomalies:{self.repository.package_id}:{symbol}:{timeframe}:"
             f"{dataset.get('current_version')}:p{PRICE_VALIDATION_VERSION}"
         )
-        cached_anomaly_count = self.store.state(anomaly_cache_key)
-        existing_anomalies = pd.DataFrame()
-        quality_probe = pd.DataFrame()
-        cache_hit = False
-        if (
-            mode == "incremental" and label_convention is None
-            and self._validation_covers(dataset, requested_start, requested_end)
-            and (cached_anomaly_count is None or int(cached_anomaly_count) == 0)
-        ):
-            state = self.repository.validation_state(
-                symbol, timeframe, adjustment=adjustment,
-                start=requested_start, end=requested_end,
-            )
-            if not state.get("failed") and not state.get("pending"):
-                if cached_anomaly_count is None:
-                    quality_probe = self.repository.bars(
-                        symbol, timeframe, adjustment=adjustment,
-                        start=requested_start, end=requested_end,
-                    )
-                    existing_anomalies = _price_anomaly_rows(
-                        quality_probe, requested_start, requested_end
-                    )
-                    cached_anomaly_count = len(existing_anomalies)
-                    self.store.state(anomaly_cache_key, int(cached_anomaly_count))
-                cache_hit = int(cached_anomaly_count) == 0
-        if cache_hit:
-            state = self.repository.validation_state(
-                symbol, timeframe, adjustment=adjustment,
-                start=requested_start, end=requested_end,
-            )
-            if not state.get("failed") and not state.get("pending"):
-                record_count("validation_cache_hits", 1)
-                progress(1.0, f"{timeframe} 已有有效校验，复用 {state.get('validated_days', 0)} 日")
-                return {
-                    "symbol": symbol, "timeframe": timeframe, "status": "complete",
-                    "pending_validation": [],
-                    "report": {
-                        "status": "complete", "mode": mode, "checked_days": 0,
-                        "skipped_days": state.get("validated_days", 0),
-                        "verified_from": state.get("verified_from"),
-                        "verified_through": state.get("verified_through"),
-                        "pending_validation": [], "failed": [], "cached": True,
-                    },
-                    "verified_from": state.get("verified_from"),
-                    "verified_through": state.get("verified_through"),
-                }
-        if quality_probe.empty:
-            record_count("validation_cache_misses", 1)
-            quality_probe = self.repository.bars(
-                symbol, timeframe, adjustment=adjustment,
-                start=requested_start, end=requested_end,
-            )
-            existing_anomalies = _price_anomaly_rows(
-                quality_probe, requested_start, requested_end
-            )
-            self.store.state(anomaly_cache_key, int(len(existing_anomalies)))
-        frame = self.repository.active_rows(
+        archive = CoverageArchive(self.repository)
+        archive_head = archive.trusted_head(
             symbol, timeframe, adjustment,
-            start=None if label_convention not in (None, "auto") else requested_start,
-            end=None if label_convention not in (None, "auto") else requested_end,
+            start=requested_start, end=requested_end,
         )
-        if frame.empty:
-            raise MarketDataError("没有可校验的本地行情")
+        frame = pd.DataFrame()
+        preloaded_months = None
+        frame_data_version = int(dataset.get("current_version") or 0)
+        if label_convention is not None or mode == "full":
+            read_options = {
+                "start": None if label_convention not in (None, "auto") else requested_start,
+                "end": None if label_convention not in (None, "auto") else requested_end,
+            }
+            if mode == "full":
+                read_options["use_cache"] = False
+            frame = self.repository.active_rows(
+                symbol, timeframe, adjustment, **read_options,
+            )
+            if frame.empty:
+                raise MarketDataError("没有可校验的本地行情")
+        initial_market_shard_reads = (
+            len({self.repository._storage_period(timeframe, stamp)[0] for stamp in frame.timestamp})
+            if mode == "full" and not frame.empty else 0
+        )
+        existing_anomalies = (
+            _price_anomaly_rows(frame, requested_start, requested_end)
+            if not frame.empty else pd.DataFrame()
+        )
+        if not frame.empty:
+            self.store.state(anomaly_cache_key, int(len(existing_anomalies)))
         ledger_changed = False
         if label_convention is not None and timeframe in MINUTE_TIMEFRAMES:
             if label_convention not in {"auto", "start", "end"}:
@@ -1164,15 +1375,14 @@ class MarketDataService:
                 fingerprint = hashlib.sha256(
                     f"revalidate|{symbol}|{timeframe}|{label_convention}|{frame.timestamp.min()}|{frame.timestamp.max()}|{len(frame)}".encode()
                 ).hexdigest()
-                self.repository.commit_bars(
+                label_commit = self.repository.commit_bars(
                     symbol, timeframe, frame, adjustment=adjustment, source="revalidate",
                     file_name="local-revalidation", fingerprint=fingerprint, params_hash=params_hash,
                     report={"status": "ready", "pending_validation": []}, metadata={},
                     replace_range=label_convention == "start",
                 )
-                self.repository.invalidate_all_validations(symbol, adjustment)
+                frame_data_version = int(label_commit["version"])
                 ledger_changed = True
-                frame = self.repository.active_rows(symbol, timeframe, adjustment)
                 self.repository.save_coverage(symbol, timeframe, adjustment, frame.timestamp.min(), frame.timestamp.max(), {
                     "status": "complete", "expected_rows": len(frame), "observed_rows": len(frame),
                     "synthetic_rows": int(frame.is_synthetic.sum()), "gap_count": 0,
@@ -1184,20 +1394,26 @@ class MarketDataService:
                 fingerprint = hashlib.sha256(
                     f"volume-revalidate|{symbol}|{timeframe}|{len(verified_frame)}".encode()
                 ).hexdigest()
-                self.repository.commit_bars(
+                volume_commit = self.repository.commit_bars(
                     symbol, timeframe, verified_frame, adjustment=adjustment, source="revalidate",
                     file_name="volume-revalidation", fingerprint=fingerprint,
                     params_hash=_params_hash(timeframe, "volume", adjustment, "revalidate", PARSER_VERSION),
                     report={"status": "ready", "pending_validation": []}, metadata={},
                 )
                 frame = verified_frame
+                frame_data_version = int(volume_commit["version"])
                 self.refresh_snapshot(symbol)
-                self.repository.invalidate_all_validations(symbol, adjustment)
                 ledger_changed = True
+        if mode == "full" and not frame.empty:
+            frame.attrs["_coverage_data_version"] = frame_data_version
+            preloaded_months = _preload_storage_periods(
+                self.repository, timeframe, frame,
+            )
         validation_started = time.perf_counter()
         ledger = self._validate_ledger(
             symbol, timeframe, mode=mode, adjustment=adjustment,
-            start=start, end=end, progress=progress, cancelled=cancelled,
+            start=start, end=end, dates=dates, progress=progress, cancelled=cancelled,
+            preloaded_months=preloaded_months,
         )
         record_seconds("validation", time.perf_counter() - validation_started)
         state = self.repository.validation_state(
@@ -1206,16 +1422,30 @@ class MarketDataService:
         )
         status = "complete" if state.get("verified_through") and not state.get("failed") and not state.get("pending") else "partial"
         pending = list(state.get("pending") or [])
+        archive_anomalies = sum(
+            int(row.get("blocked_rows") or 0)
+            for row in archive.rows(
+                symbol, timeframe, adjustment,
+                start=requested_start, end=requested_end,
+            )
+        )
         if state.get("failed"):
             pending.append(f"{len(state['failed'])} 个交易日未通过校验")
-        if not existing_anomalies.empty:
-            pending.append(f"存在 {len(existing_anomalies)} 条未解决的无效价格记录")
+        anomaly_count = max(len(existing_anomalies), archive_anomalies)
+        if anomaly_count:
+            pending.append(f"存在 {anomaly_count} 条未解决的无效价格记录")
             status = "partial"
         validation_report = {
             "status": status,
             "mode": mode,
             "checked_days": ledger.get("checked_days", 0),
+            "cached": int(ledger.get("checked_days") or 0) == 0,
             "skipped_days": ledger.get("skipped_days", 0),
+            "reused_days": ledger.get("reused_days", 0),
+            "archive_hit": bool(ledger.get("archive_hit") or archive_head),
+            "scanned_months": ledger.get("scanned_months", 0),
+            "scanned_shards": ledger.get("scanned_shards", ledger.get("scanned_months", 0)),
+            "parallel_workers": ledger.get("parallel_workers", 0),
             "verified_from": state.get("verified_from"),
             "verified_through": state.get("verified_through"),
             "failed": state.get("failed", []),
@@ -1224,6 +1454,11 @@ class MarketDataService:
                 existing_anomalies, symbol=symbol, timeframe=timeframe, limit=200
             ),
             "ledger_changed": ledger_changed,
+            "archive_revision": ledger.get("archive_revision"),
+            "market_data_read_calls": int(ledger.get("market_data_read_calls") or 0)
+            + (1 if not frame.empty else 0),
+            "market_shard_reads": int(ledger.get("market_shard_reads") or 0)
+            + initial_market_shard_reads,
         }
         return {
             "symbol": symbol, "timeframe": timeframe, "status": status,
@@ -1236,46 +1471,160 @@ class MarketDataService:
         self, symbol: str, timeframe: str, *, mode: str, adjustment: str,
         start=None, end=None, progress: Callable[[float, str], None] = lambda *_: None,
         cancelled: Callable[[], bool] = lambda: False,
+        dates=None, force_dates: bool | None = None,
+        preloaded_months: dict[str, pd.DataFrame] | None = None,
     ) -> dict:
         """Validate independent months in parallel and commit from the parent."""
         dataset = self.repository.dataset(symbol, timeframe, adjustment)
         if not dataset:
             raise MarketDataError("没有可校验的本地行情")
-        first = pd.Timestamp(start or dataset["first_time"]).normalize()
-        last = pd.Timestamp(end or dataset["last_time"]).normalize()
-        months: list[tuple[pd.Timestamp, pd.Timestamp]] = []
-        cursor = first.to_period("M").start_time.normalize()
-        while cursor <= last:
-            month_end = (cursor + pd.offsets.MonthBegin(1)).normalize() - pd.Timedelta(days=1)
-            months.append((max(first, cursor), min(last, month_end)))
-            cursor += pd.offsets.MonthBegin(1)
+        selection = validation_targets(
+            self, symbol, timeframe, mode=mode, start=start, end=end, dates=dates,
+            force_dates=bool(dates is not None if force_dates is None else force_dates),
+            adjustment=adjustment,
+        )
+        first, last = selection["lower"], selection["upper"]
+        base_data_version = int(dataset.get("current_version") or 0)
+        head = selection.get("archive")
+        file_state = selection.get("file_state") or {}
+        files_valid = str(file_state.get("status") or "readable") == "readable"
+        invalid_ranges = []
+        for start_value, end_value in file_state.get("invalid_ranges") or []:
+            try:
+                invalid_ranges.append((
+                    pd.Timestamp(start_value).normalize(),
+                    pd.Timestamp(end_value).normalize(),
+                ))
+            except (TypeError, ValueError):
+                continue
+        untrusted_rebuild = bool(head is None or (
+            int(head.get("data_version") or 0)
+            != int(dataset.get("current_version") or 0)
+            and not selection.get("has_pending_scope")
+        ))
+        if untrusted_rebuild:
+            CoverageArchive(self.repository).mark_all_dirty(
+                symbol, timeframe, "行情版本或档案文件待复核", adjustment=adjustment,
+            )
+        elif not files_valid:
+            archive_index = CoverageArchive(self.repository)
+            invalid_days = [
+                row["trade_date"] for row in archive_index.rows(
+                    symbol, timeframe, adjustment, start=first, end=last,
+                )
+                if any(
+                    start <= pd.Timestamp(row["trade_date"]).normalize() <= end
+                    for start, end in invalid_ranges
+                )
+            ]
+            archive_index.mark_dirty(
+                symbol, timeframe, invalid_days, reason="行情分片文件异常",
+                adjustment=adjustment,
+            )
+        else:
+            archive_index = CoverageArchive(self.repository)
+            if selection.get("dependency_stale"):
+                archive_index.mark_dirty(
+                    symbol, timeframe, selection["dependency_stale"],
+                    reason="日历或公司行动依赖变化", adjustment=adjustment,
+                )
+            if selection.get("rules_stale"):
+                archive_index.mark_dirty(
+                    symbol, timeframe, selection["rules_stale"],
+                    reason="校验规则升级", adjustment=adjustment,
+                )
+        target_days = selection["targets"]
+        if not target_days:
+            return {
+                "symbol": symbol, "timeframe": timeframe, "mode": mode,
+                "checked_days": 0, "skipped_days": len(selection["calendar_days"]),
+                "reused_days": selection["reused_days"], "failed_days": 0,
+                "parallel_workers": 0, "archive_hit": selection["archive_hit"],
+                "scanned_months": 0,
+            }
+        month_periods = sorted({pd.Timestamp(day).to_period("M") for day in target_days})
+        months = [(period.start_time.normalize(), period.end_time.normalize()) for period in month_periods]
+        scanned_shard_count = len({
+            self.repository._storage_period(timeframe, day)[0] for day in target_days
+        })
         configured = self.settings.performance
         workers = min(
             effective_setting(configured, "validation_workers", 4, 4),
             effective_cpu_budget(configured), max(1, len(months)),
             max(1, int(configured.workspace_mb) // 256),
         )
-        if len(months) <= 1 or workers <= 1:
-            return validate_incremental(
-                self, symbol, timeframe, mode=mode, start=first, end=last,
+        if timeframe not in MINUTE_TIMEFRAMES or len(months) <= 1 or workers <= 1:
+            ledger, read_calls = _counted_validate_incremental(
+                self, symbol, timeframe, mode=mode, start=first, end=last, dates=dates,
+                force_dates=bool(dates is not None if force_dates is None else force_dates),
+                adjustment=adjustment, selection=selection,
+                preloaded_months=preloaded_months,
                 progress=progress, cancelled=cancelled,
             )
+            ledger["market_data_read_calls"] = read_calls
+            return ledger
         executor = ProcessPoolExecutor(
             max_workers=workers,
             mp_context=multiprocessing.get_context("spawn"),
         )
+        dates_by_month = {
+            period: tuple(sorted(
+                str(pd.Timestamp(day).date()) for day in target_days
+                if pd.Timestamp(day).to_period("M") == period
+            ))
+            for period in month_periods
+        }
+        preloaded_daily_by_month: dict[Any, pd.DataFrame] = {}
+        daily_read_calls = 0
+        daily_shard_reads = 0
+        if timeframe in MINUTE_TIMEFRAMES:
+            daily_dataset = self.repository.dataset(symbol, "1day", adjustment)
+            daily_version = int((daily_dataset or {}).get("current_version") or 0)
+            daily_read_metrics: dict[str, Any] = {"calls": 0, "periods": set()}
+            daily_frame = (
+                _read_daily_dependencies(
+                    self.repository, symbol, target_days, adjustment,
+                    read_metrics=daily_read_metrics, use_cache=mode != "full",
+                )
+                if daily_dataset else pd.DataFrame()
+            )
+            daily_frame.attrs["_coverage_data_version"] = daily_version
+            daily_read_calls = int(daily_read_metrics.get("calls") or 0)
+            daily_shard_reads = len(daily_read_metrics.get("periods") or set())
+            if not daily_frame.empty:
+                daily_stamps = pd.to_datetime(daily_frame.timestamp, errors="coerce").dt.normalize()
+            else:
+                daily_stamps = pd.Series(dtype="datetime64[ns]")
+            for period, dates in dates_by_month.items():
+                subset = (
+                    daily_frame.loc[daily_stamps.isin(pd.to_datetime(list(dates)).normalize())].copy()
+                    if not daily_frame.empty else pd.DataFrame()
+                )
+                subset.attrs["_coverage_data_version"] = daily_version
+                preloaded_daily_by_month[period] = subset
         futures = {
             executor.submit(
                 _validate_month_worker,
                 str(self.store.root), str(self.repository.package_dir),
                 symbol, timeframe, adjustment, mode,
                 str(month_start.date()), str(month_end.date()),
-            ): (month_start, month_end)
-            for month_start, month_end in months
+                dates_by_month[period],
+                ({self.repository._storage_period(timeframe, month_start)[0]:
+                  preloaded_months[self.repository._storage_period(timeframe, month_start)[0]]}
+                 if preloaded_months and self.repository._storage_period(timeframe, month_start)[0] in preloaded_months
+                 else None),
+                preloaded_daily_by_month.get(period),
+            ): (period, month_start, month_end)
+            for period, (month_start, month_end) in zip(month_periods, months)
         }
-        checked = skipped = failed = 0
+        read_calls = daily_read_calls
+        shard_reads = daily_shard_reads
         completed = 0
+        coverage_rows: list[dict[str, Any]] = []
+        validation_rows: list[dict[str, Any]] = []
+        archive = CoverageArchive(self.repository)
         scheduler_poll = float(self.settings.market_data.scheduler_poll_seconds)
+        interrupted: BaseException | None = None
         try:
             pending = set(futures)
             while pending:
@@ -1286,29 +1635,96 @@ class MarketDataService:
                 )
                 for future in done:
                     result = future.result()
-                    checked += int(result.get("checked_days", 0) or 0)
-                    skipped += int(result.get("skipped_days", 0) or 0)
-                    failed += int(result.get("failed_days", 0) or 0)
+                    read_calls += int(result.get("_market_data_read_calls") or 0)
+                    shard_reads += int(result.get("market_shard_reads") or 0)
                     completed += 1
+                    coverage_rows.extend(result.get("_coverage_rows") or [])
+                    validation_rows.extend(result.get("_validation_rows") or [])
                     record_count("validation_months", 1)
                     progress(
                         completed / max(1, len(months)),
                         f"校验 {timeframe}：{completed}/{len(months)} 个月完成 · {workers} 进程",
                     )
-        except BaseException:
+        except BaseException as exc:
+            interrupted = exc
             for process in list(getattr(executor, "_processes", {}).values()):
                 try:
                     process.terminate()
                 except Exception:
                     pass
             executor.shutdown(wait=False, cancel_futures=True)
-            raise
         else:
             executor.shutdown(wait=True, cancel_futures=True)
+        archive_head = None
+        accepted_dates: set[str] = set()
+        accepted_verdicts: dict[str, str] = {}
+        stale_dates: set[str] = set()
+        if coverage_rows:
+            archive_head = archive.commit_rows(
+                coverage_rows,
+                validation_rows=validation_rows,
+                expected_data_version=base_data_version,
+                changed_months={str(pd.Timestamp(row["trade_date"]).to_period("M")) for row in coverage_rows},
+            )
+            evidence_reads = int(archive_head.get("_evidence_read_calls") or 0)
+            read_calls += evidence_reads
+            shard_reads += evidence_reads
+            accepted_dates.update(archive_head.get("_accepted_dates") or [])
+            accepted_set = set(archive_head.get("_accepted_dates") or [])
+            accepted_verdicts.update({
+                str(pd.Timestamp(row["trade_date"]).date()): str(row.get("status") or "")
+                for row in coverage_rows
+                if str(pd.Timestamp(row["trade_date"]).date()) in accepted_set
+            })
+            stale_dates.update(archive_head.get("_stale_dates") or [])
+        retry_count = 0
+        while stale_dates and retry_count < 3:
+            if cancelled():
+                break
+            retry_count += 1
+            retry_result, retry_reads = _counted_validate_incremental(
+                self, symbol, timeframe, mode=mode,
+                dates=sorted(stale_dates), force_dates=True,
+                adjustment=adjustment, persist_results=False,
+                persist_archive=False, progress=lambda *_: None, cancelled=cancelled,
+            )
+            read_calls += retry_reads
+            shard_reads += int(retry_result.get("market_shard_reads") or 0)
+            retry_coverage = retry_result.get("_coverage_rows") or []
+            retry_validation = retry_result.get("_validation_rows") or []
+            if not retry_coverage:
+                break
+            retry_head = archive.commit_rows(
+                retry_coverage, validation_rows=retry_validation,
+                expected_data_version=int((self.repository.dataset(symbol, timeframe, adjustment) or {}).get("current_version") or 0),
+                changed_months={str(pd.Timestamp(row["trade_date"]).to_period("M")) for row in retry_coverage},
+            )
+            evidence_reads = int(retry_head.get("_evidence_read_calls") or 0)
+            read_calls += evidence_reads
+            shard_reads += evidence_reads
+            archive_head = retry_head
+            accepted_dates.update(retry_head.get("_accepted_dates") or [])
+            accepted_set = set(retry_head.get("_accepted_dates") or [])
+            accepted_verdicts.update({
+                str(pd.Timestamp(row["trade_date"]).date()): str(row.get("status") or "")
+                for row in retry_coverage
+                if str(pd.Timestamp(row["trade_date"]).date()) in accepted_set
+            })
+            stale_dates = set(retry_head.get("_stale_dates") or [])
+        if interrupted is not None:
+            raise interrupted
         return {
             "symbol": symbol, "timeframe": timeframe, "mode": mode,
-            "checked_days": checked, "skipped_days": skipped,
-            "failed_days": failed, "parallel_workers": workers,
+            "checked_days": len(accepted_dates), "skipped_days": selection["reused_days"],
+            "failed_days": sum(status == "failed" for status in accepted_verdicts.values()), "parallel_workers": workers,
+            "reused_days": selection["reused_days"],
+            "archive_revision": int((archive_head or {}).get("revision") or 0),
+            "archive_hit": selection["archive_hit"],
+            "scanned_months": len(months),
+            "scanned_shards": scanned_shard_count,
+            "stale_dates": sorted(stale_dates),
+            "market_data_read_calls": read_calls,
+            "market_shard_reads": shard_reads,
         }
 
     def readiness(self, config: BacktestConfig, version: str | None = None) -> dict:
@@ -1323,7 +1739,12 @@ class MarketDataService:
                 "gaps": [{"kind": "version", "message": "DATA_VERSION_NOT_FOUND: 原数据版本已清理"}],
             }
         market_versions = (manifest or {}).get("market_versions", {})
-        calendar = self.repository.auxiliary(symbol, "calendar")
+        auxiliary_versions = (manifest or {}).get("auxiliary_versions", {})
+        calendar_version = auxiliary_versions.get("calendar") if version else None
+        calendar = (
+            self.repository.auxiliary(symbol, "calendar", version=calendar_version)
+            if version else self.repository.auxiliary(symbol, "calendar")
+        )
         if not calendar or not calendar.get("payload"):
             gaps.append({
                 "kind": "calendar", "timeframe": "1day",
@@ -1341,6 +1762,10 @@ class MarketDataService:
             pd.Timestamp(daily.get("last_time")).normalize() if daily and daily.get("last_time") else pd.Timestamp(config.start_date).normalize()
         )
         requested_start = pd.Timestamp(config.start_date).normalize()
+        snapshot_daily_version = (
+            int(market_versions["1day"]["version"])
+            if version and "1day" in market_versions else None
+        )
         degraded_days: list[dict] = []
         if target in DERIVED_SOURCES and not version:
             try:
@@ -1361,10 +1786,33 @@ class MarketDataService:
                 message = f"{target} 行情文件缺失" if minute.get("file_status") == "missing" else f"{target} 行情文件已被外部修改，需要重新登记和校验"
                 gaps.append({"kind": "bars", "timeframe": target, "message": message})
             elif minute:
-                contract = self.repository.dataset(symbol, DERIVED_SOURCES.get(target, target))
-                if not self._validation_covers(contract, requested_start, requested_end):
+                source_timeframe = DERIVED_SOURCES.get(target, target)
+                if version and source_timeframe not in market_versions:
+                    # A frozen package may contain a native coarse series without
+                    # the historical 1min source.  Use that exact target series
+                    # rather than falling back to the live source dataset.
+                    source_timeframe = target
+                source_version = (
+                    int(market_versions[source_timeframe]["version"])
+                    if version and source_timeframe in market_versions else None
+                )
+                contract = (
+                    self.repository.version_info(
+                        symbol, source_timeframe, int(source_version)
+                    ) if source_version is not None else
+                    self.repository.dataset(symbol, source_timeframe)
+                )
+                if not self._validation_covers(
+                    contract, requested_start, requested_end,
+                    version=source_version, calendar_version=calendar_version,
+                    daily_version=snapshot_daily_version,
+                    manifest=manifest if version else None,
+                ):
                     degradable = self._degradable_minute_days(
                         contract, requested_start, requested_end,
+                        version=source_version, calendar_version=calendar_version,
+                        manifest=manifest if version else None,
+                        daily_version=snapshot_daily_version,
                     )
                     if degradable is None:
                         gaps.append({"kind": "quality", "timeframe": target,
@@ -1395,20 +1843,30 @@ class MarketDataService:
                         ),
                     })
         if daily:
+            daily_version = (
+                snapshot_daily_version
+                if version and snapshot_daily_version is not None
+                else int(daily.get("current_version") or 0) or None
+            )
             if daily.get("file_status") != "readable":
                 message = "日线行情文件缺失" if daily.get("file_status") == "missing" else "日线行情文件已被外部修改，需要重新登记和校验"
                 gaps.append({"kind": "daily", "timeframe": "1day", "message": message})
-            if daily.get("first_time") and pd.Timestamp(config.start_date) < pd.Timestamp(daily["first_time"]):
+            if daily.get("first_time") and (
+                requested_start < pd.Timestamp(daily["first_time"]).normalize()
+            ):
                 gaps.append({"kind": "range", "timeframe": "1day", "message": "开始日期早于本地日线覆盖"})
-            if config.end_date and daily.get("last_time") and pd.Timestamp(config.end_date) > pd.Timestamp(daily["last_time"]):
+            if config.end_date and daily.get("last_time") and (
+                requested_end > pd.Timestamp(daily["last_time"]).normalize()
+            ):
                 gaps.append({"kind": "range", "timeframe": "1day", "message": "结束日期晚于本地日线覆盖"})
-            if not self._validation_covers(daily, requested_start, requested_end):
+            if not self._validation_covers(
+                daily, requested_start, requested_end,
+                version=daily_version if version else None,
+                calendar_version=calendar_version,
+                daily_version=daily_version,
+                manifest=manifest if version else None,
+            ):
                 gaps.append({"kind": "quality", "timeframe": "1day", "message": daily.get("reason") or "日线在本次请求区间尚未完成质量核验"})
-            daily_version = (
-                int(market_versions["1day"]["version"])
-                if version and "1day" in market_versions
-                else int(daily.get("current_version") or 0) or None
-            )
             daily_rows = self.repository.bars(
                 symbol, "1day", version=daily_version,
                 start=requested_start - pd.Timedelta(days=30), end=requested_end,
@@ -1435,7 +1893,6 @@ class MarketDataService:
                 if st_state is None or st_state.isna().any():
                     gaps.append({"kind": "fields", "timeframe": "1day",
                                  "message": "日线缺少完整 ST 历史状态，无法用于严格回测"})
-            auxiliary_versions = (manifest or {}).get("auxiliary_versions", {})
             actions = self.repository.auxiliary(
                 symbol, "actions", version=auxiliary_versions.get("actions")
             )
@@ -1461,16 +1918,27 @@ class MarketDataService:
             if asset_type == "etf" and not (actions and actions.get("verified")):
                 gaps.append({"kind": "actions", "timeframe": "1day", "message": "ETF 分红或拆分资料未完成核验"})
         if target != "1day":
-            target_dataset = self.repository.dataset(symbol, target)
+            target_dataset = minute
             if target_dataset:
-                if target_dataset.get("first_time") and pd.Timestamp(config.start_date) < pd.Timestamp(target_dataset["first_time"]):
+                if target_dataset.get("first_time") and (
+                    requested_start < pd.Timestamp(target_dataset["first_time"]).normalize()
+                ):
                     gaps.append({"kind": "range", "timeframe": target, "message": f"开始日期早于本地 {target} 覆盖"})
-                if config.end_date and target_dataset.get("last_time") and pd.Timestamp(config.end_date) > pd.Timestamp(target_dataset["last_time"]):
+                if config.end_date and target_dataset.get("last_time") and (
+                    requested_end > pd.Timestamp(target_dataset["last_time"]).normalize()
+                ):
                     gaps.append({"kind": "range", "timeframe": target, "message": f"结束日期晚于本地 {target} 覆盖"})
         warnings = []
         if degraded_days:
             dates = ", ".join(item["date"] for item in degraded_days[:8])
-            total_days = len(self.repository.trading_days(symbol, requested_start, requested_end))
+            total_days = len(self.repository.trading_days(
+                symbol, requested_start, requested_end,
+                calendar_version=calendar_version,
+                daily_version=(
+                    int(market_versions["1day"]["version"])
+                    if version and "1day" in market_versions else None
+                ),
+            ))
             ratio = 1 - len(degraded_days) / max(1, total_days)
             warnings.append(
                 f"{len(degraded_days)} 个交易日将按已校验日线降级：{dates}；"
@@ -1482,19 +1950,30 @@ class MarketDataService:
                 "checked_start": str(config.start_date),
                 "checked_end": str(config.end_date) if config.end_date else None,
                 "package_id": self.repository.package_id,
+                "snapshot_version": version,
+                "calendar_version": calendar_version,
                 "preparation": {"symbol": symbol, "frequency": target,
                 "start": str(config.start_date), "end": str(config.end_date) if config.end_date else None}}
 
-    def _validation_covers(self, dataset: dict | None, start, end) -> bool:
+    def _validation_covers(
+        self, dataset: dict | None, start, end, *, version: int | None = None,
+        calendar_version=None, daily_version: int | None = None,
+        manifest: dict | None = None,
+    ) -> bool:
         if not dataset:
             return False
         if dataset.get("file_status") not in {None, "readable"}:
             return False
-        state = self.repository.validation_state(
-            str(dataset.get("symbol")), str(dataset.get("timeframe")),
-            adjustment=str(dataset.get("adjustment") or "none"),
-            start=start, end=end,
-        )
+        state = self._frozen_quality_state(manifest, dataset, start, end, version)
+        if state is None:
+            state = self.repository.validation_state(
+                str(dataset.get("symbol")), str(dataset.get("timeframe")),
+                adjustment=str(dataset.get("adjustment") or "none"),
+                start=start, end=end, version=version,
+                calendar_version=calendar_version, daily_version=daily_version,
+            )
+        if state.get("available") is False:
+            return False
         verified_from = state.get("verified_from")
         verified_through = state.get("verified_through")
         if not verified_from or not verified_through:
@@ -1513,7 +1992,11 @@ class MarketDataService:
             and not state.get("failed") and not state.get("pending")
         )
 
-    def _degradable_minute_days(self, dataset: dict | None, start, end) -> list[dict] | None:
+    def _degradable_minute_days(
+        self, dataset: dict | None, start, end, *, version: int | None = None,
+        calendar_version=None, daily_version: int | None = None,
+        manifest: dict | None = None,
+    ) -> list[dict] | None:
         """Return failed minute sessions that can use a verified daily row.
 
         The engine already supports mixed daily/minute bundles.  Readiness was
@@ -1523,18 +2006,29 @@ class MarketDataService:
         """
         if not dataset:
             return None
+        frozen = self._frozen_quality_state(manifest, dataset, start, end, version)
+        if frozen is not None:
+            return []
         symbol = str(dataset.get("symbol"))
         timeframe = str(dataset.get("timeframe"))
         adjustment = str(dataset.get("adjustment") or "none")
         state = self.repository.validation_state(
             symbol, timeframe, adjustment=adjustment, start=start, end=end,
+            version=version, calendar_version=calendar_version,
+            daily_version=daily_version,
         )
-        if not state.get("calendar_available") or state.get("pending"):
+        if (
+            state.get("available") is False
+            or not state.get("calendar_available") or state.get("pending")
+        ):
             return None
         failed = [str(day) for day in (state.get("failed") or [])]
         if not failed:
             return None
-        expected = self.repository.trading_days(symbol, start, end)
+        expected = self.repository.trading_days(
+            symbol, start, end, calendar_version=calendar_version,
+            daily_version=daily_version,
+        )
         expected_start = state.get("expected_start")
         expected_end = state.get("expected_end")
         if (
@@ -1550,7 +2044,9 @@ class MarketDataService:
                 symbol, timeframe, adjustment=adjustment, start=start, end=end,
             )
         }
-        daily = self.repository.bars(symbol, "1day", start=start, end=end)
+        daily = self.repository.bars(
+            symbol, "1day", version=daily_version, start=start, end=end,
+        )
         if daily.empty:
             return None
         daily["_day"] = pd.to_datetime(daily["timestamp"]).dt.normalize()
@@ -1586,6 +2082,26 @@ class MarketDataService:
                 "reason": reason or f"{unfillable} 根分钟缺口",
             })
         return degraded
+
+    @staticmethod
+    def _frozen_quality_state(
+        manifest: dict | None, dataset: dict, start, end, version: int | None,
+    ) -> dict | None:
+        if manifest is None or version is None:
+            return None
+        try:
+            state = frozen_quality_state(
+                manifest, str(dataset.get("timeframe") or ""), start, end,
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not state:
+            return None
+        if state.get("status") != "complete" or state.get("available") is not True:
+            return None
+        if int(state.get("version") or -1) != int(version):
+            return None
+        return state
 
     def load_backtest_bundle(self, config: BacktestConfig, version: str | None = None):
         target = normalize_timeframe(config.frequency)

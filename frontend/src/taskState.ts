@@ -2,9 +2,11 @@ import type { Job } from './types'
 
 export const isActiveJob = (job: Pick<Job, 'status'>) => ['queued', 'running'].includes(job.status)
 export const isResearchJob = (job: Pick<Job, 'kind'>) => ['optimization', 'optimize', 'research_completion'].includes(job.kind)
+export const isEtfResearchJob = (job: Pick<Job, 'kind'>) => ['etf_research', 'etf_validation'].includes(job.kind)
+export const etfResearchResultId = (job: Pick<Job, 'kind' | 'result_id'>) => isEtfResearchJob(job) ? job.result_id ?? null : null
 export const taskStatusLabel = (status: string) => ({ queued: '排队中', running: '运行中', completed: '已完成', partial: '部分完成', cancelled: '已取消', failed: '失败' }[status] ?? status)
 export function taskLabel(job: Job) {
-  const kind = ({ backtest: '策略回测', batch_backtest: '批量回测', optimization: '参数研究', optimize: '参数研究', research_completion: '研究补算', sync: '行情同步', import: '文件导入', market_import: '周期文件导入', market_import_batch: '批量周期导入', market_sync: '周期同步', market_validate: '数据校验', market_aggregate: '本地聚合', instruments: '证券清单更新' } as Record<string, string>)[job.kind] ?? job.kind
+  const kind = ({ backtest: '策略回测', batch_backtest: '批量回测', optimization: '参数研究', optimize: '参数研究', research_completion: '研究补算', etf_research: 'ETF研究', etf_validation: 'ETF数据校验', sync: '行情同步', import: '文件导入', market_import: '周期文件导入', market_import_batch: '批量周期导入', market_sync: '周期同步', market_validate: '数据校验', market_aggregate: '本地聚合', instruments: '证券清单更新' } as Record<string, string>)[job.kind] ?? job.kind
   const config = job.payload?.config as Record<string, unknown> | undefined
   const base = config?.base as Record<string, unknown> | undefined
   const symbol = base?.symbol ?? config?.symbol

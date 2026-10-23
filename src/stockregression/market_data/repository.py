@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -30,8 +31,18 @@ from ..price_validation import details_to_rows, price_issue_details, split_inval
 PARSER_VERSION = "market-data-v3-price-validation"
 VALIDATION_RULES_VERSION = 5
 PRICE_FIELDS = ("open", "high", "low", "close", "volume", "turnover")
+
+
+# Reconciliation walks every published dataset and stats each immutable
+# manifest. It repairs index/manifest disagreement, so it only needs to run
+# when either side changes. API handlers construct a repository per request;
+# without this guard the same already-consistent 5,524-head check ran on every
+# read while the job dispatcher waited for the GIL.
+_RECONCILED_CATALOGS: dict[tuple, None] = {}
+_RECONCILED_LOCK = threading.Lock()
 TIMEFRAMES = ("1min", "5min", "15min", "30min", "60min", "1day", "1week", "1month")
 PARQUET_SCHEMA_VERSION = "market-bar-v1"
+CATALOG_LAYOUT_VERSION = 4
 PARQUET_FIELDS = (
     "symbol", "timeframe", "adjustment", "timestamp",
     "open", "high", "low", "close", "volume", "turnover",
@@ -127,7 +138,17 @@ class MarketDataRepository:
         for timeframe in TIMEFRAMES:
             (self.root / "imports" / timeframe).mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
-            self._initialize(db)
+            layout_version = int(db.execute("PRAGMA user_version").fetchone()[0])
+            initialized = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='parquet_shards'"
+            ).fetchone()
+            if layout_version != CATALOG_LAYOUT_VERSION or not initialized:
+                # DDL such as CREATE TABLE IF NOT EXISTS still opens a write
+                # transaction and changes the database change counter. Running
+                # the whole layout script on every API request made read-only
+                # pages look like writes and defeated the inventory cache.
+                self._initialize(db)
+                db.execute(f"PRAGMA user_version={CATALOG_LAYOUT_VERSION}")
         previous_package = self.meta("package_dir") or self.meta("source_package_dir")
         selected_package = package_dir or previous_package
         self.package = PackageLayout(
@@ -148,26 +169,106 @@ class MarketDataRepository:
             or (previous_generation and previous_generation != package_manifest["generation"])
         ):
             self._clear_market_index()
+        desired_meta = {
+            "package_dir": str(self.package_dir),
+            "source_package_dir": str(self.package_dir),
+            "package_id": str(package_manifest["package_id"]),
+            "generation": str(package_manifest["generation"]),
+        }
         with self._connect() as db:
-            db.execute(
-                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('package_dir',?)",
-                (str(self.package_dir),),
-            )
-            db.execute(
-                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('source_package_dir',?)",
-                (str(self.package_dir),),
-            )
-            db.execute(
-                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('package_id',?)",
-                (package_manifest["package_id"],),
-            )
-            db.execute(
-                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('generation',?)",
-                (package_manifest["generation"],),
-            )
+            existing_meta = {
+                row[0]: row[1] for row in db.execute(
+                    "SELECT key,value FROM parquet_meta WHERE key IN "
+                    "('package_dir','source_package_dir','package_id','generation')"
+                )
+            }
+            changed_meta = {
+                key: value for key, value in desired_meta.items()
+                if existing_meta.get(key) != value
+            }
+            if changed_meta:
+                # Every API request constructs a repository. Rewriting the
+                # same four rows each time forced a WAL write and serialised
+                # with job submissions even though nothing had changed.
+                db.executemany(
+                    "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES(?,?)",
+                    list(changed_meta.items()),
+                )
         with self.package.transaction_guard():
-            self._seed_manifest_from_index()
+            cache_key = self._reconciliation_key(package_manifest)
+            with _RECONCILED_LOCK:
+                reconciled = cache_key in _RECONCILED_CATALOGS
+            if not reconciled or layout_version < 4:
+                self._seed_manifest_from_index()
+                # Older writers could commit day rows before publishing their
+                # archive. Rebuild those mirrors once, even if the old header
+                # happens to match the package reference.
+                self._restore_published_archives(force=layout_version < 4)
+                # A repair can publish heads or rebuild the index. Remember
+                # the state left by the repair so the next read stays cheap.
+                cache_key = self._reconciliation_key(self.package.manifest())
+                with _RECONCILED_LOCK:
+                    if len(_RECONCILED_CATALOGS) >= 128:
+                        _RECONCILED_CATALOGS.pop(next(iter(_RECONCILED_CATALOGS)))
+                    _RECONCILED_CATALOGS[cache_key] = None
             self._recover_package_transactions()
+
+    def _restore_published_archives(self, *, force: bool = False) -> int:
+        """Reconcile the SQLite coverage mirror with manifest-published heads."""
+        from .coverage_index import CoverageArchive
+
+        package = self.package.manifest()
+        archive = CoverageArchive(self)
+        restored = 0
+        for key, head in (package.get("datasets") or {}).items():
+            try:
+                symbol, timeframe, adjustment = str(key).split("|", 2)
+                timeframe = normalize_timeframe(timeframe)
+            except (TypeError, ValueError):
+                continue
+            reference = dict(head.get("quality_archive") or {})
+            with self._connect() as db:
+                indexed = db.execute(
+                    "SELECT data_version,revision,path,sha256 "
+                    "FROM parquet_coverage_archives WHERE symbol=? AND timeframe=? AND adjustment=?",
+                    (symbol, timeframe, adjustment),
+                ).fetchone()
+            if not reference:
+                with self._connect() as db:
+                    db.execute(
+                        "DELETE FROM parquet_coverage_days WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+                    db.execute(
+                        "DELETE FROM parquet_coverage_archives WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+                continue
+            if not force and indexed and (
+                int(indexed["revision"] or 0) == int(reference.get("revision") or 0)
+                and int(indexed["data_version"] or 0) == int(reference.get("data_version") or 0)
+                and str(indexed["path"] or "") == str(reference.get("path") or "")
+                and str(indexed["sha256"] or "") == str(reference.get("sha256") or "")
+            ):
+                continue
+            loaded = archive.load_head(symbol, timeframe, adjustment)
+            if not loaded:
+                with self._connect() as db:
+                    db.execute(
+                        "DELETE FROM parquet_coverage_days WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+                    db.execute(
+                        "DELETE FROM parquet_coverage_archives WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+                continue
+            if int(loaded.get("data_version") or 0) > int(head.get("version") or 0):
+                continue
+            count = archive.restore({"payload": loaded})
+            archive.record_archive(loaded, reference)
+            restored += count
+        return restored
 
     def attach_package(self, package_dir: str | Path) -> None:
         previous_id = self.meta("package_id")
@@ -183,23 +284,31 @@ class MarketDataRepository:
             or (previous_generation and previous_generation != manifest["generation"])
         ):
             self._clear_market_index()
+        desired_meta = {
+            "package_dir": str(self.package_dir),
+            "source_package_dir": str(self.package_dir),
+            "package_id": str(manifest["package_id"]),
+            "generation": str(manifest["generation"]),
+        }
         with self._connect() as db:
-            db.execute(
-                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('package_dir',?)",
-                (str(self.package_dir),),
-            )
-            db.execute(
-                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('source_package_dir',?)",
-                (str(self.package_dir),),
-            )
-            db.execute(
-                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('package_id',?)",
-                (manifest["package_id"],),
-            )
-            db.execute(
-                "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES('generation',?)",
-                (manifest["generation"],),
-            )
+            existing_meta = {
+                row[0]: row[1] for row in db.execute(
+                    "SELECT key,value FROM parquet_meta WHERE key IN "
+                    "('package_dir','source_package_dir','package_id','generation')"
+                )
+            }
+            changed_meta = {
+                key: value for key, value in desired_meta.items()
+                if existing_meta.get(key) != value
+            }
+            if changed_meta:
+                # Every API request constructs a repository. Rewriting the
+                # same four rows each time forced a WAL write and serialised
+                # with job submissions even though nothing had changed.
+                db.executemany(
+                    "INSERT OR REPLACE INTO parquet_meta(key,value) VALUES(?,?)",
+                    list(changed_meta.items()),
+                )
 
     def _clear_market_index(self) -> None:
         """Detach the old package index while preserving saved results and configs."""
@@ -210,6 +319,7 @@ class MarketDataRepository:
                 ).fetchall()
             }
             for table in (
+                "parquet_coverage_days", "parquet_coverage_archives",
                 "parquet_day_validation", "parquet_shards", "parquet_source_archives",
                 "parquet_derived", "parquet_coverage", "parquet_imports",
                 "parquet_auxiliary_history", "parquet_versions",
@@ -271,6 +381,36 @@ class MarketDataRepository:
             );
             CREATE INDEX IF NOT EXISTS parquet_day_validation_range
                 ON parquet_day_validation(symbol,timeframe,adjustment,trade_date,status);
+            CREATE TABLE IF NOT EXISTS parquet_coverage_days(
+                symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
+                adjustment TEXT NOT NULL DEFAULT 'none', trade_date TEXT NOT NULL,
+                is_trading_day INTEGER NOT NULL DEFAULT 1,
+                scanned INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'unknown',
+                row_count INTEGER NOT NULL DEFAULT 0, first_time TEXT, last_time TEXT,
+                synthetic_rows INTEGER NOT NULL DEFAULT 0,
+                auction_placeholders INTEGER NOT NULL DEFAULT 0,
+                blocked_rows INTEGER NOT NULL DEFAULT 0,
+                gap_count INTEGER NOT NULL DEFAULT 0,
+                gaps TEXT NOT NULL DEFAULT '[]', pending TEXT NOT NULL DEFAULT '[]',
+                source_hash TEXT, dependency_hash TEXT,
+                rules_version INTEGER NOT NULL DEFAULT 0, dirty_reason TEXT,
+                report TEXT NOT NULL DEFAULT '{}', checked_at TEXT,
+                PRIMARY KEY(symbol,timeframe,adjustment,trade_date)
+            );
+            CREATE INDEX IF NOT EXISTS parquet_coverage_days_range
+                ON parquet_coverage_days(symbol,timeframe,adjustment,trade_date,
+                                         scanned,status,dirty_reason);
+            CREATE TABLE IF NOT EXISTS parquet_coverage_archives(
+                symbol TEXT NOT NULL, timeframe TEXT NOT NULL,
+                adjustment TEXT NOT NULL DEFAULT 'none',
+                data_version INTEGER NOT NULL, revision INTEGER NOT NULL,
+                path TEXT NOT NULL, sha256 TEXT NOT NULL,
+                gap_count INTEGER NOT NULL DEFAULT 0,
+                pending_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(symbol,timeframe,adjustment)
+            );
             CREATE TABLE IF NOT EXISTS parquet_source_archives(
                 source_path TEXT PRIMARY KEY, source_sha256 TEXT NOT NULL,
                 archive_path TEXT NOT NULL, size INTEGER NOT NULL,
@@ -375,12 +515,6 @@ class MarketDataRepository:
             indexed = db.execute(
                 "SELECT symbol,timeframe,adjustment,current_version FROM parquet_datasets"
             ).fetchall()
-            raw_rows = db.execute(
-                """SELECT s.path,MAX(s.size) size FROM parquet_shards s
-                   JOIN parquet_datasets d ON d.symbol=s.symbol AND d.timeframe=s.timeframe
-                    AND d.adjustment=s.adjustment AND d.current_version=s.version
-                   WHERE s.timeframe IN ('1day','1min') GROUP BY s.path"""
-            ).fetchall()
             package_id = db.execute(
                 "SELECT value FROM parquet_meta WHERE key='package_id'"
             ).fetchone()
@@ -401,9 +535,31 @@ class MarketDataRepository:
             and all(indexed_heads.get(key) == version for key, version in expected_heads.items())
             and all(key in expected_heads for key in indexed_heads)
         )
-        unique_sizes = {str(row["path"]): int(row["size"] or 0) for row in raw_rows}
-        shard_count = len(unique_sizes)
-        shard_bytes = sum(unique_sizes.values())
+        if index_ready:
+            # The package manifest publishes authoritative per-dataset shard
+            # totals when each head is advanced. Re-aggregating every current
+            # shard path made this tiny status endpoint scan ~180k rows on
+            # every request. Version equality above proves these heads are the
+            # ones represented by the SQLite index.
+            shard_count = sum(
+                int(head.get("shard_count") or 0) for head in heads.values()
+            )
+            shard_bytes = sum(
+                int(head.get("shard_bytes") or 0) for head in heads.values()
+            )
+        else:
+            # A stale index may contain versions that the manifest no longer
+            # publishes. Keep reporting the actual indexed state until repair.
+            with self._connect() as db:
+                raw_rows = db.execute(
+                    """SELECT s.path,MAX(s.size) size FROM parquet_shards s
+                       JOIN parquet_datasets d ON d.symbol=s.symbol AND d.timeframe=s.timeframe
+                        AND d.adjustment=s.adjustment AND d.current_version=s.version
+                       WHERE s.timeframe IN ('1day','1min') GROUP BY s.path"""
+                ).fetchall()
+            unique_sizes = {str(row["path"]): int(row["size"] or 0) for row in raw_rows}
+            shard_count = len(unique_sizes)
+            shard_bytes = sum(unique_sizes.values())
         readable = self.package_dir.is_dir()
         pending = self.package.pending_transactions()
         manifest_ready = bool(heads)
@@ -526,6 +682,25 @@ class MarketDataRepository:
             symbols = sorted({symbol for symbol, _ in package_ahead})
             timeframes = sorted({timeframe for _, timeframe in package_ahead})
             self.rebuild_index(symbols=symbols, timeframes=timeframes)
+
+    def _reconciliation_key(self, manifest: dict) -> tuple:
+        """Cheaply identify the index and manifest state already reconciled."""
+        try:
+            stat = self.package.manifest_path.stat()
+            manifest_stat = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            manifest_stat = (0, 0)
+        with self._connect() as db:
+            index_state = tuple(db.execute(
+                """SELECT COUNT(*),COALESCE(MAX(updated_at),''),
+                          COALESCE(SUM(current_version),0)
+                   FROM parquet_datasets"""
+            ).fetchone())
+        return (
+            str(self.db_path), str(manifest.get("package_id") or ""),
+            str(manifest.get("generation") or ""),
+            str(manifest.get("updated_at") or ""), manifest_stat, index_state,
+        )
 
     def _manifest_shards(self, shards: Sequence[dict]) -> list[dict]:
         normalized = []
@@ -694,7 +869,8 @@ class MarketDataRepository:
                     previous_datasets[(symbol, timeframe, adjustment)] = dict(row)
             if not wanted_symbols and not wanted_timeframes:
                 for table in ("parquet_shards", "parquet_versions",
-                              "parquet_datasets", "parquet_derived"):
+                              "parquet_datasets", "parquet_derived",
+                              "parquet_coverage_days", "parquet_coverage_archives"):
                     db.execute(f"DELETE FROM {table}")
             else:
                 for symbol, timeframe, adjustment in current_keys:
@@ -712,6 +888,14 @@ class MarketDataRepository:
                     )
                     db.execute(
                         "DELETE FROM parquet_derived WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+                    db.execute(
+                        "DELETE FROM parquet_coverage_days WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+                    db.execute(
+                        "DELETE FROM parquet_coverage_archives WHERE symbol=? AND timeframe=? AND adjustment=?",
                         (symbol, timeframe, adjustment),
                     )
             version_count = 0
@@ -795,6 +979,14 @@ class MarketDataRepository:
                         "DELETE FROM parquet_coverage WHERE symbol=? AND timeframe=? AND adjustment=?",
                         (symbol, timeframe, adjustment),
                     )
+                    db.execute(
+                        "DELETE FROM parquet_coverage_days WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
+                    db.execute(
+                        "DELETE FROM parquet_coverage_archives WHERE symbol=? AND timeframe=? AND adjustment=?",
+                        (symbol, timeframe, adjustment),
+                    )
                 elif previous:
                     # Revalidation and later metadata updates belong to this
                     # exact data version. Immutable publication manifests only
@@ -839,6 +1031,37 @@ class MarketDataRepository:
                 (str(self.package_dir),),
             )
             db.commit()
+        # The package head is authoritative.  Restore its exact quality
+        # revision after the market index exists, so moving a package to a new
+        # catalog does not turn known gaps into an unknown whole series.
+        from .coverage_index import CoverageArchive
+        for (symbol, timeframe, adjustment), value in latest_by_key.items():
+            try:
+                archive = CoverageArchive(self)
+                head = archive.trusted_head(symbol, timeframe, adjustment)
+                if not head or int(head.get("data_version") or 0) > int(value["version"]):
+                    continue
+                archive.restore({"payload": head})
+                with self._connect() as db:
+                    reference = archive.head_reference(symbol, timeframe, adjustment) or {}
+                    db.execute(
+                        """INSERT OR REPLACE INTO parquet_coverage_archives(
+                           symbol,timeframe,adjustment,data_version,revision,path,sha256,
+                           gap_count,pending_count,failed_count,updated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            symbol, timeframe, adjustment, int(head["data_version"]),
+                            int(head.get("revision") or 0), str(reference.get("path") or ""),
+                            str(reference.get("sha256") or ""),
+                            int(head.get("gap_count") or 0),
+                            int(head.get("pending_count") or 0),
+                            int(head.get("failed_count") or 0), utc_now(),
+                        ),
+                    )
+            except (OSError, ValueError, MarketDataError):
+                # A missing or invalid archive leaves the dataset available but
+                # pending validation; it never manufactures a complete result.
+                continue
         return {
             "status": "completed", "datasets": len(latest_by_key),
             "versions": version_count, "shards": shard_count,
@@ -953,6 +1176,27 @@ class MarketDataRepository:
             end = pd.Timestamp(year=value.year + 1, month=1, day=1)
             key = f"year={value.year:04d}"
         return key, start.isoformat(), end.isoformat()
+
+    def _read_storage_periods(
+        self, symbol: str, timeframe: str, adjustment: str, version: int,
+        periods: dict[str, tuple[str, str]], shards: Sequence[dict],
+    ) -> dict[str, pd.DataFrame]:
+        """Read only the indexed shard files for explicitly affected periods."""
+        shards_by_period: dict[str, list[dict]] = {}
+        wanted = set(periods)
+        for shard in shards:
+            key = str(shard.get("period_key") or "")
+            if key in wanted:
+                shards_by_period.setdefault(key, []).append(shard)
+
+        result: dict[str, pd.DataFrame] = {}
+        for key in periods:
+            selected = shards_by_period.get(key, [])
+            result[key] = (
+                self._read_paths([row["path"] for row in selected])
+                if selected else pd.DataFrame()
+            )
+        return result
 
     def _copy_version_shards(
         self, db, symbol: str, timeframe: str, adjustment: str,
@@ -1072,6 +1316,7 @@ class MarketDataRepository:
         item["timeframe"] = timeframe
         item["version"] = int(item["current_version"])
         file_errors: list[str] = []
+        invalid_ranges: list[tuple[str, str]] = []
         manifest = self.package.manifest()
         head = manifest.get("datasets", {}).get(
             self.package.dataset_key(symbol, timeframe, adjustment), {}
@@ -1080,10 +1325,9 @@ class MarketDataRepository:
             item["file_status"] = "changed"
             file_errors.append("SQLite 索引与包级清单版本不一致")
         else:
-            # File existence and content are checked when a query opens the
-            # selected shard; listing relies on the manifest-backed index.
             item["file_status"] = "readable"
         item["file_errors"] = file_errors
+        item["invalid_ranges"] = invalid_ranges
         item["missing_files"] = 0
         item["changed_files"] = len(file_errors)
         latest_coverage = coverage_rows[-1] if coverage_rows else None
@@ -1136,6 +1380,18 @@ class MarketDataRepository:
         compliance = self.validation_state(symbol, timeframe, adjustment=adjustment)
         item["verified_from"] = compliance.get("verified_from")
         item["verified_through"] = compliance.get("verified_through")
+        if compliance.get("quality_source") == "ledger":
+            archive_complete = bool(
+                compliance.get("verified_through") and last_day is not None
+                and pd.Timestamp(compliance["verified_through"]).normalize() >= last_day
+                and not compliance.get("pending")
+                and not compliance.get("failed")
+            )
+            item["coverage_status"] = (
+                "complete" if archive_complete else
+                "partial" if int(compliance.get("validated_days") or 0) else "unknown"
+            )
+            item["fully_covered"] = archive_complete
         item["validation"] = {
             "rules_version": compliance.get("rules_version"),
             "validated_days": compliance.get("validated_days", 0),
@@ -1181,6 +1437,41 @@ class MarketDataRepository:
         item["archive"] = self.archive_status(symbol, timeframe, adjustment)
         return item
 
+    def market_file_state(
+        self, symbol: str, timeframe: str, adjustment: str = "none",
+    ) -> dict[str, Any]:
+        """Check the active shard references without decoding market bodies."""
+        timeframe = normalize_timeframe(timeframe)
+        with self._connect() as db:
+            dataset = self._dataset_row(db, symbol, timeframe, adjustment)
+            if not dataset:
+                return {"status": "missing", "errors": [], "invalid_ranges": []}
+            shards = self._current_shards(
+                db, symbol, timeframe, adjustment, int(dataset["current_version"]),
+            )
+        errors: list[str] = []
+        invalid_ranges: list[tuple[str, str]] = []
+        status = "readable"
+        for shard in shards:
+            relative = str(shard.get("path") or "")
+            path = self.package.absolute(relative)
+            if Path(relative).is_absolute() or ".." in Path(relative).parts:
+                status = "changed"
+                errors.append(f"行情分片路径越界：{relative}")
+            elif not path.is_file():
+                status = "missing"
+                errors.append(f"行情分片缺失：{relative}")
+            elif int(shard.get("size") or -1) != path.stat().st_size:
+                status = "changed"
+                errors.append(f"行情分片大小与索引不符：{relative}")
+            else:
+                continue
+            invalid_ranges.append((
+                str(shard.get("period_start") or ""),
+                str(shard.get("period_end") or ""),
+            ))
+        return {"status": status, "errors": errors, "invalid_ranges": invalid_ranges}
+
     def datasets(
         self, timeframe: str | None = None, query: str = "", status: str | None = None,
         limit: int = 200, offset: int = 0,
@@ -1212,11 +1503,283 @@ class MarketDataRepository:
                 " ORDER BY updated_at DESC,symbol,timeframe LIMIT ? OFFSET ?",
                 [*args, limit, offset],
             ).fetchall()
+        selected = [dict(row) for row in rows]
+        if not selected:
+            return {"items": [], "count": int(total), "timeframes": list(TIMEFRAMES)}
+
+        keys = [
+            (str(row["symbol"]), str(row["timeframe"]), str(row["adjustment"]))
+            for row in selected
+        ]
+        versions = {
+            key: int(row["current_version"] or 0)
+            for key, row in zip(keys, selected)
+        }
+        symbols = sorted({key[0] for key in keys})
+        coverage_map: dict[tuple[str, str, str], list[dict]] = {}
+        shard_map: dict[tuple[str, str, str], list[dict]] = {}
+        history_bytes: dict[tuple[str, str, str], int] = {}
+        validation_map: dict[tuple[str, str, str], list[dict]] = {}
+        derived_map: dict[tuple[str, str, str], dict] = {}
+        calendar_raw_by_symbol: dict[str, str] = {}
+        daily_versions: dict[str, int] = {}
+        daily_shards: list[tuple[str, str]] = []
+
+        with self._connect() as db:
+            for start in range(0, len(keys), 200):
+                chunk = keys[start:start + 200]
+                values = ",".join("(?,?,?)" for _ in chunk)
+                params = [value for key in chunk for value in key]
+                for row in db.execute(
+                    f"""WITH selected(symbol,timeframe,adjustment) AS (VALUES {values})
+                        SELECT c.symbol,c.timeframe,c.adjustment,c.status,c.report,
+                               c.start_time,c.end_time
+                        FROM parquet_coverage c
+                        JOIN selected s USING(symbol,timeframe,adjustment)
+                        ORDER BY c.symbol,c.timeframe,c.adjustment,
+                                 c.start_time,c.end_time""",
+                    params,
+                ):
+                    key = (row["symbol"], row["timeframe"], row["adjustment"])
+                    coverage_map.setdefault(key, []).append(dict(row))
+                for row in db.execute(
+                    f"""WITH selected(symbol,timeframe,adjustment) AS (VALUES {values})
+                        SELECT s.symbol,s.timeframe,s.adjustment,s.version,s.path,s.size
+                        FROM parquet_shards s
+                        JOIN selected x USING(symbol,timeframe,adjustment)
+                        ORDER BY s.symbol,s.timeframe,s.adjustment,s.sequence""",
+                    params,
+                ):
+                    key = (row["symbol"], row["timeframe"], row["adjustment"])
+                    if int(row["version"] or 0) == versions[key]:
+                        shard_map.setdefault(key, []).append(dict(row))
+                for row in db.execute(
+                    f"""WITH selected(symbol,timeframe,adjustment) AS (VALUES {values})
+                        SELECT h.symbol,h.timeframe,h.adjustment,SUM(h.size) bytes
+                        FROM (
+                            SELECT s.symbol,s.timeframe,s.adjustment,s.path,MAX(s.size) size
+                            FROM parquet_shards s
+                            JOIN selected x USING(symbol,timeframe,adjustment)
+                            GROUP BY s.symbol,s.timeframe,s.adjustment,s.path
+                        ) h
+                        GROUP BY h.symbol,h.timeframe,h.adjustment""",
+                    params,
+                ):
+                    history_bytes[(row["symbol"], row["timeframe"], row["adjustment"])] = int(row["bytes"] or 0)
+                for row in db.execute(
+                    f"""WITH selected(symbol,timeframe,adjustment) AS (VALUES {values})
+                        SELECT v.symbol,v.timeframe,v.adjustment,v.trade_date,
+                               v.status,v.rules_version
+                        FROM parquet_day_validation v
+                        JOIN selected s USING(symbol,timeframe,adjustment)
+                        ORDER BY v.symbol,v.timeframe,v.adjustment,v.trade_date""",
+                    params,
+                ):
+                    key = (row["symbol"], row["timeframe"], row["adjustment"])
+                    validation_map.setdefault(key, []).append(dict(row))
+                for row in db.execute(
+                    f"""WITH selected(symbol,timeframe,adjustment) AS (VALUES {values})
+                        SELECT d.symbol,d.timeframe,d.adjustment,d.source_timeframe,
+                               d.target_timeframe,d.source_version,d.start_time,
+                               d.end_time,d.stale,d.updated_at
+                        FROM parquet_derived d
+                        JOIN selected s USING(symbol,timeframe,adjustment)
+                        WHERE d.target_timeframe=d.timeframe""",
+                    params,
+                ):
+                    derived_map[(row["symbol"], row["timeframe"], row["adjustment"])] = dict(row)
+            for start in range(0, len(symbols), 400):
+                chunk = symbols[start:start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in db.execute(
+                    f"""SELECT symbol,payload,updated_at
+                        FROM parquet_auxiliary_history
+                        WHERE kind='calendar' AND symbol IN ({placeholders})
+                        ORDER BY symbol,updated_at""",
+                    chunk,
+                ):
+                    calendar_raw_by_symbol[row["symbol"]] = str(row["payload"])
+                for row in db.execute(
+                    f"""SELECT symbol,current_version FROM parquet_datasets
+                        WHERE timeframe='1day' AND adjustment='none'
+                          AND symbol IN ({placeholders})""",
+                    chunk,
+                ):
+                    daily_versions[row["symbol"]] = int(row["current_version"] or 0)
+            for start in range(0, len(daily_versions), 200):
+                chunk = list(daily_versions.items())[start:start + 200]
+                values = ",".join("(?,?)" for _ in chunk)
+                params = [value for item in chunk for value in item]
+                for row in db.execute(
+                    f"""WITH selected(symbol,version) AS (VALUES {values})
+                        SELECT s.symbol,s.path FROM parquet_shards s
+                        JOIN selected x ON s.symbol=x.symbol AND s.version=x.version
+                        WHERE s.timeframe='1day' AND s.adjustment='none'
+                        ORDER BY s.symbol,s.sequence""",
+                    params,
+                ):
+                    daily_shards.append((str(row["symbol"]), str(row["path"])))
+
+        parsed_calendars: dict[str, tuple[pd.DatetimeIndex, bool]] = {}
+        calendar_by_symbol: dict[str, tuple[pd.DatetimeIndex, bool]] = {}
+        for symbol, raw in calendar_raw_by_symbol.items():
+            parsed = parsed_calendars.get(raw)
+            if parsed is None:
+                payload = _load(raw, [])
+                parsed = (self._calendar_dates(payload), bool(payload))
+                parsed_calendars[raw] = parsed
+            calendar_by_symbol[symbol] = parsed
+        calendar_by_market: dict[str, pd.DatetimeIndex] | None = None
+
+        daily_dates: dict[str, pd.DatetimeIndex] = {}
+        if daily_shards:
+            resolved_shards = [
+                (symbol, str(self.package.absolute(path)))
+                for symbol, path in daily_shards
+            ]
+            absolute_paths = [path for _, path in resolved_shards]
+            path_symbols = {
+                os.path.normcase(os.path.normpath(path)): symbol
+                for symbol, path in resolved_shards
+            }
+            with duckdb.connect() as connection:
+                relation = connection.read_parquet(
+                    absolute_paths, union_by_name=True, filename=True,
+                )
+                stamps = relation.project("filename,timestamp").distinct().df()
+            stamps["symbol"] = (
+                stamps["filename"].astype(str).str.replace("\\", "/", regex=False)
+                .str.extract(r"symbol=([^/]+)", expand=False)
+            )
+            missing_symbol = stamps["symbol"].isna()
+            if missing_symbol.any():
+                stamps.loc[missing_symbol, "symbol"] = stamps.loc[
+                    missing_symbol, "filename"
+                ].map(lambda value: path_symbols.get(
+                    os.path.normcase(os.path.normpath(str(value)))
+                ))
+            stamps["timestamp"] = pd.to_datetime(
+                stamps["timestamp"], errors="coerce"
+            ).dt.normalize()
+            stamps = stamps.dropna(subset=["symbol", "timestamp"])
+            stamps = stamps.drop_duplicates(["symbol", "timestamp"])
+            daily_dates = {
+                str(symbol): pd.DatetimeIndex(group["timestamp"].sort_values())
+                for symbol, group in stamps.groupby("symbol", sort=False)
+            }
+
+        manifest_heads = self.package.manifest().get("datasets", {})
+
+        def expected_dates_for(symbol: str, records: list[dict]) -> tuple[pd.DatetimeIndex, pd.DatetimeIndex, bool]:
+            nonlocal calendar_by_market
+            stored = calendar_by_symbol.get(symbol)
+            if stored is None:
+                if calendar_by_market is None:
+                    calendar_by_market = self._calendar_dates_by_market()
+                calendar_dates = calendar_by_market.get(symbol[-2:], pd.DatetimeIndex([]))
+                calendar_available = bool(len(calendar_dates))
+            else:
+                calendar_dates, calendar_available = stored
+            actual = daily_dates.get(symbol, pd.DatetimeIndex([]))
+            values = calendar_dates.union(actual) if len(actual) else calendar_dates
+            if not len(values) and records:
+                values = pd.DatetimeIndex([
+                    pd.Timestamp(item["trade_date"]).normalize() for item in records
+                ]).unique().sort_values()
+            return calendar_dates, values, calendar_available
+
         items = []
-        for row in rows:
-            item = self.dataset(row["symbol"], row["timeframe"], row["adjustment"])
-            if item:
-                items.append(item)
+        for row in selected:
+            key = (row["symbol"], row["timeframe"], row["adjustment"])
+            item = dict(row)
+            item["metadata"] = _load(item.get("metadata"), {})
+            item["timeframe"] = normalize_timeframe(item["timeframe"])
+            item["version"] = int(item["current_version"])
+            head = manifest_heads.get(self.package.dataset_key(*key)) or {}
+            if int(head.get("version") or 0) != int(item["current_version"]):
+                item["file_status"] = "changed"
+                file_errors = ["SQLite 索引与包级清单版本不一致"]
+            else:
+                item["file_status"] = "readable"
+                file_errors = []
+            item["file_errors"] = file_errors
+            item["missing_files"] = 0
+            item["changed_files"] = len(file_errors)
+
+            coverage_rows = coverage_map.get(key, [])
+            latest_coverage = coverage_rows[-1] if coverage_rows else None
+            intervals = self._coverage_intervals(coverage_rows)
+            first_day = pd.Timestamp(item["first_time"]).normalize() if item.get("first_time") else None
+            last_day = pd.Timestamp(item["last_time"]).normalize() if item.get("last_time") else None
+            fully_covered = bool(
+                first_day is not None and last_day is not None
+                and any(left <= first_day and right >= last_day for left, right in intervals)
+            )
+            item["coverage_status"] = (
+                "complete" if fully_covered else "partial" if intervals else "unknown"
+            )
+            stored_status = str(item.get("status") or "pending_validation")
+            item["fully_covered"] = fully_covered
+            item["stored_status"] = stored_status
+            item["latest_record_time"] = item.get("last_time")
+
+            records = validation_map.get(key, [])
+            calendar_dates, expected_dates, calendar_available = expected_dates_for(
+                item["symbol"], records,
+            )
+            compliance = self._validation_from_parts(
+                item, records, calendar_dates,
+                calendar_available=calendar_available,
+                expected_dates=expected_dates, include_days=True,
+            )
+            item["verified_from"] = compliance.get("verified_from")
+            item["verified_through"] = compliance.get("verified_through")
+            item["validation"] = {
+                "rules_version": compliance.get("rules_version"),
+                "validated_days": compliance.get("validated_days", 0),
+                "pending": compliance.get("pending", []),
+                "failed": compliance.get("failed", []),
+                "calendar_available": compliance.get("calendar_available", False),
+            }
+            if compliance.get("failed"):
+                item["quality_status"] = "failed"
+            elif (
+                last_day is not None and compliance.get("verified_through")
+                and pd.Timestamp(compliance["verified_through"]).normalize() >= last_day
+            ):
+                item["quality_status"] = "passed"
+            elif compliance.get("verified_through"):
+                item["quality_status"] = "partial"
+            else:
+                item["quality_status"] = "pending"
+            effective_status = (
+                "ready" if item["quality_status"] == "passed" and item["file_status"] == "readable"
+                else "failed" if item["quality_status"] == "failed"
+                else "missing" if item["file_status"] == "missing"
+                else "partial" if item["file_status"] == "changed"
+                else "partial" if item["quality_status"] == "partial" or item["coverage_status"] == "partial"
+                else "pending_validation"
+            )
+            item["status"] = effective_status
+            item["ready"] = effective_status == "ready"
+            item["storage"] = "parquet"
+            item["storage_path"] = str(
+                self.package.partitions_dir / item["timeframe"] / f"symbol={item['symbol']}"
+            )
+            shards = shard_map.get(key, [])
+            item["file_count"] = len(shards)
+            item["shard_count"] = len(shards)
+            item["current_bytes"] = sum(int(shard["size"] or 0) for shard in shards)
+            item["history_bytes"] = history_bytes.get(key, 0)
+            derived = derived_map.get(key)
+            item["derived"] = dict(derived) if derived else None
+            item["derived_stale"] = bool(derived["stale"]) if derived else False
+            item["coverage_unknown"] = item["coverage_status"] == "unknown"
+            item["archive"] = {
+                "symbol": item["symbol"], "timeframe": item["timeframe"],
+                "protected": bool(shards), "sources": [],
+            }
+            items.append(item)
         return {"items": items, "count": int(total), "timeframes": list(TIMEFRAMES)}
 
     def symbols_for_timeframe(self, timeframe: str) -> list[str]:
@@ -1266,8 +1829,12 @@ class MarketDataRepository:
                    FROM parquet_coverage ORDER BY end_time DESC,checked_at DESC"""
             ).fetchall()
             shard_rows = db.execute(
-                """SELECT symbol,timeframe,adjustment,version,path,size FROM parquet_shards
-                   ORDER BY version"""
+                """SELECT s.symbol,s.timeframe,s.adjustment,s.version,s.path,s.size
+                   FROM parquet_shards s
+                   JOIN parquet_datasets d
+                     ON d.symbol=s.symbol AND d.timeframe=s.timeframe
+                    AND d.adjustment=s.adjustment AND d.current_version=s.version
+                   ORDER BY s.version"""
             ).fetchall()
             instrument_rows = db.execute("SELECT * FROM instruments").fetchall()
             validation_rows = db.execute(
@@ -1295,15 +1862,63 @@ class MarketDataRepository:
                 (row["symbol"], row["timeframe"], row["adjustment"]), []
             ).append(dict(row))
         calendar_by_symbol = {}
+        calendar_raw_by_symbol = {}
+        parsed_calendars: dict[str, tuple[pd.DatetimeIndex, bool]] = {}
         for row in calendar_rows:
-            payload = _load(row["payload"], [])
-            calendar_by_symbol[row["symbol"]] = (self._calendar_dates(payload), bool(payload))
+            raw = str(row["payload"])
+            parsed = parsed_calendars.get(raw)
+            if parsed is None:
+                payload = _load(raw, [])
+                parsed = (self._calendar_dates(payload), bool(payload))
+                parsed_calendars[raw] = parsed
+            calendar_by_symbol[row["symbol"]] = parsed
+            calendar_raw_by_symbol[row["symbol"]] = raw
         calendar_by_market = self._calendar_dates_by_market()
+        combined_calendars: dict[tuple[str, str], pd.DatetimeIndex] = {}
+        for symbol, (dates, _available) in list(calendar_by_symbol.items()):
+            suffix = symbol[-2:]
+            key = (calendar_raw_by_symbol[symbol], suffix)
+            combined = combined_calendars.get(key)
+            if combined is None:
+                market_dates = calendar_by_market.get(suffix, pd.DatetimeIndex([]))
+                combined = dates.union(market_dates) if len(market_dates) else dates
+                combined_calendars[key] = combined
+            calendar_by_symbol[symbol] = (
+                combined,
+                bool(len(combined)),
+            )
         manifest_heads = self.package.manifest().get("datasets", {})
         selected_rows = [dict(row) for row in rows if not timeframe or row["timeframe"] == timeframe]
         symbols_all = sorted({row["symbol"] for row in selected_rows})
         dataset_summaries = []
         trading_dates_by_symbol: dict[str, pd.DatetimeIndex] = {}
+
+        def expected_dates_for(dataset: dict, records: list[dict],
+                               calendar_dates: pd.DatetimeIndex,
+                               calendar_available: bool):
+            if not records:
+                return None
+            # Inventory already holds both the per-symbol auxiliary calendar
+            # and the exchange calendar. Their union covers the historical
+            # dates that a recent incremental calendar omits, without reading
+            # one daily Parquet series per validated symbol.
+            record_dates = [
+                pd.Timestamp(item["trade_date"]).normalize() for item in records
+            ]
+            record_first = min(record_dates)
+            record_last = max(record_dates)
+            if calendar_available and len(calendar_dates):
+                if calendar_dates[0] <= record_first and calendar_dates[-1] >= record_last:
+                    return calendar_dates
+            symbol = dataset["symbol"]
+            if symbol not in trading_dates_by_symbol:
+                same_symbol = [item for item in selected_rows if item["symbol"] == symbol]
+                trading_dates_by_symbol[symbol] = self.trading_days(
+                    symbol, min(item["first_time"] for item in same_symbol),
+                    max(item["last_time"] for item in same_symbol),
+                )
+            return trading_dates_by_symbol[symbol]
+
         for row in selected_rows:
             key = (row["symbol"], row["timeframe"], row["adjustment"])
             coverage_rows_for_key = coverage_map.get(key, [])
@@ -1335,21 +1950,15 @@ class MarketDataRepository:
                 calendar_dates = calendar_by_market.get(row["symbol"][-2:], pd.DatetimeIndex([]))
                 calendar_available = bool(len(calendar_dates))
             records = validation_map.get(key, [])
-            expected_dates = None
-            if records:
-                if row["symbol"] not in trading_dates_by_symbol:
-                    same_symbol = [item for item in selected_rows if item["symbol"] == row["symbol"]]
-                    trading_dates_by_symbol[row["symbol"]] = self.trading_days(
-                        row["symbol"], min(item["first_time"] for item in same_symbol),
-                        max(item["last_time"] for item in same_symbol),
-                    )
-                expected_dates = trading_dates_by_symbol[row["symbol"]]
+            expected_dates = expected_dates_for(
+                row, records, calendar_dates, calendar_available,
+            )
             compliance = self._validation_from_parts(
                 row, records, calendar_dates, calendar_available=calendar_available,
-                expected_dates=expected_dates,
+                expected_dates=expected_dates, include_days=False,
             )
             quality_status = (
-                "failed" if compliance.get("failed") else
+                "failed" if compliance.get("failed_count") else
                 "passed" if compliance.get("verified_through") and pd.Timestamp(
                     compliance["verified_through"]
                 ).normalize() >= pd.Timestamp(row["last_time"]).normalize() else
@@ -1378,6 +1987,29 @@ class MarketDataRepository:
         symbols = sorted({row["symbol"] for row in dataset_summaries})
         page_symbols = symbols[int(offset): int(offset) + int(limit)]
         page_set = set(page_symbols)
+        # Day lists are only returned for the requested page. Materialising
+        # them for every dataset made the response build dominate the refresh.
+        for row in dataset_summaries:
+            if row["symbol"] not in page_set:
+                continue
+            key = (row["symbol"], row["timeframe"], row["adjustment"])
+            stored_calendar = calendar_by_symbol.get(row["symbol"])
+            if stored_calendar is not None:
+                calendar_dates, calendar_available = stored_calendar
+            else:
+                calendar_dates = calendar_by_market.get(
+                    row["symbol"][-2:], pd.DatetimeIndex([])
+                )
+                calendar_available = bool(len(calendar_dates))
+            records = validation_map.get(key, [])
+            row["validation"] = self._validation_from_parts(
+                row, records, calendar_dates,
+                calendar_available=calendar_available,
+                expected_dates=expected_dates_for(
+                    row, records, calendar_dates, calendar_available,
+                ),
+                include_days=True,
+            )
         grouped = {symbol: [] for symbol in page_symbols}
         for row in dataset_summaries:
             if row["symbol"] in page_set:
@@ -1417,7 +2049,13 @@ class MarketDataRepository:
         for row in dataset_summaries:
             for item in shard_map.get((row["symbol"], row["timeframe"], row["adjustment"]), []):
                 if int(item.get("version") or 0) == int(row["current_version"] or 0):
-                    bytes_by_path[self.package.relative(item["path"])] = int(item.get("size") or 0)
+                    raw_path = str(item["path"])
+                    relative = (
+                        raw_path.replace("\\", "/")
+                        if not os.path.isabs(raw_path)
+                        else self.package.relative(raw_path)
+                    )
+                    bytes_by_path[relative] = int(item.get("size") or 0)
         return {
             "items": items,
             "count": len(symbols),
@@ -1488,7 +2126,16 @@ class MarketDataRepository:
             if limit is not None:
                 relation = relation.limit(int(limit))
             relation = relation.project(", ".join(columns))
-            return self._frame_for_consumer(relation.df())
+            result = relation.df()
+            if columns == ("timestamp",):
+                # A timestamp-only projection is metadata, not a price body.
+                # Running OHLC quality checks here would reject every row for
+                # fields that were intentionally never read.
+                stamps = pd.to_datetime(result["timestamp"], errors="coerce")
+                result = result.loc[stamps.notna()].copy()
+                result["timestamp"] = stamps.loc[stamps.notna()]
+                return result.sort_values("timestamp", kind="stable").reset_index(drop=True)
+            return self._frame_for_consumer(result)
 
     def _read_version(
         self, symbol: str, timeframe: str, adjustment: str, version: int, *,
@@ -1578,6 +2225,7 @@ class MarketDataRepository:
     def active_rows(
         self, symbol: str, timeframe: str, adjustment: str = "none",
         start=None, end=None, limit: int | None = None,
+        *, use_cache: bool = True,
     ) -> pd.DataFrame:
         timeframe = normalize_timeframe(timeframe)
         with self._connect() as db:
@@ -1590,7 +2238,7 @@ class MarketDataRepository:
         )
         return self._read_version(
             symbol, timeframe, adjustment, int(dataset["current_version"]),
-            start=start, end=exclusive_end, limit=limit,
+            start=start, end=exclusive_end, limit=limit, use_cache=use_cache,
         )
 
     def bars(
@@ -1906,6 +2554,7 @@ class MarketDataRepository:
         fingerprint: str | None, params_hash: str, report: dict,
         metadata: dict, completed_through: str | None,
         advance_completed: bool, derived: dict | None, replace_range: bool = False,
+        include_preloaded: bool = False,
     ) -> dict:
         """Publish additions and corrections as complete time-bucket shards."""
         with self._connect() as db:
@@ -1919,26 +2568,15 @@ class MarketDataRepository:
             key, start, end = self._storage_period(timeframe, stamp)
             periods[key] = (start, end)
         ordered = sorted(periods.items())
-        read_start = pd.Timestamp(min(value[0] for _, value in ordered))
-        read_end = pd.Timestamp(max(value[1] for _, value in ordered)) - pd.Timedelta(nanoseconds=1)
         # A first import has no published version yet.  Version zero is an
         # empty baseline, not a readable historical snapshot.
-        existing = (
-            self._read_version(
-                symbol, timeframe, adjustment, current_version,
-                start=read_start, end=read_end + pd.Timedelta(nanoseconds=1),
-                use_cache=False,
+        existing_by_period = (
+            self._read_storage_periods(
+                symbol, timeframe, adjustment, current_version, periods,
+                current_shards,
             )
-            if current_version > 0 else pd.DataFrame()
+            if current_version > 0 else {}
         )
-        existing_by_period: dict[str, pd.DataFrame] = {}
-        if not existing.empty:
-            for key, (start, end) in periods.items():
-                part = existing[
-                    (existing.timestamp >= pd.Timestamp(start))
-                    & (existing.timestamp < pd.Timestamp(end))
-                ]
-                existing_by_period[key] = part
 
         changed_periods: dict[str, pd.DataFrame] = {}
         all_inserted = all_updated = 0
@@ -1980,6 +2618,10 @@ class MarketDataRepository:
             combined, inserted, updated, same, period_conflicts = self._merge_market_frames(
                 current, incoming
             )
+            removed_timestamps = (
+                set(original_current.timestamp) - set(combined.timestamp)
+                if not original_current.empty else set()
+            )
             unchanged += same
             conflicts.extend(period_conflicts)
             if not inserted and not updated:
@@ -1997,6 +2639,9 @@ class MarketDataRepository:
             pending_delta += new_pending - old_pending
             for row in [*inserted, *updated]:
                 changed_dates.add(str(pd.Timestamp(row["timestamp"]).date()))
+            changed_dates.update(
+                str(pd.Timestamp(value).date()) for value in removed_timestamps
+            )
             new_first = combined.timestamp.min() if new_first is None else min(new_first, combined.timestamp.min())
             new_last = combined.timestamp.max() if new_last is None else max(new_last, combined.timestamp.max())
 
@@ -2068,7 +2713,18 @@ class MarketDataRepository:
             "shards": self._manifest_shards([*kept_shards, *written]),
             "derived": derived,
         }
-        self.package.publish_dataset(published_payload, expected_version=current_version)
+        self.package.publish_dataset(
+            published_payload, expected_version=current_version,
+            pending_updates=[{
+                "dates": sorted(changed_dates), "reason": "行情新增或修订",
+            }],
+            dependent_pending_updates={
+                minute: [{
+                    "dates": sorted(changed_dates), "reason": "日线依赖修订",
+                }]
+                for minute in MINUTE_TIMEFRAMES
+            } if timeframe == "1day" else None,
+        )
         self.package.update_transaction(transaction_path, {"status": "manifest_published"})
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -2164,6 +2820,10 @@ class MarketDataRepository:
                     "AND adjustment=? AND trade_date=?",
                     (symbol, timeframe, adjustment, changed_day),
                 )
+            self._mark_coverage_dirty_in_db(
+                db, symbol, timeframe, adjustment, changed_dates,
+                "行情新增或修订",
+            )
             db.execute(
                 "UPDATE parquet_derived SET stale=1,updated_at=? WHERE symbol=? "
                 "AND adjustment=? AND source_timeframe=? AND source_version<?",
@@ -2172,7 +2832,7 @@ class MarketDataRepository:
             db.commit()
         self.package.update_transaction(transaction_path, {"status": "database_committed"})
         self.package.finish_transaction(transaction_path)
-        return {
+        result = {
             "symbol": symbol, "timeframe": timeframe, "version": version,
             "rows_read": len(frame), "inserted": all_inserted, "updated": all_updated,
             "unchanged": unchanged, "removed": all_removed, "synthetic": int(frame.is_synthetic.sum()),
@@ -2181,6 +2841,20 @@ class MarketDataRepository:
             "changed_dates": sorted(changed_dates), "shard_count": len(written),
             "layout": "time_partitioned",
         }
+        if include_preloaded:
+            preloaded_months: dict[str, pd.DataFrame] = {}
+            for combined in changed_periods.values():
+                combined.attrs["_coverage_data_version"] = version
+                for month in combined.timestamp.dt.to_period("M").unique():
+                    preloaded_months[str(month)] = combined
+            empty = frame.iloc[0:0].copy()
+            empty.attrs["_coverage_data_version"] = version
+            for value in changed_dates:
+                preloaded_months.setdefault(
+                    str(pd.Timestamp(value).to_period("M")), empty.copy()
+                )
+            result["_preloaded_months"] = preloaded_months
+        return result
 
     def _commit_snapshot_bars(
         self, symbol: str, timeframe: str, frame: pd.DataFrame, **kwargs,
@@ -2194,6 +2868,7 @@ class MarketDataRepository:
         fingerprint: str | None, params_hash: str, report: dict,
         metadata: dict, completed_through: str | None,
         advance_completed: bool, derived: dict | None,
+        include_preloaded: bool = False,
     ) -> dict:
         """Publish a complete input snapshot and withdraw omitted time buckets."""
         with self._connect() as db:
@@ -2314,7 +2989,14 @@ class MarketDataRepository:
             "synthetic_rows": synthetic_rows, "pending_rows": pending_rows,
             "metadata": item_metadata, "shards": self._manifest_shards(written),
             "derived": derived,
-        }, expected_version=current_version)
+        }, expected_version=current_version, pending_updates=[{
+            "dates": changed_day_values, "reason": "行情快照变更",
+        }], dependent_pending_updates={
+            minute: [{
+                "dates": changed_day_values, "reason": "日线依赖修订",
+            }]
+            for minute in MINUTE_TIMEFRAMES
+        } if timeframe == "1day" else None)
         self.package.update_transaction(transaction_path, {"status": "manifest_published"})
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -2413,6 +3095,10 @@ class MarketDataRepository:
                     "AND adjustment=? AND date(start_time)<=? AND date(end_time)>=?",
                     (symbol, timeframe, adjustment, changed_day, changed_day),
                 )
+            self._mark_coverage_dirty_in_db(
+                db, symbol, timeframe, adjustment, changed_day_values,
+                "行情快照变更",
+            )
             db.execute(
                 "UPDATE parquet_derived SET stale=1,updated_at=? WHERE symbol=? "
                 "AND adjustment=? AND source_timeframe=? AND source_version<?",
@@ -2421,7 +3107,7 @@ class MarketDataRepository:
             db.commit()
         self.package.update_transaction(transaction_path, {"status": "database_committed"})
         self.package.finish_transaction(transaction_path)
-        return {
+        result = {
             "symbol": symbol, "timeframe": timeframe, "version": version,
             "rows_read": len(frame), "inserted": len(frame), "updated": 0,
             "unchanged": 0, "removed": 0, "synthetic": synthetic_rows,
@@ -2430,6 +3116,18 @@ class MarketDataRepository:
             "changed_dates": sorted(str(day.date()) for day in changed_days),
             "layout": "time_partitioned",
         }
+        if include_preloaded:
+            frame.attrs["_coverage_data_version"] = version
+            preloaded_months = {
+                str(month): frame
+                for month in frame.timestamp.dt.to_period("M").unique()
+            }
+            empty = frame.iloc[0:0].copy()
+            empty.attrs["_coverage_data_version"] = version
+            for day in changed_days:
+                preloaded_months.setdefault(str(day.to_period("M")), empty.copy())
+            result["_preloaded_months"] = preloaded_months
+        return result
 
     @_serialized_package
     def commit_bars(
@@ -2439,7 +3137,7 @@ class MarketDataRepository:
         report: dict | None = None, metadata: dict | None = None,
         completed_through: str | None = None, derived: dict | None = None,
         replace_range: bool = False, advance_completed: bool = True,
-        import_mode: str = "merge",
+        import_mode: str = "merge", include_preloaded: bool = False,
     ) -> dict:
         """Publish merged or replacement input as immutable time-bucket shards."""
         timeframe = normalize_timeframe(timeframe)
@@ -2460,13 +3158,14 @@ class MarketDataRepository:
                 file_name=file_name, fingerprint=fingerprint, params_hash=params_hash,
                 report=report, metadata=metadata, completed_through=completed_through,
                 advance_completed=advance_completed, derived=derived,
+                include_preloaded=include_preloaded,
             )
         return self._commit_merge_bars(
             symbol, timeframe, frame, adjustment=adjustment, source=source,
             file_name=file_name, fingerprint=fingerprint, params_hash=params_hash,
             report=report, metadata=metadata, completed_through=completed_through,
             advance_completed=advance_completed, derived=derived,
-            replace_range=replace_range,
+            replace_range=replace_range, include_preloaded=include_preloaded,
         )
 
     def _mark_derived_stale(self, symbol, adjustment, source_timeframe, source_version):
@@ -2487,6 +3186,48 @@ class MarketDataRepository:
                 (utc_now(), symbol, timeframe, adjustment, timeframe),
             )
 
+    @staticmethod
+    def _mark_coverage_dirty_in_db(
+        db: sqlite3.Connection, symbol: str, timeframe: str, adjustment: str,
+        dates: Iterable[str], reason: str,
+    ) -> int:
+        """Invalidate exact daily conclusions inside the publication transaction."""
+        values = sorted({str(value)[:10] for value in dates if value})
+        if not values:
+            return 0
+        targets = [(timeframe, reason)]
+        if timeframe == "1day":
+            existing = {
+                str(row[0]) for row in db.execute(
+                    "SELECT timeframe FROM parquet_datasets WHERE symbol=? AND adjustment=?",
+                    (symbol, adjustment),
+                ).fetchall()
+            }
+            targets.extend(
+                (minute, "日线依赖修订")
+                for minute in MINUTE_TIMEFRAMES if minute in existing
+            )
+        changed = 0
+        for target_timeframe, target_reason in targets:
+            for offset in range(0, len(values), 400):
+                chunk = values[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                before = db.total_changes
+                db.execute(
+                    "UPDATE parquet_coverage_days SET dirty_reason=? "
+                    "WHERE symbol=? AND timeframe=? AND adjustment=? "
+                    "AND trade_date IN (" + placeholders + ")",
+                    (target_reason, symbol, target_timeframe, adjustment, *chunk),
+                )
+                changed += int(db.total_changes - before)
+                if target_timeframe != timeframe:
+                    db.execute(
+                        "DELETE FROM parquet_day_validation WHERE symbol=? AND timeframe=? "
+                        "AND adjustment=? AND trade_date IN (" + placeholders + ")",
+                        (symbol, target_timeframe, adjustment, *chunk),
+                    )
+        return changed
+
     def invalidate_day_validations(
         self, symbol: str, timeframe: str, days: Iterable[str], *,
         adjustment: str = "none",
@@ -2506,6 +3247,11 @@ class MarketDataRepository:
                     (symbol, timeframe, adjustment, *chunk),
                 )
                 removed += int(db.total_changes - before)
+        from .coverage_index import CoverageArchive
+
+        CoverageArchive(self).mark_dirty(
+            symbol, timeframe, values, reason="行情或依赖修订", adjustment=adjustment,
+        )
         return removed
 
     def record_day_validations(self, rows: Iterable[dict]) -> int:
@@ -2541,7 +3287,19 @@ class MarketDataRepository:
                 "DELETE FROM parquet_day_validation WHERE symbol=? AND adjustment=?",
                 (symbol, adjustment),
             )
-            return int(db.total_changes - before)
+            removed = int(db.total_changes - before)
+            timeframes = {
+                str(row[0]) for row in db.execute(
+                    "SELECT timeframe FROM parquet_datasets WHERE symbol=? AND adjustment=?",
+                    (symbol, adjustment),
+                ).fetchall()
+            }
+        from .coverage_index import CoverageArchive
+
+        archive = CoverageArchive(self)
+        for timeframe in timeframes:
+            archive.mark_all_dirty(symbol, timeframe, "依赖变更", adjustment)
+        return removed
 
     def day_validations(
         self, symbol: str, timeframe: str, *,
@@ -2568,32 +3326,40 @@ class MarketDataRepository:
             output.append(item)
         return output
 
-    def trading_days(self, symbol: str, start, end) -> pd.DatetimeIndex:
+    def trading_days(
+        self, symbol: str, start, end, *, calendar_version=None, daily_version=None,
+    ) -> pd.DatetimeIndex:
         """Combine auxiliary dates with the package's actual daily trading series.
 
-        Read the daily version directly: dataset() itself asks validation_state()
-        for compliance, so going through dataset()/read_frame() would recurse.
+        Read only timestamps from the selected daily version.  This keeps
+        snapshot metadata checks independent of OHLC bodies and avoids the
+        dataset()/validation_state() recursion.  A missing explicitly locked
+        calendar is a hard failure rather than an invitation to use the live
+        exchange calendar.
         """
         first, last = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
-        calendar = self.auxiliary(symbol, "calendar")
-        values = pd.DatetimeIndex(pd.to_datetime(
-            [row.get("date") for row in (calendar or {}).get("payload", [])],
-            errors="coerce",
-        ).dropna())
+        calendar = self.auxiliary(symbol, "calendar", version=calendar_version)
+        calendar_dates = self._calendar_dates(
+            (calendar or {}).get("payload") or []
+        )
+        if calendar_version is not None and not len(calendar_dates):
+            return pd.DatetimeIndex([])
+        values = calendar_dates
         with self._connect() as db:
             daily_row = self._dataset_row(db, symbol, "1day", "none")
-        if daily_row:
+        selected_version = (
+            int(daily_version) if daily_version is not None else
+            int(daily_row["current_version"])
+            if calendar_version is None and daily_row else None
+        )
+        if selected_version is not None:
             daily = self._read_version(
-                symbol, "1day", "none", int(daily_row["current_version"]),
+                symbol, "1day", "none", selected_version,
                 start=first, end=last + pd.Timedelta(days=1),
+                fields=("timestamp",),
             )
             if not daily.empty:
                 values = values.append(pd.DatetimeIndex(daily.timestamp))
-            blocked = daily.attrs.get("price_anomaly_rows") or []
-            if blocked:
-                values = values.append(pd.DatetimeIndex(pd.to_datetime(
-                    [row.get("timestamp") for row in blocked], errors="coerce",
-                ).dropna()))
         values = values.normalize().unique().sort_values()
         return values[(values >= first) & (values <= last)]
 
@@ -2601,9 +3367,13 @@ class MarketDataRepository:
     def _calendar_dates(payload) -> pd.DatetimeIndex:
         if not payload:
             return pd.DatetimeIndex([])
-        return pd.DatetimeIndex(pd.to_datetime(
-            [row.get("date") for row in payload], errors="coerce"
-        ).dropna()).normalize().unique().sort_values()
+        raw = [row.get("date") for row in payload]
+        stamps = pd.to_datetime(raw, format="ISO8601", errors="coerce")
+        if len(raw) and stamps.isna().all():
+            # Calendar payloads written by older imports may not be ISO
+            # timestamps; keep those readable without slowing the common path.
+            stamps = pd.to_datetime(raw, errors="coerce")
+        return pd.DatetimeIndex(stamps).dropna().normalize().unique().sort_values()
 
     def _calendar_dates_by_market(self) -> dict[str, pd.DatetimeIndex]:
         output = {}
@@ -2620,7 +3390,7 @@ class MarketDataRepository:
     def _validation_from_parts(
         self, dataset: dict, records: list[dict], calendar_dates: pd.DatetimeIndex,
         *, calendar_available: bool | None = None, start=None, end=None,
-        expected_dates: pd.DatetimeIndex | None = None,
+        expected_dates: pd.DatetimeIndex | None = None, include_days: bool = True,
     ) -> dict:
         symbol, timeframe = dataset["symbol"], dataset["timeframe"]
         first = pd.Timestamp(start or dataset["first_time"]).normalize()
@@ -2629,10 +3399,19 @@ class MarketDataRepository:
         if calendar_available is None:
             calendar_available = bool(len(calendar_dates))
         expected = pd.DatetimeIndex([])
+
+        def window(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+            if not len(index):
+                return index
+            return index[
+                index.searchsorted(first, side="left"):
+                index.searchsorted(last, side="right")
+            ]
+
         if expected_dates is not None:
-            expected = expected_dates[(expected_dates >= first) & (expected_dates <= last)]
+            expected = window(expected_dates)
         elif calendar_available:
-            expected = calendar_dates[(calendar_dates >= first) & (calendar_dates <= last)]
+            expected = window(calendar_dates)
         if records:
             # Keep historical failures visible even with an incremental calendar.
             observed = pd.DatetimeIndex(sorted(by_day)).normalize().sort_values()
@@ -2643,33 +3422,71 @@ class MarketDataRepository:
             expected = pd.DatetimeIndex(sorted(by_day)).normalize()
         failed = []
         pending = []
-        for day in expected:
-            row = by_day.get(pd.Timestamp(day).normalize())
-            if row is None:
-                pending.append(str(day.date()))
-            elif row["status"] == "failed":
-                failed.append(str(day.date()))
-            elif int(row.get("rules_version") or 0) < VALIDATION_RULES_VERSION:
-                pending.append(str(day.date()))
+        failed_count = 0
+        pending_count = 0
+        if records:
+            accepted = 0
+            for item in records:
+                stale = bool(
+                    item.get("dirty_reason")
+                    or not item.get("scanned", True)
+                    or int(item.get("rules_version") or 0) < VALIDATION_RULES_VERSION
+                )
+                if stale:
+                    continue
+                if item["status"] == "failed":
+                    failed_count += 1
+                elif (
+                    item["status"] in {"passed", "suspended"}
+                ):
+                    accepted += 1
+            pending_count = max(0, int(len(expected)) - accepted - failed_count)
+        if include_days and records:
+            detail_first = min(by_day)
+            detail_last = max(by_day)
+            for day in expected:
+                if day < detail_first or day > detail_last:
+                    continue
+                row = by_day.get(pd.Timestamp(day).normalize())
+                if (
+                    row is None
+                    or row.get("dirty_reason")
+                    or not row.get("scanned", True)
+                    or int(row.get("rules_version") or 0) < VALIDATION_RULES_VERSION
+                ):
+                    pending.append(str(day.date()))
+                elif row["status"] == "failed":
+                    failed.append(str(day.date()))
+                elif (
+                    row["status"] not in {"passed", "suspended"}
+                ):
+                    pending.append(str(day.date()))
+        elif not records:
+            # A dataset with no day ledger is wholly pending. Callers that
+            # only need the quality state must not pay for one string per day.
+            pending_count = int(len(expected))
         verified_from = None
         verified_through = None
         started = False
-        for index, day in enumerate(expected):
-            row = by_day.get(pd.Timestamp(day).normalize())
-            passed = bool(
-                row and row["status"] in {"passed", "suspended"}
-                and int(row.get("rules_version") or 0) >= VALIDATION_RULES_VERSION
-            )
-            if not started:
-                if index == 0 and not passed:
+        if records:
+            for index, day in enumerate(expected):
+                row = by_day.get(pd.Timestamp(day).normalize())
+                passed = bool(
+                    row and row["status"] in {"passed", "suspended"}
+                    and row.get("scanned", True)
+                    and not row.get("dirty_reason")
+                    and int(row.get("rules_version") or 0) >= VALIDATION_RULES_VERSION
+                )
+                if not started:
+                    if index == 0 and not passed:
+                        break
+                    started = True
+                    verified_from = pd.Timestamp(day).normalize()
+                    verified_through = verified_from
+                    continue
+                if not passed:
                     break
-                started = True
-                verified_from = pd.Timestamp(day).normalize()
-                verified_through = verified_from
-                continue
-            if not passed:
-                break
-            verified_through = pd.Timestamp(day).normalize()
+                verified_through = pd.Timestamp(day).normalize()
         return {
             "symbol": symbol, "timeframe": timeframe,
             "rules_version": VALIDATION_RULES_VERSION,
@@ -2677,9 +3494,12 @@ class MarketDataRepository:
             "verified_through": verified_through.date().isoformat() if verified_through is not None else None,
             "validated_days": sum(
                 1 for row in records if row["status"] in {"passed", "suspended"}
+                and row.get("scanned", True)
+                and not row.get("dirty_reason")
                 and int(row.get("rules_version") or 0) >= VALIDATION_RULES_VERSION
             ),
             "failed": failed, "pending": pending,
+            "failed_count": failed_count, "pending_count": pending_count,
             "calendar_available": calendar_available,
             "range_start": first.date().isoformat(), "range_end": last.date().isoformat(),
             "expected_start": expected[0].date().isoformat() if len(expected) else None,
@@ -2690,29 +3510,322 @@ class MarketDataRepository:
 
     def validation_state(
         self, symbol: str, timeframe: str, *, adjustment: str = "none",
-        start=None, end=None,
+        start=None, end=None, version: int | None = None,
+        calendar_version: str | int | None = None,
+        daily_version: int | None = None,
     ) -> dict:
+        """Return quality coverage, optionally scoped to one data snapshot.
+
+        The day ledger predates snapshot columns, so it is only authoritative
+        for the currently published target version.  An older version may use
+        its immutable dataset report when that report records complete
+        validation; otherwise the answer is explicitly unavailable.  This
+        prevents a newly validated current dataset from blessing an old one.
+        """
+        timeframe = normalize_timeframe(timeframe)
         with self._connect() as db:
             dataset_row = self._dataset_row(db, symbol, timeframe, adjustment)
+            daily_row = self._dataset_row(db, symbol, "1day", "none")
+            version_row = None
+            if version is not None:
+                version_row = db.execute(
+                    """SELECT * FROM parquet_versions
+                       WHERE symbol=? AND timeframe=? AND adjustment=? AND version=?""",
+                    (symbol, timeframe, adjustment, int(version)),
+                ).fetchone()
         dataset = dict(dataset_row) if dataset_row else None
-        if not dataset:
+        selected = dict(version_row) if version_row else dataset
+        requested_calendar = (
+            str(calendar_version) if calendar_version is not None else None
+        )
+        if not selected:
             return {
-                "symbol": symbol, "timeframe": timeframe, "rules_version": VALIDATION_RULES_VERSION,
-                "verified_from": None, "verified_through": None, "validated_days": 0,
-                "failed": [], "pending": [], "calendar_available": False,
+                "symbol": symbol, "timeframe": timeframe,
+                "rules_version": VALIDATION_RULES_VERSION,
+                "verified_from": None, "verified_through": None,
+                "validated_days": 0, "failed": [], "pending": [],
+                "calendar_available": False, "version": version,
+                "calendar_version": requested_calendar,
+                "daily_version": (
+                    int(daily_version) if daily_version is not None else None
+                ), "available": False,
+                "status": "unavailable", "quality_source": "none",
+                "reason": "指定行情版本或质量状态不存在",
             }
-        first = pd.Timestamp(start or dataset["first_time"]).normalize()
-        last = pd.Timestamp(end or dataset["last_time"]).normalize()
-        records = self.day_validations(
-            symbol, timeframe, adjustment=adjustment, start=first, end=last
+
+        first = pd.Timestamp(start or selected["first_time"]).normalize()
+        last = pd.Timestamp(end or selected["last_time"]).normalize()
+        current_version = int(dataset["current_version"]) if dataset else None
+        current_daily_version = (
+            int(daily_row["current_version"]) if daily_row else None
         )
-        calendar = self.auxiliary(symbol, "calendar")
-        payload = calendar.get("payload") if calendar else None
-        return self._validation_from_parts(
-            dataset, records, self._calendar_dates(payload),
-            calendar_available=bool(payload), start=start, end=end,
-            expected_dates=self.trading_days(symbol, first, last) if records else None,
+        current_calendar = self.auxiliary_versions(symbol).get("calendar")
+        active_calendar = (
+            requested_calendar if requested_calendar is not None
+            else (str(current_calendar) if current_calendar is not None else None)
         )
+        requested_daily = int(daily_version) if daily_version is not None else None
+        if version is not None and timeframe == "1day":
+            if requested_daily is not None and requested_daily != int(version):
+                selected = None
+            effective_daily_version = int(version)
+        elif requested_daily is not None:
+            effective_daily_version = requested_daily
+        elif version is None:
+            effective_daily_version = current_daily_version
+        else:
+            # A historical minute snapshot must bind an explicit daily version;
+            # substituting today's daily series would make replay look valid.
+            effective_daily_version = None
+
+        if selected is None:
+            return {
+                "symbol": symbol, "timeframe": timeframe,
+                "rules_version": VALIDATION_RULES_VERSION,
+                "verified_from": None, "verified_through": None,
+                "validated_days": 0, "failed": [], "pending": [],
+                "calendar_available": False, "version": version,
+                "calendar_version": requested_calendar,
+                "daily_version": requested_daily,
+                "available": False, "status": "unavailable",
+                "quality_source": "none",
+                "reason": "日线版本与目标日线版本不一致",
+            }
+
+        def unavailable(reason: str) -> dict:
+            calendar = self.auxiliary(
+                symbol, "calendar", version=active_calendar
+            ) if active_calendar else None
+            calendar_dates = self._calendar_dates(
+                calendar.get("payload") if calendar else None
+            )
+            return {
+                "symbol": symbol, "timeframe": timeframe,
+                "rules_version": VALIDATION_RULES_VERSION,
+                "verified_from": None, "verified_through": None,
+                "validated_days": 0, "failed": [], "pending": [],
+                "calendar_available": bool(len(calendar_dates)),
+                "range_start": first.date().isoformat(),
+                "range_end": last.date().isoformat(),
+                "expected_start": first.date().isoformat(),
+                "expected_end": last.date().isoformat(),
+                "calendar_start": (
+                    calendar_dates[0].date().isoformat()
+                    if len(calendar_dates) else None
+                ),
+                "calendar_end": (
+                    calendar_dates[-1].date().isoformat()
+                    if len(calendar_dates) else None
+                ),
+                "version": int(version) if version is not None else current_version,
+                "calendar_version": active_calendar,
+                "daily_version": effective_daily_version,
+                "available": False, "status": "unavailable",
+                "quality_source": "none", "reason": reason,
+            }
+
+        if version is not None and current_version != int(version):
+            if requested_calendar is None:
+                return unavailable(
+                    "历史快照必须提供锁定交易日历；不能使用当前日历"
+                )
+            try:
+                manifest = self.package.load_dataset_manifest(
+                    symbol, timeframe, adjustment, int(version)
+                )
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                return unavailable(f"历史质量清单不可用：{exc}")
+            if not manifest:
+                return unavailable("历史数据版本质量清单不存在")
+            metadata = manifest.get("metadata") or {}
+            report = manifest.get("report") or {}
+            evidence = [
+                value for value in (report, metadata.get("validation") or {})
+                if isinstance(value, dict)
+            ]
+            complete = any(
+                str(value.get("status") or "").lower() in {"complete", "ready"}
+                and not value.get("pending_validation")
+                and not value.get("failed")
+                and str(value.get("coverage_status") or "complete").lower()
+                not in {"partial", "unknown"}
+                for value in evidence
+            )
+            version_first = pd.Timestamp(
+                manifest.get("first_time") or selected.get("first_time")
+            ).normalize()
+            version_last = pd.Timestamp(
+                manifest.get("last_time") or selected.get("last_time")
+            ).normalize()
+            if not complete or first < version_first or last > version_last:
+                return unavailable(
+                    "历史快照没有覆盖所请求区间的逐日质量结论；当前账本不能用于旧版本"
+                )
+            for evidence_item in evidence:
+                report_first = evidence_item.get("first_time")
+                report_last = evidence_item.get("last_time")
+                if report_first and first < pd.Timestamp(report_first).normalize():
+                    return unavailable("历史质量报告未覆盖请求开始日期")
+                if report_last and last > pd.Timestamp(report_last).normalize():
+                    return unavailable("历史质量报告未覆盖请求结束日期")
+            calendar = self.auxiliary(
+                symbol, "calendar", version=active_calendar
+            ) if active_calendar else None
+            calendar_dates = self._calendar_dates(
+                calendar.get("payload") if calendar else None
+            )
+            if not len(calendar_dates):
+                return unavailable("历史快照引用的交易日历不存在")
+            if effective_daily_version is None:
+                if first < calendar_dates[0] or last > calendar_dates[-1]:
+                    return unavailable(
+                        "历史快照交易日历只覆盖短区间，且没有锁定日线版本；"
+                        "不能用当前日线补全"
+                    )
+                expected_dates = calendar_dates[
+                    (calendar_dates >= first) & (calendar_dates <= last)
+                ]
+            else:
+                try:
+                    expected_dates = self.trading_days(
+                        symbol, first, last, calendar_version=active_calendar,
+                        daily_version=effective_daily_version,
+                    )
+                except MarketDataError as exc:
+                    return unavailable(f"历史冻结日线不可用：{exc}")
+            if not len(expected_dates):
+                return unavailable("历史冻结日线与交易日历未覆盖请求区间")
+            if first < expected_dates[0] or last > expected_dates[-1]:
+                return unavailable("历史冻结日线与交易日历未覆盖请求区间")
+            requested_days = expected_dates[
+                (expected_dates >= first) & (expected_dates <= last)
+            ]
+            return {
+                "symbol": symbol, "timeframe": timeframe,
+                "rules_version": VALIDATION_RULES_VERSION,
+                "verified_from": first.date().isoformat(),
+                "verified_through": last.date().isoformat(),
+                "validated_days": int(len(requested_days)),
+                "failed": [], "pending": [],
+                "calendar_available": True,
+                "range_start": first.date().isoformat(),
+                "range_end": last.date().isoformat(),
+                "expected_start": first.date().isoformat(),
+                "expected_end": last.date().isoformat(),
+                "calendar_start": expected_dates[0].date().isoformat(),
+                "calendar_end": expected_dates[-1].date().isoformat(),
+                "version": int(version),
+                "calendar_version": active_calendar,
+                "daily_version": effective_daily_version,
+                "available": True, "status": "complete",
+                "quality_source": "version_report", "reason": None,
+            }
+
+        if version is not None:
+            if not current_calendar:
+                return unavailable("当前版本缺少锁定交易日历，无法核验质量账本")
+            if active_calendar != str(current_calendar):
+                return unavailable(
+                    "快照交易日历与当前质量账本依赖不一致；不能复用当前账本"
+                )
+            calendar = self.auxiliary(symbol, "calendar", version=active_calendar)
+            if not calendar or not calendar.get("payload"):
+                return unavailable("快照引用的交易日历不存在")
+            calendar_dates = self._calendar_dates(calendar.get("payload"))
+            if effective_daily_version is None:
+                if first < calendar_dates[0] or last > calendar_dates[-1]:
+                    return unavailable(
+                        "快照交易日历只覆盖短区间，且没有锁定日线版本；"
+                        "不能用当前日线补全"
+                    )
+                expected_dates = calendar_dates[
+                    (calendar_dates >= first) & (calendar_dates <= last)
+                ]
+            else:
+                try:
+                    expected_dates = self.trading_days(
+                        symbol, first, last, calendar_version=active_calendar,
+                        daily_version=effective_daily_version,
+                    )
+                except MarketDataError as exc:
+                    return unavailable(f"快照冻结日线不可用：{exc}")
+            if not len(expected_dates):
+                return unavailable("快照冻结日线与交易日历未覆盖请求区间")
+        else:
+            calendar = self.auxiliary(
+                symbol, "calendar", version=active_calendar
+            ) if active_calendar else self.auxiliary(symbol, "calendar")
+            if active_calendar is None and calendar:
+                active_calendar = str(calendar.get("version") or "") or None
+            calendar_dates = self._calendar_dates(
+                calendar.get("payload") if calendar else None
+            )
+            expected_dates = self.trading_days(
+                symbol, first, last, calendar_version=active_calendar,
+                daily_version=effective_daily_version,
+            )
+        from .coverage_index import CoverageArchive
+
+        archive_index = CoverageArchive(self)
+        coverage_records = archive_index.rows(
+            symbol, timeframe, adjustment, start=first, end=last,
+        )
+        archive_head = archive_index.validation_head(
+            symbol, timeframe, adjustment, start=first, end=last,
+        )
+        invalid_archive_months = set((archive_head or {}).get("_invalid_months") or [])
+        pending_publication = archive_index.pending_dates(
+            archive_head, first, last,
+        )
+        if (
+            version is None and coverage_records
+            and archive_head is None
+        ):
+            coverage_records = []
+        elif (
+            version is None and coverage_records and archive_head
+            and int(archive_head.get("data_version") or 0) != int(current_version or 0)
+            and not pending_publication
+        ):
+            coverage_records = []
+        if coverage_records:
+            records = []
+            for row in coverage_records:
+                status = str(row.get("status") or "unknown")
+                if (
+                    row.get("dirty_reason") or not row.get("scanned")
+                    or pd.Timestamp(row["trade_date"]).normalize() in pending_publication
+                    or str(row["trade_date"])[:7] in invalid_archive_months
+                ):
+                    status = "pending"
+                records.append({
+                    **row, "status": status,
+                    "trade_date": row["trade_date"],
+                    "rules_version": int(row.get("rules_version") or 0),
+                })
+        else:
+            records = [] if archive_index.head_reference(symbol, timeframe, adjustment) else self.day_validations(
+                symbol, timeframe, adjustment=adjustment, start=first, end=last
+            )
+        state = self._validation_from_parts(
+            selected, records, calendar_dates,
+            calendar_available=bool(len(calendar_dates)), start=first, end=last,
+            expected_dates=expected_dates,
+        )
+        state.update({
+            "version": int(version) if version is not None else current_version,
+            "calendar_version": active_calendar,
+            "daily_version": effective_daily_version,
+            "available": True,
+            "status": (
+                "failed" if state.get("failed") else
+                "complete" if state.get("verified_from") and not state.get("pending") else
+                "pending"
+            ),
+            "quality_source": "ledger",
+            "reason": None,
+        })
+        return state
 
     def archive_status(
         self, symbol: str, timeframe: str, adjustment: str = "none",
@@ -2801,6 +3914,8 @@ class MarketDataRepository:
             )
 
     def coverage(self, symbol: str, timeframe: str, adjustment: str = "none") -> dict | None:
+        from .coverage_index import CoverageArchive
+
         timeframe = normalize_timeframe(timeframe)
         item = self.dataset(symbol, timeframe, adjustment)
         if not item:
@@ -2817,12 +3932,66 @@ class MarketDataRepository:
                    AND adjustment=? ORDER BY end_time DESC LIMIT 200""",
                 (symbol, timeframe, adjustment),
             ).fetchall()
+        file_state = self.market_file_state(symbol, timeframe, adjustment)
+        if file_state["status"] != "readable":
+            item["file_status"] = file_state["status"]
+            item["file_errors"] = list(file_state["errors"])
+            item["changed_files"] = len(file_state["errors"])
+            item["invalid_ranges"] = list(file_state["invalid_ranges"])
         item["versions"] = [
             {**dict(row), "report": _load(row["report"], {})} for row in versions
         ]
         item["segments"] = [
             {**dict(row), "report": _load(row["report"], {})} for row in segments
         ]
+        archive = CoverageArchive(self)
+        head = archive.trusted_head(symbol, timeframe, adjustment)
+        item["archive_hit"] = head is not None
+        item["quality_source"] = "coverage_archive" if head else "legacy"
+        item["archive"] = {
+            "valid": head is not None,
+            "data_version": int((head or {}).get("data_version") or 0),
+            "revision": int((head or {}).get("revision") or 0),
+            "rules_version": int((head or {}).get("rules_version") or 0),
+            "data_start": (head or {}).get("data_start"),
+            "data_end": (head or {}).get("data_end"),
+            "verified_through": (head or {}).get("verified_through"),
+            "first_time": (head or {}).get("first_time"),
+            "last_time": (head or {}).get("last_time"),
+            "scanned_start": (head or {}).get("scanned_start"),
+            "scanned_end": (head or {}).get("scanned_end"),
+            "gap_count": int((head or {}).get("gap_count") or 0),
+            "pending_count": int((head or {}).get("pending_count") or 0),
+            "failed_count": int((head or {}).get("failed_count") or 0),
+            "pending_updates": list((head or {}).get("_pending_updates") or []),
+            "months": list((head or {}).get("months") or []),
+            "path": str(((head or {}).get("_reference") or {}).get("path") or ""),
+            "sha256": str(((head or {}).get("_reference") or {}).get("sha256") or ""),
+        }
+        if head:
+            by_month: dict[str, list[dict[str, Any]]] = {}
+            for row in archive.rows(symbol, timeframe, adjustment):
+                by_month.setdefault(str(row["trade_date"])[:7], []).append(row)
+            item["segments"] = []
+            for month, rows in sorted(by_month.items()):
+                pending = any(
+                    row.get("dirty_reason") or not row.get("scanned") for row in rows
+                )
+                failed = any(row.get("status") == "failed" for row in rows)
+                item["segments"].append({
+                    "start_time": rows[0]["trade_date"],
+                    "end_time": rows[-1]["trade_date"],
+                    "status": "failed" if failed else "partial" if pending else "complete",
+                    "expected_rows": sum(
+                        int((row.get("report") or {}).get("expected_rows") or 0)
+                        for row in rows
+                    ),
+                    "observed_rows": sum(int(row.get("row_count") or 0) for row in rows),
+                    "synthetic_rows": sum(int(row.get("synthetic_rows") or 0) for row in rows),
+                    "gap_count": sum(int(row.get("gap_count") or 0) for row in rows),
+                    "report": {"source": "coverage_archive", "month": month,
+                               "days": len(rows)},
+                })
         return item
 
     @_serialized_package
@@ -2844,15 +4013,22 @@ class MarketDataRepository:
         version: str = "local", verified: bool = False,
     ) -> str:
         frame = pd.DataFrame(payload if isinstance(payload, list) else payload or [])
+        previous_payload: list[dict[str, Any]] = []
         relative = auxiliary_relative_path(symbol, kind)
         destination = self.package.absolute(relative)
         destination.parent.mkdir(parents=True, exist_ok=True)
         if kind == "calendar" and destination.is_file() and "date" in frame:
             previous = pd.read_parquet(destination)
             if not previous.empty and "date" in previous:
+                previous_payload = previous.to_dict("records")
                 frame = pd.concat([previous[["date"]], frame[["date"]]], ignore_index=True)
                 frame["date"] = pd.to_datetime(frame["date"], errors="coerce")
                 frame = frame.dropna(subset=["date"]).drop_duplicates("date").sort_values("date")
+        elif destination.is_file():
+            try:
+                previous_payload = pd.read_parquet(destination).to_dict("records")
+            except (OSError, ValueError):
+                previous_payload = []
         if destination.exists():
             backup_dir = self.package.history_dir / "auxiliary" / symbol / kind
             backup_dir.mkdir(parents=True, exist_ok=True)
@@ -2877,7 +4053,92 @@ class MarketDataRepository:
         Store(self.root).save_market_auxiliary(
             symbol, kind, payload, version=str(version), verified=verified
         )
+        self._invalidate_auxiliary_coverage(
+            symbol, kind, previous_payload, frame.to_dict("records"),
+        )
         return str(version)
+
+    def _invalidate_auxiliary_coverage(
+        self, symbol: str, kind: str, previous: list[dict[str, Any]],
+        current: list[dict[str, Any]],
+    ) -> None:
+        """Invalidate only dates whose auxiliary dependency actually changed."""
+        from .coverage_index import CoverageArchive
+
+        with self._connect() as db:
+            datasets = [
+                (str(row[0]), str(row[1] or "none")) for row in db.execute(
+                    "SELECT timeframe,adjustment FROM parquet_datasets WHERE symbol=?",
+                    (symbol,),
+                ).fetchall()
+            ]
+        if not datasets:
+            return
+        archive = CoverageArchive(self)
+        if kind == "calendar":
+            old_dates = pd.DatetimeIndex(pd.to_datetime(
+                [row.get("date") for row in previous], errors="coerce"
+            ).dropna()).normalize()
+            new_dates = pd.DatetimeIndex(pd.to_datetime(
+                [row.get("date") for row in current], errors="coerce"
+            ).dropna()).normalize()
+            removed = old_dates.difference(new_dates)
+            for timeframe, adjustment in datasets:
+                # Keep the day record and reopen it.  Deleting it would make
+                # the date disappear from expected-day union until a later
+                # validation happens, so a copied package could keep the old
+                # "trading day passed" conclusion indefinitely.
+                changed = archive.mark_dirty(
+                    symbol, timeframe, removed, reason="交易日历修订",
+                    adjustment=adjustment,
+                )
+                if changed and archive.head_reference(symbol, timeframe, adjustment):
+                    archive.persist(
+                        symbol, timeframe, adjustment,
+                        changed_months={str(day.to_period("M")) for day in removed},
+                    )
+            return
+        if kind != "actions":
+            return
+        old_rows = {_json(row): row for row in previous}
+        new_rows = {_json(row): row for row in current}
+        changed = [
+            row for key, row in {**old_rows, **new_rows}.items()
+            if old_rows.get(key) != new_rows.get(key)
+        ]
+        affected: set[pd.Timestamp] = set()
+        malformed = False
+        for row in changed:
+            value = row.get("ex_date")
+            if value in {None, ""}:
+                malformed = True
+                continue
+            try:
+                start = pd.Timestamp(value).normalize()
+            except (TypeError, ValueError):
+                malformed = True
+                continue
+            affected.update(pd.date_range(start, start + pd.Timedelta(days=10)))
+        for timeframe, adjustment in datasets:
+            if malformed:
+                archive.mark_all_dirty(
+                    symbol, timeframe, "公司行动修订", adjustment=adjustment,
+                )
+                if archive.head_reference(symbol, timeframe, adjustment):
+                    archive.persist(symbol, timeframe, adjustment)
+            else:
+                archive.mark_dirty(
+                    symbol, timeframe, affected, reason="公司行动修订",
+                    adjustment=adjustment,
+                )
+            if (
+                not malformed and affected
+                and archive.head_reference(symbol, timeframe, adjustment)
+            ):
+                archive.persist(
+                    symbol, timeframe, adjustment,
+                    changed_months={str(day.to_period("M")) for day in affected},
+                )
 
     def auxiliary(self, symbol: str, kind: str, version: str | None = None) -> dict | None:
         relative = auxiliary_relative_path(symbol, kind)

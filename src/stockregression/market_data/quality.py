@@ -23,6 +23,7 @@ class ValidationResult:
     frame: pd.DataFrame
     report: dict
     pending: list[str]
+    details: dict | None = None
 
 
 def _bool_column(values: pd.Series) -> pd.Series:
@@ -223,7 +224,15 @@ def validate_and_fill(
     )
     report["first_time"] = result.timestamp.min().isoformat() if len(result) else None
     report["last_time"] = result.timestamp.max().isoformat() if len(result) else None
-    return ValidationResult(result, report, report["pending_validation"])
+    details = {
+        "missing_timestamps": [str(value) for value in sorted(set(unfillable))]
+        if spec.kind == "minute" else [],
+        "missing_days": [str(value.date()) for value in missing_labels]
+        if spec.kind != "minute" else [],
+        "blocked_timestamps": [str(value) for value in blocked],
+        "auction_placeholders": int(report.get("auction_placeholders") or 0),
+    }
+    return ValidationResult(result, report, report["pending_validation"], details)
 
 
 def _minute_count_validation(
@@ -289,7 +298,15 @@ def _minute_count_validation(
     report["pending_validation"] = list(dict.fromkeys(pending))
     report["first_time"] = output.timestamp.min().isoformat() if len(output) else None
     report["last_time"] = output.timestamp.max().isoformat() if len(output) else None
-    return ValidationResult(output, report, report["pending_validation"])
+    return ValidationResult(
+        output, report, report["pending_validation"],
+        {
+            "missing_timestamps": [str(value) for value in missing_index],
+            "missing_days": [],
+            "blocked_timestamps": [str(value) for value in sorted(set(blocked_slots))],
+            "auction_placeholders": auction_placeholders,
+        },
+    )
 
 
 def _attach_price_anomalies(report: dict, price_anomalies) -> None:

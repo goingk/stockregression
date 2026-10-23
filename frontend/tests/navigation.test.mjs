@@ -4,19 +4,19 @@ import { navigationFromHistory, navigationFromUrl, navigationHistoryState, navig
 
 test('copied URLs restore the page, selections and relevant filters', () => {
   const url = navigationUrl('', {
-    page: 'results', result: 'abc123', compare: 'def456', research: null, report: null,
+    page: 'results', result: 'abc123', compare: 'def456', research: null, etfResult: null, report: null,
     resultView: 'month', researchDecision: null, taskFilter: 'failed', taskKind: 'optimization',
   })
   assert.equal(url, '?page=results&result=abc123&compare=def456&result_view=month&task_filter=failed&task_kind=optimization')
   assert.deepEqual(navigationFromUrl(url), {
-    page: 'results', result: 'abc123', compare: 'def456', research: null, report: null,
+    page: 'results', result: 'abc123', compare: 'def456', research: null, etfResult: null, report: null,
     resultView: 'month', researchDecision: null, taskFilter: 'failed', taskKind: 'optimization',
   })
 })
 
 test('a selection is omitted from pages that cannot consume it', () => {
   const url = navigationUrl('', {
-    page: 'backtest', result: 'abc', compare: 'def', research: 'ghi', report: 'jkl',
+    page: 'backtest', result: 'abc', compare: 'def', research: 'ghi', etfResult: 'etf-1', report: 'jkl',
     resultView: 'year', researchDecision: 'adaptive:2', taskFilter: 'all', taskKind: '',
   })
   assert.equal(url, '?page=backtest')
@@ -35,4 +35,17 @@ test('History API state is validated before it is applied', () => {
   const state = navigationFromUrl('?page=research&research=result-1&research_decision=adaptive%3A1')
   assert.deepEqual(navigationFromHistory(navigationHistoryState(state)), state)
   assert.equal(navigationFromHistory({ stockregression: { page: 'results', result: '../bad' } }).result, null)
+})
+
+test('ETF result links round-trip only on the ETF page', () => {
+  const state = { ...navigationFromUrl(''), page: 'etf', etfResult: 'etf-result-1' }
+  const url = navigationUrl('', state)
+  assert.equal(url, '?page=etf&etf_result=etf-result-1')
+  assert.equal(navigationFromUrl(url).etfResult, 'etf-result-1')
+  assert.equal(navigationFromUrl('?page=research&etf_result=etf-result-1').etfResult, null)
+  assert.equal(
+    navigationFromUrl('?page=etf&etf_result=validation-report-1').etfResult,
+    'validation-report-1',
+  )
+  assert.equal(navigationUrl('', { ...state, etfResult: null }), '?page=etf')
 })

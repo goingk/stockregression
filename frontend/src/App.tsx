@@ -1,11 +1,11 @@
 import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import type { ErrorInfo, ReactNode } from 'react'
-import { Activity, BarChart3, Database, FlaskConical, HardDrive, Layers3, Menu, RotateCcw, TrendingUp } from 'lucide-react'
+import { Activity, BarChart3, Database, FlaskConical, HardDrive, Layers3, Menu, RotateCcw, ScanSearch, TrendingUp } from 'lucide-react'
 import { get, post } from './api'
 import { Button, defaultConfig, Loading } from './components'
 import { TaskButton, TaskProvider } from './TaskCenter'
 import { WorkbenchProvider, useWorkspaces } from './WorkbenchState'
-import { isResearchJob } from './taskState'
+import { etfResearchResultId, isEtfResearchJob, isResearchJob } from './taskState'
 import {
   navigationFromHistory, navigationFromUrl, navigationHistoryState, navigationUrl,
 } from './navigation'
@@ -19,11 +19,13 @@ const DataManagementPage = lazy(() => import('./pages/DataManagementPage'))
 const BacktestPage = lazy(() => import('./pages/BacktestPage'))
 const ResultsPage = lazy(() => import('./pages/ResultsPage'))
 const ResearchPage = lazy(() => import('./pages/ResearchPage'))
+const EtfResearchPage = lazy(() => import('./pages/EtfResearchPage'))
 
 export type PageKey = AppPage
 const nav: Array<{ id: PageKey; label: string; hint: string; icon: typeof Database }> = [
   { id: 'data', label: '行情', hint: '股票 · ETF · 自选', icon: Database },
   { id: 'data-admin', label: '数据管理', hint: '周期 · 导入 · 校验', icon: HardDrive },
+  { id: 'etf', label: 'ETF 研究', hint: '范围 · 评分 · 核验', icon: ScanSearch },
   { id: 'backtest', label: '策略回测', hint: '网格 · 实时预览', icon: Layers3 },
   { id: 'research', label: '参数研究', hint: '择参 · 样本外验证', icon: FlaskConical },
   { id: 'results', label: '结果分析', hint: '绩效与交易', icon: BarChart3 },
@@ -104,7 +106,8 @@ function AppWindow() {
     commitNavigation(previous => ({ ...previous, page: next }))
   }, [commitNavigation])
   const openJobResult = useCallback((job: Job) => {
-    if (isResearchJob(job)) commitNavigation(previous => ({ ...previous, page: 'research', research: job.id }))
+    if (isEtfResearchJob(job)) commitNavigation(previous => ({ ...previous, page: 'etf', etfResult: etfResearchResultId(job) }))
+    else if (isResearchJob(job)) commitNavigation(previous => ({ ...previous, page: 'research', research: job.id }))
     else if (['backtest', 'batch_backtest'].includes(job.kind)) commitNavigation(previous => ({ ...previous, page: 'results', result: job.result_id ?? null }))
     else commitNavigation(previous => ({ ...previous, page: 'data-admin', report: job.result_id ?? null }))
   }, [commitNavigation])
@@ -123,9 +126,9 @@ function AppWindow() {
     setTransferNotice({ page: 'research', message: '已复制回测配置；可调整本页的评估区间与搜索设置后启动研究。' })
     go('research')
   }
-  const backtestFromResearch = (config: BacktestConfig) => {
+  const backtestFromResearch = (config: BacktestConfig, message?: string) => {
     workspace.transfer('backtest', config)
-    setTransferNotice({ page: 'backtest', message: `研究参数已载入回测。${config.selection_asof ? '选参截止日：' + config.selection_asof + '。' : ''}预览将自动更新。` })
+    setTransferNotice({ page: 'backtest', message: message ?? `研究参数已载入回测。${config.selection_asof ? '选参截止日：' + config.selection_asof + '。' : ''}预览将自动更新。` })
     go('backtest')
   }
   const unsupportedRestartMessage = '当前后台仍是旧版本，无法通过网页重启。请关闭当前服务后重新运行 start.cmd；新版服务启动后，这个按钮即可直接重启项目。'
@@ -207,6 +210,7 @@ function AppWindow() {
           <Suspense fallback={<div className="route-loading">载入工作区…</div>}>
             {page === 'data' && <DataCenterPage requestedReport={navigation.report} onReportHandled={clearRequestedReport} onOpenDataManagement={() => go('data-admin')} />}
             {page === 'data-admin' && <DataManagementPage requestedReport={navigation.report} onReportHandled={clearRequestedReport} preparation={dataPreparation} onPreparationJob={(jobId) => setDataPreparation(current => current ? { ...current, preparationJobId: jobId } : current)} onReturn={dataPreparation ? finishDataPreparation : undefined} />}
+            {page === 'etf' && <EtfResearchPage requestedResult={navigation.etfResult} onSelectedResultChange={(result) => commitNavigation(previous => ({ ...previous, etfResult: result }), { replace: true, scroll: false })} onLoadBacktest={backtestFromResearch} />}
             {page === 'backtest' && <BacktestPage onResearch={researchFromConfig} onPrepareData={(request) => prepareData(request, 'backtest')} />}
             {page === 'research' && (workspace.research && workspace.researchSettings ? <ResearchPage base={workspace.research} settings={workspace.researchSettings} onBaseChange={workspace.updateResearch} onSettingsChange={workspace.updateResearchSettings} onLoadConfig={backtestFromResearch} requestedResource={navigation.research} onSelectedResourceChange={(resource) => commitNavigation(previous => ({ ...previous, research: resource }), { replace: true, scroll: false })} completionDecision={navigation.researchDecision} onCompletionDecisionChange={(decision) => commitNavigation(previous => ({ ...previous, researchDecision: decision }), { replace: true, scroll: false })} onFeeDefaultsEdit={workspace.rememberFees} onDefaultsEdit={workspace.rememberStrategy} onRestore={() => workspace.restore('research')} onPrepareData={(request) => prepareData(request, 'research')} /> : <Loading label="读取本机研究设置…" />)}
             {page === 'results' && <ResultsPage selectedResultId={navigation.result} selectedCompareId={navigation.compare} view={navigation.resultView} onSelectionChange={(result, compare) => commitNavigation(previous => ({ ...previous, result, compare }), { replace: true, scroll: false })} onViewChange={(resultView) => commitNavigation(previous => ({ ...previous, resultView }), { replace: true, scroll: false })} />}

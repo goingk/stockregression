@@ -19,6 +19,14 @@ def import_watchlist_snapshot(store: Store, path: Path) -> int:
         return 0
     digest = hashlib.sha256(content).hexdigest()
     key = "watchlist_snapshot:" + str(path.resolve())
+    # The common path is an unchanged versioned snapshot. Check it with a
+    # deferred read first so ordinary watchlist page loads do not take
+    # SQLite's write lock and contend with job dispatch.
+    with store.db() as db:
+        row = db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+    previous = json.loads(row[0]) if row else {}
+    if previous.get("digest") == digest:
+        return 0
     # Serialize checks and writes across concurrent refreshes and app instances.
     with FileLock(str(store.root / "watchlist-import.lock"), timeout=10):
         with store.db() as db:

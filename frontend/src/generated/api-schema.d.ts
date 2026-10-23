@@ -549,6 +549,94 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/etf-research/preflight": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Etf Preflight */
+        post: operations["etf_preflight_api_v1_etf_research_preflight_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/etf-research/validation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Etf Validation */
+        post: operations["etf_validation_api_v1_etf_research_validation_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/etf-research": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Etf Research */
+        post: operations["etf_research_api_v1_etf_research_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/etf-research/{result_id}/validate/{symbol}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Etf Validate Original Symbol
+         * @description Validate a historical row against its original, immutable inputs.
+         */
+        post: operations["etf_validate_original_symbol_api_v1_etf_research__result_id__validate__symbol__post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/etf-research/{result_id}/items": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Etf Result Items */
+        get: operations["etf_result_items_api_v1_etf_research__result_id__items_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/data/reference-price/{symbol}": {
         parameters: {
             query?: never;
@@ -1402,6 +1490,77 @@ export interface components {
              * @default 0
              */
             initial_shares: number;
+        };
+        /** EtfExecutionTemplate */
+        EtfExecutionTemplate: {
+            /**
+             * Initial Shares
+             * @default 1000
+             */
+            initial_shares: number;
+            /**
+             * Min Shares
+             * @default 0
+             */
+            min_shares: number;
+            /**
+             * Max Shares
+             * @default 2000
+             */
+            max_shares: number | null;
+            /**
+             * Buy Shares
+             * @default 100
+             */
+            buy_shares: number;
+            /**
+             * Sell Shares
+             * @default 100
+             */
+            sell_shares: number;
+            fees?: components["schemas"]["FeeConfig"];
+        };
+        /** EtfResearchRequest */
+        EtfResearchRequest: {
+            /**
+             * Scope
+             * @default watchlist
+             * @enum {string}
+             */
+            scope: "watchlist" | "local" | "selected";
+            /** Symbols */
+            symbols?: string[];
+            /** As Of */
+            as_of?: string | null;
+            /**
+             * Window Days
+             * @default 120
+             * @enum {integer}
+             */
+            window_days: 120 | 250;
+            /**
+             * Validation Top K
+             * @default 10
+             */
+            validation_top_k: number;
+            execution?: components["schemas"]["EtfExecutionTemplate"];
+            /**
+             * Min Trades
+             * @default 10
+             */
+            min_trades: number;
+            /**
+             * Max Principal Drawdown
+             * @default 0.2
+             */
+            max_principal_drawdown: number;
+            /**
+             * Max Runtime Seconds
+             * @default 3600
+             */
+            max_runtime_seconds: number;
+            /** Configuration Revision */
+            configuration_revision?: string | null;
         };
         /** FeeConfig */
         FeeConfig: {
@@ -3756,7 +3915,9 @@ export interface operations {
     };
     backtest_api_v1_backtests_post: {
         parameters: {
-            query?: never;
+            query?: {
+                version?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -3766,6 +3927,172 @@ export interface operations {
                 "application/json": components["schemas"]["BacktestConfig"];
             };
         };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    etf_preflight_api_v1_etf_research_preflight_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EtfResearchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    etf_validation_api_v1_etf_research_validation_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EtfResearchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    etf_research_api_v1_etf_research_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EtfResearchRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    etf_validate_original_symbol_api_v1_etf_research__result_id__validate__symbol__post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                result_id: string;
+                symbol: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    etf_result_items_api_v1_etf_research__result_id__items_get: {
+        parameters: {
+            query?: {
+                offset?: number;
+                limit?: number;
+                symbol?: string | null;
+            };
+            header?: never;
+            path: {
+                result_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {

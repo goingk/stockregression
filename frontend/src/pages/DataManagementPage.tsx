@@ -306,9 +306,10 @@ export default function DataManagementPage({
     reportRequest.current.invalidate()
     if (!requestedReport) { setReport(null); setReportError(''); return }
     const ticket = reportRequest.current.begin(requestedReport)
+    setReport(null)
     setReportError('')
     get<ReportRecord>(`/results/${encodeURIComponent(requestedReport)}`)
-      .then(value => { if (reportRequest.current.isCurrent(ticket)) { setReport(value); onReportHandled?.() } })
+      .then(value => { if (reportRequest.current.isCurrent(ticket)) setReport(value) })
       .catch(cause => {
         if (!reportRequest.current.isCurrent(ticket)) return
         setReportError(cause instanceof ApiError && cause.status === 404
@@ -316,7 +317,14 @@ export default function DataManagementPage({
           : errorText(cause))
       })
     return () => { reportRequest.current.invalidate(ticket.key) }
-  }, [requestedReport, onReportHandled, errorText, reportRetryToken])
+  }, [requestedReport, errorText, reportRetryToken])
+
+  const closeReport = () => {
+    reportRequest.current.invalidate()
+    setReport(null)
+    setReportError('')
+    onReportHandled?.()
+  }
 
   const completedDataJobs = tasks.jobs
     .filter(job => DATA_JOB_KINDS.has(job.kind) && TERMINAL.has(job.status))
@@ -354,12 +362,12 @@ export default function DataManagementPage({
     void loadPlan()
   }, [completedDataJobs, loadPlan, preparation?.request.config])
 
-  const run = async (label: string, action: () => Promise<unknown>, success: string) => {
+  const run = async (label: string, action: () => Promise<unknown>, success: string, reload = true) => {
     setBusy(label); setError(''); setNotice('')
     try {
       await tasks.run(label, action)
       setNotice(success)
-      await Promise.allSettled([loadInventory(), loadPackage(), loadSources(), loadConfiguration()])
+      if (reload) await Promise.allSettled([loadInventory(), loadPackage(), loadSources(), loadConfiguration()])
     } catch (cause) { setError(errorText(cause)) } finally { setBusy('') }
   }
 
@@ -377,7 +385,7 @@ export default function DataManagementPage({
       symbols, scope: syncScope, timeframe: timeframes[0], timeframes, mode: syncMode,
       start_date: syncStart || null, end_date: syncEnd || null, resume: true,
       initialize: syncScope === 'market' && initializeAll,
-    }), `已提交 ${timeframes.join('、')} 基础行情更新。`)
+    }), `已提交 ${timeframes.join('、')} 基础行情更新。`, false)
   }
 
   const chooseSource = async (capability: string, source: string) => {
@@ -391,7 +399,7 @@ export default function DataManagementPage({
   }
 
   const probeSource = (source: string, capability: string, market = 'all') => {
-    void run('探测数据源', () => post('/data/sources/probe', { source, capability, market }), `${source} 探测任务已提交；完成后刷新状态。`)
+    void run('探测数据源', () => post('/data/sources/probe', { source, capability, market }), `${source} 探测任务已提交；完成后刷新状态。`, false)
   }
 
   const configuredSchedule = (workspace.configuration.schedule ?? {}) as Partial<ScheduleDraft>
@@ -449,7 +457,7 @@ export default function DataManagementPage({
       if (etfCategory) body.append('etf_category', etfCategory)
       if (calendarFile) body.append('calendar_file', calendarFile)
       if (actionsFile) body.append('actions_file', actionsFile)
-      void run('导入行情文件', () => postForm('/data/upload', body), `已提交 ${marketFile.name}，将合并到数据包中的 ${selectedTimeframe}。`)
+      void run('导入行情文件', () => postForm('/data/upload', body), `已提交 ${marketFile.name}，将合并到数据包中的 ${selectedTimeframe}。`, false)
       return
     }
     void run('导入行情文件', () => post('/data/import', {
@@ -458,7 +466,7 @@ export default function DataManagementPage({
       etf_category: etfCategory || null, calendar_path: calendarPath.trim() || null,
       actions_path: actionsPath.trim() || null, skip_invalid_rows: skipInvalidRows,
       import_mode: importMode,
-    }), `已提交本地路径 ${importPath.trim()}。`)
+    }), `已提交本地路径 ${importPath.trim()}。`, false)
   }
 
   const chooseBatchFiles = (files: FileList | null) => {
@@ -477,7 +485,7 @@ export default function DataManagementPage({
       body.append('skip_invalid_rows', String(skipInvalidRows))
       body.append('import_mode', batchImportMode)
       if (batchCalendar) body.append('calendar_file', batchCalendar)
-      void run('批量导入', () => postForm('/data/upload-batch', body), `已上传 ${batchFiles.length} 个文件，将写入数据包。`)
+      void run('批量导入', () => postForm('/data/upload-batch', body), `已上传 ${batchFiles.length} 个文件，将写入数据包。`, false)
       return
     }
     if (!folder.trim()) { setError('请选择文件或填写本机文件夹。'); return }
@@ -485,7 +493,7 @@ export default function DataManagementPage({
       folder: folder.trim(), timeframe: selectedTimeframe, recursive,
       label_convention: batchLabel, resume: true, skip_invalid_rows: skipInvalidRows,
       import_mode: batchImportMode,
-    }), `已提交文件夹 ${folder.trim()}。`)
+    }), `已提交文件夹 ${folder.trim()}。`, false)
   }
 
   const scanFolder = async () => {
@@ -511,7 +519,7 @@ export default function DataManagementPage({
     void run('重建索引', () => post('/data/import-package', {
       folder: packageFolder.trim(), format: 'package', timeframes: null, symbols: null,
       label_convention: 'auto', resume: true, workers: 4, skip_invalid_rows: false,
-    }), '已提交从数据包清单重建索引的任务。')
+    }), '已提交从数据包清单重建索引的任务。', false)
   }
 
   const runAggregate = () => {
@@ -521,14 +529,14 @@ export default function DataManagementPage({
       symbols, source_timeframe: aggregate.source_timeframe,
       target_timeframe: aggregate.target_timeframe,
       start_date: aggregate.start_date || null, end_date: aggregate.end_date || null,
-    }), '本地聚合任务已提交，结果将写入数据包。')
+    }), '本地聚合任务已提交，结果将写入数据包。', false)
   }
 
   const archiveSelected = () => {
     if (!selectedItem) return
     void run('保护历史快照', () => post('/data/archive', {
       symbols: [selectedItem.symbol], timeframe: selectedTimeframe,
-    }), '历史快照归档任务已提交。')
+    }), '历史快照归档任务已提交。', false)
   }
 
   const submitPreparation = async () => {
@@ -605,7 +613,7 @@ export default function DataManagementPage({
         {coverageLoading && coverage && <p className="inline-warning">正在刷新覆盖详情，当前显示上次成功结果。</p>}
         <div className="stat-grid four"><Stat label="首末时间" value={`${dateText(selectedPeriod.first_time)} → ${dateText(selectedPeriod.last_time)}`} note={`版本 ${selectedPeriod.current_version}`} /><Stat label="覆盖" value={{ complete: '完整', partial: '有缺口', unknown: '未知' }[selectedPeriod.coverage_status] || selectedPeriod.coverage_status} note={`已核验至 ${dateText(selectedPeriod.verified_through)}`} tone={selectedPeriod.coverage_status === 'complete' ? 'green' : 'amber'} /><Stat label="文件 / 质量" value={`${selectedPeriod.file_status === 'readable' ? '可读' : selectedPeriod.file_status === 'changed' ? '已变化' : '缺失'} / ${selectedPeriod.quality_status === 'passed' ? '通过' : selectedPeriod.quality_status === 'failed' ? '失败' : '待核验'}`} note={`${compact(selectedPeriod.row_count)} 行`} /><Stat label="合成记录" value={selectedPeriod.synthetic_rows} note="不能触发交易" tone={selectedPeriod.synthetic_rows ? 'amber' : 'green'} /></div>
         {coverage?.segments?.length ? <div className="table-wrap coverage-table compact-coverage"><table><thead><tr><th>检查区间</th><th>结果</th><th>预期 / 实际</th><th>缺口</th><th>检查时间</th></tr></thead><tbody>{coverage.segments.map((segment, index) => { const row = segment as Record<string, unknown>; return <tr key={String(row.start_time) + index}><td>{dateText(String(row.start_time))} → {dateText(String(row.end_time))}</td><td>{String(row.status ?? '—')}</td><td>{String(row.expected_rows ?? '—')} / {String(row.observed_rows ?? '—')}</td><td>{String(row.gap_count ?? 0)}</td><td>{dateText(String(row.checked_at))}</td></tr> })}</tbody></table></div> : <p className="inline-warning">该版本尚无检查区间报告。登记成功不等于质量已通过。</p>}
-        <div className="button-row"><Badge tone={selectedPeriod.archive?.protected ? 'green' : 'amber'}>{selectedPeriod.archive?.protected ? '历史快照已保护' : '历史快照未保护'}</Badge><Badge tone="blue">当前分片 {selectedPeriod.shard_count || 0}</Badge>{selectedItem.periods['1day'] && <Badge>日线合规至 {dateText(selectedItem.periods['1day']?.verified_through)}</Badge>}{selectedItem.periods['1min'] && <Badge>1 分钟合规至 {dateText(selectedItem.periods['1min']?.verified_through)}</Badge>}</div><div className="button-row data-detail-actions"><Button variant="secondary" busy={busy === '校验'} onClick={() => void run('校验', () => post('/data/validate', { symbol: selectedItem.symbol, timeframe: selectedTimeframe }), '增量校验任务已提交。')}><ShieldCheck size={14} />增量校验</Button><Button variant="quiet" onClick={() => { setSyncSymbols(selectedItem.symbol); setSyncScope('selected'); document.getElementById('data-import-update')?.scrollIntoView({ behavior: 'smooth' }) }}>更新该周期</Button><Button variant="quiet" busy={busy === '保护历史快照'} disabled={!selectedPeriod.archive || selectedPeriod.archive.protected} onClick={archiveSelected}><Archive size={14} />保护历史快照</Button></div>
+        <div className="button-row"><Badge tone={selectedPeriod.archive?.protected ? 'green' : 'amber'}>{selectedPeriod.archive?.protected ? '历史快照已保护' : '历史快照未保护'}</Badge><Badge tone="blue">当前分片 {selectedPeriod.shard_count || 0}</Badge>{selectedItem.periods['1day'] && <Badge>日线合规至 {dateText(selectedItem.periods['1day']?.verified_through)}</Badge>}{selectedItem.periods['1min'] && <Badge>1 分钟合规至 {dateText(selectedItem.periods['1min']?.verified_through)}</Badge>}</div><div className="button-row data-detail-actions"><Button variant="secondary" busy={busy === '校验'} onClick={() => void run('校验', () => post('/data/validate', { symbol: selectedItem.symbol, timeframe: selectedTimeframe }), '增量校验任务已提交。', false)}><ShieldCheck size={14} />增量校验</Button><Button variant="quiet" onClick={() => { setSyncSymbols(selectedItem.symbol); setSyncScope('selected'); document.getElementById('data-import-update')?.scrollIntoView({ behavior: 'smooth' }) }}>更新该周期</Button><Button variant="quiet" busy={busy === '保护历史快照'} disabled={!selectedPeriod.archive || selectedPeriod.archive.protected} onClick={archiveSelected}><Archive size={14} />保护历史快照</Button></div>
         {coverage?.versions?.length ? <details className="advanced-data"><summary>版本历史（{coverage.versions.length}）</summary><div className="table-wrap compact-coverage"><table><thead><tr><th>版本</th><th>时间</th><th>行数</th><th>状态</th><th>来源</th></tr></thead><tbody>{coverage.versions.map((version, index) => { const row = version as Record<string, unknown>; return <tr key={String(row.version) + index}><td>{String(row.version)}</td><td>{dateText(String(row.created_at))}</td><td>{compact(Number(row.row_count))}</td><td>{String(row.status)}</td><td>{String(row.source ?? '—')}</td></tr> })}</tbody></table></div></details> : null}
       </>}
     </Card>
@@ -670,7 +678,7 @@ export default function DataManagementPage({
       <div className='button-row'><Button variant='secondary' busy={busy === '保存更新计划'} onClick={() => saveSchedule()}>保存计划</Button><Button variant='quiet' busy={busy === '保存更新计划'} onClick={() => saveSchedule(true)}>保存并安装</Button><Button variant='quiet' busy={busy === '保存更新计划'} onClick={() => saveSchedule(false)}>移除系统计划</Button></div>
     </Card>
 
-    {report && <div className="task-drawer-overlay" onMouseDown={event => { if (event.target === event.currentTarget) setReport(null) }}><section className="task-drawer report-drawer" role="dialog" aria-modal="true" aria-label="数据任务报告"><Card title="数据任务报告" subtitle={String(report.message ?? report.status ?? '')} action={<Button variant="quiet" onClick={() => setReport(null)}><X size={14} />关闭</Button>}>
+    {report && <div className="task-drawer-overlay" onMouseDown={event => { if (event.target === event.currentTarget) closeReport() }}><section className="task-drawer report-drawer" role="dialog" aria-modal="true" aria-label="数据任务报告"><Card title="数据任务报告" subtitle={String(report.message ?? report.status ?? '')} action={<Button variant="quiet" onClick={closeReport}><X size={14} />关闭</Button>}>
       <DataTaskReport report={report} />
       <details className="advanced-data"><summary>高级诊断 JSON</summary><pre className="json-preview">{JSON.stringify(report, null, 2)}</pre></details>
     </Card></section></div>}

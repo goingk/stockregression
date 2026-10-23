@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { isResearchJob, mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds, taskLabel, taskNoticeMessage } from '../src/taskState.ts'
+import { etfResearchResultId, isEtfResearchJob, isResearchJob, mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds, taskLabel, taskNoticeMessage } from '../src/taskState.ts'
 
 const job = (id, status, values = {}) => ({ id, kind: 'backtest', status, progress: 0, message: '', ...values })
 const ids = (jobs) => jobs.map((entry) => entry.id)
@@ -26,6 +26,19 @@ test('research completion jobs are treated as research tasks and labelled as suc
   assert.equal(isResearchJob({ kind: 'optimization' }), true)
   assert.equal(isResearchJob({ kind: 'optimize' }), true)
   assert.equal(isResearchJob({ kind: 'backtest' }), false)
+})
+
+test('ETF research and data-validation jobs open the ETF workspace', () => {
+  assert.equal(isEtfResearchJob({ kind: 'etf_research' }), true)
+  assert.equal(isEtfResearchJob({ kind: 'etf_validation' }), true)
+  assert.equal(isEtfResearchJob({ kind: 'optimization' }), false)
+  assert.equal(isResearchJob({ kind: 'etf_research' }), false)
+  assert.equal(taskLabel({ kind: 'etf_research', payload: {} }), 'ETF研究')
+  assert.equal(taskLabel({ kind: 'etf_validation', payload: {} }), 'ETF数据校验')
+  assert.equal(etfResearchResultId({ kind: 'etf_research', result_id: 'etf-result' }), 'etf-result')
+  assert.equal(etfResearchResultId({ kind: 'etf_validation', result_id: 'validation-result' }), 'validation-result')
+  assert.equal(etfResearchResultId({ kind: 'etf_validation' }), null)
+  assert.equal(etfResearchResultId({ kind: 'etf_research', result_id: undefined }), null)
 })
 
 test('first history load restores queued and running notices without replaying old terminal results', () => {

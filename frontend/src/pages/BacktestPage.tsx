@@ -97,7 +97,7 @@ export default function BacktestPage({ onResearch, onPrepareData }: { onResearch
     {dataIssue && <div className="notice"><span>本次区间缺少本地数据。可在数据管理中显式准备该标的和周期；系统不会在后台自动下载。</span><Button variant="secondary" onClick={() => onPrepareData?.(dataIssue)}>去准备数据</Button></div>}
     {workspace.error && <ErrorBox message={workspace.error} />}
     {notice && <div className="notice success"><span>{notice}</span><button className="text-link" onClick={() => setNotice('')}>收起</button></div>}
-    {config.selection_asof && <div className="selection-context"><Badge tone="amber">研究参数</Badge><span>选参截止 {config.selection_asof}{config.start_date < config.selection_asof ? ' · 当前区间为样本内历史回看' : ''}</span></div>}
+    {config.selection_asof && <div className="selection-context"><Badge tone="amber">研究参数</Badge><span>选参截止 {config.selection_asof}{config.start_date <= config.selection_asof ? ' · 当前区间为样本内历史回看' : ''}</span></div>}
     <div className="workbench-layout">
       <section className="workbench-config-column"><Card title="策略配置" subtitle="常用参数直接调整，其他设置可展开。">
         <div className="parameter-scroll"><ConfigForm key={formRevision} value={config} onChange={updateConfig} onFeeDefaultsEdit={workspace.rememberFees} onDefaultsEdit={workspace.rememberStrategy} /></div>

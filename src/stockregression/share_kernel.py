@@ -497,10 +497,23 @@ def simulate(
                     bonus_delta += action_bonus_ratio[action]
             factor = 1.0
             if has_ex_action and prior_close > 0:
-                if math.isfinite(preclose_by_day[day_id]) and preclose_by_day[day_id] > 0:
-                    factor = preclose_by_day[day_id] / prior_close
+                implied_close = prior_close * (1.0 + bonus_delta)
+                implied_factor = max(
+                    0.0,
+                    (prior_close - cash_delta) / implied_close
+                    if implied_close > 0 else 0.0,
+                )
+                official = preclose_by_day[day_id]
+                if (
+                    math.isfinite(official) and official > 0
+                    and abs(official - prior_close * implied_factor) <= tick * 1.1
+                ):
+                    factor = official / prior_close
                 else:
-                    factor = max(0.0, (prior_close - cash_delta) / (prior_close * (1.0 + bonus_delta)))
+                    # A stale or unrelated preclose is not a verified ex-rights
+                    # reference.  Use the action-implied factor, matching the
+                    # training-window and statistics path.
+                    factor = implied_factor
                 if factor <= 0 or not math.isfinite(factor):
                     raise ValueError("公司行动除权参考价无效")
             for slot in range(active_count):
@@ -510,6 +523,10 @@ def simulate(
                         reference[account] *= factor
                     if fixed_anchor[account] > 0:
                         fixed_anchor[account] *= factor
+                    if lower_price > 0:
+                        lower_price *= factor
+                    if upper_price > 0:
+                        upper_price *= factor
                     last_grid_price *= factor
                     if floor_active:
                         floor_anchor *= factor

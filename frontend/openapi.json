@@ -1401,16 +1401,265 @@
       "post": {
         "summary": "Backtest",
         "operationId": "backtest_api_v1_backtests_post",
+        "parameters": [
+          {
+            "name": "version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Version"
+            }
+          }
+        ],
         "requestBody": {
+          "required": true,
           "content": {
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/BacktestConfig"
               }
             }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/etf-research/preflight": {
+      "post": {
+        "summary": "Etf Preflight",
+        "operationId": "etf_preflight_api_v1_etf_research_preflight_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EtfResearchRequest"
+              }
+            }
           },
           "required": true
         },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/etf-research/validation": {
+      "post": {
+        "summary": "Etf Validation",
+        "operationId": "etf_validation_api_v1_etf_research_validation_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EtfResearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/etf-research": {
+      "post": {
+        "summary": "Etf Research",
+        "operationId": "etf_research_api_v1_etf_research_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EtfResearchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/etf-research/{result_id}/validate/{symbol}": {
+      "post": {
+        "summary": "Etf Validate Original Symbol",
+        "description": "Validate a historical row against its original, immutable inputs.",
+        "operationId": "etf_validate_original_symbol_api_v1_etf_research__result_id__validate__symbol__post",
+        "parameters": [
+          {
+            "name": "result_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Result Id"
+            }
+          },
+          {
+            "name": "symbol",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/etf-research/{result_id}/items": {
+      "get": {
+        "summary": "Etf Result Items",
+        "operationId": "etf_result_items_api_v1_etf_research__result_id__items_get",
+        "parameters": [
+          {
+            "name": "result_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Result Id"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Symbol"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -3800,6 +4049,146 @@
         "additionalProperties": false,
         "type": "object",
         "title": "DcaDefaults"
+      },
+      "EtfExecutionTemplate": {
+        "properties": {
+          "initial_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 0.0,
+            "title": "Initial Shares",
+            "default": 1000
+          },
+          "min_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 0.0,
+            "title": "Min Shares",
+            "default": 0
+          },
+          "max_shares": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "multipleOf": 100.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Shares",
+            "default": 2000
+          },
+          "buy_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 100.0,
+            "title": "Buy Shares",
+            "default": 100
+          },
+          "sell_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 100.0,
+            "title": "Sell Shares",
+            "default": 100
+          },
+          "fees": {
+            "$ref": "#/components/schemas/FeeConfig"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "EtfExecutionTemplate"
+      },
+      "EtfResearchRequest": {
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "watchlist",
+              "local",
+              "selected"
+            ],
+            "title": "Scope",
+            "default": "watchlist"
+          },
+          "symbols": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 10000,
+            "title": "Symbols"
+          },
+          "as_of": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "As Of"
+          },
+          "window_days": {
+            "type": "integer",
+            "enum": [
+              120,
+              250
+            ],
+            "title": "Window Days",
+            "default": 120
+          },
+          "validation_top_k": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Validation Top K",
+            "default": 10
+          },
+          "execution": {
+            "$ref": "#/components/schemas/EtfExecutionTemplate"
+          },
+          "min_trades": {
+            "type": "integer",
+            "maximum": 1000000.0,
+            "minimum": 0.0,
+            "title": "Min Trades",
+            "default": 10
+          },
+          "max_principal_drawdown": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Max Principal Drawdown",
+            "default": 0.2
+          },
+          "max_runtime_seconds": {
+            "type": "integer",
+            "maximum": 86400.0,
+            "minimum": 1.0,
+            "title": "Max Runtime Seconds",
+            "default": 3600
+          },
+          "configuration_revision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Configuration Revision"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "EtfResearchRequest"
       },
       "FeeConfig": {
         "properties": {

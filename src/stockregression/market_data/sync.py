@@ -27,6 +27,7 @@ from .models import MarketDataError
 from .quality import validate_and_fill
 from .reader import normalize_frame
 from .service import MarketDataService
+from .repository import VALIDATION_RULES_VERSION
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe, timeframe_spec
 
 
@@ -368,6 +369,8 @@ class MarketDataSyncService:
                             source_metadata=source.get("metadata") or {},
                             coverage_start=source.get("coverage_start"),
                             coverage_end=source.get("coverage_end"),
+                            validation_start=source.get("request_start"),
+                            validation_end=source.get("request_end"),
                             import_mode="merge",
                         )
                         results.append({
@@ -419,12 +422,16 @@ class MarketDataSyncService:
                 repair_windows = self._repair_windows(symbol, "1day", request_start, request_end)
                 if not repair_windows:
                     return {"symbol": symbol, "timeframe": "1day", "skipped": True,
-                            "message": "所选区间未发现需要修补的缺口"}
+                            "message": "所选区间未发现需要修补的缺口",
+                            "metrics": {"archive_hit": True, "checked_days": 0,
+                                        "reused_days": 0, "scanned_shards": 0}}
             elif dataset and self.repository.auxiliary(symbol, "calendar"):
                 repair_windows = self._repair_windows(symbol, "1day", request_start, request_end)
                 if not repair_windows:
                     return {"symbol": symbol, "timeframe": "1day", "skipped": True,
-                            "message": "所选区间已有完整本地数据，未调用行情来源"}
+                            "message": "所选区间已有完整本地数据，未调用行情来源",
+                            "metrics": {"archive_hit": True, "checked_days": 0,
+                                        "reused_days": 0, "scanned_shards": 0}}
         if request_start > request_end:
             raise MarketDataError("开始日期不能晚于结束日期")
         frames, source, metadata = [], "", {}
@@ -517,12 +524,16 @@ class MarketDataSyncService:
                 repair_windows = self._repair_windows(symbol, timeframe, request_start, request_end)
                 if not repair_windows:
                     return {"symbol": symbol, "timeframe": timeframe, "skipped": True,
-                            "message": "所选区间已有完整本地数据，未调用行情来源" if mode == "history" else "所选区间未发现需要修补的缺口"}
+                            "message": "所选区间已有完整本地数据，未调用行情来源" if mode == "history" else "所选区间未发现需要修补的缺口",
+                            "metrics": {"archive_hit": True, "checked_days": 0,
+                                        "reused_days": 0, "scanned_shards": 0}}
             elif mode == "history" and dataset and self.repository.auxiliary(symbol, "calendar"):
                 repair_windows = self._repair_windows(symbol, timeframe, request_start, request_end)
                 if not repair_windows:
                     return {"symbol": symbol, "timeframe": timeframe, "skipped": True,
-                            "message": "所选区间已有完整本地数据，未调用行情来源"}
+                            "message": "所选区间已有完整本地数据，未调用行情来源",
+                            "metrics": {"archive_hit": True, "checked_days": 0,
+                                        "reused_days": 0, "scanned_shards": 0}}
         if request_start > request_end:
             raise MarketDataError("开始日期不能晚于结束日期")
         if cancelled():
@@ -572,6 +583,7 @@ class MarketDataSyncService:
             pending=pending, source=source, adjustment="none", etf_category=metadata.get("etf_category"),
             calendar_path=None, actions_path=None, progress=lambda *_: None, cancelled=cancelled,
             coverage_start=normalized.timestamp.min(), coverage_end=normalized.timestamp.max(),
+            validation_start=request_start, validation_end=request_end,
             source_metadata={key: value for key, value in metadata.items() if key not in {"calendar", "actions"}},
         )
         # Persist auxiliary material only when the same source request supplied it.
@@ -587,61 +599,101 @@ class MarketDataSyncService:
         calendar_saved = self.repository.auxiliary(symbol, "calendar")
         if not calendar_saved:
             raise MarketDataError("缺口修补需要本地交易日历；请先导入或同步交易日历资料")
-        calendar = self.repository.trading_days(symbol, start, end)
+        calendar = self.repository._calendar_dates(calendar_saved.get("payload") or [])
+        calendar = calendar[
+            (calendar >= pd.Timestamp(start).normalize())
+            & (calendar <= pd.Timestamp(end).normalize())
+        ]
         if not len(calendar):
             return []
-        spec = timeframe_spec(timeframe)
-        observed = self.repository.active_rows(symbol, timeframe, start=start, end=end + pd.Timedelta(days=1))
-        if spec.kind == "minute":
-            observed_stamps = pd.DatetimeIndex(observed.timestamp) if not observed.empty else pd.DatetimeIndex([])
-            # Compare every session against its own bars instead of
-            # differencing the whole observed frame day by day.
-            observed_by_day = _group_stamps_by_day(observed_stamps)
-            missing_days = []
-            bar_size = spec.minutes or 1
-            for day in calendar:
-                all_slots = minute_slots(day)
-                expected = pd.DatetimeIndex(sorted(set(all_slots[(bar_size - 1)::bar_size])))
-                missing = expected.difference(
-                    observed_by_day.get(pd.Timestamp(day).normalize(), pd.DatetimeIndex([]))
-                )
-                if bar_size == 1 and symbol.endswith(".SZ") and day >= pd.Timestamp("2023-02-17"):
-                    anchor_1457 = day + pd.Timedelta(hours=14, minutes=57)
-                    anchor_1500 = day + pd.Timedelta(hours=15)
-                    if anchor_1457 in observed_stamps and anchor_1500 in observed_stamps:
-                        missing = missing.difference(pd.DatetimeIndex([
-                            day + pd.Timedelta(hours=14, minutes=58),
-                            day + pd.Timedelta(hours=14, minutes=59),
-                        ]))
-                if len(missing):
-                    missing_days.append(day)
-            missing_days = pd.DatetimeIndex(missing_days)
-        elif timeframe == "1day":
-            observed_days = pd.DatetimeIndex(observed.timestamp.dt.normalize().unique()) if not observed.empty else pd.DatetimeIndex([])
-            missing_days = calendar.difference(observed_days)
-        elif timeframe == "1week":
-            labels = pd.Series(calendar, index=calendar).groupby(calendar.to_period("W-FRI")).max()
-            observed_labels = pd.DatetimeIndex(observed.timestamp.dt.normalize().unique()) if not observed.empty else pd.DatetimeIndex([])
-            missing_days = pd.DatetimeIndex([value for value in labels if value not in observed_labels])
-        else:
-            labels = pd.Series(calendar, index=calendar).groupby(calendar.to_period("M")).max()
-            observed_labels = pd.DatetimeIndex(observed.timestamp.dt.normalize().unique()) if not observed.empty else pd.DatetimeIndex([])
-            missing_days = pd.DatetimeIndex([value for value in labels if value not in observed_labels])
-        if not len(missing_days):
+        from .coverage_index import CoverageArchive
+        from .validation import validate_incremental
+
+        archive = CoverageArchive(self.repository)
+        head = archive.trusted_head(symbol, timeframe, "none", start=start, end=end)
+        file_state = self.repository.market_file_state(symbol, timeframe, "none")
+        invalid_ranges = []
+        for start_value, end_value in file_state.get("invalid_ranges") or []:
+            try:
+                invalid_ranges.append((
+                    pd.Timestamp(start_value).normalize(),
+                    pd.Timestamp(end_value).normalize(),
+                ))
+            except (TypeError, ValueError):
+                continue
+        requested_calendar = set(calendar)
+        rows = archive.rows(symbol, timeframe, "none", start=start, end=end)
+        scanned = {
+            pd.Timestamp(row["trade_date"]).normalize() for row in rows
+            if row.get("scanned") and not row.get("dirty_reason")
+            and int(row.get("rules_version") or 0) >= VALIDATION_RULES_VERSION
+            and not any(
+                start_value <= pd.Timestamp(row["trade_date"]).normalize() <= end_value
+                for start_value, end_value in invalid_ranges
+            )
+        }
+        pending = archive.pending_dates(head, start, end)
+        unscanned = [
+            day for day in sorted(requested_calendar)
+            if day not in scanned or day in pending
+        ]
+        if head is None:
+            # The first repair is the explicit archive-building pass. It reads
+            # local shards only; no provider request is issued until gaps exist.
+            validate_incremental(
+                self.service, symbol, timeframe, mode="incremental",
+                start=start, end=end,
+            )
+        elif unscanned:
+            validate_incremental(
+                self.service, symbol, timeframe, mode="incremental",
+                start=start, end=end, dates=unscanned, force_dates=True,
+            )
+        result = CoverageArchive(self.repository).coverage_gaps(
+            symbol, timeframe, start, end,
+        )
+        gap_dates = {
+            pd.Timestamp(gap.get("trade_date") or gap.get("start")).normalize()
+            for gap in result.get("gaps") or []
+            if gap.get("trade_date") or gap.get("start")
+        }
+        gap_dates.update(
+            pd.Timestamp(value).normalize()
+            for value in result.get("unknown_dates") or []
+            if pd.Timestamp(value).normalize() in requested_calendar
+        )
+        if not gap_dates:
             return []
-        windows = []
-        first = previous = missing_days[0]
-        for value in missing_days[1:]:
-            # Period labels can skip weekends; fetch a bounded envelope.
-            if (value - previous) > pd.Timedelta(days=10):
-                windows.append((first - pd.Timedelta(days=10), previous + pd.Timedelta(days=1)))
-                first = value
-            previous = value
-        windows.append((first - pd.Timedelta(days=10), previous + pd.Timedelta(days=1)))
+        interval = timeframe_spec(timeframe).minutes or 1
+        windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+        for day in sorted(gap_dates):
+            window = (
+                max(pd.Timestamp(start).normalize(), day - pd.Timedelta(days=10)),
+                min(
+                    pd.Timestamp(end).normalize() + pd.Timedelta(days=1),
+                    day + pd.Timedelta(days=1, minutes=interval),
+                ),
+            )
+            if windows and window[0] <= windows[-1][1]:
+                windows[-1] = (windows[-1][0], max(windows[-1][1], window[1]))
+            else:
+                windows.append(window)
         return windows
 
     def _increment_range(self, dataset, timeframe):
-        last = pd.Timestamp(dataset["last_time"]).normalize()
+        from .coverage_index import CoverageArchive
+
+        archive_head = CoverageArchive(self.repository).load_head(
+            dataset["symbol"], timeframe, dataset.get("adjustment", "none")
+        )
+        # The archive records the tail that has actually reached the quality
+        # index.  If publication stopped between market and archive heads, the
+        # overlap is intentionally fetched again; unchanged rows are discarded.
+        archive_last = pd.Timestamp(
+            (archive_head or {}).get("last_time") or dataset["last_time"]
+        ).normalize()
+        dataset_last = pd.Timestamp(dataset["last_time"]).normalize()
+        last = min(archive_last, dataset_last)
         cutoff = pd.Timestamp(latest_closed_date()).normalize()
         spec = timeframe_spec(timeframe)
         if spec.kind == "minute":

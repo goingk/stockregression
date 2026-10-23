@@ -17,6 +17,7 @@ from typing import Any
 import pandas as pd
 
 from ..models import DataBundle
+from ..price_basis import action_factors
 
 
 MIN_TRAINING_OFFSET = 250
@@ -158,133 +159,21 @@ def _daily_prices(data: DataBundle) -> pd.DataFrame:
     return frame[["close", "high", "low", "preclose"]].sort_index()
 
 
-def _price_tick(data: DataBundle) -> float:
-    """Exchange price tick used to verify ex-rights reference prices."""
-    try:
-        from ..rules import instrument_terms
-        metadata = data.metadata if isinstance(data.metadata, dict) else {}
-        tick = float(instrument_terms(data.symbol, metadata).get("price_tick") or 0.0)
-    except Exception:
-        tick = 0.0
-    return tick if tick > 0 else 0.01
-
-
-def _explicitly_not_implemented(value: Any) -> bool:
-    """True only when an action is explicitly marked as not implemented.
-
-    A missing or unreadable flag stays optimistically implemented, matching the
-    ledger's ``bool(implemented)`` handling in ``engine._prepare_actions``;
-    only an explicit ``false`` marks the action as unverified.
-    """
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return value.strip().lower() in {"0", "false", "no", "n", "否"}
-    try:
-        if bool(pd.isna(value)):
-            return False
-    except (TypeError, ValueError):
-        return False
-    return not bool(value)
-
-
 def _adjusted_daily_prices(
     data: DataBundle, anchor: pd.Timestamp, prices: pd.DataFrame,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]], str | None]:
-    """Express historical high/low values in the decision-date share basis.
-
-    Only implemented corporate actions with an ex-date on or before the anchor
-    are applied.  An action that is explicitly marked as not implemented is a
-    data issue, never a silently skipped adjustment.  The exchange ex-rights
-    reference price is only trusted when it agrees with the reference implied
-    by the action itself; a stale or unrelated preclose falls back to the
-    cash-and-bonus factor and is recorded as a mismatch.
-    """
+    """Compatibility wrapper that adjusts only the window's high/low values."""
+    factors, data_issue = action_factors(data, anchor, prices)
     adjusted = prices.copy()
-    actions = data.actions if isinstance(data.actions, pd.DataFrame) else pd.DataFrame()
-    if actions.empty or not {"ex_date"}.issubset(actions.columns):
-        return adjusted, [], None
     applied: list[dict[str, Any]] = []
-    tick = _price_tick(data)
-    tolerance = tick * 1.1
-    rows = actions.copy()
-    for column in ("ex_date", "cash_per_share", "bonus_ratio", "implemented", "unsupported_reason"):
-        if column not in rows:
-            rows[column] = True if column == "implemented" else ("" if column == "unsupported_reason" else 0.0)
-    rows["ex_date"] = pd.to_datetime(rows["ex_date"], errors="coerce").dt.normalize()
-    rows = rows[rows["ex_date"].notna() & (rows["ex_date"] <= anchor)].copy()
-
-    for ex_date, same_day in rows.groupby("ex_date", sort=True):
-        action_rows = list(same_day.itertuples(index=False))
-        unverified = [
-            row for row in action_rows
-            if _explicitly_not_implemented(getattr(row, "implemented", True))
-        ]
-        if unverified:
-            return adjusted, applied, (
-                f"选窗遇到未确认已实施的公司行动（{ex_date:%Y-%m-%d}）："
-                "除权事实无法核实，训练窗口不可用"
-            )
-        implemented_rows = action_rows
-        reasons = [
-            str(getattr(row, "unsupported_reason", "") or "").strip()
-            for row in implemented_rows if str(getattr(row, "unsupported_reason", "") or "").strip()
-        ]
-        if reasons:
-            return adjusted, applied, f"选窗遇到未支持的公司行动（{ex_date:%Y-%m-%d}）：{reasons[0]}"
-        ex_date = pd.Timestamp(ex_date).normalize()
-        before = adjusted.index[adjusted.index < ex_date]
-        if not len(before):
-            continue
-        prior_close = float(adjusted.loc[before[-1], "close"])
-        reference = adjusted.loc[ex_date, "preclose"] if ex_date in adjusted.index else math.nan
-        try:
-            reference = float(reference)
-            cash = math.fsum(float(getattr(row, "cash_per_share", 0.0) or 0.0) for row in implemented_rows)
-            bonus = math.fsum(float(getattr(row, "bonus_ratio", 0.0) or 0.0) for row in implemented_rows)
-        except (TypeError, ValueError):
-            return adjusted, applied, f"选窗公司行动 {ex_date.date()} 缺少有效分红或送转数据"
-        if not math.isfinite(prior_close) or prior_close <= 0:
-            return adjusted, applied, (
-                f"选窗公司行动 {ex_date.date()} 的除权因子无效：除权日前一交易日缺少有效收盘价"
-            )
-        if 1.0 + bonus <= 0:
-            return adjusted, applied, f"选窗公司行动 {ex_date.date()} 的除权因子无效：送转比例不可用"
-        implied_reference = (prior_close - cash) / (1.0 + bonus)
-        if not math.isfinite(implied_reference) or implied_reference <= 0:
-            return adjusted, applied, f"选窗公司行动 {ex_date.date()} 的除权因子无效：除权参考价不可用"
-        mismatch: dict[str, Any] | None = None
-        if math.isfinite(reference) and reference > 0:
-            difference = abs(reference - implied_reference)
-            if difference <= tolerance:
-                factor = reference / prior_close
-                source = "verified_preclose"
-            else:
-                # The preclose disagrees with the action itself, so it is not a
-                # verified ex-rights reference price.  Use the factor implied by
-                # the action and report the mismatch explicitly.
-                factor = implied_reference / prior_close
-                source = "cash_and_bonus"
-                mismatch = {
-                    "observed_reference": reference,
-                    "implied_reference": float(implied_reference),
-                    "difference": float(difference),
-                    "tolerance": float(tolerance),
-                }
-        else:
-            factor = implied_reference / prior_close
-            source = "cash_and_bonus"
-        if not math.isfinite(factor) or factor <= 0:
-            return adjusted, applied, f"选窗公司行动 {ex_date.date()} 的除权因子无效"
-        adjusted.loc[before, ["high", "low"]] = adjusted.loc[before, ["high", "low"]] * factor
-        applied.append({
-            "ex_date": ex_date.date().isoformat(), "factor": float(factor), "source": source,
-            "cash_per_share": cash, "bonus_ratio": bonus, "action_count": len(implemented_rows),
-            "preclose": reference if math.isfinite(reference) else None,
-            "implied_reference": float(implied_reference),
-            "preclose_mismatch": mismatch,
-        })
-    return adjusted, applied, None
+    for item in factors:
+        ex_date = pd.Timestamp(item["ex_date"]).normalize()
+        before = adjusted.index < ex_date
+        adjusted.loc[before, ["high", "low"]] = (
+            adjusted.loc[before, ["high", "low"]] * float(item["factor"])
+        )
+        applied.append({**item, "ex_date": ex_date.date().isoformat()})
+    return adjusted, applied, data_issue
 
 
 def training_window(

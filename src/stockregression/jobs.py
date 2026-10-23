@@ -42,6 +42,9 @@ def _runtime_limit_seconds(job: dict) -> int:
     payload = job.get("payload") or {}
     if not isinstance(payload, dict):
         return 0
+    if job.get("kind") in {"etf_research", "etf_validation"}:
+        config = payload.get("config") or {}
+        return int(config.get("max_runtime_seconds", 3600))
     if job.get("kind") == "research_completion":
         return int(payload.get("max_runtime_seconds", 0) or 0)
     config = payload.get("config")
@@ -291,7 +294,7 @@ def execute_job(root: str, job_id: str, observer=None):
         tick = time.monotonic()
         if tick - last_progress > progress_update_seconds or fraction <= 0 or fraction >= 1:
             rendered = str(message)
-            if job.get("kind") in {"backtest", "optimization", "batch", "batch_backtest"} and 0 < fraction < 1:
+            if job.get("kind") in {"backtest", "optimization", "batch", "batch_backtest", "etf_research", "etf_validation"} and 0 < fraction < 1:
                 rendered += f" · {max(1, lease.units)} 线程"
             write_job(progress=max(0, min(1, float(fraction))), message=rendered)
             if observer:
@@ -302,7 +305,7 @@ def execute_job(root: str, job_id: str, observer=None):
         payload, kind = job["payload"], job["kind"]
         computation_started = None
         submission_provenance = None
-        if kind == "optimization":
+        if kind in {"optimization", "etf_research", "etf_validation"}:
             from .reproducibility import computation_provenance, reproducibility_mismatches
             from .settings import PROJECT_ROOT
             submission_provenance = payload.get("submission_provenance")
@@ -326,6 +329,19 @@ def execute_job(root: str, job_id: str, observer=None):
             with trace.measure("backtest"):
                 result = run_backtest(config, bundle, lambda fraction, message: progress(0.33 + 0.67 * fraction, message), cancelled)
             symbol, title = config.symbol, "现金补足网格 / 定投 / 买入持有" if config.schema_version == 3 else "股数网格 / 定投 / 买入持有" if config.schema_version == 2 else "网格 / 定投 / 初始全仓"
+        elif kind in {"etf_research", "etf_validation"}:
+            from .etf_models import EtfResearchRequest
+            from .etf_research import run_etf_research, run_local_validation
+            config = EtfResearchRequest.model_validate(payload["config"])
+            function = run_etf_research if kind == "etf_research" else run_local_validation
+            result = function(
+                store, config, payload["plan"],
+                market=MarketDataService(store, settings=configured),
+                progress=progress, cancelled=cancelled,
+            )
+            if payload.get("source_result_id"):
+                result["source_result_id"] = payload["source_result_id"]
+            symbol, title = "", "ETF 网格研究" if kind == "etf_research" else "ETF 本地批量校验"
         elif kind == "research_completion":
             from .research_completion import complete_research_result
             result_id = str(payload["result_id"])
@@ -573,12 +589,12 @@ def execute_job(root: str, job_id: str, observer=None):
             symbol, title = "", "证券清单更新"
         else:
             raise ValueError("未知任务类型：" + kind)
-        if cancelled() and kind != "optimization":
+        if cancelled() and kind not in {"optimization", "etf_research", "etf_validation"}:
             raise InterruptedError("任务已取消")
         was_cancelled = cancelled()
         failed_sync = kind in {"market_sync", "market_source_probe", "market_import", "market_import_batch", "market_import_package", "market_index_package", "market_aggregate", "market_prepare", "market_archive"} and result.get("status") == "failed"
         failed_research = kind == "optimization" and payload.get("config", {}).get("protocol_version") == 5 and _research_failed(result)
-        result_cancelled = kind == "optimization" and result.get("status") == "cancelled"
+        result_cancelled = kind in {"optimization", "etf_research", "etf_validation"} and result.get("status") == "cancelled"
         cancelled_job = was_cancelled or result_cancelled
         if kind == "optimization" and payload.get("config", {}).get("protocol_version") == 5:
             if failed_research:
@@ -590,7 +606,7 @@ def execute_job(root: str, job_id: str, observer=None):
         if isinstance(result, dict):
             result["performance"] = trace.snapshot()
             result["configuration_snapshot"] = frozen if isinstance(frozen, dict) else None
-            if kind == "optimization":
+            if kind in {"optimization", "etf_research", "etf_validation"}:
                 from .reproducibility import computation_provenance, reproducibility_mismatches
                 from .settings import PROJECT_ROOT
                 computation_finished = computation_provenance(
@@ -757,7 +773,7 @@ class JobManager:
                     continue
                 job = store.job(job_id) or {}
                 limit = _runtime_limit_seconds(job)
-                if job.get("kind") in {"optimization", "research_completion"} and limit > 0:
+                if job.get("kind") in {"optimization", "research_completion", "etf_research", "etf_validation"} and limit > 0:
                     elapsed = _elapsed_seconds(job)
                     stage = timeout_stage(elapsed, limit)
                     if stage == "stop":

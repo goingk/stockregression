@@ -11,6 +11,7 @@ from filelock import FileLock
 from ..storage import Store
 from .cache import _cache
 from .models import MarketDataError
+from .package_layout import PackageLayout, is_package_root, resolve_package_root
 from .repository import TIMEFRAMES, utc_now
 
 
@@ -69,7 +70,8 @@ def preview_reset(root: str | Path) -> dict:
         counts = {}
         for table in (
             "parquet_datasets", "parquet_versions", "parquet_shards",
-            "parquet_imports", "parquet_coverage", "parquet_derived",
+            "parquet_imports", "parquet_coverage", "parquet_coverage_days",
+            "parquet_coverage_archives", "parquet_derived",
             "parquet_auxiliary_history", "snapshots", "active_snapshots",
             "market_auxiliary", "sync_items",
         ):
@@ -125,6 +127,20 @@ def reset_market_storage(
         raise MarketDataError("另一个行情重建任务正在执行")
     try:
         store = Store(root_path)
+        # Capture the attached package before catalog cleanup.  A reset must not
+        # silently revive its old market datasets on the next repository open.
+        attached_packages: set[Path] = set()
+        with sqlite3.connect(root_path / "catalog.sqlite") as db:
+            exists = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='parquet_meta'"
+            ).fetchone()
+            if exists:
+                for key in ("package_dir", "source_package_dir"):
+                    row = db.execute(
+                        "SELECT value FROM parquet_meta WHERE key=?", (key,)
+                    ).fetchone()
+                    if row and row[0]:
+                        attached_packages.add(Path(row[0]).resolve())
         active_count = store.active_job_count()
         if active_count and not force_jobs:
             raise MarketDataError(
@@ -140,7 +156,8 @@ def reset_market_storage(
                 path.unlink(missing_ok=True)
         with store.db() as db:
             for table in (
-                "parquet_day_validation", "parquet_shards", "parquet_source_archives",
+                "parquet_day_validation", "parquet_coverage_days",
+                "parquet_coverage_archives", "parquet_shards", "parquet_source_archives",
                 "parquet_versions", "parquet_datasets",
                 "parquet_imports", "parquet_coverage", "parquet_derived",
                 "parquet_auxiliary_history", "snapshots", "active_snapshots",
@@ -168,7 +185,8 @@ def reset_market_storage(
                 (generation,),
             )
             db.execute(
-                "DELETE FROM parquet_meta WHERE key IN ('source_package_dir')"
+                "DELETE FROM parquet_meta WHERE key IN "
+                "('package_dir','source_package_dir')"
             )
             db.execute(
                 "INSERT OR REPLACE INTO state(key,value) VALUES(?,?)",
@@ -181,6 +199,32 @@ def reset_market_storage(
                     }, ensure_ascii=False),
                 ),
             )
+        candidate = resolve_package_root(root_path / "package")
+        if is_package_root(candidate):
+            package = PackageLayout(candidate)
+            manifest = dict(package.manifest())
+            # root/package is the repository's fallback package.  Leaving its
+            # dataset heads in place would make the cleared catalog rebuild the
+            # exact market data that reset was asked to remove.
+            manifest["datasets"] = {}
+            manifest["shard_count"] = 0
+            manifest["shard_bytes"] = 0
+            package.publish(manifest)
+        # A package explicitly attached from elsewhere is not deleted.  It is
+        # detached above, and its quality references are cleared so a later
+        # explicit attachment cannot inherit results from the reset dataset.
+        for package_path in sorted(attached_packages - {candidate}):
+            if not is_package_root(package_path):
+                continue
+            package = PackageLayout(package_path)
+            manifest = dict(package.manifest())
+            changed = False
+            for dataset in manifest.get("datasets", {}).values():
+                if dataset.get("quality_archive") is not None:
+                    dataset["quality_archive"] = None
+                    changed = True
+            if changed:
+                package.publish(manifest)
         _cache.clear()
         return {
             "status": "completed", "generation": generation,

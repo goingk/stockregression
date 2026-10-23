@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import shutil
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from itertools import combinations, product
@@ -37,6 +38,7 @@ from .data_diagnostics import derive_source_spans, project_data_diagnostics
 from .quality import QUALITY_RULES_VERSION, _closing_auction_placeholders, minute_slots
 from .jobs import JobManager
 from .models import BacktestConfig, OptimizationConfig, ResearchRequestV5, normalize_symbol
+from .etf_models import EtfResearchRequest
 from .market_data import MarketDataService
 from .market_data.aggregation import AggregationService
 from .market_data.models import DataVersionNotFound, MarketDataError
@@ -878,6 +880,8 @@ def public_result(result: dict, full: bool = False, data_metadata: dict | None =
     """Send UI-sized results by default, preserving raw data for full requests."""
     if full:
         return result
+    if result.get("kind") in {"etf_research", "etf_validation"}:
+        return {key: value for key, value in result.items() if key != "rows"}
     result = dict(result)
     config = result.get("config") if isinstance(result.get("config"), dict) else {}
     is_v5_research = (
@@ -960,6 +964,10 @@ def _with_data_availability(store: Store, result: dict) -> dict:
 
 
 def _require_supported_result(result: dict) -> None:
+    if result.get("kind") in {"etf_research", "etf_validation"}:
+        if result.get("result_schema_version") == 1:
+            return
+        raise HTTPException(410, "不支持该 ETF 研究结果版本")
     protocol = result.get("protocol_version")
     if protocol is None:
         return
@@ -1117,6 +1125,79 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     manager = JobManager(root, active_max_workers, active_scheduler_poll_seconds)
     previews = PreviewManager(store)
     instance_id = uuid.uuid4().hex
+    inventory_lock = threading.Lock()
+    inventory_cache: dict[tuple, tuple[tuple, dict]] = {}
+
+    def inventory_revision() -> tuple:
+        """Identify the market catalog and package state used by inventory.
+
+        The SQLite WAL changes for unrelated job progress writes. Keying the
+        inventory cache off that file made a completed page load go stale
+        every time a queued job advanced, re-triggering the full catalog walk.
+        Only the tables read by inventory participate here.
+        """
+        manifest_path = Path(package_dir) / ".stockregression" / "manifest.json"
+        revision = []
+        for path in (manifest_path,):
+            try:
+                stat = path.stat()
+                revision.append((stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                revision.append((0, 0))
+        with store.db() as db:
+            revision.append(tuple(db.execute(
+                """SELECT COUNT(*),COALESCE(MAX(updated_at),''),
+                          COALESCE(SUM(row_count),0),COALESCE(SUM(current_version),0),
+                          COALESCE(SUM(length(status)+length(COALESCE(reason,''))),0)
+                   FROM parquet_datasets"""
+            ).fetchone()))
+            revision.append(tuple(db.execute(
+                """SELECT COUNT(*),COALESCE(MAX(checked_at),''),
+                          COALESCE(SUM(length(status)+length(report)),0)
+                   FROM parquet_coverage"""
+            ).fetchone()))
+            revision.append(tuple(db.execute(
+                """SELECT COUNT(*),COALESCE(MAX(checked_at),''),
+                          COALESCE(SUM(length(status)),0)
+                   FROM parquet_day_validation"""
+            ).fetchone()))
+            revision.append(tuple(db.execute(
+                """SELECT COUNT(*),COALESCE(MAX(updated_at),''),
+                          COALESCE(SUM(length(payload)+length(version)),0)
+                   FROM parquet_auxiliary_history"""
+            ).fetchone()))
+            revision.append(tuple(db.execute(
+                """SELECT COUNT(*),COALESCE(MAX(rowid),0),
+                          COALESCE(SUM(length(name)+length(metadata)
+                            +length(COALESCE(listing_date,''))),0)
+                   FROM instruments"""
+            ).fetchone()))
+        return tuple(revision)
+
+    def inventory_snapshot(*, q: str, asset_type: str | None, timeframe: str | None,
+                           status: str | None, limit: int, offset: int) -> dict:
+        """Reuse one inventory walk until the catalog or package changes.
+
+        The inventory walks every dataset in the package. Letting several
+        page refreshes run that walk concurrently held the GIL long enough
+        to delay the job dispatcher by seconds, so every task appeared to
+        stay queued. The revision cache absorbs repeated page loads and the
+        lock keeps the walk from multiplying across worker threads.
+        """
+        key = (q, asset_type, timeframe, status, int(limit), int(offset), package_dir)
+        revision = inventory_revision()
+        with inventory_lock:
+            cached = inventory_cache.get(key)
+            if cached and cached[0] == revision:
+                return cached[1]
+            result = json_safe(MarketDataService(store).inventory(
+                query=q, asset_type=asset_type, timeframe=timeframe,
+                status=status, limit=limit, offset=offset,
+            ))
+            inventory_cache[key] = (revision, result)
+            if len(inventory_cache) > 64:
+                inventory_cache.pop(next(iter(inventory_cache)), None)
+            return result
 
     @asynccontextmanager
     async def lifespan(app):
@@ -1157,7 +1238,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             })
         frozen.setdefault("configuration_revision", snapshot.get("revision"))
         frozen.setdefault("configuration_snapshot", snapshot)
-        if kind == "optimization" and "submission_provenance" not in frozen:
+        if kind in {"optimization", "etf_research", "etf_validation"} and "submission_provenance" not in frozen:
             from .reproducibility import computation_provenance
             from .settings import PROJECT_ROOT
             frozen["submission_provenance"] = computation_provenance(
@@ -1169,10 +1250,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             **({"created": created} if include_created else {}),
         }
 
-    def require_ready(config):
-        manifest = store.snapshot(config.symbol)
+    def require_ready(config, version=None):
+        manifest = store.snapshot(config.symbol, version)
         if manifest and manifest.get("market_data"):
-            readiness = MarketDataService(store).readiness(config)
+            readiness = MarketDataService(store).readiness(config, version)
             if not readiness["ready"]:
                 raise HTTPException(409, detail={
                     "code": "DATA_NOT_READY", **readiness,
@@ -1183,7 +1264,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             "code": "DATA_NOT_READY", "ready": False, "symbol": config.symbol,
             "frequency": config.frequency,
             "config": config.model_dump(mode="json"),
-            "gaps": [{"kind": "local", "message": "当前有效数据包中没有本次请求的行情；请先登记或同步基础行情"}],
+            "gaps": [{
+                "kind": "version" if version else "local",
+                "message": "指定行情版本已清理或不属于当前数据代际，不能改用当前行情" if version else "当前有效数据包中没有本次请求的行情；请先登记或同步基础行情",
+            }],
             "preparation": {"symbol": config.symbol, "frequency": config.frequency,
                               "start": str(config.start_date), "end": str(config.end_date)},
         })
@@ -1273,7 +1357,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
 
     @app.get("/api/v1/data/frequencies")
     def data_frequencies():
-        return {"timeframes": MarketDataService(store).frequency_catalog()}
+        return {"timeframes": MarketDataService.frequency_catalog()}
 
     @app.get(
         "/api/v1/data/package",
@@ -1292,10 +1376,10 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         limit: int = Query(50, ge=1, le=500), offset: int = Query(0, ge=0),
     ):
         try:
-            return json_safe(MarketDataService(store).inventory(
-                query=q, asset_type=asset_type, timeframe=timeframe,
+            return inventory_snapshot(
+                q=q, asset_type=asset_type, timeframe=timeframe,
                 status=status, limit=limit, offset=offset,
-            ))
+            )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -1664,11 +1748,98 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         return []
 
     @app.post("/api/v1/backtests")
-    def backtest(config: BacktestConfig):
-        version = require_ready(config)
+    def backtest(config: BacktestConfig, version: str | None = None):
+        version = require_ready(config, version)
         if config.schema_version != 3:
             raise HTTPException(422, "只接受 schema_version=3 的当前股数配置")
         return submit("backtest", {"config": config.model_dump(mode="json"), "version": version})
+
+    @app.post("/api/v1/etf-research/preflight")
+    def etf_preflight(request: EtfResearchRequest):
+        from .etf_research import preflight
+        try:
+            return preflight(store, request, market=MarketDataService(store, settings=configured))
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    def submit_etf(request, kind):
+        from .etf_research import preflight, request_fingerprint
+        try:
+            plan = preflight(store, request, market=MarketDataService(store, settings=configured), persist=True)
+            if not plan["symbols"]:
+                raise HTTPException(422, "当前范围没有本地 ETF，请添加自选或指定标的")
+            return submit(kind, {
+                "config": request.model_dump(mode="json"), "plan": plan,
+                "configuration_revision": request.configuration_revision,
+            }, dedupe_key=f"{kind}:{request_fingerprint(request, plan)}")
+        except (ValueError, MarketDataError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.post("/api/v1/etf-research/validation", status_code=202)
+    def etf_validation(request: EtfResearchRequest):
+        return submit_etf(request, "etf_validation")
+
+    @app.post("/api/v1/etf-research", status_code=202)
+    def etf_research(request: EtfResearchRequest):
+        return submit_etf(request, "etf_research")
+
+    @app.post("/api/v1/etf-research/{result_id}/validate/{symbol}", status_code=202)
+    def etf_validate_original_symbol(result_id: str, symbol: str):
+        """Validate a historical row against its original, immutable inputs."""
+        from .etf_research import request_fingerprint
+        original = store.result(result_id)
+        if original is None or original.get("kind") != "etf_research":
+            raise HTTPException(404, "ETF 研究结果不存在")
+        _require_supported_result(original)
+        try:
+            symbol = normalize_symbol(symbol)
+            request = EtfResearchRequest.model_validate({
+                **original["request"], "scope": "selected", "symbols": [symbol],
+                "validation_top_k": 1, "configuration_revision": None,
+            })
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(422, "原结果没有完整的 ETF 研究配置") from exc
+        row = next((item for item in original.get("rows", []) if item.get("symbol") == symbol), None)
+        if row is None:
+            raise HTTPException(404, "该 ETF 不在原始候选池中")
+        if not row.get("window_start") or not row.get("window_end"):
+            raise HTTPException(409, {"code": "DATA_NOT_READY", "message": "原结果没有完整历史窗口；补齐数据后请创建新的研究"})
+        frozen = original.get("universe", {}).get("versions", {}).get(symbol)
+        if not frozen or store.snapshot(symbol, frozen["version"], persist=False) is None:
+            raise HTTPException(409, {"code": "DATA_VERSION_NOT_FOUND", "message": "原始行情版本已清理或代际已改变，不能改用当前数据"})
+        row = {key: value for key, value in row.items() if key in {
+            "symbol", "symbol_name", "window_start", "window_end", "daily_start", "version", "gaps", "warnings",
+        }}
+        row.update(status="ready", version=frozen["version"])
+        row.setdefault("gaps", [])
+        row.setdefault("warnings", [])
+        plan = {
+            "as_of": original["as_of"], "requested_as_of": original["as_of"],
+            "scope": "selected", "symbols": [symbol], "window_days": request.window_days,
+            "rows": [row], "counts": {"total": 1, "ready": 1},
+            "universe": {**original["universe"], "scope": "selected", "symbols": [symbol], "versions": {symbol: frozen}},
+        }
+        return submit("etf_research", {
+            "config": request.model_dump(mode="json"), "plan": plan,
+            "source_result_id": result_id,
+        }, dedupe_key=f"etf_research:{request_fingerprint(request, plan)}")
+
+    @app.get("/api/v1/etf-research/{result_id}/items")
+    def etf_result_items(result_id: str, offset: int = Query(0, ge=0),
+                         limit: int = Query(50, ge=1, le=1000), symbol: str | None = None):
+        result = store.result(result_id)
+        if result is None or result.get("kind") not in {"etf_research", "etf_validation"}:
+            raise HTTPException(404, "ETF 研究结果不存在")
+        if result.get("result_schema_version") != 1:
+            raise HTTPException(410, "不支持该 ETF 研究结果版本")
+        rows = result.get("rows", [])
+        if symbol is not None:
+            try:
+                normalized = normalize_symbol(symbol)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+            rows = [row for row in rows if row.get("symbol") == normalized]
+        return {"items": rows[offset:offset + limit], "total": len(rows), "offset": offset, "limit": limit}
 
     @app.get("/api/v1/data/reference-price/{symbol}")
     def reference_price(symbol: str, start_date: str):
@@ -1898,7 +2069,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         result = store.result(job["result_id"])
         content = result.get("result", result)
         groups: list[dict] = []
-        for name in ("results", "failures", "skipped_items", "symbols", "skipped"):
+        for name in ("results", "failures", "skipped_items", "symbols", "skipped", "rows"):
             if section not in ("all", name):
                 continue
             values = content.get(name, []) if isinstance(content, dict) else []

@@ -296,9 +296,17 @@ def test_cash_dividend_and_bonus_shares_follow_the_ledger():
         "cash_per_share": 0.5, "bonus_ratio": 0.1, "implemented": True, "unsupported_reason": "",
     }])
     config, bundle = build_bundle(
-        [[10.0], [10.0], [10.0], [10.0]], actions=actions
+        [[10.0], [10.0], [10.0], [10.0]], actions=actions,
+        # This fixture keeps all raw prices at 10 while the action implies an
+        # ex-right reference near 8.636.  Wide boundaries isolate settlement
+        # from the intentional re-anchoring that would otherwise sell a grid
+        # lot before the dividend cash is paid.
+        buy_step=0.5,
     )
     result = engine.run_backtest(config, bundle)
+
+    assert grid_trade(result) == [], "权益结算测试不得混入网格自主成交"
+    assert result["funding"]["topups"] == pytest.approx(0.0)
 
     for name in ("grid", "matched_funding_hold"):
         rows = result["strategies"][name]["equity"]

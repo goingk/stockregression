@@ -1,6 +1,6 @@
 /** URL and History API state for the single-page workbench. */
 
-export type AppPage = 'data' | 'data-admin' | 'backtest' | 'research' | 'results'
+export type AppPage = 'data' | 'data-admin' | 'etf' | 'backtest' | 'research' | 'results'
 export type ResultView = 'year' | 'month'
 
 export interface NavigationState {
@@ -8,6 +8,7 @@ export interface NavigationState {
   result: string | null
   compare: string | null
   research: string | null
+  etfResult: string | null
   report: string | null
   resultView: ResultView
   researchDecision: string | null
@@ -16,11 +17,11 @@ export interface NavigationState {
 }
 
 export const NAVIGATION_STATE_KEY = 'stockregression'
-export const APP_PAGES: readonly AppPage[] = ['data', 'data-admin', 'backtest', 'research', 'results']
+export const APP_PAGES: readonly AppPage[] = ['data', 'data-admin', 'etf', 'backtest', 'research', 'results']
 
 export function defaultNavigation(): NavigationState {
   return {
-    page: 'data', result: null, compare: null, research: null, report: null,
+    page: 'data', result: null, compare: null, research: null, etfResult: null, report: null,
     resultView: 'year', researchDecision: null, taskFilter: 'all', taskKind: '',
   }
 }
@@ -37,14 +38,16 @@ function pageValue(value: string | null): AppPage {
 /** Restore a page from a copied URL. Unknown or malformed ids become null. */
 export function navigationFromUrl(search: string): NavigationState {
   const params = new URLSearchParams(search)
+  const page = pageValue(params.get('page'))
   const resultView = params.get('result_view') === 'month' ? 'month' : 'year'
   const taskFilter = params.get('task_filter') ?? 'all'
   const allowedFilters = new Set(['all', 'active', 'completed', 'partial', 'failed', 'cancelled'])
   return {
-    page: pageValue(params.get('page')),
+    page,
     result: cleanId(params.get('result')),
     compare: cleanId(params.get('compare')),
     research: cleanId(params.get('research')),
+    etfResult: page === 'etf' ? cleanId(params.get('etf_result')) : null,
     report: cleanId(params.get('report')),
     resultView,
     researchDecision: cleanId(params.get('research_decision')),
@@ -57,7 +60,7 @@ export function navigationFromUrl(search: string): NavigationState {
 export function navigationUrl(search: string, state: NavigationState): string {
   const params = new URLSearchParams(search)
   for (const key of [
-    'page', 'result', 'compare', 'research', 'report', 'result_view',
+    'page', 'result', 'compare', 'research', 'etf_result', 'report', 'result_view',
     'research_decision', 'task_filter', 'task_kind',
   ]) params.delete(key)
   params.set('page', state.page)
@@ -70,6 +73,7 @@ export function navigationUrl(search: string, state: NavigationState): string {
     if (state.research) params.set('research', state.research)
     if (state.researchDecision) params.set('research_decision', state.researchDecision)
   }
+  if (state.page === 'etf' && state.etfResult) params.set('etf_result', state.etfResult)
   if (state.page === 'data' || state.page === 'data-admin') {
     if (state.report) params.set('report', state.report)
   }
@@ -95,6 +99,7 @@ export function navigationFromHistory(value: unknown): NavigationState | null {
     result: typeof item.result === 'string' ? item.result : null,
     compare: typeof item.compare === 'string' ? item.compare : null,
     research: typeof item.research === 'string' ? item.research : null,
+    etfResult: typeof item.etfResult === 'string' ? item.etfResult : null,
     report: typeof item.report === 'string' ? item.report : null,
     resultView: item.resultView === 'month' ? 'month' : 'year',
     researchDecision: typeof item.researchDecision === 'string' ? item.researchDecision : null,
