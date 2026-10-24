@@ -303,6 +303,7 @@ class MarketDataSettings(BaseModel):
     cache_mb: int = Field(default=256, ge=0, le=16384)
     recent_minute_source: Literal["sina", "tdx"] = "sina"
     etf_daily_source: Literal["baostock", "eastmoney"] = "baostock"
+    etf_daily_fallback_enabled: bool = True
     network_timeout_seconds: float = Field(default=15, ge=1, le=300)
     request_retries: int = Field(default=1, ge=0, le=5)
     failure_cooldown_hours: int = Field(default=24, ge=0, le=720)

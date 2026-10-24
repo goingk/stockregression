@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import re
 from contextlib import contextmanager
 from typing import Callable, Iterable
 
@@ -15,6 +16,8 @@ from .storage import Store, now_iso
 SOURCE_POLICY_VERSION = "market-sources-v1"
 SOURCE_COOLDOWN_HOURS = 24
 SOURCE_STATE_VERSION = 1
+SOURCE_QUALIFICATION_VERSION = "etf-daily-type-probe-v1"
+SOURCE_QUALIFICATION_MAX_AGE_HOURS = 24
 
 SOURCE_CAPABILITIES = {
     "recent_minute": {
@@ -47,15 +50,47 @@ _PROBE_LOCK = threading.Lock()
 
 
 class SourceFailure(RuntimeError):
-    def __init__(self, source: str, capability: str, category: str, message: str):
+    def __init__(
+        self, source: str, capability: str, category: str, message: str,
+        source_attempts: list[dict] | None = None,
+        etf_daily_route: dict | None = None, source_events: list[dict] | None = None,
+    ):
         super().__init__(message)
         self.source = source
         self.capability = capability
         self.category = category
+        self.source_attempts = list(source_attempts or [])
+        self.etf_daily_route = dict(etf_daily_route or {})
+        self.source_events = list(source_events or [])
 
     def __reduce__(self):
         # ProcessPoolExecutor must reconstruct all routing fields, not just args[0].
-        return type(self), (self.source, self.capability, self.category, str(self))
+        return type(self), (
+            self.source, self.capability, self.category, str(self), self.source_attempts,
+            self.etf_daily_route, self.source_events,
+        )
+
+
+def classify_etf_product(metadata: dict | None) -> str:
+    """Classify only from explicit listing/product labels, never symbol-derived terms."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    labels = [str(metadata.get(key, "")) for key in (
+        "product_type", "security_type", "instrument_type", "etf_type", "listing_type",
+        "listing_label", "name",
+    )]
+    text = " ".join(labels).casefold()
+    has_lof = bool(re.search(r"lof|上市开放式基金", text, re.IGNORECASE))
+    has_reit = bool(re.search(r"reits?|不动产投资信托", text, re.IGNORECASE))
+    if has_lof and has_reit:
+        return "unknown"
+    if has_lof:
+        return "lof"
+    if has_reit:
+        return "reit"
+    explicit_type = " ".join(labels).casefold()
+    if re.search(r"etf", text, re.IGNORECASE) or explicit_type.strip() == "交易型开放式指数基金":
+        return "etf"
+    return "unknown"
 
 
 def market_for_symbol(symbol: str) -> str:
@@ -71,6 +106,9 @@ def classify_source_error(exc: BaseException) -> str:
         return "network"
     if isinstance(exc, SourceFailure):
         return exc.category
+    explicit_category = getattr(exc, "category", None)
+    if explicit_category in {"empty_unresolved", "empty", "unsupported", "data_quality", "provider", "network", "timeout", "protocol"}:
+        return explicit_category
     status = getattr(getattr(exc, "response", None), "status_code", None)
     if isinstance(status, int) and (500 <= status < 600 or status in {408, 429}):
         return "network"
@@ -88,7 +126,7 @@ def classify_source_error(exc: BaseException) -> str:
         return "empty"
     if any(word in message for word in ("不存在", "无此代码", "未上市", "不支持该标的", "unsupported symbol")):
         return "unsupported"
-    if any(word in message for word in ("非正", "字段", "质量", "invalid")):
+    if any(word in message for word in ("非正", "字段", "质量", "无效", "invalid")):
         return "data_quality"
     return "provider"
 
@@ -99,6 +137,64 @@ def is_transient(category: str) -> bool:
 
 def _health_key(source: str, capability: str, market: str) -> str:
     return f"source-health:{SOURCE_POLICY_VERSION}:{capability}:{source}:{market}"
+
+
+def _qualification_key(source: str, product_type: str) -> str:
+    return f"source-qualification:{SOURCE_QUALIFICATION_VERSION}:etf_daily:{source}:{product_type}"
+
+
+def source_qualification(store: Store, source: str, product_type: str) -> dict:
+    value = store.state(_qualification_key(source, product_type))
+    if not isinstance(value, dict):
+        return {"status": "unknown", "source": source, "product_type": product_type,
+                "policy_version": SOURCE_QUALIFICATION_VERSION}
+    result = dict(value)
+    if result.get("policy_version") != SOURCE_QUALIFICATION_VERSION:
+        result["status"] = "unknown"
+        result["qualification_error"] = "policy_version_mismatch"
+        return result
+    try:
+        expires = pd.Timestamp(result.get("expires_at"))
+        checked = pd.Timestamp(result.get("checked_at"))
+        now = pd.Timestamp.now(tz="UTC")
+        fresh = checked <= now < expires and expires <= checked + pd.Timedelta(hours=24)
+        evidence_valid = (
+            int(result.get("rows") or 0) > 0 and bool(result.get("sample_symbol"))
+            and pd.notna(pd.Timestamp(result.get("coverage_start")))
+            and pd.notna(pd.Timestamp(result.get("coverage_end")))
+            and pd.Timestamp(result["coverage_start"]) <= pd.Timestamp(result["coverage_end"])
+        )
+    except (TypeError, ValueError):
+        fresh = False
+        evidence_valid = False
+    if result.get("product_type") != product_type or result.get("source") != source:
+        result["status"] = "unknown"
+    elif result.get("status") == "passed" and not evidence_valid:
+        result["status"] = "unknown"
+        result["qualification_error"] = "missing_probe_evidence"
+    elif not fresh and result.get("status") == "passed":
+        result["status"] = "expired"
+    return result
+
+
+def _record_source_qualification(
+    store: Store, source: str, product_type: str, sample_symbol: str,
+    *, status: str, rows: int = 0, coverage_start=None, coverage_end=None, error=None,
+) -> dict:
+    checked = pd.Timestamp.now(tz="UTC")
+    value = {
+        "status": status, "source": source, "product_type": product_type,
+        "sample_symbol": sample_symbol, "rows": int(rows),
+        "coverage_start": str(coverage_start) if coverage_start is not None else None,
+        "coverage_end": str(coverage_end) if coverage_end is not None else None,
+        "checked_at": checked.isoformat(),
+        "expires_at": (checked + pd.Timedelta(hours=SOURCE_QUALIFICATION_MAX_AGE_HOURS)).isoformat(),
+        "policy_version": SOURCE_QUALIFICATION_VERSION,
+        "error_category": classify_source_error(error) if error is not None else None,
+        "error": str(error) if error is not None else None,
+    }
+    store.state(_qualification_key(source, product_type), value)
+    return value
 
 
 def _market_list(capability: str, market: str | None) -> tuple[str, ...]:
@@ -223,20 +319,40 @@ class SourceRouter:
         self.settings = settings or store.settings
         self.market_settings = self.settings.market_data
 
-    def route(self, capability: str, market: str) -> dict:
+    def route(self, capability: str, market: str, product_type: str | None = None) -> dict:
         spec = SOURCE_CAPABILITIES[capability]
         default = spec["default"]
         optional = spec["optional"]
         field = "recent_minute_source" if capability == "recent_minute" else "etf_daily_source"
         configured = getattr(self.settings, field)
         if configured == default:
-            return {"configured": default, "effective": default, "fallback": False, "reason": None}
+            result = {"configured": default, "effective": default, "fallback": False, "reason": None}
+            if capability == "etf_daily":
+                result.update({
+                    "product_type": product_type or "unknown",
+                    "qualification": source_qualification(self.store, optional, product_type or "unknown"),
+                })
+            return result
         state = source_state(self.store, optional, capability, market)
-        effective = optional if state["status"] == "passed" or _recovery_due(state) else default
+        type_qualification = None
+        if capability == "etf_daily":
+            type_qualification = source_qualification(
+                self.store, optional, product_type or "unknown",
+            )
+        qualified = type_qualification is None or type_qualification["status"] == "passed"
+        effective = optional if qualified and (state["status"] == "passed" or _recovery_due(state)) else default
         reason = None
         if effective == default and optional == configured:
-            reason = "可选来源尚未通过检测" if state["status"] == "unknown" else state.get("error") or "可选来源暂不可用"
-        return {"configured": configured, "effective": effective, "fallback": effective != configured, "reason": reason}
+            if not qualified:
+                reason = f"Eastmoney 未通过 {product_type or 'unknown'} 类型的 24 小时资格探测"
+            else:
+                reason = "可选来源尚未通过检测" if state["status"] == "unknown" else state.get("error") or "可选来源暂不可用"
+        return {
+            "configured": configured, "effective": effective,
+            "fallback": effective != configured, "reason": reason,
+            **({"product_type": product_type or "unknown", "qualification": type_qualification}
+               if capability == "etf_daily" else {}),
+        }
 
     def call(
         self,
@@ -247,8 +363,9 @@ class SourceRouter:
         record: bool = True,
         fallbacks: Iterable[str] = (),
         accept: Callable[[object, str], None] | None = None,
+        product_type: str | None = None,
     ):
-        choice = self.route(capability, market)
+        choice = self.route(capability, market, product_type=product_type)
         primary = choice["effective"]
 
         optional = SOURCE_CAPABILITIES[capability]["optional"]
@@ -274,6 +391,8 @@ class SourceRouter:
             retries = int(self.market_settings.request_retries)
             try:
                 value = calls[source]()
+                if isinstance(value, pd.DataFrame) and value.empty:
+                    raise SourceFailure(source, capability, "empty_unresolved", f"{source} 返回空数据")
                 if accept is not None:
                     accept(value, source)
                 if record:
@@ -285,12 +404,17 @@ class SourceRouter:
                         duration_seconds=round(time.monotonic() - started, 3),
                         market_settings=self.market_settings,
                     )
-                return value, source
+                return value, source, {
+                    "source": source, "status": "passed",
+                    "rows": len(value) if isinstance(value, (pd.DataFrame, list, tuple)) else None,
+                    "coverage_start": str(decode_coverage(value)[0]) if isinstance(value, pd.DataFrame) and decode_coverage(value)[0] is not None else None,
+                    "coverage_end": str(decode_coverage(value)[1]) if isinstance(value, pd.DataFrame) and decode_coverage(value)[1] is not None else None,
+                }
             except InterruptedError:
                 raise
             except Exception as exc:
                 category = classify_source_error(exc)
-                if record and category not in {"empty", "unsupported", "data_quality"}:
+                if record and category not in {"empty", "empty_unresolved", "unsupported", "data_quality"}:
                     record_failure(
                         self.store, source, capability, market, exc,
                         duration_seconds=round(time.monotonic() - started, 3),
@@ -299,6 +423,8 @@ class SourceRouter:
                 for _attempt in range(retries if is_transient(category) else 0):
                     try:
                         value = calls[source]()
+                        if isinstance(value, pd.DataFrame) and value.empty:
+                            raise SourceFailure(source, capability, "empty_unresolved", f"{source} 返回空数据")
                         if accept is not None:
                             accept(value, source)
                         if record:
@@ -310,11 +436,17 @@ class SourceRouter:
                                 duration_seconds=round(time.monotonic() - started, 3),
                                 market_settings=self.market_settings,
                             )
-                        return value, source
+                        start, end = decode_coverage(value) if isinstance(value, pd.DataFrame) else (None, None)
+                        return value, source, {
+                            "source": source, "status": "passed",
+                            "rows": len(value) if isinstance(value, (pd.DataFrame, list, tuple)) else None,
+                            "coverage_start": str(start) if start is not None else None,
+                            "coverage_end": str(end) if end is not None else None,
+                        }
                     except InterruptedError:
                         raise
                     except Exception as retry_error:
-                        if record and classify_source_error(retry_error) not in {"empty", "unsupported", "data_quality"}:
+                        if record and classify_source_error(retry_error) not in {"empty", "empty_unresolved", "unsupported", "data_quality"}:
                             record_failure(
                                 self.store, source, capability, market, retry_error,
                                 duration_seconds=round(time.monotonic() - started, 3),
@@ -324,7 +456,11 @@ class SourceRouter:
                         category = classify_source_error(exc)
                         if not is_transient(category):
                             break
-                raise SourceFailure(source, capability, category, str(exc)) from exc
+                attempt = {
+                    "source": source, "status": "failed", "error_category": category,
+                    "error": str(exc),
+                }
+                raise SourceFailure(source, capability, category, str(exc), [attempt]) from exc
 
         if primary not in calls:
             raise ValueError(f"来源 {primary} 不支持 {capability}")
@@ -333,22 +469,29 @@ class SourceRouter:
             if source in calls and source not in chain:
                 chain.append(source)
         failures: list[str] = []
+        attempts: list[dict] = []
         last_category = "provider"
         try:
             for index, source in enumerate(chain):
                 try:
-                    value, actual = invoke(source)
+                    value, actual, successful_attempt = invoke(source)
+                    attempts.append(successful_attempt)
                     if index == 0:
-                        return value, actual, choice
+                        return value, actual, {**choice, "source_attempts": attempts}
                     return value, actual, {
                         **choice, "effective": actual, "fallback": True,
                         "reason": "；".join(failures) or choice.get("reason"),
+                        "source_attempts": attempts,
                     }
                 except SourceFailure as exc:
                     failures.append(str(exc))
+                    attempts.extend(exc.source_attempts or [{
+                        "source": source, "status": "failed",
+                        "error_category": exc.category, "error": str(exc),
+                    }])
                     last_category = exc.category
             if failures:
-                raise SourceFailure(primary, capability, last_category, "；".join(failures))
+                raise SourceFailure(primary, capability, last_category, "；".join(failures), attempts)
             raise SourceFailure(primary, capability, "provider", f"来源 {primary} 不可用")
         finally:
             if recovery_lock is not None:
@@ -408,8 +551,10 @@ def configured_sources(store: Store) -> dict:
 def validate_source_settings(store: Store, values: dict) -> None:
     if values.get("recent_minute_source") == "tdx" and not source_is_ready(store, "tdx", "recent_minute"):
         raise ValueError("通达信尚未通过股票和 ETF 的近期分钟检测，暂不能设为默认来源")
-    if values.get("etf_daily_source") == "eastmoney" and not source_is_ready(store, "eastmoney", "etf_daily"):
-        raise ValueError("东方财富 ETF 日线尚未通过检测，暂不能设为默认来源")
+    if values.get("etf_daily_source") == "eastmoney":
+        qualification = source_qualification(store, "eastmoney", "etf")
+        if qualification["status"] != "passed":
+            raise ValueError("东方财富尚未通过 24 小时内的 ETF 类型探测，暂不能设为默认来源")
 
 
 def _component_call(
@@ -428,7 +573,7 @@ def _component_call(
             raise
         except Exception as exc:
             category = classify_source_error(exc)
-            if category not in {"empty", "unsupported", "data_quality", "cancelled"}:
+            if category not in {"empty", "empty_unresolved", "unsupported", "data_quality", "cancelled"}:
                 record_failure(
                     store, source, capability, market, exc,
                     duration_seconds=round(time.monotonic() - started, 3),
@@ -459,13 +604,34 @@ def fetch_auxiliary_routed(
     )
 
     market = market_for_symbol(symbol)
-    router = SourceRouter(store)
+    frozen_settings = store.settings
+    router = SourceRouter(store, settings=frozen_settings)
     network_timeout = router.market_settings.network_timeout_seconds
     metadata: dict = {}
     events: list[dict] = []
     if market == "etf":
-        daily, daily_source, route = router.call(
-            "etf_daily", market,
+        instrument = store.instrument(symbol) or {}
+        product_type = classify_etf_product(instrument)
+        market_settings = router.market_settings
+        configured_source = market_settings.etf_daily_source
+        fallback_qualification = source_qualification(store, "eastmoney", product_type)
+        fallback_allowed = (
+            configured_source == "baostock"
+            and market_settings.etf_daily_fallback_enabled
+            and product_type in {"etf", "lof", "reit"}
+            and fallback_qualification["status"] == "passed"
+        )
+        fallback_reasons = []
+        if not market_settings.etf_daily_fallback_enabled:
+            fallback_reasons.append("ETF 日线备用来源已关闭")
+        elif product_type == "unknown":
+            fallback_reasons.append("证券产品类型未能从元数据确认")
+        elif fallback_qualification["status"] != "passed":
+            fallback_reasons.append("Eastmoney 未通过该产品类型的 24 小时探测")
+        fallbacks = ("eastmoney",) if fallback_allowed else ()
+        try:
+            daily, daily_source, route = router.call(
+                "etf_daily", market,
             {
                 "baostock": lambda: fetch_etf_daily(
                     symbol, start, end, "baostock", cancelled,
@@ -476,12 +642,71 @@ def fetch_auxiliary_routed(
                     network_timeout=network_timeout,
                 ),
             },
-        )
-        metadata.update({"daily_source": daily_source, "etf_daily_route": route})
+                fallbacks=fallbacks,
+                product_type=product_type,
+            )
+        except SourceFailure as exc:
+            fallback_attempted = any(
+                attempt.get("source") == "eastmoney"
+                for attempt in exc.source_attempts
+            )
+            failure_route = {
+                "configured": configured_source,
+                "effective": None,
+                "fallback": False,
+                "product_type": product_type,
+                "qualification": fallback_qualification,
+                "fallback_attempted": fallback_attempted,
+                "fallback_status": (
+                    "failed" if fallback_allowed and fallback_attempted
+                    else "not_eligible" if not fallback_allowed else "not_attempted"
+                ),
+                "fallback_reason": "；".join(fallback_reasons) or str(exc),
+                "source_attempts": exc.source_attempts,
+            }
+            failure_events = ([{
+                "kind": "source_fallback", "source": configured_source,
+                "fallback": "eastmoney", "product_type": product_type,
+                "message": f"{configured_source} ETF 日线失败，Eastmoney 回退也未完成：{exc}",
+            }] if fallback_attempted else [])
+            if exc.category in {"empty", "empty_unresolved"}:
+                from .providers import EmptyUnresolvedError
+                raise EmptyUnresolvedError(
+                    f"日线来源未返回可确认数据：{exc}",
+                    source_attempts=exc.source_attempts,
+                    product_type=product_type,
+                    fallback_status=failure_route["fallback_status"],
+                    fallback_reason=failure_route["fallback_reason"],
+                    configured_source=configured_source,
+                    fallback_attempted=fallback_attempted,
+                    etf_daily_route=failure_route,
+                    source_events=failure_events,
+                ) from exc
+            exc.etf_daily_route = failure_route
+            exc.source_events = failure_events
+            raise
+        route.update({
+            "product_type": product_type,
+            "fallback_attempted": any(item.get("source") == "eastmoney" for item in route.get("source_attempts", [])),
+            "fallback_status": (
+                "succeeded" if daily_source == "eastmoney" and configured_source == "baostock"
+                else "failed" if fallback_allowed and any(item.get("source") == "eastmoney" for item in route.get("source_attempts", []))
+                else "not_eligible" if not fallback_allowed else "not_attempted"
+            ),
+            "fallback_reason": route.get("reason") or ("；".join(fallback_reasons) or None),
+            "qualification": fallback_qualification,
+        })
+        metadata.update({
+            "daily_source": daily_source,
+            "product_type": product_type,
+            "source_attempts": route.get("source_attempts", []),
+            "etf_daily_route": route,
+        })
         if route.get("fallback"):
             events.append({
-                "kind": "source_fallback", "source": "eastmoney", "fallback": daily_source,
-                "message": "东方财富 ETF 日线不可用，本次已使用 BaoStock；可选来源暂停至重新检测。"
+                "kind": "source_fallback", "source": configured_source, "fallback": daily_source,
+                "product_type": product_type,
+                "message": f"{configured_source} ETF 日线不可用，本次已使用 {daily_source}。"
                 + (" " + str(route.get("reason") or "") if route.get("reason") else ""),
             })
     else:
@@ -521,6 +746,8 @@ def probe_source(
     capability: str,
     market: str = "all",
     cancelled: Callable[[], bool] = lambda: False,
+    product_type: str = "etf",
+    sample_symbol: str | None = None,
 ) -> dict:
     """Probe a source without writing market data or changing the selected source."""
     from .providers import fetch_etf_daily, fetch_sina, fetch_tdx, fetch_ths, latest_closed_date
@@ -535,6 +762,14 @@ def probe_source(
         raise ValueError(f"{source} 不适用于 {capability}")
     if capability == "etf_daily" and source not in {"baostock", "eastmoney"}:
         raise ValueError("ETF 日线探测来源应为 baostock 或 eastmoney")
+    if capability != "etf_daily" and (product_type != "etf" or sample_symbol is not None):
+        raise ValueError("产品类型和样本证券只适用于 ETF 日线探测")
+    if capability == "etf_daily" and product_type not in {"etf", "lof", "reit"}:
+        raise ValueError("ETF 日线探测类型应为 etf/lof/reit")
+    if capability == "etf_daily" and product_type in {"lof", "reit"} and sample_symbol is None:
+        raise ValueError(f"{product_type.upper()} 类型探测必须提供本地元数据匹配的 sample_symbol")
+    if capability == "etf_daily" and market not in {"all", "etf"}:
+        raise ValueError("ETF 日线探测仅支持 ETF 市场")
     markets = _market_list(capability, market)
     network_timeout = store.market_settings.network_timeout_seconds
     end = pd.Timestamp(latest_closed_date()).normalize()
@@ -543,7 +778,11 @@ def probe_source(
     for item in markets:
         if cancelled():
             raise InterruptedError("任务已取消")
-        symbol = "159611.SZ" if item == "etf" else "600000.SH"
+        symbol = (sample_symbol or "159611.SZ") if capability == "etf_daily" else ("159611.SZ" if item == "etf" else "600000.SH")
+        if capability == "etf_daily" and sample_symbol is not None:
+            stored = store.instrument(sample_symbol)
+            if classify_etf_product(stored) != product_type:
+                raise ValueError(f"样本证券 {sample_symbol} 的本地元数据不能确认类型 {product_type}")
         started = time.monotonic()
         try:
             with probe_guard(store, source, capability, item):
@@ -567,25 +806,46 @@ def probe_source(
                         network_timeout=network_timeout,
                     )
             if frame is None or frame.empty:
-                raise RuntimeError(f"{source} 探测未返回数据")
+                from .providers import EmptyUnresolvedError
+                raise EmptyUnresolvedError(f"{source} 探测未返回数据", product_type=product_type)
             coverage_start, coverage_end = decode_coverage(frame)
+            if capability == "etf_daily":
+                coverage_end = pd.Timestamp(coverage_end).normalize()
+                latest = pd.Timestamp(end).normalize()
+                if coverage_end > latest or coverage_end < latest - pd.Timedelta(days=7):
+                    raise ValueError(f"{source} 样本数据未覆盖最近已收盘日附近：{coverage_end.date()}")
             state = record_success(
                 store, source, capability, item, rows=len(frame),
                 coverage_start=coverage_start, coverage_end=coverage_end,
                 duration_seconds=round(time.monotonic() - started, 3),
             )
-            results.append({"market": item, "symbol": symbol, "status": "passed", "state": state})
+            result = {"market": item, "symbol": symbol, "status": "passed", "state": state}
+            if capability == "etf_daily":
+                result["qualification"] = _record_source_qualification(
+                    store, source, product_type, symbol, status="passed", rows=len(frame),
+                    coverage_start=coverage_start, coverage_end=coverage_end,
+                )
+            results.append(result)
         except InterruptedError:
             raise
         except Exception as exc:
-            state = record_failure(
-                store, source, capability, item, exc,
-                duration_seconds=round(time.monotonic() - started, 3),
-            )
-            results.append({
+            category = classify_source_error(exc)
+            if category not in {"empty", "empty_unresolved", "unsupported", "data_quality", "cancelled"}:
+                state = record_failure(
+                    store, source, capability, item, exc,
+                    duration_seconds=round(time.monotonic() - started, 3),
+                )
+            else:
+                state = source_state(store, source, capability, item)
+            result = {
                 "market": item, "symbol": symbol, "status": "failed",
-                "error_category": classify_source_error(exc), "error": str(exc), "state": state,
-            })
+                "error_category": category, "error": str(exc), "state": state,
+            }
+            if capability == "etf_daily":
+                result["qualification"] = _record_source_qualification(
+                    store, source, product_type, symbol, status="failed", error=exc,
+                )
+            results.append(result)
     passed = [item for item in results if item["status"] == "passed"]
     status = "completed" if len(passed) == len(results) else "partial" if passed else "failed"
     return {

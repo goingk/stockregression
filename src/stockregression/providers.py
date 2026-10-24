@@ -30,6 +30,40 @@ _SINA_MINUTE_URL = "https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataSe
 _THS_MINUTE_URL = "https://d.10jqka.com.cn/v6/line/hs_{code}/61/all.js"
 
 
+class EmptyUnresolvedError(RuntimeError):
+    """A provider returned no usable bars for a request whose applicability is unknown."""
+
+    category = "empty_unresolved"
+
+    def __init__(
+        self, message: str, *, source_attempts=None, product_type: str | None = None,
+        fallback_status: str | None = None, fallback_reason: str | None = None,
+        configured_source: str | None = None, fallback_attempted: bool = False,
+        etf_daily_route: dict | None = None, source_events=None,
+    ):
+        super().__init__(message)
+        self.source_attempts = list(source_attempts or [])
+        self.product_type = product_type
+        self.fallback_status = fallback_status
+        self.fallback_reason = fallback_reason
+        self.configured_source = configured_source
+        self.fallback_attempted = bool(fallback_attempted)
+        self.etf_daily_route = dict(etf_daily_route or {})
+        self.source_events = list(source_events or [])
+
+
+def _canonical_etf_daily(frame: pd.DataFrame, start, end, source: str) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        raise EmptyUnresolvedError(f"{source} ETF 日线未返回所选区间数据")
+    daily = canonical_frame(frame, daily=True, source=source)
+    lower, upper = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
+    if daily.empty:
+        raise EmptyUnresolvedError(f"{source} ETF 日线未返回所选区间数据")
+    if (daily.date < lower).any() or (daily.date > upper).any():
+        raise ValueError(f"{source} ETF 日线包含请求区间外记录")
+    return daily
+
+
 def serialized_baostock(function):
     @wraps(function)
     def call(*args, **kwargs):
@@ -482,10 +516,10 @@ def fetch_etf_daily(
                 end_date=pd.Timestamp(end).strftime("%Y%m%d"), adjust="",
             )
         if frame is None or frame.empty:
-            raise RuntimeError("东方财富 ETF 日线未返回所选区间数据")
+            raise EmptyUnresolvedError("东方财富 ETF 日线未返回所选区间数据")
         if "涨跌额" in frame:
             frame["preclose"] = (pd.to_numeric(frame["收盘"]) - pd.to_numeric(frame["涨跌额"])).round(3)
-        daily = canonical_frame(frame, daily=True)
+        daily = _canonical_etf_daily(frame, start, end, "东方财富")
         daily["volume"] *= 100  # Eastmoney reports lots.
         return daily
     if source != "baostock":
@@ -509,8 +543,8 @@ def fetch_etf_daily(
         _baostock_reset()
         raise
     if not rows:
-        raise RuntimeError("BaoStock ETF 日线未返回所选区间数据")
-    return canonical_frame(pd.DataFrame(rows, columns=result.fields), daily=True)
+        raise EmptyUnresolvedError("BaoStock ETF 日线未返回所选区间数据")
+    return _canonical_etf_daily(pd.DataFrame(rows, columns=result.fields), start, end, "BaoStock")
 
 
 def fetch_auxiliary(

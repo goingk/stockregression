@@ -21,6 +21,7 @@ from .market_data.package import import_etf_package, index_etf_package_direct
 from .market_data.maintenance import rebuild_state, update_rebuild_state
 from .market_data.preparation import MarketPreparationService
 from .market_data.sync import MarketDataSyncService
+from .market_data.models import MarketSyncCancelled
 from .performance import PerformanceTrace, activate_performance, reset_performance
 from .research_preparation import prepare_research_bundle
 from .resources import ResourceLease, clear_stale_leases
@@ -194,6 +195,81 @@ def _research_failed(result: dict) -> bool:
     return bool(statuses) and all(status in {"failed", "error"} for status in statuses)
 
 
+def _aggregate_failure_categories(runs: list[dict], fallback: dict | None = None) -> dict[str, int]:
+    """Aggregate per-run failure categories without counting run failures twice."""
+    aggregated: dict[str, int] = {}
+    for run in runs:
+        categories = run.get("failure_categories")
+        if isinstance(categories, dict) and categories:
+            for category, count in categories.items():
+                if isinstance(count, (int, float)) and not isinstance(count, bool):
+                    key = str(category or "unknown")
+                    aggregated[key] = aggregated.get(key, 0) + int(count)
+            continue
+        for failure in run.get("failures") or []:
+            if not isinstance(failure, dict):
+                continue
+            key = str(failure.get("category") or failure.get("error_category") or "unknown")
+            aggregated[key] = aggregated.get(key, 0) + 1
+    if not aggregated and isinstance(fallback, dict):
+        return {
+            str(category or "unknown"): int(count)
+            for category, count in fallback.items()
+            if isinstance(count, (int, float)) and not isinstance(count, bool)
+        }
+    return aggregated
+
+
+def _market_sync_cancel_report(completed_runs: list[dict], current: dict | None,
+                               timeframes: list[str]) -> dict:
+    """Merge finished timeframes with the partial report for the cancelled one."""
+    report = current if isinstance(current, dict) else {}
+    current_runs = report.get("runs")
+    if isinstance(current_runs, list):
+        runs = [*completed_runs, *[item for item in current_runs if isinstance(item, dict)]]
+    elif report:
+        runs = [*completed_runs, report]
+    else:
+        runs = list(completed_runs)
+    failures = []
+    failure_keys = set()
+    for failure in [
+        *(report.get("failures") or []),
+        *[
+            {**failure, **({"timeframe": run.get("timeframe")} if run.get("timeframe") else {})}
+            for run in runs for failure in (run.get("failures") or [])
+        ],
+    ]:
+        if not isinstance(failure, dict):
+            continue
+        key = json.dumps(failure, sort_keys=True, ensure_ascii=False, default=str)
+        if key not in failure_keys:
+            failure_keys.add(key)
+            failures.append(failure)
+    quality_partial = any(
+        run.get("status") == "partial"
+        or any(item.get("quality_status") in {"partial", "failed"}
+               for item in [*(run.get("symbols") or []), *(run.get("skipped") or [])]
+               if isinstance(item, dict))
+        for run in runs
+    ) or report.get("quality_status") in {"partial", "failed"}
+    run_timeframes = [str(run["timeframe"]) for run in runs if run.get("timeframe")]
+    merged = {
+        **report,
+        "status": "cancelled",
+        "timeframes": list(dict.fromkeys([*timeframes, *run_timeframes])),
+        "runs": runs,
+        "failures": failures,
+        "failure_categories": _aggregate_failure_categories(runs, report.get("failure_categories")),
+        "message": "同步已取消，已保留各周期已完成与当前周期部分结果",
+    }
+    if quality_partial:
+        merged["quality_status"] = "partial"
+    else:
+        merged.pop("quality_status", None)
+    return merged
+
+
 def execute_job(root: str, job_id: str, observer=None):
     store = Store(root)
     job = store.job(job_id)
@@ -272,6 +348,9 @@ def execute_job(root: str, job_id: str, observer=None):
         reset_performance(performance_tokens)
         return
     last_progress = 0.0
+    pending_progress_detail: dict | None = None
+    last_progress_detail_stage: str | None = None
+    progress_detail_lock = threading.Lock()
     last_cancel_check = 0.0
     cancel_state = False
     cancel_poll_seconds = max(.05, int(configured.performance.job_cancel_poll_ms) / 1000)
@@ -290,16 +369,31 @@ def execute_job(root: str, job_id: str, observer=None):
         return cancel_state
 
     def progress(fraction, message):
-        nonlocal last_progress
+        nonlocal last_progress, pending_progress_detail
         tick = time.monotonic()
         if tick - last_progress > progress_update_seconds or fraction <= 0 or fraction >= 1:
             rendered = str(message)
             if job.get("kind") in {"backtest", "optimization", "batch", "batch_backtest", "etf_research", "etf_validation"} and 0 < fraction < 1:
                 rendered += f" · {max(1, lease.units)} 线程"
-            write_job(progress=max(0, min(1, float(fraction))), message=rendered)
+            normalized_fraction = max(0, min(1, float(fraction)))
+            with progress_detail_lock:
+                detail = pending_progress_detail
+                pending_progress_detail = None
+                write_job(
+                    progress=normalized_fraction, message=rendered,
+                    **({"progress_detail": detail} if detail is not None else {}),
+                )
             if observer:
                 observer(fraction, rendered)
             last_progress = tick
+
+    def flush_progress_detail() -> None:
+        nonlocal pending_progress_detail
+        with progress_detail_lock:
+            detail = pending_progress_detail
+            pending_progress_detail = None
+            if detail is not None:
+                write_job(progress_detail=detail)
     try:
         service = DataService(store, settings=configured)
         payload, kind = job["payload"], job["kind"]
@@ -475,7 +569,99 @@ def execute_job(root: str, job_id: str, observer=None):
                 raise ValueError("1 分钟行情不支持全市场在线初始化；请登记本地数据包或导入文件。")
             combined = []
             failures = []
+            sync_cancelled = False
             ordered = sorted(set(timeframes), key=lambda value: 0 if value == "1day" else 1)
+            cutoff_date = payload.get("cutoff_date")
+            if not cutoff_date:
+                from .providers import latest_closed_date
+                cutoff_date = str(latest_closed_date().date())
+            write_job(message="正在核对数据包清单与同步检查点", progress_detail={
+                "stage": "package_recovery", "cutoff_date": str(cutoff_date),
+                "counts": {"total": len(symbols), "processed": 0, "succeeded": 0,
+                           "failed": 0, "reused": 0, "skipped": 0,
+                           "unprocessed": len(symbols)},
+                "resources": {"download_workers": 0, "baostock_sessions": 0, "write_workers": 1},
+            })
+            sync_service = MarketDataSyncService(MarketDataService(store, settings=configured))
+            package_id = str(sync_service.repository.package_id)
+            if payload.get("package_id") and str(payload["package_id"]) != package_id:
+                raise ValueError("任务绑定的行情数据包已切换，不能继续原同步检查点")
+            package_generation = str(sync_service.repository.generation)
+            if payload.get("package_generation") and str(payload["package_generation"]) != package_generation:
+                raise ValueError("任务绑定的行情数据包代际已变化，不能继续原同步检查点")
+
+            def period_progress(index, fraction, message):
+                base = index / len(ordered)
+                span = 1 / len(ordered)
+                progress(base + span * max(0.0, min(1.0, float(fraction))), message)
+
+            frozen_by_timeframe = payload.get("sync_symbols_by_timeframe")
+            if not isinstance(frozen_by_timeframe, dict):
+                frozen_by_timeframe = {}
+            if not frozen_by_timeframe:
+                if scope == "market" and payload.get("initialize"):
+                    service.refresh_instruments(
+                        lambda fraction, message: period_progress(0, .1 * fraction, message),
+                        cancelled,
+                    )
+                    selected_symbols = [row["symbol"] for row in store.instruments(limit=None)]
+                    frozen_by_timeframe = {timeframe: list(selected_symbols) for timeframe in ordered}
+                elif scope == "market":
+                    frozen_by_timeframe = {
+                        timeframe: list(sync_service.repository.symbols_for_timeframe(timeframe))
+                        for timeframe in ordered
+                    }
+                elif scope == "watchlist":
+                    selected_symbols = [row["symbol"] for row in store.watches()]
+                    frozen_by_timeframe = {timeframe: list(selected_symbols) for timeframe in ordered}
+                else:
+                    frozen_by_timeframe = {timeframe: list(symbols) for timeframe in ordered}
+            else:
+                frozen_by_timeframe = {
+                    timeframe: list(frozen_by_timeframe.get(timeframe, symbols))
+                    for timeframe in ordered
+                }
+            symbols = list(dict.fromkeys(
+                symbol for timeframe in ordered for symbol in frozen_by_timeframe[timeframe]
+            ))
+            payload.update({
+                "symbols": symbols,
+                "sync_symbols_by_timeframe": frozen_by_timeframe,
+                "package_id": package_id,
+                "package_generation": package_generation,
+                "cutoff_date": str(cutoff_date),
+            })
+            write_job(payload=payload)
+
+            def sync_detail(detail):
+                nonlocal pending_progress_detail, last_progress_detail_stage
+                if not isinstance(detail, dict):
+                    return
+                counts = detail.get("counts") if isinstance(detail.get("counts"), dict) else {}
+                resources = detail.get("resources") if isinstance(detail.get("resources"), dict) else {}
+                snapshot = {
+                    "stage": str(detail.get("stage") or "sync"),
+                    "symbol": detail.get("symbol"),
+                    "checked_days": detail.get("checked_days"),
+                    "total_days": detail.get("total_days"),
+                    "counts": {
+                        name: int(counts.get(name, 0) or 0)
+                        for name in ("total", "processed", "succeeded", "failed", "reused", "skipped", "unprocessed")
+                    },
+                    "resources": {
+                        "download_workers": int(resources.get("download_workers", configured.performance.download_workers)),
+                        "baostock_sessions": int(resources.get("baostock_sessions", configured.performance.download_workers)),
+                        "write_workers": int(resources.get("write_workers", configured.performance.download_workers)),
+                    },
+                    "cutoff_date": str(detail.get("cutoff_date") or cutoff_date),
+                }
+                with progress_detail_lock:
+                    stage_changed = snapshot["stage"] != last_progress_detail_stage
+                    last_progress_detail_stage = snapshot["stage"]
+                    pending_progress_detail = snapshot
+                    if stage_changed:
+                        pending_progress_detail = None
+                        write_job(progress_detail=snapshot)
             # Every timeframe reports its own 0..1 fraction.  Giving each one
             # a slice of a single scale keeps the bar from restarting at 0%
             # every time the next period begins, so the job reads as one
@@ -487,51 +673,56 @@ def execute_job(root: str, job_id: str, observer=None):
                 def period_progress(fraction, message, base=base, span=span):
                     progress(base + span * max(0.0, min(1.0, float(fraction))), message)
 
-                selected = list(symbols)
+                selected = list(frozen_by_timeframe[timeframe])
                 sync_progress = period_progress
-                if scope == "market":
-                    if payload.get("initialize"):
-                        # Catalog refresh is its own stage before market sync.
-                        # Reserve the first tenth of this timeframe's slice for
-                        # it, then map sync into the remaining nine tenths so
-                        # progress never drops back after the refresh finishes.
-                        service.refresh_instruments(
-                            lambda fraction, message: period_progress(
-                                0.1 * max(0.0, min(1.0, float(fraction))), message,
-                            ),
-                            cancelled,
-                        )
-                        sync_progress = lambda fraction, message: period_progress(
-                            0.1 + 0.9 * max(0.0, min(1.0, float(fraction))), message,
-                        )
-                        selected = [row["symbol"] for row in store.instruments(limit=None)]
-                    else:
-                        selected = MarketDataService(store, settings=configured).repository.symbols_for_timeframe(timeframe)
-                elif scope == "watchlist":
-                    selected = [row["symbol"] for row in store.watches()]
-                one = MarketDataSyncService(MarketDataService(store, settings=configured)).sync(
-                    selected, timeframe, payload.get("mode", "incremental"),
-                    start=payload.get("start_date"), end=payload.get("end_date"),
-                    resume=payload.get("resume", False), retry_failed=payload.get("retry_failed", False),
-                    workers=payload.get("workers", configured.performance.download_workers),
-                    progress=sync_progress, cancelled=cancelled,
-                )
+                if scope == "market" and payload.get("initialize") and index == 0:
+                    sync_progress = lambda fraction, message: period_progress(
+                        0.1 + 0.9 * max(0.0, min(1.0, float(fraction))), message,
+                    )
+                try:
+                    one = MarketDataSyncService(
+                        sync_service.service, job_id=job_id, job_claim_token=claim_token,
+                        detail=sync_detail, cutoff_date=cutoff_date,
+                    ).sync(
+                        selected, timeframe, payload.get("mode", "incremental"),
+                        start=payload.get("start_date"), end=payload.get("end_date"),
+                        resume=payload.get("resume", False), retry_failed=payload.get("retry_failed", False),
+                        workers=payload.get("workers", configured.performance.download_workers),
+                        progress=sync_progress, cancelled=cancelled,
+                    )
+                except MarketSyncCancelled as exc:
+                    result = _market_sync_cancel_report(combined, exc.report, ordered)
+                    sync_cancelled = True
+                    break
                 combined.append(one)
                 failures.extend({**item, "timeframe": timeframe} for item in one.get("failures", []))
-            succeeded = sum(len(run.get("symbols", [])) for run in combined)
-            skipped = sum(len(run.get("skipped", [])) for run in combined)
-            sync_status = "completed" if not failures else "partial" if succeeded or skipped else "failed"
-            result = {
-                "status": sync_status,
-                "timeframes": sorted(set(timeframes)),
-                "runs": combined, "failures": failures,
-                "message": f"处理 {len(combined)} 个基础周期：成功 {succeeded} 项，跳过 {skipped} 项，失败 {len(failures)} 项",
-            }
+            if not sync_cancelled:
+                succeeded = sum(len(run.get("symbols", [])) for run in combined)
+                skipped = sum(len(run.get("skipped", [])) for run in combined)
+                quality_partial = any(
+                    run.get("status") == "partial"
+                    or any(item.get("quality_status") in {"partial", "failed"}
+                           for item in [*(run.get("symbols") or []), *(run.get("skipped") or [])]
+                           if isinstance(item, dict))
+                    for run in combined
+                )
+                sync_status = "partial" if quality_partial or (failures and (succeeded or skipped)) else "failed" if failures else "completed"
+                result = {
+                    "status": sync_status,
+                    "timeframes": sorted(set(timeframes)),
+                    "runs": combined, "failures": failures,
+                    "failure_categories": _aggregate_failure_categories(combined),
+                    "message": f"处理 {len(combined)} 个基础周期：成功 {succeeded} 项，跳过 {skipped} 项，失败 {len(failures)} 项",
+                }
             symbol, title = ",".join(symbols), f"基础行情同步 · {', '.join(sorted(set(timeframes)))}"
         elif kind == "market_source_probe":
+            probe_options = {
+                key: payload[key] for key in ("product_type", "sample_symbol")
+                if payload.get(key) is not None
+            }
             result = probe_source(
                 store, payload["source"], payload["capability"],
-                payload.get("market", "all"), cancelled,
+                payload.get("market", "all"), cancelled, **probe_options,
             )
             symbol, title = "", f"数据源探测 · {payload['source']}"
         elif kind == "market_validate":
@@ -589,13 +780,16 @@ def execute_job(root: str, job_id: str, observer=None):
             symbol, title = "", "证券清单更新"
         else:
             raise ValueError("未知任务类型：" + kind)
-        if cancelled() and kind not in {"optimization", "etf_research", "etf_validation"}:
+        if cancelled() and kind not in {"optimization", "etf_research", "etf_validation"} \
+                and not (kind == "market_sync" and result.get("status") == "cancelled"):
             raise InterruptedError("任务已取消")
         was_cancelled = cancelled()
         failed_sync = kind in {"market_sync", "market_source_probe", "market_import", "market_import_batch", "market_import_package", "market_index_package", "market_aggregate", "market_prepare", "market_archive"} and result.get("status") == "failed"
         failed_research = kind == "optimization" and payload.get("config", {}).get("protocol_version") == 5 and _research_failed(result)
         result_cancelled = kind in {"optimization", "etf_research", "etf_validation"} and result.get("status") == "cancelled"
-        cancelled_job = was_cancelled or result_cancelled
+        cancelled_job = was_cancelled or result_cancelled or (
+            kind == "market_sync" and result.get("status") == "cancelled"
+        )
         if kind == "optimization" and payload.get("config", {}).get("protocol_version") == 5:
             if failed_research:
                 title += " · 失败"
@@ -641,19 +835,25 @@ def execute_job(root: str, job_id: str, observer=None):
                 "resource_settings": configured.performance.model_dump(mode="json"),
                 "cpu_units": int(cpu_units),
             }
+        if kind == "market_sync":
+            flush_progress_detail()
         if kind == "research_completion":
             # The revision is stored beside the original immutable result.  A
             # separate result artifact would look like a second research study
             # and would not contain the original protocol/configuration.
             result_id = str(result.get("result_id") or "")
         else:
-            result_id = store.save_result(kind, result, symbol, title)
+            deterministic_id = (
+                f"market-sync-cancel-{job_id}"
+                if kind == "market_sync" and result.get("status") == "cancelled" else None
+            )
+            result_id = store.save_result(kind, result, symbol, title, result_id=deterministic_id)
         sync_error = None
         if failed_sync:
             failures = result.get("failures", [])
             sync_error = "; ".join(f"{item.get('symbol', '标的')}: {item.get('reason', '未知错误')}" for item in failures) or result.get("message") or "所有同步目标失败"
         if cancelled_job:
-            message = "已取消，已完成的搜索候选保留"
+            message = "同步已取消，已保存部分报告" if kind == "market_sync" else "已取消，已完成的搜索候选保留"
         elif failed_sync:
             message = f"同步失败：{sync_error}"
         elif failed_research:
@@ -671,7 +871,13 @@ def execute_job(root: str, job_id: str, observer=None):
             # stopped because it ran out of time does not look like a plain
             # user cancellation.
             terminal_error = (store.job(job_id) or {}).get("error")
-        write_job(status="cancelled" if cancelled_job else "failed" if failed_sync or failed_research else "partial" if partial else "completed", progress=1, message=message, error=terminal_error, result_id=result_id)
+        terminal_values = {
+            "status": "cancelled" if cancelled_job else "failed" if failed_sync or failed_research else "partial" if partial else "completed",
+            "message": message, "error": terminal_error, "result_id": result_id,
+        }
+        if not cancelled_job:
+            terminal_values["progress"] = 1
+        write_job(**terminal_values)
     except ClaimLostError:
         return
     except InterruptedError as exc:

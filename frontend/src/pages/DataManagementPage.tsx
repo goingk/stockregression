@@ -398,6 +398,14 @@ export default function DataManagementPage({
     } catch (cause) { setError(errorText(cause)) } finally { setBusy('') }
   }
 
+  const setEtfDailyFallback = async (enabled: boolean) => {
+    setBusy('ETF 日线备用来源'); setError(''); setNotice('')
+    try {
+      await workspace.saveConfiguration({ market_data: { etf_daily_fallback_enabled: enabled } })
+      setNotice(`ETF 日线备用来源已${enabled ? '启用' : '关闭'}。`)
+    } catch (cause) { setError(errorText(cause)) } finally { setBusy('') }
+  }
+
   const probeSource = (source: string, capability: string, market = 'all') => {
     void run('探测数据源', () => post('/data/sources/probe', { source, capability, market }), `${source} 探测任务已提交；完成后刷新状态。`, false)
   }
@@ -586,15 +594,16 @@ export default function DataManagementPage({
       {packageError && <ErrorBox message={'数据包信息读取失败：' + packageError} onRetry={() => void loadPackage()} />}
       {packageLoading && packageInfo && <p className="inline-warning">正在刷新数据包信息，当前显示上次成功结果。</p>}
       <div className="package-summary"><div><small>当前路径 · {packageInfo?.storage_layout || '—'}</small><strong>{packageInfo?.path || configurationRead.active_package_dir || '未配置'}</strong></div><div><small>包身份 · generation</small><strong>{packageInfo?.package_id || '—'} · {packageInfo?.generation || '—'}</strong></div><div><small>有效基础分片 · 索引</small><strong>{compact(packageInfo?.shard_count ?? 0)} 个 · {formatBytes(packageInfo?.shard_bytes || 0)} · {packageInfo?.index_status === 'ready' ? '一致' : '待重建'}</strong></div></div>
-      <div className="source-panel-head"><div><strong>在线数据源</strong><span>默认来源直接使用；可选来源检测通过后才能启用，失败会暂停 {sources?.cooldown_hours ?? 24} 小时并回退默认来源；默认与可选来源都失败时自动转同花顺。</span></div><Button variant="quiet" busy={sourcesLoading} onClick={() => void loadSources()}><RefreshCw size={14} />刷新状态</Button></div>
+      <div className="source-panel-head"><div><strong>在线数据源</strong><span>可选来源须通过探测才可启用；失败来源会冷却 {sources?.cooldown_hours ?? 24} 小时。近期分钟行情可按来源策略回退到同花顺，ETF 日线使用下方独立备用开关。</span></div><Button variant="quiet" busy={sourcesLoading} onClick={() => void loadSources()}><RefreshCw size={14} />刷新状态</Button></div>
       {sourcesError && <ErrorBox message={'数据源状态读取失败：' + sourcesError} onRetry={() => void loadSources()} />}
       {sourcesLoading && sources && <p className="inline-warning">正在刷新来源状态，当前显示上次成功结果。</p>}
       {!sources && sourcesLoading ? <Loading label="读取来源状态…" /> : sources ? <div className="source-grid">{sources.capabilities.map(capability => <div className="source-panel" key={capability.capability}>
-        <div className="source-panel-head"><div><strong>{capability.label}</strong><span>{capability.description}</span></div><Badge tone={capability.routes.some(route => route.fallback) ? 'amber' : 'blue'}>{capability.routes.some(route => route.fallback) ? `${capability.configured} · 部分回退` : `当前 ${capability.configured}`}</Badge></div>
+        <div className="source-panel-head"><div><strong>{capability.label}</strong><span>{capability.capability === 'etf_daily' ? 'ETF 日线默认使用 BaoStock。东方财富（AKShare）探测通过并符合 24 小时来源健康策略后，才可作为备用来源；ETF 日线不会回退到同花顺分钟接口。' : capability.description}</span></div><Badge tone={capability.routes.some(route => route.fallback) ? 'amber' : 'blue'}>{capability.routes.some(route => route.fallback) ? `${capability.configured} · 部分回退` : `当前 ${capability.configured}`}</Badge></div>
+        {capability.capability === 'etf_daily' && <label className="source-fallback-setting"><input type="checkbox" checked={Boolean(((workspace.configuration.market_data ?? {}) as Record<string, unknown>).etf_daily_fallback_enabled ?? true)} disabled={busy === 'ETF 日线备用来源'} onChange={event => void setEtfDailyFallback(event.target.checked)} /><span><strong>启用 ETF 日线合格备用来源</strong><small>启用后仅在备用来源探测合格且健康状态允许时回退；关闭时同步只使用当前已选来源。</small></span></label>}
         <div className="source-options">{capability.sources.map(option => {
           return <div className="source-option" key={option.source}>
             <div><strong>{option.label}</strong><small>{option.role === 'default' ? '默认来源' : option.role === 'fallback' ? '自动回退来源' : '可选来源'}</small></div>
-            <div className="source-state-list">{option.states.map(state => <span key={state.market} title={state.error || ''}><b>{state.market === 'etf' ? 'ETF' : '股票'}</b><Badge tone={state.status === 'passed' ? 'green' : state.status === 'failed' ? 'red' : 'neutral'}>{state.status === 'passed' ? '通过' : state.status === 'failed' ? '失败' : '未检测'}</Badge><small>{state.rows ? `${compact(state.rows)} 行` : ''}{state.coverage_end ? ` · ${dateText(state.coverage_end)}` : ''}</small></span>)}</div>
+            <div className="source-state-list">{option.states.map(state => <span key={state.market} title={state.error || ''}><b>{state.market === 'etf' ? 'ETF' : '股票'}</b><Badge tone={state.status === 'passed' ? 'green' : state.status === 'failed' ? 'red' : 'neutral'}>{state.status === 'passed' ? '通过' : state.status === 'failed' ? '失败' : '未检测'}</Badge><small>{state.rows ? `${compact(state.rows)} 行` : ''}{state.coverage_end ? ` · ${dateText(state.coverage_end)}` : ''}{state.qualification != null ? ` · ${typeof state.qualification === 'string' ? state.qualification : JSON.stringify(state.qualification)}` : ''}</small></span>)}</div>
             <div className="button-row"><Button variant="quiet" busy={busy === '探测数据源'} onClick={() => probeSource(option.source, capability.capability)}>检测</Button>{option.role === 'fallback' ? <Badge tone="neutral">自动回退</Badge> : !option.selected && <Button variant="secondary" disabled={!option.selectable || busy === '切换来源'} onClick={() => void chooseSource(capability.capability, option.source)}>{option.selectable ? '启用' : '检测通过后启用'}</Button>}</div>
           </div>
         })}</div>

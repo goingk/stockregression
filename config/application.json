@@ -132,6 +132,7 @@
     "cache_mb": 256,
     "recent_minute_source": "sina",
     "etf_daily_source": "baostock",
+    "etf_daily_fallback_enabled": true,
     "network_timeout_seconds": 15.0,
     "request_retries": 1,
     "failure_cooldown_hours": 24,
@@ -182,5 +183,5 @@
     "subprocess_timeout_seconds": 45,
     "lock_timeout_seconds": 30
   },
-  "config_revision": "18ad3f25f58b7d6250fcb616e8c09b970165c5aed121f766d98b8f86f8ce77c4"
+  "config_revision": "ed68030af10b5ff2442b65afe8bce4227d23b7a66125f87fb894ebd1514a6af1"
 }

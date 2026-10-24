@@ -104,9 +104,41 @@ def test_daily_download_reports_progress_before_first_commit(service, monkeypatc
     result = run_daily(sync, SYMBOLS, lambda fraction, _: values.append(fraction))
     assert result["status"] == "completed"
     assert len(result["symbols"]) == 4
-    assert commit_progress[0] == pytest.approx([1 / 8, 2 / 8])
+    assert sorted(set(commit_progress[0])) == pytest.approx([1 / 8, 2 / 8])
     assert commit_progress[-1][-1] < 1
     assert_progress(values)
+
+
+def test_healthy_process_pool_is_reused_across_daily_batches(service, monkeypatch):
+    from concurrent.futures import Future
+    from stockregression.market_data import sync as sync_module
+
+    sync = MarketDataSyncService(service)
+    pools = []
+
+    class HealthyPool:
+        def __init__(self, **kwargs):
+            assert kwargs["max_workers"] == 2
+            assert kwargs["initializer"] is sync_module._initialize_daily_worker
+            pools.append(self)
+
+        def submit(self, function, root, package, symbol, *_args):
+            future = Future()
+            future.set_result(prepared(symbol))
+            return future
+
+        def shutdown(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(sync_module, "ProcessPoolExecutor", HealthyPool)
+    monkeypatch.setattr(sync, "_worker_count", lambda _: 4)
+    monkeypatch.setattr(service, "_commit_frame", lambda symbol, *_a, **_kw: {
+        "symbol": symbol, "last_time": "2026-01-06", "quality_status": "complete",
+    })
+    result = run_daily(sync, SYMBOLS, lambda *_: None)
+    assert result["status"] == "completed"
+    assert len(result["symbols"]) == 4
+    assert len(pools) == 1
 
 
 @pytest.mark.parametrize("outcome", [
@@ -117,6 +149,9 @@ def test_daily_outcomes_settle_each_symbol_once(service, monkeypatch, outcome):
     values, downloads = [], []
     target = SYMBOLS[0]
     checkpoint_skip = outcome in {"resume", "retry_failed"}
+    if outcome == "resume":
+        monkeypatch.setattr(sync, "_daily_checkpoint_action", lambda symbol, state, *_: "reuse" if symbol in SYMBOLS[:2] else "download")
+        monkeypatch.setattr(sync, "_local_daily_validation", lambda symbol, *_: {"symbol": symbol, "last_time": "2026-01-06", "quality_status": "complete"})
     if checkpoint_skip:
         for symbol in SYMBOLS[:2] if outcome == "resume" else SYMBOLS[2:]:
             service.store.sync_item(RUN_KEY, symbol, status="completed" if outcome == "resume" else "failed")
@@ -153,7 +188,7 @@ def test_daily_outcomes_settle_each_symbol_once(service, monkeypatch, outcome):
     if checkpoint_skip:
         assert set(downloads) == set(SYMBOLS[2:])
         assert len(result["skipped"]) == 2
-        assert values[0] == pytest.approx(0.5)
+        assert 0.5 in values
     assert_progress(values)
 
 

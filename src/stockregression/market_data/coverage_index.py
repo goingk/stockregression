@@ -111,6 +111,15 @@ class CoverageArchive:
         self._month_cache[key] = value
         return value
 
+    def _remember_written_payload(self, relative, digest, raw):
+        """Reuse bytes just written atomically; later file changes invalidate it."""
+        state = self.package.absolute(relative).stat()
+        key = (str(self.package.root), relative, digest,
+               state.st_size, state.st_mtime_ns, state.st_ctime_ns)
+        if len(self._month_cache) >= 512:
+            self._month_cache.pop(next(iter(self._month_cache)))
+        self._month_cache[key] = json.loads(raw.decode("utf-8"))
+
     def _key(self, symbol: str, timeframe: str, adjustment: str) -> str:
         return PackageLayout.dataset_key(symbol, timeframe, adjustment)
 
@@ -274,7 +283,43 @@ class CoverageArchive:
         self, symbol: str, timeframe: str, adjustment: str = "none",
         *, start=None, end=None,
     ) -> list[dict[str, Any]]:
+        timeframe = normalize_timeframe(timeframe)
+        if getattr(self.repository, "_read_only", False):
+            reference = self.head_reference(symbol, timeframe, adjustment)
+            if reference:
+                head = self.load_head(symbol, timeframe, adjustment)
+                if head is None:
+                    raise MarketDataError(
+                        f"只读覆盖档案 head 无法验证：{symbol} {timeframe}"
+                    )
+                lower = pd.Timestamp(start).normalize() if start is not None else None
+                upper = pd.Timestamp(end).normalize() if end is not None else None
+                selected_months = {
+                    str(item.get("month")) for item in head.get("months") or []
+                    if (lower is None or pd.Period(str(item.get("month")), freq="M") >= lower.to_period("M"))
+                    and (upper is None or pd.Period(str(item.get("month")), freq="M") <= upper.to_period("M"))
+                }
+                month_rows = self._published_month_rows(head, selected_months)
+                return sorted(
+                    [
+                        row for month in month_rows.values() for row in month
+                        if (lower is None or pd.Timestamp(row["trade_date"]).normalize() >= lower)
+                        and (upper is None or pd.Timestamp(row["trade_date"]).normalize() <= upper)
+                    ],
+                    key=lambda row: str(row["trade_date"]),
+                )
+            # Packages without an archive head can still have legacy mirror
+            # rows. Reading that mirror is safe; read-only repositories never
+            # repair or claim it as current.
+            return self._mirror_rows(symbol, timeframe, adjustment, start=start, end=end)
+
         self._ensure_mirror(symbol, timeframe, adjustment)
+        return self._mirror_rows(symbol, timeframe, adjustment, start=start, end=end)
+
+    def _mirror_rows(
+        self, symbol: str, timeframe: str, adjustment: str = "none",
+        *, start=None, end=None,
+    ) -> list[dict[str, Any]]:
         clauses = ["symbol=?", "timeframe=?", "adjustment=?"]
         params: list[Any] = [symbol, normalize_timeframe(timeframe), adjustment]
         if start is not None:
@@ -303,6 +348,11 @@ class CoverageArchive:
         return result
 
     def _ensure_mirror(self, symbol: str, timeframe: str, adjustment: str) -> None:
+        if getattr(self.repository, "_read_only", False):
+            # Read-only download contexts read the package head directly via
+            # rows(); they must not acquire the package publication lock or
+            # attempt to repair a lagging SQLite projection.
+            return
         reference = self.head_reference(symbol, timeframe, adjustment)
         if not reference:
             return
@@ -318,7 +368,159 @@ class CoverageArchive:
         # A publisher may have committed the package but not its SQLite mirror.
         # Serialize with it before readers use any day result.
         with self.package.transaction_guard():
-            self.repository._restore_published_archives()
+            # Restoring every coverage archive can be very expensive and is
+            # unnecessary here: this reference identifies one authoritative
+            # archive head. Restore only this dataset from its immutable files.
+            current = self.head_reference(symbol, timeframe, adjustment)
+            if current and not (indexed and all(
+                str(indexed[key]) == str(current.get(key))
+                for key in ("path", "sha256", "revision")
+            )):
+                head = self.load_head(symbol, timeframe, adjustment)
+                if head is None:
+                    raise MarketDataError(
+                        f"覆盖档案 head 无法读取，拒绝从旧 SQLite 镜像继续：{symbol} {timeframe}"
+                    )
+                self._restore_mirror_from_head(head)
+
+    def _published_month_rows(
+        self, head: dict[str, Any], months: set[str] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Read verified month payloads from the published head.
+
+        SQLite is a rebuildable mirror. In particular, it can lag a head that
+        was published immediately before a process or mirror transaction
+        failed, so it must not be used as the merge base for that head.
+        """
+        symbol = str(head.get("symbol") or "")
+        timeframe = normalize_timeframe(str(head.get("timeframe") or "1day"))
+        adjustment = str(head.get("adjustment") or "none")
+        selected = None if months is None else {str(value)[:7] for value in months}
+        result: dict[str, list[dict[str, Any]]] = {}
+        pending = {
+            _day_text(day): str(update.get("reason") or "行情修订")
+            for update in head.get("_pending_updates") or []
+            for day in update.get("dates") or []
+        }
+        for item in head.get("months") or []:
+            month = str(item.get("month") or "")
+            if selected is not None and month not in selected:
+                continue
+            payload = self._month_payload(item)
+            if (
+                payload is None
+                or payload.get("symbol") != symbol
+                or normalize_timeframe(str(payload.get("timeframe") or "1day")) != timeframe
+                or payload.get("adjustment", "none") != adjustment
+                or not isinstance(payload.get("days"), list)
+                or len(payload["days"]) != int(item.get("days") or 0)
+            ):
+                if not self._mirror_matches_head(head):
+                    raise MarketDataError(
+                        f"覆盖档案月份不可验证，SQLite 镜像也未确认属于当前 head：{month or item.get('path')}"
+                    )
+                period = pd.Period(month, freq="M")
+                # A matching archive reference proves this mirror was written
+                # for this exact head. It is safe to use it to repair only the
+                # damaged month, while all valid months still come from the
+                # immutable published head.
+                rows = self._mirror_rows(
+                    symbol, timeframe, adjustment,
+                    start=period.start_time, end=period.end_time,
+                )
+                result[month] = [{
+                    **row, "dirty_reason": pending.get(
+                        _day_text(row["trade_date"]), row.get("dirty_reason"),
+                    ),
+                } for row in rows]
+                continue
+            rows = []
+            for row in payload["days"]:
+                if not isinstance(row, dict) or _month_key(row.get("trade_date")) != month:
+                    raise MarketDataError(f"覆盖档案月份日期无效：{month}")
+                day = _day_text(row["trade_date"])
+                rows.append({
+                    **row,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "adjustment": adjustment,
+                    "dirty_reason": pending.get(day, row.get("dirty_reason")),
+                })
+            result[month] = rows
+        if selected is not None:
+            for month in selected:
+                result.setdefault(month, [])
+        return result
+
+    def _mirror_matches_head(self, head: dict[str, Any]) -> bool:
+        reference = dict(head.get("_reference") or {})
+        if not reference:
+            return False
+        return self._mirror_matches_reference(
+            reference, str(head.get("symbol") or ""),
+            normalize_timeframe(str(head.get("timeframe") or "1day")),
+            str(head.get("adjustment") or "none"),
+        )
+
+    def _mirror_matches_reference(
+        self, reference: dict[str, Any], symbol: str,
+        timeframe: str, adjustment: str,
+    ) -> bool:
+        with self.repository._connect() as db:
+            indexed = db.execute(
+                "SELECT path,sha256,revision FROM parquet_coverage_archives "
+                "WHERE symbol=? AND timeframe=? AND adjustment=?",
+                (symbol, normalize_timeframe(timeframe), adjustment),
+            ).fetchone()
+        return bool(indexed) and all(
+            str(indexed[key]) == str(reference.get(key))
+            for key in ("path", "sha256", "revision")
+        )
+
+    def _mirror_dirty_reasons(
+        self, symbol: str, timeframe: str, adjustment: str,
+        months: set[str] | None,
+    ) -> dict[str, str]:
+        clauses = ["symbol=?", "timeframe=?", "adjustment=?", "dirty_reason IS NOT NULL"]
+        arguments: list[Any] = [symbol, normalize_timeframe(timeframe), adjustment]
+        if months is not None:
+            selected = sorted(months)
+            if not selected:
+                return {}
+            clauses.append("substr(trade_date,1,7) IN (" + ",".join("?" for _ in selected) + ")")
+            arguments.extend(selected)
+        with self.repository._connect() as db:
+            rows = db.execute(
+                "SELECT trade_date,dirty_reason FROM parquet_coverage_days WHERE "
+                + " AND ".join(clauses),
+                arguments,
+            ).fetchall()
+        return {_day_text(row["trade_date"]): str(row["dirty_reason"]) for row in rows}
+
+    def _restore_mirror_from_head(self, head: dict[str, Any]) -> int:
+        """Restore just this archive's SQLite projection in one transaction."""
+        symbol = str(head["symbol"])
+        timeframe = normalize_timeframe(str(head["timeframe"]))
+        adjustment = str(head.get("adjustment") or "none")
+        month_rows = self._published_month_rows(head)
+        entries = [row for month in sorted(month_rows) for row in month_rows[month]]
+        reference = dict(head.get("_reference") or {})
+        if not reference:
+            raise MarketDataError("覆盖档案 head 缺少已发布引用")
+        with self.repository._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                "DELETE FROM parquet_coverage_days WHERE symbol=? AND timeframe=? AND adjustment=?",
+                (symbol, timeframe, adjustment),
+            )
+            db.execute(
+                "DELETE FROM parquet_day_validation WHERE symbol=? AND timeframe=? AND adjustment=?",
+                (symbol, timeframe, adjustment),
+            )
+            restored = self.save_rows(entries, db=db)
+            self._write_validations([row for row in entries if not row.get("dirty_reason")], db)
+            self.record_archive(head, reference, db=db)
+        return restored
 
     def save_rows(self, rows: Sequence[dict[str, Any]], *, db=None) -> int:
         """Write a mirror, only after publication or while restoring a head."""
@@ -492,6 +694,25 @@ class CoverageArchive:
         self, rows: Sequence[dict[str, Any]], *, validation_rows=(),
         expected_data_version: int | None = None, changed_months=None,
     ) -> dict[str, Any]:
+        import time
+        from ..performance import record_seconds
+
+        started = time.perf_counter()
+        try:
+            result = self._commit_rows_impl(
+                rows, validation_rows=validation_rows,
+                expected_data_version=expected_data_version,
+                changed_months=changed_months,
+            )
+            result["_publication_seconds"] = time.perf_counter() - started
+            return result
+        finally:
+            record_seconds("ledger_publication", time.perf_counter() - started)
+
+    def _commit_rows_impl(
+        self, rows: Sequence[dict[str, Any]], *, validation_rows=(),
+        expected_data_version: int | None = None, changed_months=None,
+    ) -> dict[str, Any]:
         """Publish immutable evidence before making its SQLite mirror visible."""
         if not rows:
             return {"_stale_dates": [], "_accepted_dates": []}
@@ -509,14 +730,37 @@ class CoverageArchive:
                 symbol, timeframe, adjustment, expected_data_version=current,
                 changed_months=months, _updates=accepted, _record_mirror=False,
             )
-            reference = self.head_reference(symbol, timeframe, adjustment)
+            # The package head is published before its SQLite projection. Make
+            # the projection match every touched month from that exact head,
+            # including previously published rows from a failed earlier
+            # mirror transaction, in the same SQLite transaction as this
+            # chunk's accepted evidence.
+            published = self.load_head(symbol, timeframe, adjustment)
+            if published is None:
+                raise MarketDataError("覆盖档案 head 发布后无法重新读取")
+            month_rows = self._published_month_rows(published, months)
+            reference = dict(published.get("_reference") or {})
             accepted_dates = {_day_text(row["trade_date"]) for row in accepted}
             with self.repository._connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                self.save_rows(accepted, db=db)
-                # The compatibility ledger is a projection of these exact
-                # accepted records, never an independently committed verdict.
-                self._write_validations(accepted, db)
+                for month in sorted(months):
+                    start = pd.Period(month, freq="M").start_time.strftime("%Y-%m-%d")
+                    end = pd.Period(month, freq="M").end_time.strftime("%Y-%m-%d")
+                    db.execute(
+                        "DELETE FROM parquet_coverage_days WHERE symbol=? AND timeframe=? "
+                        "AND adjustment=? AND trade_date>=? AND trade_date<=?",
+                        (symbol, timeframe, adjustment, start, end),
+                    )
+                    db.execute(
+                        "DELETE FROM parquet_day_validation WHERE symbol=? AND timeframe=? "
+                        "AND adjustment=? AND trade_date>=? AND trade_date<=?",
+                        (symbol, timeframe, adjustment, start, end),
+                    )
+                    month_entries = month_rows.get(month, [])
+                    self.save_rows(month_entries, db=db)
+                    self._write_validations(
+                        [row for row in month_entries if not row.get("dirty_reason")], db,
+                    )
                 self.record_archive(head, reference, db=db)
             return {**head, "_stale_dates": sorted(stale),
                     "_accepted_dates": sorted(accepted_dates),
@@ -551,6 +795,8 @@ class CoverageArchive:
         actions = self.repository.auxiliary(symbol, "actions")
         manifests = {}
         frames = {}
+        day_hashes: dict[tuple[str, str], str | None] = {}
+        dependency_hashes: dict[str, str] = {}
 
         def shard_signature(period, version, day):
             if not version:
@@ -567,6 +813,9 @@ class CoverageArchive:
                                 if str(item.get("partition_key") or item.get("period_key")) == storage))
 
         def current_hash(period, day):
+            cache_key = (str(period), _day_text(day))
+            if cache_key in day_hashes:
+                return day_hashes[cache_key]
             storage, start, end = self.repository._storage_period(period, day)
             key = (period, storage)
             if key not in frames:
@@ -576,15 +825,21 @@ class CoverageArchive:
                 )
             frame = frames[key]
             if frame.empty or "timestamp" not in frame:
+                day_hashes[cache_key] = None
                 return None
             part = frame.loc[pd.to_datetime(frame.timestamp).dt.normalize() == day]
-            return _frame_hash(part)
+            day_hashes[cache_key] = _frame_hash(part)
+            return day_hashes[cache_key]
 
         accepted, stale = [], set()
         for row in rows:
             day = pd.Timestamp(row["trade_date"]).normalize()
             day_text = _day_text(day)
-            if row.get("dependency_hash") != _dependency_hash(calendar_days, actions, day):
+            current_dependency = dependency_hashes.get(day_text)
+            if current_dependency is None:
+                current_dependency = _dependency_hash(calendar_days, actions, day)
+                dependency_hashes[day_text] = current_dependency
+            if row.get("dependency_hash") != current_dependency:
                 stale.add(day_text)
                 continue
             base = row.get("_data_version", expected_version)
@@ -642,36 +897,69 @@ class CoverageArchive:
         changed = None if changed_months is None else sorted({
             str(value)[:7] for value in changed_months if value
         })
-        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        if changed is None:
-            for row in self.rows(symbol, timeframe, adjustment):
-                grouped[_month_key(row["trade_date"])].append(row)
-        else:
-            for month in changed:
-                start = pd.Period(month, freq="M").start_time.normalize()
-                end = pd.Period(month, freq="M").end_time.normalize()
-                grouped[month] = self.rows(
-                    symbol, timeframe, adjustment, start=start, end=end,
-                )
         package = self.package.manifest()
         base = self._archive_base(symbol, timeframe, adjustment)
         reference = self.head_reference(symbol, timeframe, adjustment)
         previous_head = self.load_head(symbol, timeframe, adjustment)
-        if changed is not None and reference and previous_head is None:
-            # The manifest still names an archive, but its head cannot be read.
-            # Never publish a replacement that silently omits every month that
-            # this call did not happen to touch.  Rebuild from the SQLite mirror
-            # instead; a missing mirror will still fail closed at read time.
+        if reference and previous_head is None:
+            if not self._mirror_matches_reference(
+                reference, symbol, timeframe, adjustment,
+            ):
+                # A corrupt or missing published head must never be replaced
+                # from a potentially stale SQLite mirror: that could make
+                # published dates disappear permanently.
+                raise MarketDataError(
+                    f"已发布覆盖档案 head 无法验证，拒绝以 SQLite 镜像覆盖：{symbol} {timeframe}"
+                )
+            # The mirror explicitly records this exact published head. It can
+            # therefore recover a damaged head, but rebuild all month payloads
+            # from the mirror because the old head's unaffected month refs are
+            # no longer readable.
+            previous_head = None
             changed = None
-            grouped = defaultdict(list)
+        if previous_head is not None:
+            grouped = defaultdict(
+                list, self._published_month_rows(
+                    previous_head, None if changed is None else set(changed),
+                ),
+            )
+            if self._mirror_matches_head(previous_head):
+                # Local invalidation marks are written to SQLite before their
+                # replacement head. Carry only the dirty flag from a mirror
+                # proven to represent this exact head; never use a lagging
+                # mirror as the content merge base.
+                mirror_months = set(grouped) if changed is None else set(changed)
+                dirty_by_day = self._mirror_dirty_reasons(
+                    symbol, timeframe, adjustment,
+                    None if changed is None else mirror_months,
+                )
+                for month in mirror_months:
+                    if any(day[:7] == month for day in dirty_by_day):
+                        grouped[month] = [{
+                            **row,
+                            "dirty_reason": dirty_by_day.get(
+                                _day_text(row["trade_date"]), row.get("dirty_reason"),
+                            ),
+                        } for row in grouped.get(month, [])]
+        else:
+            grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+            # No archive head exists yet. The SQLite projection is the only
+            # seed available for the first publication.
             for row in self.rows(symbol, timeframe, adjustment):
                 grouped[_month_key(row["trade_date"])].append(row)
+            if changed is not None:
+                grouped = defaultdict(list, {
+                    month: grouped.get(month, []) for month in changed
+                })
+        updates_by_month: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
         for row in _updates:
             month = _month_key(row["trade_date"])
             # Never serialize transient worker evidence as package metadata.
             entry = {key: value for key, value in row.items() if not key.startswith("_")}
-            entries = {item["trade_date"]: item for item in grouped.get(month, [])}
-            entries[_day_text(row["trade_date"])] = entry
+            updates_by_month[month][_day_text(row["trade_date"])] = entry
+        for month, updates in updates_by_month.items():
+            entries = {_day_text(item["trade_date"]): item for item in grouped.get(month, [])}
+            entries.update(updates)
             grouped[month] = [entries[key] for key in sorted(entries)]
         calendar = self.repository.auxiliary(symbol, "calendar")
         calendar_dates = self.repository._calendar_dates((calendar or {}).get("payload") or [])
@@ -702,6 +990,7 @@ class CoverageArchive:
                 temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".writing")
                 temporary.write_bytes(raw)
                 temporary.replace(path)
+                self._remember_written_payload(relative, digest, raw)
             months.append({
                 "month": month, "path": relative, "sha256": digest,
                 "size": len(raw),
@@ -832,6 +1121,7 @@ class CoverageArchive:
         else:
             temporary.write_bytes(raw)
             temporary.replace(path)
+            self._remember_written_payload(relative, head_digest, raw)
         pending_groups: dict[str, list[str]] = defaultdict(list)
         for day, reason in unresolved.items():
             pending_groups[reason].append(day)

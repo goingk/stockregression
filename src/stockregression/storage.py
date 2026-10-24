@@ -638,7 +638,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS watchlist(symbol TEXT PRIMARY KEY,created_at TEXT);
                 CREATE TABLE IF NOT EXISTS snapshots(version TEXT PRIMARY KEY,symbol TEXT,created_at TEXT,manifest TEXT);
                 CREATE TABLE IF NOT EXISTS active_snapshots(symbol TEXT PRIMARY KEY,version TEXT);
-                CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,kind TEXT,status TEXT,progress REAL,message TEXT,error TEXT,result_id TEXT,payload TEXT,created_at TEXT,updated_at TEXT,cancel_requested INTEGER DEFAULT 0,pid INTEGER,claim_token TEXT,claimed_at TEXT,dedupe_key TEXT);
+                CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,kind TEXT,status TEXT,progress REAL,message TEXT,error TEXT,result_id TEXT,payload TEXT,created_at TEXT,updated_at TEXT,cancel_requested INTEGER DEFAULT 0,pid INTEGER,claim_token TEXT,claimed_at TEXT,dedupe_key TEXT,progress_detail TEXT);
                 CREATE TABLE IF NOT EXISTS results(id TEXT PRIMARY KEY,kind TEXT,symbol TEXT,created_at TEXT,title TEXT,path TEXT,protocol_version INTEGER,result_schema_version INTEGER,reproducible INTEGER);
                 CREATE TABLE IF NOT EXISTS configs(id TEXT PRIMARY KEY,name TEXT,config TEXT,created_at TEXT);
                 CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT);
@@ -650,6 +650,8 @@ class Store:
             for column in ("claim_token", "claimed_at", "dedupe_key"):
                 if column not in job_columns:
                     db.execute(f"ALTER TABLE jobs ADD COLUMN {column} TEXT")
+            if "progress_detail" not in job_columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN progress_detail TEXT")
             db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedupe ON jobs(dedupe_key) "
                 "WHERE dedupe_key IS NOT NULL AND status IN ('queued','running')"
@@ -733,6 +735,15 @@ class Store:
             for column in ("daily_status", "minute_status"):
                 if column not in sync_columns:
                     db.execute(f"ALTER TABLE sync_items ADD COLUMN {column} TEXT NOT NULL DEFAULT 'pending'")
+            for column, kind in (
+                ("last_attempt_job_id", "TEXT"), ("job_claim_token", "TEXT"),
+                ("attempt_token", "TEXT"), ("error_category", "TEXT"),
+                ("target_start", "TEXT"), ("target_end", "TEXT"),
+                ("data_version", "INTEGER"), ("quality_revision", "INTEGER"),
+                ("quality_status", "TEXT"), ("details", "TEXT"),
+            ):
+                if column not in sync_columns:
+                    db.execute(f"ALTER TABLE sync_items ADD COLUMN {column} {kind}")
 
     @contextmanager
     def db(self):
@@ -806,9 +817,163 @@ class Store:
         with self.db() as db:
             row = db.execute("SELECT * FROM sync_items WHERE run_key=? AND symbol=?", (run_key, symbol)).fetchone()
             if not values:
-                return dict(row) if row else None
-            item = {"status": "pending", "mode": "history", "daily_through": None, "minute_through": None, "error": None, "daily_status": "pending", "minute_status": "pending", **(dict(row) if row else {}), **values}
-            db.execute("INSERT OR REPLACE INTO sync_items(run_key,symbol,status,mode,daily_through,minute_through,error,updated_at,daily_status,minute_status) VALUES(?,?,?,?,?,?,?,?,?,?)", (run_key, symbol, item["status"], item["mode"], item["daily_through"], item["minute_through"], item["error"], now_iso(), item["daily_status"], item["minute_status"]))
+                return self._decode_sync_item(row) if row else None
+            allowed = {
+                "status", "mode", "daily_through", "minute_through", "error",
+                "daily_status", "minute_status", "last_attempt_job_id", "job_claim_token",
+                "attempt_token", "error_category", "target_start", "target_end",
+                "data_version", "quality_revision", "quality_status", "details",
+            }
+            values = {key: value for key, value in values.items() if key in allowed}
+            if not values:
+                return self._decode_sync_item(row) if row else None
+            item = {
+                "status": "pending", "mode": "history", "daily_through": None,
+                "minute_through": None, "error": None, "daily_status": "pending",
+                "minute_status": "pending",
+                **(self._decode_sync_item(row) if row else {}), **values,
+            }
+            if values.get("status") in {"running", "completed"}:
+                item["error"] = None
+                item["error_category"] = None
+            item["updated_at"] = now_iso()
+            item["details"] = dumps(item["details"]) if isinstance(item.get("details"), (dict, list, tuple)) else item.get("details")
+            columns = [
+                "run_key", "symbol",
+                *[key for key in item if key not in {"run_key", "symbol", "updated_at"}],
+                "updated_at",
+            ]
+            db.execute(
+                f"INSERT OR REPLACE INTO sync_items({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+                [run_key, symbol, *[item[key] for key in columns[2:-1]], item["updated_at"]],
+            )
+            return self._decode_sync_item(db.execute(
+                "SELECT * FROM sync_items WHERE run_key=? AND symbol=?", (run_key, symbol),
+            ).fetchone())
+
+    @staticmethod
+    def _decode_sync_item(row):
+        if row is None:
+            return None
+        item = dict(row)
+        details = item.get("details")
+        if isinstance(details, str):
+            try:
+                item["details"] = json.loads(details)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        return item
+
+    @staticmethod
+    def _decode_job(row):
+        item = dict(row)
+        item["payload"] = json.loads(item["payload"] or "null")
+        detail = item.get("progress_detail")
+        if isinstance(detail, str):
+            try:
+                item["progress_detail"] = json.loads(detail)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        item["cancel_requested"] = bool(item["cancel_requested"])
+        return item
+
+    @staticmethod
+    def _job_claim_valid(db, job_id: str, job_claim_token: str) -> bool:
+        row = db.execute(
+            "SELECT 1 FROM jobs WHERE id=? AND status='running' AND claim_token=? AND cancel_requested=0",
+            (job_id, job_claim_token),
+        ).fetchone()
+        return row is not None
+
+    def claim_sync_item(self, run_key, symbol, *, job_id, job_claim_token,
+                        attempt_token=None, mode="incremental", target_start=None,
+                        target_end=None) -> dict | None:
+        """Atomically claim a sync checkpoint for one currently owned job attempt."""
+        supplied_attempt_token = attempt_token is not None
+        attempt_token = str(attempt_token or uuid.uuid4().hex)
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not self._job_claim_valid(db, str(job_id), str(job_claim_token)):
+                return None
+            row = db.execute(
+                "SELECT * FROM sync_items WHERE run_key=? AND symbol=?", (run_key, symbol),
+            ).fetchone()
+            if row:
+                item = dict(row)
+                if item.get("status") == "running" and item.get("last_attempt_job_id"):
+                    same_owner = (
+                        item.get("last_attempt_job_id") == str(job_id)
+                        and item.get("job_claim_token") == str(job_claim_token)
+                    )
+                    owner_live = self._job_claim_valid(
+                        db, str(item.get("last_attempt_job_id")), str(item.get("job_claim_token") or ""),
+                    )
+                    if owner_live and not same_owner:
+                        return None
+                    if owner_live and same_owner:
+                        if supplied_attempt_token and item.get("attempt_token") != attempt_token:
+                            return None
+                        if not supplied_attempt_token:
+                            attempt_token = str(item.get("attempt_token") or attempt_token)
+            else:
+                item = {
+                    "status": "pending", "daily_status": "pending", "minute_status": "pending",
+                    "daily_through": None, "minute_through": None, "error": None,
+                    "error_category": None,
+                }
+            item.update({
+                "status": "running", "mode": mode, "error": None, "error_category": None,
+                "last_attempt_job_id": str(job_id), "job_claim_token": str(job_claim_token),
+                "attempt_token": attempt_token, "target_start": target_start,
+                "target_end": target_end, "updated_at": now_iso(),
+            })
+            columns = [
+                "run_key", "symbol",
+                *[key for key in item if key not in {"run_key", "symbol", "updated_at"}],
+                "updated_at",
+            ]
+            db.execute(
+                f"INSERT OR REPLACE INTO sync_items({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+                [run_key, symbol, *[item[key] for key in columns[2:-1]], item["updated_at"]],
+            )
+            return self._decode_sync_item(db.execute(
+                "SELECT * FROM sync_items WHERE run_key=? AND symbol=?", (run_key, symbol),
+            ).fetchone())
+
+    def sync_attempt_current(self, run_key, symbol, *, job_id, job_claim_token, attempt_token) -> bool:
+        with self.db() as db:
+            if not self._job_claim_valid(db, str(job_id), str(job_claim_token)):
+                return False
+            row = db.execute(
+                "SELECT 1 FROM sync_items WHERE run_key=? AND symbol=? AND status='running' "
+                "AND last_attempt_job_id=? AND job_claim_token=? AND attempt_token=?",
+                (run_key, symbol, str(job_id), str(job_claim_token), str(attempt_token)),
+            ).fetchone()
+            return row is not None
+
+    def finish_sync_item(self, run_key, symbol, *, job_id, job_claim_token, attempt_token, **values) -> bool:
+        allowed = {
+            "status", "mode", "daily_through", "minute_through", "error", "daily_status",
+            "minute_status", "error_category", "target_start", "target_end", "data_version",
+            "quality_revision", "quality_status", "details",
+        }
+        values = {key: value for key, value in values.items() if key in allowed}
+        if not values:
+            return False
+        if "details" in values and isinstance(values["details"], (dict, list, tuple)):
+            values["details"] = dumps(values["details"])
+        values["updated_at"] = now_iso()
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not self._job_claim_valid(db, str(job_id), str(job_claim_token)):
+                return False
+            cursor = db.execute(
+                "UPDATE sync_items SET " + ",".join(f"{key}=?" for key in values) +
+                " WHERE run_key=? AND symbol=? AND status='running' AND last_attempt_job_id=? "
+                "AND job_claim_token=? AND attempt_token=?",
+                [*values.values(), run_key, symbol, str(job_id), str(job_claim_token), str(attempt_token)],
+            )
+            return cursor.rowcount > 0
 
     def sync_status(self, run_key=None, status=None, limit=100, offset=0):
         conditions, arguments = [], []
@@ -820,7 +985,7 @@ class Store:
         with self.db() as db:
             counts = {row[0]: row[1] for row in db.execute("SELECT status,COUNT(*) FROM sync_items" + where + " GROUP BY status", arguments)}
             rows = db.execute("SELECT * FROM sync_items" + where + " ORDER BY updated_at DESC,symbol LIMIT ? OFFSET ?", [*arguments, limit, offset]).fetchall()
-        return {"items": [dict(row) for row in rows], "counts": counts, "total": sum(counts.values())}
+        return {"items": [self._decode_sync_item(row) for row in rows], "counts": counts, "total": sum(counts.values())}
 
     def state(self, key: str, value: Any = ...):
         with self.db() as db:
@@ -927,7 +1092,7 @@ class Store:
             db.execute("INSERT OR REPLACE INTO active_snapshots VALUES(?,?)", (symbol, version))
         return self.snapshot(symbol, version)
 
-    def put_market_snapshot(self, manifest: dict, symbol: str):
+    def put_market_snapshot(self, manifest: dict, symbol: str, *, repository=None):
         """Register a snapshot whose bar payload lives in frequency databases."""
         symbol = normalize_symbol(symbol)
         version = manifest["version"]
@@ -936,7 +1101,7 @@ class Store:
         with self.db() as db:
             db.execute("INSERT OR IGNORE INTO snapshots VALUES(?,?,?,?)", (version, symbol, created, dumps(manifest)))
             db.execute("INSERT OR REPLACE INTO active_snapshots VALUES(?,?)", (symbol, version))
-        return self.snapshot(symbol, version)
+        return self.snapshot(symbol, version, **({"repository": repository} if repository is not None else {}))
 
     def remember_market_snapshots(self, manifests: list[dict]) -> None:
         """Register a frozen cohort in one transaction without changing active heads.
@@ -952,7 +1117,8 @@ class Store:
         with self.db() as db:
             db.executemany("INSERT OR IGNORE INTO snapshots VALUES(?,?,?,?)", records)
 
-    def snapshot(self, symbol: str, version: str | None = None, *, persist: bool = True) -> dict | None:
+    def snapshot(self, symbol: str, version: str | None = None, *, persist: bool = True,
+                 repository=None) -> dict | None:
         symbol = normalize_symbol(symbol)
         with self.db() as db:
             if version:
@@ -964,7 +1130,7 @@ class Store:
             if version is not None and manifest.get("market_data"):
                 try:
                     from .market_data.repository import MarketDataRepository
-                    repository = MarketDataRepository(self.root)
+                    repository = repository or MarketDataRepository(self.root)
                     package = repository.package.manifest()
                     if (
                         manifest.get("package_id") != package.get("package_id")
@@ -1054,11 +1220,12 @@ class Store:
         allowed = {
             "status", "progress", "message", "error", "result_id",
             "cancel_requested", "pid", "payload", "claim_token", "claimed_at",
-            "dedupe_key",
+            "dedupe_key", "progress_detail",
         }
         values = {k: v for k, v in values.items() if k in allowed}
-        if "payload" in values:
-            values["payload"] = dumps(values["payload"])
+        for key in ("payload", "progress_detail"):
+            if key in values:
+                values[key] = dumps(values[key])
         if not values:
             return False
         values["updated_at"] = now_iso()
@@ -1159,10 +1326,7 @@ class Store:
             ).fetchall()
         values = []
         for row in rows:
-            item = dict(row)
-            item["payload"] = json.loads(item["payload"])
-            item["cancel_requested"] = bool(item["cancel_requested"])
-            values.append(item)
+            values.append(self._decode_job(row))
         return values
 
     def job(self, job_id: str) -> dict | None:
@@ -1170,10 +1334,7 @@ class Store:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             return None
-        result = dict(row)
-        result["payload"] = json.loads(result["payload"])
-        result["cancel_requested"] = bool(result["cancel_requested"])
-        return result
+        return self._decode_job(row)
 
     def jobs(self, limit=100, *, status: str | None = None,
              kind: str | None = None, offset: int = 0):
@@ -1194,10 +1355,7 @@ class Store:
             ).fetchall()
         values = []
         for row in rows:
-            item = dict(row)
-            item["payload"] = json.loads(item["payload"])
-            item["cancel_requested"] = bool(item["cancel_requested"])
-            values.append(item)
+            values.append(self._decode_job(row))
         return values
 
     def job_history(self, limit: int = 50, *, offset: int = 0,
@@ -1225,10 +1383,7 @@ class Store:
             ).fetchall()
         items = []
         for row in rows:
-            item = dict(row)
-            item["payload"] = json.loads(item["payload"])
-            item["cancel_requested"] = bool(item["cancel_requested"])
-            items.append(item)
+            items.append(self._decode_job(row))
         return {
             "items": items, "total": total, "offset": page_offset,
             "limit": page_limit, "status": status, "kind": kind,
@@ -1244,10 +1399,7 @@ class Store:
             ).fetchall()
         values = []
         for row in rows:
-            item = dict(row)
-            item["payload"] = json.loads(item["payload"])
-            item["cancel_requested"] = bool(item["cancel_requested"])
-            values.append(item)
+            values.append(self._decode_job(row))
         return values
 
     def recent_submitted_symbols(self, limit: int = 10) -> list[dict[str, str]]:
@@ -1309,20 +1461,22 @@ class Store:
             for symbol, submitted_at in list(recent.items())[:limit]
         ]
 
-    def save_result(self, kind: str, result: dict, symbol: str, title: str) -> str:
-        result_id = uuid.uuid4().hex
+    def save_result(self, kind: str, result: dict, symbol: str, title: str, *, result_id: str | None = None) -> str:
+        result_id = str(result_id or uuid.uuid4().hex)
         folder = self.root / "results"
         folder.mkdir(exist_ok=True)
         target = folder / f"{result_id}.json"
         payload = {**result, "id": result_id}
         if result.get("protocol_version") == 5:
             payload = _detach_candidate_archives(self.root, payload)
-        target.write_text(dumps(payload), encoding="utf-8")
+        temporary = folder / f".{result_id}.{uuid.uuid4().hex}.writing"
+        temporary.write_text(dumps(payload), encoding="utf-8")
+        temporary.replace(target)
         provenance = result.get("computation_provenance") if isinstance(result.get("computation_provenance"), dict) else {}
         reproducible = provenance.get("reproducible") if provenance else None
         with self.db() as db:
             db.execute(
-                "INSERT INTO results(id,kind,symbol,created_at,title,path,protocol_version,result_schema_version,reproducible) "
+                "INSERT OR REPLACE INTO results(id,kind,symbol,created_at,title,path,protocol_version,result_schema_version,reproducible) "
                 "VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     result_id, kind, symbol, now_iso(), title, str(target.relative_to(self.root)),

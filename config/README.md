@@ -111,6 +111,7 @@
 | `market_data.cache_mb` | MiB | `256` | 0–16384 | ByteLRU | 文件 | 保存后配置缓存 | 否 |
 | `market_data.recent_minute_source` | 枚举 | `sina` | sina/tdx | 近期分钟主来源；同花顺为自动回退 | 文件 / 数据操作 | 新同步 | 否 |
 | `market_data.etf_daily_source` | 枚举 | `baostock` | baostock/eastmoney | ETF 日线来源 | 文件 / 数据操作 | 新同步 | 否 |
+| `market_data.etf_daily_fallback_enabled` | 布尔 | `true` | 布尔值；只允许使用产品类型匹配且 24 小时内显式探测通过的 Eastmoney 备用源 | ETF 日线备用路由 | 文件 | 新同步 | 否 |
 | `market_data.network_timeout_seconds` | 秒 | `15` | 1–300 | HTTP 请求 | 文件 | 下次请求 | 否 |
 | `market_data.request_retries` | 次数 | `1` | 0–5 | 来源重试 | 文件 | 下次请求 | 否 |
 | `market_data.failure_cooldown_hours` | 小时 | `24` | 0–720 | 来源健康 | 文件 / 数据诊断 | 下次请求 | 否 |
@@ -150,6 +151,8 @@
 | `schedule.weekly_time` | HH:MM | `10:00` | 安装时校验 | 周末核对 | 数据中心 | 下次安装 | 否 |
 | `schedule.subprocess_timeout_seconds` | 秒 | `45` | 5–900 | 计划任务子进程 | 文件 | 下次安装 | 否 |
 | `schedule.lock_timeout_seconds` | 秒 | `30` | 1–300 | 计划任务锁 | 文件 | 下次安装 | 否 |
+
+ETF 日线来源资格只由显式来源探测写入，按产品类型分别记录并在 24 小时后失效；普通同步产生的 `passed` 健康状态不能授予备用源资格。无法从现有证券元数据确认 ETF/LOF/REIT 类型时不尝试 Eastmoney。空响应不会登记为来源成功，也不会推进行情覆盖水位；备用源返回的数据仍须完成原请求区间的行情质量校验，首次历史同步必须建立完整质量账本。
 
 ## 拒绝与恢复
 

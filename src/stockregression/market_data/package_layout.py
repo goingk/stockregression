@@ -6,6 +6,8 @@ import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ from .timeframes import normalize_timeframe
 PACKAGE_SCHEMA_VERSION = 2
 ETF_PREFIXES = {"15", "16", "50", "51", "52", "56", "58"}
 _MANIFEST_THREAD_LOCK = threading.RLock()
+_PUBLICATION_CHECKS = ContextVar("package_publication_checks", default={})
 
 
 def is_package_root(path: str | Path) -> bool:
@@ -99,8 +102,9 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 class PackageLayout:
     """Stable on-disk identity and publication metadata for one data package."""
 
-    def __init__(self, root: str | Path, *, market_settings=None):
+    def __init__(self, root: str | Path, *, market_settings=None, read_only: bool = False):
         self.root = Path(root).expanduser().resolve()
+        self.read_only = read_only
         from ..settings import load_settings
 
         self.market_settings = market_settings or load_settings().market_data
@@ -118,10 +122,11 @@ class PackageLayout:
         self.manifest_path = self.control / "manifest.json"
         self._transaction_lock = FileLock(
             str(self.control / "transactions.lock"), timeout=self.lock_timeout,
+            is_singleton=True,
         )
         self._manifest_cache: dict[str, Any] | None = None
         self._manifest_cache_key: tuple[int, int] | None = None
-        for path in (
+        for path in (() if read_only else (
             self.root,
             self.control,
             self.versions_dir,
@@ -132,7 +137,7 @@ class PackageLayout:
             self.staging_dir,
             self.transactions_dir,
             self.locks_dir,
-        ):
+        )):
             path.mkdir(parents=True, exist_ok=True)
 
     def _load_manifest(self) -> dict[str, Any]:
@@ -145,6 +150,8 @@ class PackageLayout:
         return {}
 
     def _manifest_guard(self):
+        if self.read_only:
+            return nullcontext()
         lock = FileLock(str(self.control / "manifest.lock"), timeout=self.lock_timeout)
 
         class Guard:
@@ -227,6 +234,7 @@ class PackageLayout:
         dependent_pending_updates: dict[str, list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         """Publish one immutable dataset manifest, then atomically advance its package head."""
+        self.check_publication()
         symbol = str(payload["symbol"])
         timeframe = normalize_timeframe(str(payload["timeframe"]))
         adjustment = str(payload.get("adjustment") or "none")
@@ -339,6 +347,7 @@ class PackageLayout:
             package["partition_root"] = "partitions"
             package["schema_version"] = PACKAGE_SCHEMA_VERSION
             package["updated_at"] = utc_now()
+            self.check_publication()
             _atomic_json(self.manifest_path, package)
             return self._remember_manifest(package)
 
@@ -358,6 +367,7 @@ class PackageLayout:
         package head.  The monthly archive files themselves are immutable and
         content addressed; only this small reference advances.
         """
+        self.check_publication()
         timeframe = normalize_timeframe(timeframe)
         key = self.dataset_key(symbol, timeframe, adjustment)
         relative = str(reference.get("path") or "").replace("\\", "/")
@@ -396,6 +406,7 @@ class PackageLayout:
             package["package_version"] = int(package.get("package_version", 0)) + 1
             package["schema_version"] = PACKAGE_SCHEMA_VERSION
             package["updated_at"] = utc_now()
+            self.check_publication()
             _atomic_json(self.manifest_path, package)
             return self._remember_manifest(package)
 
@@ -440,9 +451,12 @@ class PackageLayout:
             if cached is not None:
                 return cached
             raw = self._load_manifest()
+            if self.read_only and not raw:
+                raise ValueError("只读下载上下文要求已发布的数据包清单")
             value = self._fresh_manifest(raw)
-            if value != raw:
+            if value != raw and not self.read_only:
                 value["updated_at"] = utc_now()
+                self.check_publication()
                 _atomic_json(self.manifest_path, value)
             return self._remember_manifest(value)
 
@@ -451,6 +465,7 @@ class PackageLayout:
             value = self._fresh_manifest(manifest)
             value["schema_version"] = PACKAGE_SCHEMA_VERSION
             value["updated_at"] = utc_now()
+            self.check_publication()
             _atomic_json(self.manifest_path, value)
             return self._remember_manifest(value)
 
@@ -483,6 +498,7 @@ class PackageLayout:
             manifest["index_only"] = False
             manifest["schema_version"] = PACKAGE_SCHEMA_VERSION
             manifest["updated_at"] = utc_now()
+            self.check_publication()
             _atomic_json(self.manifest_path, manifest)
             return self._remember_manifest(manifest)
 
@@ -501,16 +517,19 @@ class PackageLayout:
             }
             manifest["schema_version"] = PACKAGE_SCHEMA_VERSION
             manifest["updated_at"] = utc_now()
+            self.check_publication()
             _atomic_json(self.manifest_path, manifest)
             return self._remember_manifest(manifest)
 
     def write_quality(self, symbol: str, timeframe: str, payload: dict[str, Any]) -> None:
+        self.check_publication()
         digest = hashlib.sha256(
             f"{symbol}|{normalize_timeframe(timeframe)}".encode()
         ).hexdigest()[:16]
         _atomic_json(self.quality_dir / f"{symbol}-{digest}.json", payload)
 
     def write_version_manifest(self, version: str, payload: dict[str, Any]) -> None:
+        self.check_publication()
         safe = "".join(char for char in str(version) if char.isalnum() or char in "-_.")
         if safe:
             _atomic_json(self.versions_dir / f"{safe}.json", payload)
@@ -546,6 +565,7 @@ class PackageLayout:
             manifest["files"][relative_path] = entry
             manifest["schema_version"] = PACKAGE_SCHEMA_VERSION
             manifest["updated_at"] = utc_now()
+            self.check_publication()
             _atomic_json(self.manifest_path, manifest)
             self._remember_manifest(manifest)
 
@@ -553,6 +573,7 @@ class PackageLayout:
         return dict(self.manifest()["files"].get(str(relative_path).replace("\\", "/")) or {})
 
     def begin_transaction(self, payload: dict[str, Any]) -> tuple[str, Path]:
+        self.check_publication()
         transaction_id = uuid.uuid4().hex
         path = self.transactions_dir / f"{transaction_id}.json"
         _atomic_json(path, {"id": transaction_id, "status": "prepared", **payload})
@@ -561,6 +582,24 @@ class PackageLayout:
     def transaction_guard(self):
         """Serialize publication and recovery across threads and processes."""
         return self._transaction_lock
+
+    @contextmanager
+    def publication_fence(self, check):
+        """Carry the attempt claim to each atomic head switch in this context."""
+        checks = {**_PUBLICATION_CHECKS.get(), str(self.root): check}
+        token = _PUBLICATION_CHECKS.set(checks)
+        try:
+            check()
+            yield
+        finally:
+            _PUBLICATION_CHECKS.reset(token)
+
+    def check_publication(self):
+        if self.read_only:
+            raise ValueError("只读下载上下文不能发布数据包")
+        check = _PUBLICATION_CHECKS.get().get(str(self.root))
+        if check is not None:
+            check()
 
     def update_transaction(self, path: Path, values: dict[str, Any]) -> None:
         # A vanished transaction was completed elsewhere. Never resurrect it

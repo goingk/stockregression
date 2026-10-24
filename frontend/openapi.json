@@ -2160,7 +2160,13 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/JobResponse"
+                  },
+                  "title": "Response Jobs Api V1 Jobs Get"
+                }
               }
             }
           },
@@ -2245,7 +2251,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JobHistoryResponse"
+                }
               }
             }
           },
@@ -2271,7 +2279,13 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/JobResponse"
+                  },
+                  "type": "array",
+                  "title": "Response Active Jobs Api V1 Jobs Active Get"
+                }
               }
             }
           }
@@ -2298,7 +2312,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
               }
             }
           },
@@ -2335,7 +2351,9 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
               }
             }
           },
@@ -4359,6 +4377,333 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
+      "JobHistoryResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/JobResponse"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "offset": {
+            "type": "integer",
+            "title": "Offset"
+          },
+          "limit": {
+            "type": "integer",
+            "title": "Limit"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "kinds": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Kinds"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "items",
+          "total",
+          "offset",
+          "limit",
+          "kinds"
+        ],
+        "title": "JobHistoryResponse"
+      },
+      "JobProgressDetail": {
+        "properties": {
+          "stage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage"
+          },
+          "symbol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Symbol"
+          },
+          "checked_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Checked Days"
+          },
+          "total_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Days"
+          },
+          "counts": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "integer"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Counts"
+          },
+          "resources": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "integer"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Resources"
+          },
+          "cutoff_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cutoff Date"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "title": "JobProgressDetail"
+      },
+      "JobResponse": {
+        "properties": {
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "progress": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Progress"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "result_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Result Id"
+          },
+          "payload": {
+            "title": "Payload"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "cancel_requested": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cancel Requested"
+          },
+          "pid": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pid"
+          },
+          "claim_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claim Token"
+          },
+          "claimed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Claimed At"
+          },
+          "dedupe_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dedupe Key"
+          },
+          "progress_detail": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobProgressDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "title": "JobResponse"
+      },
       "MarketAggregateRequest": {
         "properties": {
           "symbols": {
@@ -4689,6 +5034,11 @@
             "title": "Etf Daily Source",
             "default": "baostock"
           },
+          "etf_daily_fallback_enabled": {
+            "type": "boolean",
+            "title": "Etf Daily Fallback Enabled",
+            "default": true
+          },
           "network_timeout_seconds": {
             "type": "number",
             "maximum": 300.0,
@@ -5017,6 +5367,33 @@
             ],
             "title": "Market",
             "default": "all"
+          },
+          "product_type": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "etf",
+                  "lof",
+                  "reit"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Product Type"
+          },
+          "sample_symbol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sample Symbol"
           }
         },
         "type": "object",

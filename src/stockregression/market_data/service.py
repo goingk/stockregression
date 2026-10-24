@@ -160,12 +160,14 @@ class MarketDataService:
         package_dir: str | Path | None = None,
         *,
         settings: Settings | None = None,
+        read_only: bool = False,
     ):
         self.settings = settings or load_settings()
         self.store = store_or_root if isinstance(store_or_root, Store) else Store(store_or_root)
         self.repository = MarketDataRepository(
             self.store.root, package_dir=package_dir,
             market_settings=self.settings.market_data,
+            initialize=not read_only,
         )
 
     @staticmethod
@@ -788,6 +790,7 @@ class MarketDataService:
         metadata = instrument_terms(symbol, metadata)
         report = {**validation.report, "pending_validation": validation.pending,
                   "reason": "; ".join(validation.pending) or None}
+        merge_started = time.perf_counter()
         result = self.repository.commit_bars(
             symbol, timeframe, validation.frame, adjustment=adjustment, source=source,
             file_name=file_name, fingerprint=fingerprint, params_hash=params_hash,
@@ -799,6 +802,8 @@ class MarketDataService:
             import_mode=import_mode,
             include_preloaded=True,
         )
+        merge_seconds = time.perf_counter() - merge_started
+        record_seconds("merge", merge_seconds)
         preloaded_months = result.pop("_preloaded_months", None)
         self.repository.save_coverage(
             symbol, timeframe, adjustment, min(validation.frame.timestamp.min(), pd.Timestamp(coverage_start) if coverage_start is not None else validation.frame.timestamp.min()),
@@ -848,15 +853,25 @@ class MarketDataService:
             )
             if validation_end is None and len(calendar_dates):
                 task_end = max(pd.Timestamp(task_end), calendar_dates.max().normalize())
+        if timeframe == "1day":
+            # Selection reads ledger metadata; only absent/dirty target days read bars.
+            # A partial prior bootstrap must finish even when recent bars are unchanged.
+            task_start = current_dataset.get("first_time") or task_start
+        history_started = time.perf_counter()
         ledger = validate_incremental(
             self, symbol, timeframe, mode="incremental",
             start=task_start, end=task_end,
             adjustment=adjustment,
             preloaded_months=preloaded_months,
-            progress=lambda fraction, message: progress(0.8 + 0.15 * fraction, message),
+            progress=lambda fraction, message: progress(0.8 + 0.15 * fraction, ("建立历史账本 " + message) if not had_archive else message),
             cancelled=cancelled,
         )
+        history_seconds = max(0.0, time.perf_counter() - history_started - float(ledger.get("ledger_publication_seconds") or 0))
+        record_seconds("history_validation", history_seconds)
         metrics = {
+            "merge_seconds": round(merge_seconds, 6),
+            "ledger_publication_seconds": round(float(ledger.get("ledger_publication_seconds") or 0), 6),
+            "history_validation_seconds": round(history_seconds, 6),
             "seconds": round(time.perf_counter() - started_at, 4),
             "rows_read": int(result.get("rows_read") or 0),
             "bytes_written": int(result.get("bytes") or 0),
@@ -869,7 +884,10 @@ class MarketDataService:
         }
         self.store.put_instrument(symbol, **{key: value for key, value in metadata.items() if key not in {"symbol", "name"}})
         self.repository.save_basic_info(symbol, metadata)
+        snapshot_started = time.perf_counter()
         self.refresh_snapshot(symbol)
+        metrics["snapshot_seconds"] = round(time.perf_counter() - snapshot_started, 6)
+        record_seconds("snapshot", metrics["snapshot_seconds"])
         progress(1.0, "行情已写入本地 Parquet 行情库")
         return FileImportResult(
             symbol, timeframe, result["status"], version=result["version"],
@@ -884,7 +902,10 @@ class MarketDataService:
             shard_count=int(result.get("shard_count") or 0),
             layout=result.get("layout"),
             metrics=metrics,
-        ).as_dict()
+        ).as_dict() | {"last_time": current_dataset.get("last_time"),
+                       "quality_status": ledger["status"],
+                       "quality_revision": ledger.get("archive_revision"),
+                       "verified_through": ledger.get("verified_through")}
 
     def _verify_volume_units(self, symbol, timeframe, frame):
         daily = self.repository.active_rows(
@@ -2119,17 +2140,18 @@ class MarketDataService:
         instrument = self.store.instrument(symbol) or instrument_terms(symbol, {"name": symbol})
         versions = market["market_versions"]
         daily = versions.get("1day", {})
+        actions = self.repository.auxiliary(symbol, "actions")
         metadata = {
             **instrument, "market_data": True, "is_demo": False,
             "daily_through": daily.get("last", "")[0:10] if daily else None,
             "minute_through": max((item.get("last") or "" for name, item in versions.items() if name.endswith("min")), default=None),
-            "actions_verified": self.repository.auxiliary(symbol, "actions") is not None,
+            "actions_verified": bool(actions and actions.get("verified")),
             "warnings": [], "quality_warnings": [],
         }
         market["metadata"] = metadata
         # The version was computed before metadata was attached; retain its
         # identity because the referenced market database versions are stable.
-        self.store.put_market_snapshot(market, symbol)
+        self.store.put_market_snapshot(market, symbol, repository=self.repository)
         self.repository.package.write_version_manifest(market["version"], market)
         return market
 

@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -114,6 +114,7 @@ def _time_text(value: Any) -> str:
 def _serialized_package(method):
     @wraps(method)
     def guarded(self, *args, **kwargs):
+        self._assert_writable_context()
         with self.package.transaction_guard():
             return method(self, *args, **kwargs)
     return guarded
@@ -128,6 +129,7 @@ class MarketDataRepository:
         package_dir: str | Path | None = None,
         *,
         market_settings=None,
+        initialize: bool = True,
     ):
         from ..settings import load_settings
 
@@ -135,6 +137,16 @@ class MarketDataRepository:
         self.db_path = self.root / "catalog.sqlite"
         self.market_settings = market_settings or load_settings().market_data
         self.sqlite_timeout = int(self.market_settings.sqlite_timeout_seconds)
+        self._read_only = not initialize
+        if not initialize:
+            if package_dir is None:
+                raise MarketDataError("只读下载上下文必须指定已初始化的数据包")
+            self.package = PackageLayout(package_dir, market_settings=self.market_settings, read_only=True)
+            self.package.manifest()
+            self.package_dir = self.package.root
+            self.market_dir = self.package_dir
+            self.staging_dir = self.package.staging_dir
+            return
         for timeframe in TIMEFRAMES:
             (self.root / "imports" / timeframe).mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
@@ -215,11 +227,18 @@ class MarketDataRepository:
 
     def _restore_published_archives(self, *, force: bool = False) -> int:
         """Reconcile the SQLite coverage mirror with manifest-published heads."""
+        self._assert_writable_context()
         from .coverage_index import CoverageArchive
 
         package = self.package.manifest()
         archive = CoverageArchive(self)
         restored = 0
+        with self._connect() as db:
+            indexed_heads = {
+                (row["symbol"], row["timeframe"], row["adjustment"]): row
+                for row in db.execute("SELECT symbol,timeframe,adjustment,data_version,revision,path,sha256 FROM parquet_coverage_archives")
+            }
+        cleanup = []
         for key, head in (package.get("datasets") or {}).items():
             try:
                 symbol, timeframe, adjustment = str(key).split("|", 2)
@@ -227,22 +246,9 @@ class MarketDataRepository:
             except (TypeError, ValueError):
                 continue
             reference = dict(head.get("quality_archive") or {})
-            with self._connect() as db:
-                indexed = db.execute(
-                    "SELECT data_version,revision,path,sha256 "
-                    "FROM parquet_coverage_archives WHERE symbol=? AND timeframe=? AND adjustment=?",
-                    (symbol, timeframe, adjustment),
-                ).fetchone()
+            indexed = indexed_heads.get((symbol, timeframe, adjustment))
             if not reference:
-                with self._connect() as db:
-                    db.execute(
-                        "DELETE FROM parquet_coverage_days WHERE symbol=? AND timeframe=? AND adjustment=?",
-                        (symbol, timeframe, adjustment),
-                    )
-                    db.execute(
-                        "DELETE FROM parquet_coverage_archives WHERE symbol=? AND timeframe=? AND adjustment=?",
-                        (symbol, timeframe, adjustment),
-                    )
+                cleanup.append((symbol, timeframe, adjustment))
                 continue
             if not force and indexed and (
                 int(indexed["revision"] or 0) == int(reference.get("revision") or 0)
@@ -253,21 +259,26 @@ class MarketDataRepository:
                 continue
             loaded = archive.load_head(symbol, timeframe, adjustment)
             if not loaded:
-                with self._connect() as db:
-                    db.execute(
-                        "DELETE FROM parquet_coverage_days WHERE symbol=? AND timeframe=? AND adjustment=?",
-                        (symbol, timeframe, adjustment),
-                    )
-                    db.execute(
-                        "DELETE FROM parquet_coverage_archives WHERE symbol=? AND timeframe=? AND adjustment=?",
-                        (symbol, timeframe, adjustment),
-                    )
+                cleanup.append((symbol, timeframe, adjustment))
                 continue
             if int(loaded.get("data_version") or 0) > int(head.get("version") or 0):
                 continue
             count = archive.restore({"payload": loaded})
             archive.record_archive(loaded, reference)
             restored += count
+        if cleanup:
+            # No-op deletes used to open and commit a catalog connection for
+            # every unarchived dataset. Reconcile all such mirrors together.
+            with self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.executemany(
+                    "DELETE FROM parquet_coverage_days WHERE symbol=? AND timeframe=? AND adjustment=?",
+                    cleanup,
+                )
+                db.executemany(
+                    "DELETE FROM parquet_coverage_archives WHERE symbol=? AND timeframe=? AND adjustment=?",
+                    cleanup,
+                )
         return restored
 
     def attach_package(self, package_dir: str | Path) -> None:
@@ -334,6 +345,15 @@ class MarketDataRepository:
 
     @contextmanager
     def _connect(self):
+        if getattr(self, "_read_only", False):
+            connection = sqlite3.connect(self.db_path.as_uri() + "?mode=ro", uri=True, timeout=self.sqlite_timeout)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            try:
+                yield connection
+            finally:
+                connection.close()
+            return
         from ..sqlite_catalog import catalog_connection
 
         with catalog_connection(self.db_path, self.sqlite_timeout, synchronous="NORMAL") as connection:
@@ -495,10 +515,16 @@ class MarketDataRepository:
             )
 
     def _assert_writable(self) -> None:
+        if getattr(self, "_read_only", False):
+            raise MarketDataError("下载上下文不能发布或恢复数据包")
         if (self.root / ".market-data-migration.lock").exists():
             raise MarketDataError("行情数据迁移期间暂停写入，请稍后重试")
         if self.package.pending_transactions():
             raise MarketDataError("数据包有待恢复事务，请重启服务恢复索引后再写入")
+
+    def _assert_writable_context(self) -> None:
+        if getattr(self, "_read_only", False):
+            raise MarketDataError("下载上下文不能发布或恢复数据包")
 
     @property
     def source_package(self) -> Path | None:
@@ -602,6 +628,8 @@ class MarketDataRepository:
                 and set(payload) <= {"id", "status"}
                 and payload.get("status") == "needs_rebuild"
             ):
+                if payload.get("id") != transaction.stem:
+                    raise MarketDataError(f"旧事务记录身份与文件名不一致：{transaction.name}")
                 # Earlier recovery could resurrect a just-completed transaction
                 # with no dataset fields. Validate published shards and rebuild
                 # from immutable manifests before retaining the damaged record.
@@ -1132,6 +1160,8 @@ class MarketDataRepository:
         )
 
     def file_lock(self, path: str | Path) -> FileLock:
+        if getattr(self, "_read_only", False):
+            return nullcontext()
         relative = self.package.relative(path)
         return self.package.lock_for("file:" + relative)
 
@@ -3363,6 +3393,45 @@ class MarketDataRepository:
         values = values.normalize().unique().sort_values()
         return values[(values >= first) & (values <= last)]
 
+    def _ledger_expected_dates(self, symbol, first, last, calendar_dates):
+        """Reuse a fully checked daily series and its explicit market changes.
+
+        This only enumerates expected dates; individual verdicts still undergo
+        normal version, dependency, pending-date and file checks below.
+        Incomplete bootstraps retain the timestamp-reading fallback.
+        """
+        from .coverage_index import CoverageArchive
+
+        archive = CoverageArchive(self)
+        head = archive.load_head(symbol, "1day", "none")
+        if not head or head.get("failed_count") or head.get("pending_count"):
+            return None
+        verified, data_end = head.get("verified_through"), head.get("data_end")
+        if not verified or not data_end or pd.Timestamp(verified).normalize() < pd.Timestamp(data_end).normalize():
+            return None
+        with self._connect() as db:
+            row = self._dataset_row(db, symbol, "1day", "none")
+        if not row:
+            return None
+        updates = list(head.get("_pending_updates") or [])
+        if int(head.get("data_version") or 0) != int(row["current_version"]) and not updates:
+            return None
+        if self._read_only:
+            dates = [entry["trade_date"] for entry in archive.rows(
+                symbol, "1day", "none", start=first, end=last,
+            )]
+        else:
+            archive._ensure_mirror(symbol, "1day", "none")
+            with self._connect() as db:
+                dates = [entry[0] for entry in db.execute(
+                    "SELECT trade_date FROM parquet_coverage_days WHERE symbol=? "
+                    "AND timeframe='1day' AND adjustment='none' AND trade_date>=? AND trade_date<=?",
+                    (symbol, str(first.date()), str(last.date())),
+                )]
+        dates.extend(value for update in updates for value in (update.get("dates") or []))
+        values = calendar_dates.append(pd.DatetimeIndex(pd.to_datetime(dates))).normalize().unique().sort_values()
+        return values[(values >= first) & (values <= last)]
+
     @staticmethod
     def _calendar_dates(payload) -> pd.DatetimeIndex:
         if not payload:
@@ -3760,10 +3829,15 @@ class MarketDataRepository:
             calendar_dates = self._calendar_dates(
                 calendar.get("payload") if calendar else None
             )
-            expected_dates = self.trading_days(
-                symbol, first, last, calendar_version=active_calendar,
-                daily_version=effective_daily_version,
+            expected_dates = (
+                self._ledger_expected_dates(symbol, first, last, calendar_dates)
+                if timeframe == "1day" and effective_daily_version == current_daily_version else None
             )
+            if expected_dates is None:
+                expected_dates = self.trading_days(
+                    symbol, first, last, calendar_version=active_calendar,
+                    daily_version=effective_daily_version,
+                )
         from .coverage_index import CoverageArchive
 
         archive_index = CoverageArchive(self)
@@ -4029,6 +4103,7 @@ class MarketDataRepository:
                 previous_payload = pd.read_parquet(destination).to_dict("records")
             except (OSError, ValueError):
                 previous_payload = []
+        backup = None
         if destination.exists():
             backup_dir = self.package.history_dir / "auxiliary" / symbol / kind
             backup_dir.mkdir(parents=True, exist_ok=True)
@@ -4040,8 +4115,23 @@ class MarketDataRepository:
                 shutil.copy2(destination, backup)
         temporary = destination.with_name(destination.name + ".writing")
         frame.to_parquet(temporary, compression="zstd", index=False)
+        manifest_before = self.package.manifest_path.read_bytes()
+        self.package.check_publication()
         os.replace(temporary, destination)
-        self.package.record_auxiliary(relative, version=str(version), verified=verified)
+        try:
+            self.package.record_auxiliary(relative, version=str(version), verified=verified)
+        except BaseException:
+            # The claim may be revoked between replacing this mutable file and
+            # switching its manifest metadata. Restore the previous published
+            # bytes while the package transaction lock still excludes writers.
+            # If the manifest already advanced, retain the published file.
+            if self.package.manifest_path.read_bytes() == manifest_before:
+                if backup is not None:
+                    shutil.copy2(backup, temporary)
+                    os.replace(temporary, destination)
+                else:
+                    destination.unlink(missing_ok=True)
+            raise
         with self._connect() as db:
             db.execute(
                 """INSERT OR REPLACE INTO parquet_auxiliary_history(

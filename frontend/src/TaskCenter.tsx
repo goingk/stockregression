@@ -5,6 +5,7 @@ import { get, post } from './api'
 import { Badge, Button, Empty, JobProgress, money, percent } from './components'
 import { DataTaskReport } from './DataTaskReport'
 import { isActiveJob, isEtfResearchJob, mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds, taskLabel, taskStatusLabel, taskNoticeMessage } from './taskState'
+import { canResumeMarketSync, syncProgressLines } from './types'
 import type { Job } from './types'
 import { useWorkbenchDefaults } from './useWorkbenchDefaults'
 import { LatestRequest } from './requestState'
@@ -158,11 +159,19 @@ function ResultCounts({ counts }: { counts: Record<string, unknown> }) {
   return <div className="task-result-counts">{entries.map(([key, value]) => <span key={key}><small>{COUNT_LABELS[key] ?? key}</small><strong>{String(value)}</strong></span>)}</div>
 }
 
-function TaskDetail({ job, cancelling, onBack, onCancel, onOpenResult }: {
+function SyncProgress({ job }: { job: Job }) {
+  const lines = syncProgressLines(job.progress_detail)
+  if (!lines.length) return null
+  return <div className="task-sync-progress" aria-label="行情同步实际进度">{lines.map((line, index) => <small key={index}>{line}</small>)}</div>
+}
+
+function TaskDetail({ job, cancelling, resuming, onBack, onCancel, onResume, onOpenResult }: {
   job: Job
   cancelling: boolean
+  resuming: boolean
   onBack: () => void
   onCancel: (id: string) => void
+  onResume: (id: string) => void
   onOpenResult: (job: Job) => void
 }) {
   const facts = useMemo(() => taskRequestFacts(job), [job.payload])
@@ -198,6 +207,7 @@ function TaskDetail({ job, cancelling, onBack, onCancel, onOpenResult }: {
     <div className="task-detail-top"><Button variant="quiet" onClick={onBack}><ArrowLeft size={14} />返回任务列表</Button><Badge tone={job.status === 'failed' ? 'red' : job.status === 'partial' ? 'amber' : job.status === 'completed' ? 'green' : isActiveJob(job) ? 'blue' : 'neutral'}>{taskStatusLabel(job.status)}</Badge></div>
     <div className="task-detail-heading"><small>任务详情</small><h2>{taskLabel(job)}</h2><p>{job.message || '等待处理'}</p></div>
     <JobProgress progress={job.progress} status={job.status} />
+    <SyncProgress job={job} />
     <section className="task-detail-section" aria-labelledby="task-detail-basics">
       <h3 id="task-detail-basics">任务信息</h3>
       <dl className="task-detail-facts">
@@ -218,6 +228,7 @@ function TaskDetail({ job, cancelling, onBack, onCancel, onOpenResult }: {
       <h3 id="task-detail-result">结果</h3>
       {job.result_id ? <>
         {isActiveJob(job) ? <p className="task-detail-empty">任务仍在执行，结束后会在这里读取已保存的结果。</p> : resultLoading ? <p className="task-result-loading" role="status"><LoaderCircle className="spin" size={15} />正在读取保存的结果…</p> : resultError ? <div className="task-result-loading failed" role="alert"><AlertCircle size={15} /><span>结果读取失败：{resultError}</span><button className="text-link" onClick={() => setResultRetry(value => value + 1)}>重试</button></div> : result ? <div className="task-result-body">
+          {(job.status === 'cancelled' || result.status === 'cancelled' || result.partial === true) && <p className="inline-warning">这是截至取消或中断时保存的部分报告，不能视为完整同步结果。</p>}
           {resultFacts.length > 0 && <dl className="task-detail-facts">{resultFacts.map(fact => <div key={fact.label}><dt>{fact.label}</dt><dd title={fact.title || fact.value}>{fact.value}</dd></div>)}</dl>}
           {resultCounts && <ResultCounts counts={resultCounts} />}
           {resultWarnings.length > 0 && <div className="task-result-warnings"><strong>警告 {resultWarnings.length} 项</strong>{resultWarnings.slice(0, 4).map((warning, index) => <p key={index}>{warning}</p>)}{resultWarnings.length > 4 && <small>另有 {resultWarnings.length - 4} 项，请在完整结果中查看。</small>}</div>}
@@ -228,6 +239,7 @@ function TaskDetail({ job, cancelling, onBack, onCancel, onOpenResult }: {
       </> : <p className="task-detail-empty">该任务没有保存结果{job.status === 'failed' ? '，请根据错误详情处理后重试。' : '。'}</p>}
     </section>
     {isActiveJob(job) && <div className="task-detail-actions"><Button variant="quiet" busy={cancelling} disabled={job.cancel_requested} onClick={() => onCancel(job.id)}>{job.cancel_requested ? '取消中…' : '取消任务'}</Button><span>任务状态会自动刷新。</span></div>}
+    {canResumeMarketSync(job) && <div className="task-detail-actions"><Button variant="secondary" busy={resuming} onClick={() => onResume(job.id)}>继续同步</Button><span>继续会沿用原任务冻结的范围和截止日；原任务记录保持终态。</span></div>}
   </div>
 }
 
@@ -258,6 +270,7 @@ export function TaskProvider({ children, onOpenResult, filter, kind, onFilterCha
   const [historyOffset, setHistoryOffset] = useState(0)
   const [selectedJobId, setSelectedJobId] = useState('')
   const [cancelling, setCancelling] = useState<Set<string>>(new Set())
+  const [resuming, setResuming] = useState<Set<string>>(new Set())
   const jobsRef = useRef<Job[]>([])
   const initialized = useRef(false)
   const pendingRefresh = useRef<Promise<void> | null>(null)
@@ -432,6 +445,23 @@ export function TaskProvider({ children, onOpenResult, filter, kind, onFilterCha
       setNotices(current => [...current.filter(notice => notice.id !== 'cancel-' + id), { id: 'cancel-' + id, label: '取消任务失败', error: cause instanceof Error ? cause.message : String(cause) }])
     } finally { setCancelling(current => { const next = new Set(current); next.delete(id); return next }) }
   }, [accept, refresh, loadHistory, historyOffset, historyOpen])
+  const resume = useCallback(async (id: string) => {
+    setResuming(current => new Set(current).add(id))
+    try {
+      const response = await post<{ job_id: string; resumed_from: string }>(`/jobs/${encodeURIComponent(id)}/resume`)
+      const resumedJob = await get<Job>(`/jobs/${encodeURIComponent(response.job_id)}`).catch(() => ({
+        id: response.job_id, kind: 'market_sync', status: 'queued' as const, progress: 0,
+        message: '继续任务已创建，正在读取进度', created_at: new Date().toISOString(),
+      }))
+      accept([resumedJob])
+      await refresh()
+      if (historyOpen) await loadHistory(historyOffset, false)
+      setSelectedJobId(response.job_id)
+      setNotices(current => [...current, { id: 'resume-' + response.job_id, label: '继续同步', expiresAt: Date.now() + 6000 }])
+    } catch (cause) {
+      setNotices(current => [...current.filter(notice => notice.id !== 'resume-' + id), { id: 'resume-' + id, label: '继续同步失败', error: cause instanceof Error ? cause.message : String(cause) }])
+    } finally { setResuming(current => { const next = new Set(current); next.delete(id); return next }) }
+  }, [accept, refresh, loadHistory, historyOffset, historyOpen])
   const openResult = useCallback((job: Job) => { setSelectedJobId(''); setHistoryOpen(false); onOpenResult(job) }, [onOpenResult])
   const showHistory = useCallback(() => { setSelectedJobId(''); setHistoryOpen(true) }, [])
   const value = useMemo(() => ({ jobs, loading, error, refresh, cancel, run, openResult, showHistory }), [jobs, loading, error, refresh, cancel, run, openResult, showHistory])
@@ -446,22 +476,22 @@ export function TaskProvider({ children, onOpenResult, filter, kind, onFilterCha
       {notices.slice(-3).reverse().map(notice => <section className={`task-toast ${notice.error || notice.job?.status === 'failed' ? 'failed' : notice.job?.status === 'partial' ? 'partial' : ''}`} key={notice.id}>
         <div className="task-toast-head"><span className="task-toast-icon">{notice.submitting || (notice.job && isActiveJob(notice.job)) ? <LoaderCircle className="spin" size={17} /> : notice.error || notice.job?.status === 'failed' || notice.job?.status === 'partial' ? <AlertCircle size={17} /> : <CheckCircle2 size={17} />}</span><strong>{notice.label}</strong>{notice.job?.status === 'partial' && <Badge tone="amber">部分完成</Badge>}<button className="icon-button" onClick={() => removeNotice(notice.id)} aria-label="收起任务提示"><X size={15} /></button></div>
         <div role="status" className="task-toast-message">{notice.error ?? (notice.submitting ? '正在提交…' : notice.job ? taskNoticeMessage(notice.job) : '操作完成')}</div>
-        {notice.job && <><JobProgress progress={notice.job.progress} status={notice.job.status} />{jobActions(notice.job)}</>}
+        {notice.job && <><JobProgress progress={notice.job.progress} status={notice.job.status} /><SyncProgress job={notice.job} />{jobActions(notice.job)}</>}
       </section>)}
       {notices.length > 3 && <button className="task-overflow" onClick={showHistory}>另有 {notices.length - 3} 条任务通知 · 查看全部</button>}
     </div>
     {historyOpen && <div className="task-drawer-overlay" onMouseDown={event => { if (event.target === event.currentTarget) setHistoryOpen(false) }}>
       <section ref={drawer} className={`task-drawer ${selectedJobId ? 'task-drawer-detail' : ''}`} role="dialog" aria-modal="true" aria-labelledby="task-center-title">
         <div className="task-drawer-head"><div><h2 id="task-center-title">任务中心</h2><p>{selectedJobId ? '请求、错误与结果入口' : '进度、历史记录与结果入口'}</p></div><button className="icon-button" onClick={() => setHistoryOpen(false)} aria-label="关闭任务中心"><X size={20} /></button></div>
-        {selectedJobId ? (selectedJob ? <TaskDetail job={selectedJob} cancelling={cancelling.has(selectedJob.id)} onBack={() => setSelectedJobId('')} onCancel={id => void cancel(id)} onOpenResult={openResult} /> : <div className="task-detail-panel"><Button variant="quiet" onClick={() => setSelectedJobId('')}><ArrowLeft size={14} />返回任务列表</Button><Empty title="任务不存在" detail="该任务可能已从当前筛选或分页中移除。" /></div>) : <>
+        {selectedJobId ? (selectedJob ? <TaskDetail job={selectedJob} cancelling={cancelling.has(selectedJob.id)} resuming={resuming.has(selectedJob.id)} onBack={() => setSelectedJobId('')} onCancel={id => void cancel(id)} onResume={id => void resume(id)} onOpenResult={openResult} /> : <div className="task-detail-panel"><Button variant="quiet" onClick={() => setSelectedJobId('')}><ArrowLeft size={14} />返回任务列表</Button><Empty title="任务不存在" detail="该任务可能已从当前筛选或分页中移除。" /></div>) : <>
           <div className="task-drawer-tools"><select className="input" aria-label="筛选任务状态" value={filter} onChange={event => onFilterChange(event.target.value, kind)}><option value="all">全部任务</option><option value="active">正在运行</option><option value="completed">已完成</option><option value="partial">部分完成</option><option value="failed">失败</option><option value="cancelled">已取消</option></select><select className="input" aria-label="筛选任务类型" value={kind} onChange={event => onFilterChange(filter, event.target.value)}><option value="">全部类型</option>{history.kinds.map(item => <option key={item.kind} value={item.kind}>{taskLabel({ id: '', kind: item.kind, status: '', progress: 0, message: '', created_at: '' })}（{item.count}）</option>)}</select><Button variant="quiet" busy={historyLoading} onClick={() => void Promise.all([refresh(), loadHistory(historyOffset, false)])}><RefreshCw size={14} />刷新</Button></div>
           {error && <p className="task-connection-note" role="status">{error}</p>}
           {historyError && <p className="task-connection-note" role="alert">{historyError} <button className="text-link" onClick={() => void loadHistory(historyOffset, false)}>重试</button></p>}
           <div className="task-drawer-list">{!history.items.length ? <Empty title={loading || historyLoading ? '正在读取任务…' : '暂无任务'} /> : history.items.map(job => <article className="task-history-item" key={job.id}>
             <div className="task-history-heading"><strong>{taskLabel(job)}</strong><Badge tone={job.status === 'failed' ? 'red' : job.status === 'partial' ? 'amber' : job.status === 'completed' ? 'green' : isActiveJob(job) ? 'blue' : 'neutral'}>{taskStatusLabel(job.status)}</Badge></div>
             <small>{job.created_at ? new Date(job.created_at).toLocaleString('zh-CN', { hour12: false }) : ''} · {job.id.slice(0, 12)}</small>
-            <JobProgress progress={job.progress} status={job.status} /><p>{job.message || '等待处理'}</p>
-            <div className="task-actions"><button className="text-link" onClick={() => setSelectedJobId(job.id)}>查看详情<ChevronRight size={13} /></button>{isActiveJob(job) && <button className="text-link danger-text" disabled={cancelling.has(job.id) || job.cancel_requested} onClick={() => void cancel(job.id)}>{cancelling.has(job.id) || job.cancel_requested ? '取消中…' : '取消任务'}</button>}</div>
+            <JobProgress progress={job.progress} status={job.status} /><p>{job.message || '等待处理'}</p><SyncProgress job={job} />
+            <div className="task-actions"><button className="text-link" onClick={() => setSelectedJobId(job.id)}>查看详情<ChevronRight size={13} /></button>{isActiveJob(job) && <button className="text-link danger-text" disabled={cancelling.has(job.id) || job.cancel_requested} onClick={() => void cancel(job.id)}>{cancelling.has(job.id) || job.cancel_requested ? '取消中…' : '取消任务'}</button>}{canResumeMarketSync(job) && <button className="text-link" disabled={resuming.has(job.id)} onClick={() => void resume(job.id)}>{resuming.has(job.id) ? '提交中…' : '继续同步'}</button>}</div>
           </article>)}</div>
           {filter !== 'active' && history.total > 0 && <div className="pagination-row"><span>第 {Math.floor(historyOffset / 50) + 1} / {Math.max(1, Math.ceil(history.total / 50))} 页 · 共 {history.total} 条</span><div><Button variant="quiet" disabled={historyLoading || historyOffset <= 0} onClick={() => void loadHistory(Math.max(0, historyOffset - 50), false)}>上一页</Button><Button variant="quiet" disabled={historyLoading || historyOffset + 50 >= history.total} onClick={() => void loadHistory(historyOffset + 50, false)}>下一页</Button></div></div>}
         </>}

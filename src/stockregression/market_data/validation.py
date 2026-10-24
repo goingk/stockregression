@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import Any, Iterable
 
 import pandas as pd
@@ -13,6 +14,228 @@ from .models import MarketDataError
 from .quality import validate_and_fill
 from .repository import VALIDATION_RULES_VERSION, utc_now
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe, timeframe_spec
+
+
+_DAILY_COMMIT_BATCH_SIZE = 512
+
+
+def _frame_day_records(
+    frame: pd.DataFrame,
+) -> dict[pd.Timestamp, list[tuple[int, dict[str, Any]]]]:
+    """Index daily source rows without materializing one DataFrame per day."""
+    if frame.empty or "timestamp" not in frame:
+        return {}
+    dates = pd.to_datetime(frame.timestamp, errors="coerce").dt.normalize()
+    records = frame.to_dict(orient="records")
+    result: dict[pd.Timestamp, list[tuple[int, dict[str, Any]]]] = {}
+    for position, (day, row) in enumerate(zip(dates, records)):
+        if pd.notna(day):
+            result.setdefault(pd.Timestamp(day).normalize(), []).append((position, row))
+    return result
+
+
+def _daily_single_row_hashes(frame: pd.DataFrame) -> dict[pd.Timestamp, str]:
+    """Hash ordinary one-row days from one byte-compatible yearly JSON pass."""
+    if frame.empty or "timestamp" not in frame:
+        return {}
+    fields = [field for field in (
+        "timestamp", "open", "high", "low", "close", "volume", "turnover",
+        "preclose", "tradestatus", "is_st", "source", "source_verified",
+        "is_synthetic", "is_auction_placeholder", "opening_auction_volume",
+        "adj_factor", "metadata",
+    ) if field in frame]
+    if not fields:
+        return {}
+    ordered = frame[fields].sort_values("timestamp")
+    serialized = ordered.to_json(
+        orient="records", date_format="iso", double_precision=15, force_ascii=False,
+    )
+    body = serialized[1:-1]
+    records = []
+    start = None
+    depth = 0
+    quoted = escaped = False
+    for position, character in enumerate(body):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            continue
+        if character == '"':
+            quoted = True
+        elif character == "{":
+            if depth == 0:
+                start = position
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0 and start is not None:
+                records.append(body[start:position + 1])
+    if len(records) != len(ordered):
+        return {}
+    days = pd.to_datetime(ordered.timestamp, errors="coerce").dt.normalize()
+    counts = days.value_counts()
+    result = {}
+    for day, record in zip(days, records):
+        if pd.notna(day) and int(counts.loc[day]) == 1:
+            result[pd.Timestamp(day).normalize()] = hashlib.sha256(
+                f"[{record}]".encode("utf-8")
+            ).hexdigest()
+    return result
+
+
+def _daily_preloaded_frames(repository, preloaded_months, adjustment):
+    """Merge overlapping preloaded month views once into their storage years."""
+    grouped: dict[str, list[tuple[int, pd.DataFrame]]] = {}
+    source_attrs = {}
+    for source_id, frame in enumerate((preloaded_months or {}).values()):
+        if frame.empty or "timestamp" not in frame:
+            continue
+        source_attrs[source_id] = dict(frame.attrs)
+        stamps = pd.to_datetime(frame.timestamp)
+        for year, positions in frame.groupby(stamps.dt.year, sort=False).indices.items():
+            key = str(repository._storage_period("1day", pd.Timestamp(year=int(year), month=1, day=1))[0])
+            piece = frame.iloc[positions].copy()
+            piece.attrs = {}
+            grouped.setdefault(key, []).append((source_id, piece))
+    result = {}
+    for key, sources in grouped.items():
+        pieces = []
+        for source_id, piece in sources:
+            piece = piece.copy()
+            piece["__daily_preload_source"] = source_id
+            pieces.append(piece)
+        merged = pd.concat(pieces, ignore_index=True, sort=False)
+        # Resolve overlaps between month views, while preserving true duplicate
+        # timestamps that already existed inside the selected source view.
+        latest_source = merged.groupby("timestamp", sort=False)["__daily_preload_source"].transform("max")
+        merged = merged.loc[merged["__daily_preload_source"] == latest_source]
+        merged = merged.drop(columns="__daily_preload_source").reset_index(drop=True)
+        attrs = {}
+        for source_id, _piece in sources:
+            for name, values in source_attrs[source_id].items():
+                if isinstance(values, list):
+                    attrs.setdefault(name, []).extend(values)
+                else:
+                    attrs[name] = values
+        merged.attrs.update(attrs)
+        for name in ("blocked_timestamps", "price_anomaly_rows"):
+            if name in merged.attrs:
+                values = merged.attrs[name]
+                if name == "blocked_timestamps":
+                    merged.attrs[name] = list(dict.fromkeys(values))
+                else:
+                    merged.attrs[name] = list({str(row): row for row in values}.values())
+        result[key] = merged
+    return result
+
+
+def _daily_fast_report(part: pd.DataFrame, day: pd.Timestamp, pending: list[str]) -> tuple[dict, dict]:
+    """Produce the daily branch of validate_and_fill without re-entering its generic pipeline."""
+    if len(part) == 1:
+        stamp = pd.Timestamp(part.timestamp.iloc[0])
+        if stamp.normalize() == day:
+            blocked_values = part.attrs.get("blocked_timestamps", [])
+            blocked = (
+                pd.DatetimeIndex(pd.to_datetime(blocked_values, errors="coerce").dropna())
+                if blocked_values else pd.DatetimeIndex([])
+            )
+            pending = list(pending)
+            if blocked.size:
+                pending.append(f"存在 {blocked.size} 条无效价格记录，相关时间点保持缺口且不自动填充")
+            report = {
+                "expected_rows": 1, "observed_rows": 1, "expected_days": 1,
+                "observed_days": 1, "calendar_available": True,
+                "missing_rows": 0, "synthetic_rows": 0, "gap_count": 0,
+                "gaps": [], "unfillable": 0,
+                "status": "pending_validation" if pending else "complete",
+                "blocked_price_rows": int(len(blocked)),
+            }
+            anomaly_rows = part.attrs.get("price_anomaly_rows") or []
+            if anomaly_rows:
+                anomalies = pd.DataFrame(anomaly_rows)
+                if "timestamp" in anomalies:
+                    anomalies["timestamp"] = pd.to_datetime(anomalies["timestamp"], errors="coerce")
+                columns = [column for column in ("timestamp", "date", "source", "quality_reason") if column in anomalies]
+                report["price_anomalies"] = anomalies.head(200)[columns].astype(str).to_dict("records")
+            report["pending_validation"] = list(dict.fromkeys(pending))
+            report["first_time"] = stamp.isoformat()
+            report["last_time"] = stamp.isoformat()
+            report["coverage_status"] = "partial" if pending else "complete"
+            return report, {
+                "missing_timestamps": [], "missing_days": [],
+                "blocked_timestamps": [str(value) for value in blocked],
+                "auction_placeholders": 0,
+            }
+    result = part.copy().sort_values("timestamp", kind="stable").reset_index(drop=True)
+    blocked = pd.DatetimeIndex(pd.to_datetime(
+        result.attrs.get("blocked_timestamps", []), errors="coerce",
+    ).dropna())
+    if blocked.size:
+        pending = list(pending)
+        pending.append(f"存在 {blocked.size} 条无效价格记录，相关时间点保持缺口且不自动填充")
+    observed_labels = pd.DatetimeIndex(result.timestamp.dt.normalize())
+    missing_labels = pd.DatetimeIndex([day]).difference(observed_labels)
+    gaps = [{"start": str(value.date()), "end": str(value.date()), "missing": 1} for value in missing_labels]
+    status = "complete" if not len(missing_labels) and not pending else (
+        "pending_validation" if not len(missing_labels) else "partial"
+    )
+    report = {
+        "expected_rows": 1, "observed_rows": len(observed_labels),
+        "expected_days": 1, "observed_days": int(observed_labels.nunique()),
+        "calendar_available": True, "missing_rows": len(missing_labels),
+        "synthetic_rows": 0, "gap_count": len(gaps), "gaps": gaps[:500],
+        "unfillable": len(missing_labels), "status": status,
+        "blocked_price_rows": int(len(blocked)),
+    }
+    anomalies = pd.DataFrame(result.attrs.get("price_anomaly_rows") or [])
+    if not anomalies.empty:
+        if "timestamp" in anomalies:
+            anomalies["timestamp"] = pd.to_datetime(anomalies["timestamp"], errors="coerce")
+        columns = [column for column in ("timestamp", "date", "source", "quality_reason") if column in anomalies]
+        report["price_anomalies"] = anomalies.head(200)[columns].astype(str).to_dict("records")
+    report["pending_validation"] = list(dict.fromkeys(pending))
+    report["first_time"] = result.timestamp.min().isoformat() if len(result) else None
+    report["last_time"] = result.timestamp.max().isoformat() if len(result) else None
+    details = {
+        "missing_timestamps": [],
+        "missing_days": [str(value.date()) for value in missing_labels],
+        "blocked_timestamps": [str(value) for value in blocked],
+        "auction_placeholders": 0,
+    }
+    report["coverage_status"] = "complete" if status == "complete" else "partial"
+    return report, details
+
+
+def _daily_fast_single_report(
+    stamp_value, pending: list[str], blocked_values: list[str],
+) -> tuple[dict, dict]:
+    """Build the ordinary one-row daily report without another DataFrame pass."""
+    stamp = pd.Timestamp(stamp_value)
+    blocked = pd.DatetimeIndex(pd.to_datetime(blocked_values, errors="coerce").dropna())
+    pending = list(pending)
+    if blocked.size:
+        pending.append(f"存在 {blocked.size} 条无效价格记录，相关时间点保持缺口且不自动填充")
+    unique_pending = list(dict.fromkeys(pending))
+    report = {
+        "expected_rows": 1, "observed_rows": 1, "expected_days": 1,
+        "observed_days": 1, "calendar_available": True,
+        "missing_rows": 0, "synthetic_rows": 0, "gap_count": 0,
+        "gaps": [], "unfillable": 0,
+        "status": "pending_validation" if unique_pending else "complete",
+        "blocked_price_rows": int(len(blocked)),
+        "pending_validation": unique_pending,
+        "first_time": stamp.isoformat(), "last_time": stamp.isoformat(),
+        "coverage_status": "partial" if unique_pending else "complete",
+    }
+    return report, {
+        "missing_timestamps": [], "missing_days": [],
+        "blocked_timestamps": [str(value) for value in blocked],
+        "auction_placeholders": 0,
+    }
 
 
 def _day_hash(frame: pd.DataFrame) -> str | None:
@@ -340,6 +563,7 @@ def validate_incremental(
     persist_results: bool = True,
     persist_archive: bool = True,
     _stale_retry: int = 0,
+    _daily_fast_path: bool = True,
     progress=lambda *_: None,
     cancelled=lambda: False,
 ) -> dict:
@@ -378,9 +602,11 @@ def validate_incremental(
     trading_days = selection["trading_days"]
     targets: list[pd.Timestamp] = selection["targets"]
     scanned_months = {pd.Timestamp(day).to_period("M") for day in targets}
-    scanned_shards = {
-        repository._storage_period(timeframe, day)[0] for day in targets
+    target_storage_map = {
+        pd.Timestamp(day).normalize(): repository._storage_period(timeframe, day)
+        for day in targets
     }
+    scanned_shards = {value[0] for value in target_storage_map.values()}
     calendar_available = selection["calendar_available"]
     head = selection.get("archive")
     file_state = selection.get("file_state") or {}
@@ -440,6 +666,7 @@ def validate_incremental(
         state = repository.validation_state(
             symbol, timeframe, adjustment=adjustment, start=lower, end=upper,
         )
+        archive_head = selection.get("archive")
         return {
             "symbol": symbol, "timeframe": timeframe,
             "status": "complete" if (
@@ -454,6 +681,9 @@ def validate_incremental(
             "failed_days": len(state.get("failed") or []),
             "calendar_available": calendar_available,
             "archive_hit": selection["archive_hit"],
+            "ledger_publication_seconds": 0.0,
+            "archive_revision": int((archive_head or {}).get("revision") or 0),
+            "_archive_head": archive_head,
             "scanned_months": 0, "scanned_shards": 0,
             "market_data_read_calls": 0, "market_data_shard_reads": 0,
             "evidence_read_calls": 0,
@@ -461,6 +691,18 @@ def validate_incremental(
         }
 
     actions = repository.auxiliary(symbol, "actions")
+    daily_calendar_hashes = None
+    daily_calendar_span = None
+    daily_trading_day_set = None
+    if timeframe == "1day" and _daily_fast_path and not (actions or {}).get("payload"):
+        daily_calendar_hashes = {}
+        for calendar_fact in ("unknown", "trading", "non-trading"):
+            calendar_hash = hashlib.sha256(calendar_fact.encode()).hexdigest()
+            payload = {"rules": VALIDATION_RULES_VERSION, "calendar": calendar_hash, "actions": []}
+            daily_calendar_hashes[calendar_fact] = hashlib.sha256(str(payload).encode()).hexdigest()
+        if len(trading_days):
+            daily_calendar_span = (trading_days.min(), trading_days.max())
+            daily_trading_day_set = set(trading_days)
     target_read_metrics = {"calls": 0}
     daily_read_metrics = {"calls": 0}
     daily_by_day: dict[pd.Timestamp, pd.Series] = {}
@@ -484,6 +726,7 @@ def validate_incremental(
     expected_rows = observed_rows = synthetic_rows = gap_count = 0
     month_key = None
     batch_month = None
+    daily_empty_frame = pd.DataFrame()
     changed_archive_months: set[str] = set()
     archive_head: dict[str, Any] | None = None
     month_frame = pd.DataFrame()
@@ -492,13 +735,31 @@ def validate_incremental(
     additional_read_calls = 0
     additional_shard_reads = 0
     evidence_read_calls = 0
+    publication_seconds = 0.0
     preloaded = {
         str(month): frame for month, frame in (preloaded_months or {}).items()
     }
+    daily_fast = timeframe == "1day" and _daily_fast_path
+    daily_period_frames = _daily_preloaded_frames(repository, preloaded_months, adjustment) if daily_fast and preloaded_months else {}
+    daily_period_rows: dict[str, dict[pd.Timestamp, list[tuple[int, dict[str, Any]]]]] = {
+        key: _frame_day_records(frame) for key, frame in daily_period_frames.items()
+    }
+    daily_hashes: dict[str, dict[pd.Timestamp, str]] = {
+        key: _daily_single_row_hashes(frame) for key, frame in daily_period_frames.items()
+    }
+    daily_anomalies: dict[str, dict[pd.Timestamp, list[dict[str, Any]]]] = {}
+    daily_blocked: dict[str, dict[pd.Timestamp, list[pd.Timestamp]]] = {}
+    instrument = service.store.instrument(symbol) if timeframe == "1day" else None
+    asset_type = str((instrument or {}).get("asset_type") or "")
+    from ..performance import current_trace
+    trace = current_trace()
+    daily_started = time.perf_counter() if daily_fast else 0.0
+    if daily_fast:
+        trace.add_count("daily_validation_fast_path_calls")
 
     def flush_batch() -> None:
         nonlocal checked, coverage_days, batch_month, archive_head
-        nonlocal additional_read_calls, additional_shard_reads, evidence_read_calls
+        nonlocal additional_read_calls, additional_shard_reads, evidence_read_calls, publication_seconds
         if not coverage_days:
             return
         changed_archive_months.update(
@@ -513,6 +774,7 @@ def validate_incremental(
                     expected_data_version=base_data_version,
                     changed_months=changed_archive_months,
                 )
+                publication_seconds += float((archive_head or {}).get("_publication_seconds") or 0)
                 evidence_reads = int((archive_head or {}).get("_evidence_read_calls") or 0)
                 evidence_read_calls += evidence_reads
                 additional_read_calls += evidence_reads
@@ -527,8 +789,10 @@ def validate_incremental(
                         persist_results=True, persist_archive=True,
                         progress=progress, cancelled=cancelled,
                         _stale_retry=_stale_retry + 1,
+                        _daily_fast_path=_daily_fast_path,
                     )
                     archive_head = retry_result.get("_archive_head", archive_head)
+                    publication_seconds += float(retry_result.get("ledger_publication_seconds") or 0)
                     additional_read_calls += int(retry_result.get("market_data_read_calls") or 0)
                     additional_shard_reads += int(retry_result.get("market_data_shard_reads") or 0)
                     evidence_read_calls += int(retry_result.get("evidence_read_calls") or 0)
@@ -542,11 +806,15 @@ def validate_incremental(
             raise InterruptedError("任务已取消")
         day = pd.Timestamp(day).normalize()
         target_month = day.to_period("M")
-        if persist_results and batch_month is not None and target_month != batch_month:
+        if persist_results and batch_month is not None and (
+            (daily_fast and len(coverage_days) >= _DAILY_COMMIT_BATCH_SIZE)
+            or (not daily_fast and target_month != batch_month)
+        ):
             flush_batch()
         if batch_month is None:
             batch_month = target_month
-        progress((index - 1) / max(1, len(targets)), f"校验 {timeframe}：{index - 1}/{len(targets)} 日 · {day.date()}")
+        if not daily_fast or index == 1 or index % 32 == 0 or index == len(targets):
+            progress((index - 1) / max(1, len(targets)), f"校验 {timeframe}：{index - 1}/{len(targets)} 日 · {day.date()}")
         checked_at = utc_now()
         report: dict[str, Any] = {}
         status = "failed"
@@ -580,14 +848,82 @@ def validate_incremental(
                 skip_minute = True
         if dependency_failed:
             reason = "缺少对应日线，无法确认交易状态与分钟依赖"
-        part = pd.DataFrame()
+        part = None if daily_fast else pd.DataFrame()
+        daily_values = None
+        daily_position = None
+        fast_daily_day = False
         if not skip_minute and status != "suspended":
-            storage_key, shard_start, shard_end = repository._storage_period(timeframe, day)
+            storage_key, shard_start, shard_end = target_storage_map[day]
             key = str(storage_key)
             monthly_preloaded = preloaded.get(str(day.to_period("M")))
             period_preloaded = preloaded.get(key)
-            if monthly_preloaded is not None or period_preloaded is not None:
+            if daily_fast:
+                if key not in daily_period_frames:
+                    if monthly_preloaded is not None or period_preloaded is not None:
+                        candidate = monthly_preloaded if monthly_preloaded is not None else period_preloaded
+                        daily_period_frames[key] = candidate
+                    else:
+                        if key != month_key:
+                            target_read_metrics["calls"] += 1
+                            target_storage_periods.add(key)
+                            month_frame = repository.active_rows(
+                                symbol, timeframe, adjustment=adjustment,
+                                start=shard_start,
+                                end=pd.Timestamp(shard_end) - pd.Timedelta(days=1),
+                                **({"use_cache": False} if mode == "full" else {}),
+                            )
+                            month_key = key
+                        daily_period_frames[key] = month_frame
+                    daily_period_rows[key] = _frame_day_records(daily_period_frames[key])
+                    daily_hashes[key] = _daily_single_row_hashes(daily_period_frames[key])
+                source_frame = daily_period_frames[key]
+                day_records = daily_period_rows[key].get(day, [])
+                if key not in daily_anomalies:
+                    anomaly_rows = source_frame.attrs.get("price_anomaly_rows") or []
+                    grouped_anomalies: dict[pd.Timestamp, list[dict[str, Any]]] = {}
+                    if anomaly_rows:
+                        anomaly_frame = pd.DataFrame(anomaly_rows)
+                        stamps = pd.to_datetime(anomaly_frame.get("timestamp"), errors="coerce")
+                        for anomaly_day, positions in anomaly_frame.groupby(stamps.dt.normalize(), sort=False).indices.items():
+                            grouped_anomalies[pd.Timestamp(anomaly_day).normalize()] = anomaly_frame.iloc[positions].to_dict("records")
+                    daily_anomalies[key] = grouped_anomalies
+                if key not in daily_blocked:
+                    blocked_values = pd.DatetimeIndex(pd.to_datetime(
+                        source_frame.attrs.get("blocked_timestamps", []), errors="coerce",
+                    ).dropna())
+                    daily_blocked[key] = {
+                        pd.Timestamp(blocked_day).normalize(): list(values)
+                        for blocked_day, values in pd.Series(blocked_values).groupby(blocked_values.normalize())
+                    }
+                anomaly_rows = daily_anomalies[key].get(day, [])
+                day_blocked = [stamp.isoformat() for stamp in daily_blocked[key].get(day, [])]
+                details["blocked_timestamps"] = day_blocked
+                price_anomalies = (
+                    anomalies_in_range(source_frame, day, day)
+                    if anomaly_rows else None
+                )
+                if len(day_records) > 1:
+                    source_days = pd.DatetimeIndex(source_frame.timestamp).normalize()
+                    part = source_frame.loc[source_days == day].copy()
+                    price_anomalies = anomalies_in_range(source_frame, day, day)
+                    part.attrs["price_anomaly_rows"] = price_anomalies.to_dict("records")
+                    part.attrs["blocked_timestamps"] = day_blocked
+                else:
+                    if day_records:
+                        daily_position, daily_values = day_records[0]
+                        fast_daily_day = True
+            elif monthly_preloaded is not None or period_preloaded is not None:
                 source_frame = monthly_preloaded if monthly_preloaded is not None else period_preloaded
+                source_days = pd.DatetimeIndex(source_frame.timestamp).normalize()
+                part = source_frame.loc[source_days == day].copy()
+                price_anomalies = anomalies_in_range(source_frame, day, day)
+                part.attrs["price_anomaly_rows"] = price_anomalies.to_dict("records")
+                blocked = pd.DatetimeIndex(pd.to_datetime(
+                    source_frame.attrs.get("blocked_timestamps", []), errors="coerce",
+                ).dropna())
+                day_blocked = [stamp.isoformat() for stamp in blocked if stamp.normalize() == day]
+                part.attrs["blocked_timestamps"] = day_blocked
+                details["blocked_timestamps"] = day_blocked
             else:
                 if key != month_key:
                     target_read_metrics["calls"] += 1
@@ -601,17 +937,17 @@ def validate_incremental(
                     month_days = pd.DatetimeIndex(month_frame.timestamp).normalize()
                     month_key = key
                 source_frame = month_frame
-            source_days = pd.DatetimeIndex(source_frame.timestamp).normalize()
-            part = source_frame.loc[source_days == day].copy()
-            price_anomalies = anomalies_in_range(source_frame, day, day)
-            part.attrs["price_anomaly_rows"] = price_anomalies.to_dict("records")
-            blocked = pd.DatetimeIndex(pd.to_datetime(
-                source_frame.attrs.get("blocked_timestamps", []), errors="coerce",
-            ).dropna())
-            day_blocked = [stamp.isoformat() for stamp in blocked if stamp.normalize() == day]
-            part.attrs["blocked_timestamps"] = day_blocked
-            details["blocked_timestamps"] = day_blocked
-            if not price_anomalies.empty:
+                source_days = pd.DatetimeIndex(source_frame.timestamp).normalize()
+                part = source_frame.loc[source_days == day].copy()
+                price_anomalies = anomalies_in_range(source_frame, day, day)
+                part.attrs["price_anomaly_rows"] = price_anomalies.to_dict("records")
+                blocked = pd.DatetimeIndex(pd.to_datetime(
+                    source_frame.attrs.get("blocked_timestamps", []), errors="coerce",
+                ).dropna())
+                day_blocked = [stamp.isoformat() for stamp in blocked if stamp.normalize() == day]
+                part.attrs["blocked_timestamps"] = day_blocked
+                details["blocked_timestamps"] = day_blocked
+            if price_anomalies is not None and not price_anomalies.empty:
                 status = "failed"
                 reason = f"存在 {len(price_anomalies)} 条无效价格，已隔离且禁止补造"
                 blocked_values = pd.to_datetime(price_anomalies.get("timestamp"), errors="coerce")
@@ -622,7 +958,7 @@ def validate_incremental(
                     "price_anomalies": price_anomalies.head(50).astype(str).to_dict("records"),
                     "reason": reason,
                 }
-            elif part.empty:
+            elif daily_values is None and (part is None or part.empty):
                 reason = reason or "交易日没有行情记录"
             elif timeframe in {"1week", "1month"}:
                 if part.source_verified.all():
@@ -631,44 +967,80 @@ def validate_incremental(
                 else:
                     reason = "周期来源尚未核验"
             else:
-                calendar_part = pd.DataFrame({"date": [day]})
                 pending: list[str] = []
                 if timeframe == "1day":
                     required = ["open", "high", "low", "close", "volume", "preclose", "tradestatus"]
-                    missing = [field for field in required if field not in part or part[field].isna().all()]
-                    asset_type = str((service.store.instrument(symbol) or {}).get("asset_type") or "")
-                    if asset_type == "stock" and ("is_st" not in part or part.is_st.isna().any()):
+                    if daily_values is not None:
+                        missing = [field for field in required
+                                   if field not in daily_values or pd.isna(daily_values[field])]
+                    else:
+                        missing = [field for field in required if field not in part or part[field].isna().all()]
+                    if asset_type == "stock" and (
+                        ("is_st" not in daily_values if daily_values is not None else "is_st" not in part)
+                        or (pd.isna(daily_values["is_st"]) if daily_values is not None else part.is_st.isna().any())
+                    ):
                         missing.append("is_st")
                     if missing:
                         pending.append("缺少严格回测字段：" + ", ".join(missing))
-                validation = validate_and_fill(
-                    part, timeframe, calendar=calendar_part, fill=True,
-                    pending=pending, coverage_start=day, coverage_end=day, symbol=symbol,
-                )
-                report = validation.report
-                details = validation.details or details
+                if fast_daily_day:
+                    if daily_values is not None:
+                        report, details = _daily_fast_single_report(
+                            daily_values["timestamp"], pending, day_blocked,
+                        )
+                    else:
+                        report, details = _daily_fast_report(part, day, pending)
+                    validation_pending = report.get("pending_validation") or []
+                else:
+                    calendar_part = pd.DataFrame({"date": [day]})
+                    validation = validate_and_fill(
+                        part, timeframe, calendar=calendar_part, fill=True,
+                        pending=pending, coverage_start=day, coverage_end=day, symbol=symbol,
+                    )
+                    report = validation.report
+                    details = validation.details or details
+                    validation_pending = validation.pending
                 if (
-                    validation.report.get("status") == "complete"
-                    and not validation.pending and not dependency_failed
+                    report.get("status") == "complete"
+                    and not validation_pending and not dependency_failed
                 ):
                     status = "passed"
                 else:
-                    reason = "; ".join(validation.pending) or reason or "所选区间存在覆盖缺口"
+                    reason = "; ".join(validation_pending) or reason or "所选区间存在覆盖缺口"
+        part_empty = daily_values is None and (part is None or part.empty)
         missing_values = details.get("missing_timestamps") or []
         missing_days = details.get("missing_days") or []
         if timeframe in MINUTE_TIMEFRAMES:
             gaps = coverage_gap_groups(missing_values, timeframe_spec(timeframe).minutes or 1)
         elif missing_days:
             gaps = [{"start": str(value), "end": str(value), "missing": 1} for value in missing_days]
-        elif status == "failed" and part.empty and not skip_minute:
+        elif status == "failed" and part_empty and not skip_minute:
             gaps = _empty_day_gaps(timeframe, day)
         else:
             gaps = []
-        dependency = _dependency_hash(trading_days, actions, day, daily_row)
-        observed_timestamps = coverage_timestamp_groups(
-            part["timestamp"] if "timestamp" in part else [],
-            timeframe_spec(timeframe).minutes or (1 if timeframe in MINUTE_TIMEFRAMES else 1440),
+        if daily_calendar_hashes is not None and daily_row is None:
+            if daily_calendar_span is None or day < daily_calendar_span[0] or day > daily_calendar_span[1]:
+                calendar_fact = "unknown"
+            else:
+                calendar_fact = "trading" if day in daily_trading_day_set else "non-trading"
+            dependency = daily_calendar_hashes[calendar_fact]
+        else:
+            dependency = _dependency_hash(trading_days, actions, day, daily_row)
+        source_hash = (
+            daily_hashes.get(key, {}).get(day)
+            if fast_daily_day and day in daily_hashes.get(key, {})
+            else _day_hash(source_frame.iloc[[daily_position]])
+            if fast_daily_day and daily_position is not None
+            else _day_hash(part if part is not None else daily_empty_frame)
         )
+        if daily_values is not None:
+            stamp_text = pd.Timestamp(daily_values["timestamp"]).isoformat()
+            observed_timestamps = [{"start": stamp_text, "end": stamp_text, "count": 1}]
+        else:
+            observed_timestamps = coverage_timestamp_groups(
+                part["timestamp"] if part is not None and "timestamp" in part else [],
+                timeframe_spec(timeframe).minutes or (1 if timeframe in MINUTE_TIMEFRAMES else 1440),
+            )
+        row_count = 1 if daily_values is not None else len(part) if part is not None else 0
         report = {
             **report, "reason": reason, "gaps": gaps, "gap_count": len(gaps),
             "observed_timestamps": observed_timestamps,
@@ -679,26 +1051,29 @@ def validate_incremental(
         gap_count += len(gaps)
         checked.append({
             "symbol": symbol, "timeframe": timeframe, "adjustment": adjustment,
-            "trade_date": str(day.date()), "status": status, "row_count": len(part),
-            "source_hash": _day_hash(part), "dependency_hash": dependency,
+            "trade_date": str(day.date()), "status": status, "row_count": row_count,
+            "source_hash": source_hash, "dependency_hash": dependency,
             "rules_version": VALIDATION_RULES_VERSION, "report": report,
             "checked_at": checked_at,
         })
         coverage_days.append({
             "symbol": symbol, "timeframe": timeframe, "adjustment": adjustment,
             "trade_date": str(day.date()), "is_trading_day": is_trading_day,
-            "scanned": True, "status": status, "row_count": len(part),
-            "first_time": str(part.timestamp.min()) if not part.empty else None,
-            "last_time": str(part.timestamp.max()) if not part.empty else None,
-            "synthetic_rows": int(part.is_synthetic.sum()) if not part.empty and "is_synthetic" in part else 0,
+            "scanned": True, "status": status, "row_count": row_count,
+            "first_time": str(daily_values["timestamp"] if daily_values is not None else part.timestamp.min()) if not part_empty else None,
+            "last_time": str(daily_values["timestamp"] if daily_values is not None else part.timestamp.max()) if not part_empty else None,
+            "synthetic_rows": int(bool(daily_values.get("is_synthetic"))) if daily_values is not None else int(part.is_synthetic.sum()) if not part_empty and "is_synthetic" in part else 0,
             "auction_placeholders": int(details.get("auction_placeholders") or 0),
             "blocked_rows": len(details.get("blocked_timestamps") or []),
             "gaps": gaps, "gap_count": len(gaps),
             "pending": [] if status in {"passed", "suspended"} else [reason or "未通过校验"],
-            "source_hash": _day_hash(part), "dependency_hash": dependency,
+            "source_hash": source_hash, "dependency_hash": dependency,
             "rules_version": VALIDATION_RULES_VERSION, "dirty_reason": None,
             "report": report, "checked_at": checked_at,
-            "_data_version": int(part.attrs.get("_coverage_data_version", base_data_version)),
+            "_data_version": int(
+                source_frame.attrs.get("_coverage_data_version", base_data_version)
+                if daily_values is not None else (part.attrs.get("_coverage_data_version", base_data_version) if part is not None else base_data_version)
+            ),
             "_daily_version": daily_data_version if timeframe in MINUTE_TIMEFRAMES else None,
             "_daily_source_hash": (
                 _day_hash(pd.DataFrame([daily_row]))
@@ -712,6 +1087,12 @@ def validate_incremental(
             suspended_days += 1
         else:
             failed_days += 1
+        if persist_results and daily_fast and len(coverage_days) >= _DAILY_COMMIT_BATCH_SIZE:
+            flush_batch()
+    if daily_fast:
+        trace.add_seconds("daily_validation_evaluation", time.perf_counter() - daily_started)
+        trace.add_count("daily_validation_days", checked_days)
+        trace.add_count("daily_validation_period_groups", len(daily_period_rows))
     if cancelled():
         raise InterruptedError("任务已取消")
     flush_batch()
@@ -783,6 +1164,7 @@ def validate_incremental(
         "pending_validation": pending_validation,
         "calendar_available": calendar_available,
         "archive_hit": selection["reused_days"] > 0,
+        "ledger_publication_seconds": publication_seconds,
         "archive_revision": int((archive_head or {}).get("revision") or 0),
         "_archive_head": archive_head,
         "scanned_months": len(scanned_months), "scanned_shards": len(scanned_shards),

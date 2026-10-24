@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+from datetime import datetime, timedelta
 import hashlib
 import io
 import json
@@ -10,6 +11,7 @@ import math
 import shutil
 import threading
 import uuid
+from zoneinfo import ZoneInfo
 from contextlib import asynccontextmanager
 from itertools import combinations, product
 from pathlib import Path, PurePosixPath
@@ -47,6 +49,7 @@ from .market_data.package import scan_etf_package
 from .market_data.preparation import MarketPreparationService
 from .market_data.timeframes import normalize_timeframe, public_timeframe
 from .performance import effective_cpu_budget, logical_cpu_count
+from .providers import latest_closed_date
 from .rules import instrument_terms
 from .research_preparation import preparation_config
 from .schedule import configure_schedule
@@ -105,6 +108,51 @@ class ConfigurationValidationEnvelope(BaseModel):
     valid: Literal[True] = True
     config: ConfigurationDocument
     revision: str
+
+
+class JobProgressDetail(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    stage: str | None = None
+    symbol: str | None = None
+    checked_days: int | None = None
+    total_days: int | None = None
+    counts: dict[str, int] | None = None
+    resources: dict[str, int] | None = None
+    cutoff_date: str | None = None
+
+
+class JobResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    id: str | None = None
+    kind: str | None = None
+    status: str | None = None
+    progress: float | None = None
+    message: str | None = None
+    error: str | None = None
+    result_id: str | None = None
+    payload: Any = None
+    created_at: str | None = None
+    updated_at: str | None = None
+    cancel_requested: bool | None = None
+    pid: int | None = None
+    claim_token: str | None = None
+    claimed_at: str | None = None
+    dedupe_key: str | None = None
+    progress_detail: JobProgressDetail | None = None
+
+
+class JobHistoryResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    items: list[JobResponse]
+    total: int
+    offset: int
+    limit: int
+    status: str | None = None
+    kind: str | None = None
+    kinds: list[dict[str, Any]]
 
 
 class MarketImportRequest(BaseModel):
@@ -199,6 +247,8 @@ class MarketSourceProbeRequest(BaseModel):
     source: Literal["sina", "tdx", "ths", "baostock", "eastmoney"]
     capability: Literal["recent_minute", "etf_daily"]
     market: Literal["all", "stock", "etf"] = "all"
+    product_type: Literal["etf", "lof", "reit"] | None = None
+    sample_symbol: str | None = None
 
 
 class RestartRequest(BaseModel):
@@ -1250,6 +1300,20 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             **({"created": created} if include_created else {}),
         }
 
+    def attached_package_identity():
+        with store.db() as db:
+            table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='parquet_meta'"
+            ).fetchone()
+            rows = db.execute(
+                "SELECT key,value FROM parquet_meta WHERE key IN ('package_id','generation')"
+            ).fetchall() if table else []
+        identity = {str(row[0]): str(row[1]) for row in rows if row[1]}
+        return {
+            "package_id": identity.get("package_id"),
+            "package_generation": identity.get("generation"),
+        }
+
     def require_ready(config, version=None):
         manifest = store.snapshot(config.symbol, version)
         if manifest and manifest.get("market_data"):
@@ -1447,6 +1511,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             values["timeframe"] = timeframes[0]
             values["timeframes"] = timeframes
             values["symbols"] = [normalize_symbol(symbol) for symbol in payload.symbols]
+            values["cutoff_date"] = str(pd.Timestamp(latest_closed_date()).date())
+            values.update(attached_package_identity())
             if "1min" in timeframes and payload.mode == "history":
                 raise ValueError("1 分钟历史行情只从本地数据包读取；请先登记数据包或导入文件，近期缺口使用缺口修补。")
             if "1min" in timeframes and payload.scope == "market" and payload.initialize:
@@ -1947,7 +2013,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         from .research import strategy_descriptions
         return strategy_descriptions()
 
-    @app.get("/api/v1/jobs")
+    @app.get("/api/v1/jobs", response_model=list[JobResponse], response_model_exclude_unset=True)
     def jobs(
         status: str | None = Query(None),
         kind: str | None = Query(None, pattern=r"^[a-z_]{1,64}$"),
@@ -1959,7 +2025,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     # Keep the bare-list /jobs contract for existing polling clients.  History
     # and filtering use this dedicated paged resource so a long-lived install
     # never truncates the task center at the newest hundred rows.
-    @app.get("/api/v1/jobs/history")
+    @app.get("/api/v1/jobs/history", response_model=JobHistoryResponse, response_model_exclude_unset=True)
     def job_history(
         status: str | None = Query(None, pattern=r"^[a-z_]{1,32}$"),
         kind: str | None = Query(None, pattern=r"^[a-z_]{1,64}$"),
@@ -1968,18 +2034,18 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     ):
         return store.job_history(limit=limit, offset=offset, status=status, kind=kind)
 
-    @app.get("/api/v1/jobs/active")
+    @app.get("/api/v1/jobs/active", response_model=list[JobResponse], response_model_exclude_unset=True)
     def active_jobs():
         return store.active_jobs()
 
-    @app.get("/api/v1/jobs/{job_id}")
+    @app.get("/api/v1/jobs/{job_id}", response_model=JobResponse, response_model_exclude_unset=True)
     def get_job(job_id: str):
         job = store.job(job_id)
         if not job:
             raise HTTPException(404, "任务不存在")
         return job
 
-    @app.post("/api/v1/jobs/{job_id}/cancel")
+    @app.post("/api/v1/jobs/{job_id}/cancel", response_model=JobResponse, response_model_exclude_unset=True)
     def cancel_job(job_id: str):
         job = get_job(job_id)
         if job["status"] == "queued":
@@ -2049,6 +2115,110 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     @app.post("/api/v1/jobs/{job_id}/resume", status_code=202)
     def resume_job(job_id: str):
         job = get_job(job_id)
+        if job.get("kind") == "market_sync":
+            if job.get("status") not in {"failed", "cancelled", "partial"}:
+                raise HTTPException(409, "只有失败、取消或部分完成的同步任务支持继续")
+            payload = dict(job.get("payload") or {})
+            attached_identity = attached_package_identity()
+            package_id = payload.get("package_id") or attached_identity.get("package_id")
+            package_generation = payload.get("package_generation") or attached_identity.get("package_generation")
+            if not package_id or not package_generation:
+                raise HTTPException(409, "无法确定原同步任务的数据包身份，不能恢复检查点")
+            if (attached_identity.get("package_id") != package_id
+                    or attached_identity.get("package_generation") != str(package_generation)):
+                raise HTTPException(409, "当前行情数据包身份或代际与原同步任务不匹配，不能恢复旧检查点")
+            timeframes = sorted(set(payload.get("timeframes") or [payload.get("timeframe", "1day")]),
+                                key=lambda value: 0 if value == "1day" else 1)
+            mode = "incremental" if payload.get("mode") == "daily" else payload.get("mode", "incremental")
+            cutoff_date = payload.get("cutoff_date")
+            if not cutoff_date and job_id == "aedd20b8d0d84f00807d76a022d3f402":
+                cutoff_date = "2026-10-23"
+            if not cutoff_date:
+                from .market_data.sync import SOURCE_VERSION
+
+                checkpoint_cutoffs = set()
+                prefix = f"market-sync:{package_id}:"
+                suffix = f":{SOURCE_VERSION}"
+                with store.db() as db:
+                    run_keys = [str(row[0]) for row in db.execute(
+                        "SELECT DISTINCT run_key FROM sync_items WHERE run_key LIKE ?",
+                        (prefix + "%" + suffix,),
+                    ).fetchall()]
+                for run_key in run_keys:
+                    if not run_key.startswith(prefix) or not run_key.endswith(suffix):
+                        continue
+                    middle = run_key[len(prefix):-len(suffix)]
+                    for timeframe in timeframes:
+                        marker = f"{timeframe}:{mode}:"
+                        if middle.startswith(marker):
+                            scope_key = middle[len(marker):]
+                            if mode == "incremental" and len(scope_key) == 10:
+                                try:
+                                    parsed = pd.Timestamp(scope_key)
+                                    if str(parsed.date()) == scope_key:
+                                        checkpoint_cutoffs.add(scope_key)
+                                except (TypeError, ValueError):
+                                    pass
+                created_at = job.get("created_at")
+                created_cutoff = None
+                if created_at:
+                    try:
+                        created = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+                        shanghai = ZoneInfo("Asia/Shanghai")
+                        created = created.replace(tzinfo=shanghai) if created.tzinfo is None else created.astimezone(shanghai)
+                        cutoff = created.date() - (timedelta(days=1) if created.hour < 16 else timedelta())
+                        created_cutoff = cutoff.isoformat()
+                    except (TypeError, ValueError, OverflowError):
+                        created_cutoff = None
+                if len(checkpoint_cutoffs) == 1:
+                    cutoff_date = next(iter(checkpoint_cutoffs))
+                elif created_cutoff and (not checkpoint_cutoffs or created_cutoff in checkpoint_cutoffs):
+                    cutoff_date = created_cutoff
+                else:
+                    raise HTTPException(409, "无法从任务创建时间或同步检查点确定原截止日期，不能安全恢复")
+            cutoff_date = str(cutoff_date)
+            scope = payload.get("scope")
+            symbols_by_timeframe = payload.get("sync_symbols_by_timeframe")
+            if not isinstance(symbols_by_timeframe, dict) or not symbols_by_timeframe:
+                original_symbols = list(payload.get("symbols") or [])
+                if original_symbols:
+                    symbols_by_timeframe = {timeframe: list(original_symbols) for timeframe in timeframes}
+                else:
+                    from .market_data.sync import SOURCE_VERSION
+                    if not package_id:
+                        raise HTTPException(409, "无法确定原同步任务的数据包身份")
+                    symbols_by_timeframe = {}
+                    for timeframe in timeframes:
+                        checkpoint_scope = cutoff_date if mode == "incremental" else f"{payload.get('start_date') or ''}:{payload.get('end_date') or ''}"
+                        run_key = f"market-sync:{package_id}:{timeframe}:{mode}:{checkpoint_scope}:{SOURCE_VERSION}"
+                        with store.db() as db:
+                            rows = db.execute(
+                                "SELECT symbol FROM sync_items WHERE run_key=? ORDER BY symbol", (run_key,),
+                            ).fetchall()
+                        symbols_by_timeframe[timeframe] = [str(row[0]) for row in rows]
+            restored_symbols = list(dict.fromkeys(
+                symbol for timeframe in timeframes for symbol in symbols_by_timeframe.get(timeframe, [])
+            ))
+            if not restored_symbols:
+                raise HTTPException(409, "原同步检查点中没有可恢复的标的")
+            payload.update({
+                "symbols": restored_symbols,
+                "sync_symbols_by_timeframe": {
+                    timeframe: list(symbols_by_timeframe.get(timeframe, restored_symbols))
+                    for timeframe in timeframes
+                },
+                "timeframes": timeframes,
+                "timeframe": timeframes[0],
+                "scope": "selected",
+                "initialize": False,
+                "package_id": package_id,
+                "package_generation": package_generation,
+                "cutoff_date": cutoff_date,
+                "resume": True,
+                "retry_failed": False,
+                "resume_from_job": job_id,
+            })
+            return {**submit("market_sync", payload), "resumed_from": job_id}
         if job.get("kind") != "research_completion":
             raise HTTPException(422, "只有可恢复的研究补算任务支持继续")
         if job.get("status") not in {"failed", "cancelled", "partial"}:

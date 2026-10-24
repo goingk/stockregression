@@ -1662,6 +1662,86 @@ export interface components {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
         };
+        /** JobHistoryResponse */
+        JobHistoryResponse: {
+            /** Items */
+            items: components["schemas"]["JobResponse"][];
+            /** Total */
+            total: number;
+            /** Offset */
+            offset: number;
+            /** Limit */
+            limit: number;
+            /** Status */
+            status?: string | null;
+            /** Kind */
+            kind?: string | null;
+            /** Kinds */
+            kinds: {
+                [key: string]: unknown;
+            }[];
+        } & {
+            [key: string]: unknown;
+        };
+        /** JobProgressDetail */
+        JobProgressDetail: {
+            /** Stage */
+            stage?: string | null;
+            /** Symbol */
+            symbol?: string | null;
+            /** Checked Days */
+            checked_days?: number | null;
+            /** Total Days */
+            total_days?: number | null;
+            /** Counts */
+            counts?: {
+                [key: string]: number;
+            } | null;
+            /** Resources */
+            resources?: {
+                [key: string]: number;
+            } | null;
+            /** Cutoff Date */
+            cutoff_date?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** JobResponse */
+        JobResponse: {
+            /** Id */
+            id?: string | null;
+            /** Kind */
+            kind?: string | null;
+            /** Status */
+            status?: string | null;
+            /** Progress */
+            progress?: number | null;
+            /** Message */
+            message?: string | null;
+            /** Error */
+            error?: string | null;
+            /** Result Id */
+            result_id?: string | null;
+            /** Payload */
+            payload?: unknown;
+            /** Created At */
+            created_at?: string | null;
+            /** Updated At */
+            updated_at?: string | null;
+            /** Cancel Requested */
+            cancel_requested?: boolean | null;
+            /** Pid */
+            pid?: number | null;
+            /** Claim Token */
+            claim_token?: string | null;
+            /** Claimed At */
+            claimed_at?: string | null;
+            /** Dedupe Key */
+            dedupe_key?: string | null;
+            progress_detail?: components["schemas"]["JobProgressDetail"] | null;
+        } & {
+            [key: string]: unknown;
+        };
         /** MarketAggregateRequest */
         MarketAggregateRequest: {
             /** Symbols */
@@ -1812,6 +1892,11 @@ export interface components {
              * @enum {string}
              */
             etf_daily_source: "baostock" | "eastmoney";
+            /**
+             * Etf Daily Fallback Enabled
+             * @default true
+             */
+            etf_daily_fallback_enabled: boolean;
             /**
              * Network Timeout Seconds
              * @default 15
@@ -1972,6 +2057,10 @@ export interface components {
              * @enum {string}
              */
             market: "all" | "stock" | "etf";
+            /** Product Type */
+            product_type?: ("etf" | "lof" | "reit") | null;
+            /** Sample Symbol */
+            sample_symbol?: string | null;
         };
         /** MarketSyncRequest */
         MarketSyncRequest: {
@@ -4419,7 +4508,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["JobResponse"][];
                 };
             };
             /** @description Validation Error */
@@ -4453,7 +4542,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["JobHistoryResponse"];
                 };
             };
             /** @description Validation Error */
@@ -4482,7 +4571,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["JobResponse"][];
                 };
             };
         };
@@ -4504,7 +4593,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["JobResponse"];
                 };
             };
             /** @description Validation Error */
@@ -4535,7 +4624,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["JobResponse"];
                 };
             };
             /** @description Validation Error */

@@ -201,7 +201,7 @@ def test_etf_actions_use_akshare_independently_of_daily_failure(tmp_path, monkey
         ),
     )
     store = Store(tmp_path / "data", settings=frozen)
-    record_success(store, "eastmoney", "etf_daily", "etf", rows=3)
+    store.put_instrument("159611.SZ", "测试ETF", asset_type="etf", etf_type="ETF")
     daily = pd.DataFrame({
         "date": [pd.Timestamp("2026-10-16")], "open": [1.0], "high": [1.1],
         "low": [0.9], "close": [1.05], "preclose": [1.0], "volume": [120000],
@@ -209,6 +209,15 @@ def test_etf_actions_use_akshare_independently_of_daily_failure(tmp_path, monkey
     })
     calendar = pd.DataFrame({"date": [pd.Timestamp("2026-10-16")]})
     actions = providers.normalize_actions(pd.DataFrame())
+
+    monkeypatch.setattr(providers, "latest_closed_date", lambda: pd.Timestamp("2026-10-16"))
+    monkeypatch.setattr(
+        providers, "fetch_etf_daily",
+        lambda *_args, **_kwargs: daily.copy(),
+    )
+    probe = probe_source(store, "eastmoney", "etf_daily", "etf")
+    assert probe["status"] == "completed"
+    assert probe["results"][0]["qualification"]["product_type"] == "etf"
 
     timeouts = []
 

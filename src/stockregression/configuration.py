@@ -59,6 +59,7 @@ _FIELD_LABELS = {
     "estimated_bytes_per_point": "单点内存估计", "stress_cost_multiplier": "费用压力倍率",
     "stress_region_count": "费用压力峰区数", "cache_mb": "行情缓存",
     "recent_minute_source": "近期分钟来源", "etf_daily_source": "ETF 日线来源",
+    "etf_daily_fallback_enabled": "ETF 日线备用来源回退",
     "network_timeout_seconds": "网络超时", "request_retries": "请求重试次数",
     "failure_cooldown_hours": "来源失败冷却", "retry_after_seconds": "准备重试等待",
     "source_lock_timeout_seconds": "来源锁超时", "sync_lock_timeout_seconds": "同步锁超时",

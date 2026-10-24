@@ -10,6 +10,14 @@ class MarketDataError(ValueError):
     """A user-visible import, validation or readiness failure."""
 
 
+class MarketSyncCancelled(InterruptedError):
+    """A stopped sync retains an honest report of its durable partial work."""
+
+    def __init__(self, report: dict[str, Any], message: str = "任务已取消"):
+        super().__init__(message)
+        self.report = report
+
+
 class DataNotReady(MarketDataError):
     """Local data exists but cannot satisfy the requested calculation."""
 

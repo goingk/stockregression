@@ -16,6 +16,8 @@ export interface DataSourceHealth {
   cooldown_until?: string | null
   error_category?: string | null
   error?: string | null
+  qualification?: unknown
+  product_type?: 'etf' | 'lof' | 'reit' | string | null
 }
 
 export interface DataSourceOption {
@@ -294,6 +296,50 @@ export interface Job {
   updated_at?: string
   cancel_requested?: boolean
   payload?: Record<string, unknown>
+  progress_detail?: {
+    stage: string
+    symbol?: string
+    checked_days?: number
+    total_days?: number
+    counts?: { total: number; processed: number; succeeded: number; failed: number; reused: number; skipped: number; unprocessed: number }
+    resources?: { download_workers: number; baostock_sessions: number; write_workers: number }
+    cutoff_date?: string
+  }
+}
+
+const SYNC_PROGRESS_COUNT_LABELS: Record<string, string> = {
+  total: '目标', processed: '已处理', succeeded: '成功', failed: '失败',
+  reused: '复用', skipped: '跳过', unprocessed: '未处理',
+}
+
+export function syncProgressLines(detail?: Job['progress_detail'] | null): string[] {
+  if (!detail) return []
+  const lines: string[] = []
+  const stages: Record<string, string> = {
+    download: '下载行情', merge: '合并行情', history_validation: '建立与核对历史账本',
+    ledger_publication: '发布质量账本', snapshot: '更新快照',
+    completed: '当前证券处理完成', checkpoint: '核对检查点',
+    package_recovery: '核对数据包清单与检查点',
+  }
+  const phase = [stages[detail.stage] ?? detail.stage, detail.symbol].filter(Boolean).join(' · ')
+  if (phase) lines.push(phase + (Number.isFinite(detail.checked_days) && Number.isFinite(detail.total_days)
+    ? ` ${detail.checked_days}/${detail.total_days} 日` : ''))
+  if (detail.counts) {
+    const counts = Object.entries(SYNC_PROGRESS_COUNT_LABELS)
+      .filter(([key]) => typeof detail.counts?.[key as keyof NonNullable<Job['progress_detail']>['counts']] === 'number')
+      .map(([key, label]) => `${label} ${detail.counts?.[key as keyof NonNullable<Job['progress_detail']>['counts']]}`)
+    if (counts.length) lines.push(counts.join(' · '))
+  }
+  if (detail.resources) {
+    const { download_workers, baostock_sessions, write_workers } = detail.resources
+    lines.push(`下载并发 ${download_workers} · BaoStock 会话 ${baostock_sessions} · 写入并发 ${write_workers}`)
+  }
+  if (detail.cutoff_date) lines.push(`本次截止日 ${detail.cutoff_date}`)
+  return lines
+}
+
+export function canResumeMarketSync(job: Pick<Job, 'kind' | 'status'>) {
+  return job.kind === 'market_sync' && ['failed', 'cancelled', 'partial'].includes(job.status)
 }
 
 export interface ConfigRecord {
