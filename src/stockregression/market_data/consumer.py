@@ -4,13 +4,19 @@ import numpy as np
 import pandas as pd
 
 from ..models import BacktestConfig, DataBundle
-from ..quality import DataQualityError, apply_price_limits, minute_slots, prepare_bundle
-from ..price_validation import anomaly_records, anomalies_in_range
+from ..quality import (
+    DataQualityError, _closing_auction_placeholders, apply_price_limits,
+    minute_slots, prepare_bundle,
+)
+from ..price_validation import anomaly_records, anomalies_in_range, price_issue_details
 from .models import DataNotReady
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe, timeframe_spec
 
 
-def load_native_bundle(service, config: BacktestConfig, version: str | None = None) -> DataBundle:
+def load_native_bundle(
+    service, config: BacktestConfig, version: str | None = None, *,
+    statistics_only: bool = False,
+) -> DataBundle:
     """Read an immutable snapshot from the frequency databases.
 
     Native coarse-minute datasets are consumed directly.  The legacy
@@ -82,12 +88,128 @@ def load_native_bundle(service, config: BacktestConfig, version: str | None = No
     if minute.empty:
         raise DataQualityError(f"所选区间没有 {target} 行情")
     if target == "1min":
+        if statistics_only:
+            return _statistics_bundle(
+                config, minute, daily, actions, calendar, manifest,
+            )
         return prepare_bundle(
             config.symbol, minute, daily, actions, calendar, start, end,
             config.frequency, manifest["version"], _metadata(manifest, daily, target), manifest.get("profiles", {}),
         )
     return _native_coarse_bundle(
         config, target, minute, daily, actions, calendar, manifest
+    )
+
+
+def _statistics_bundle(config, minute, daily, actions, calendar, manifest):
+    """Keep frozen raw minute prices intact for statistics without replay prep."""
+    invalid = price_issue_details(minute)
+    if not invalid.empty:
+        raise DataNotReady(
+            f"1min存在 {len(invalid)} 条无效价格，当前版本不能用于统计",
+            gaps=[{"kind": "price_quality", "timeframe": "1min", "anomalies": anomaly_records(
+                invalid, symbol=config.symbol, timeframe="1min",
+                version=int(manifest["market_versions"]["1min"]["version"]), limit=50,
+            )}],
+        )
+    start = pd.Timestamp(config.start_date).normalize()
+    end = pd.Timestamp(config.end_date).normalize() if config.end_date else daily.date.max()
+    end = min(end, daily.date.max())
+    days = pd.DatetimeIndex(pd.to_datetime(calendar.date)).normalize().sort_values().unique()
+    days = days[(days >= start) & (days <= end)]
+    daily_window = daily[daily.date.isin(days)].copy()
+    missing_daily = days.difference(pd.DatetimeIndex(daily_window.date))
+    if len(missing_daily):
+        raise DataQualityError(
+            "所选交易日缺少日线，无法确认交易状态："
+            + ", ".join(str(day.date()) for day in missing_daily[:20])
+        )
+    daily_lookup = daily_window.set_index("date")
+    minute = minute.copy()
+    minute["timestamp"] = pd.to_datetime(minute.timestamp)
+    # The repository's target is known to be 1min. Set the consumer label on
+    # observed rows before concatenating auction placeholders, which would
+    # otherwise create a frequency column only on those two placeholder rows.
+    minute["frequency"] = "1m"
+    groups = {
+        pd.Timestamp(day).normalize(): group.copy()
+        for day, group in minute.groupby(minute.timestamp.dt.normalize(), sort=False)
+    }
+    placeholders = []
+    quality_days = []
+    volume_unverified_days = []
+    volume_comparable_days = 0
+    for day in days:
+        row = daily_lookup.loc[day] if day in daily_lookup.index else None
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[-1]
+        if row is None:
+            continue
+        status = int(row.tradestatus)
+        daily_volume = float(row.volume)
+        if status not in (0, 1):
+            raise DataQualityError(f"{day.date()} 的交易状态未知")
+        if status == 0:
+            quality_days.append({"date": str(day.date()), "mode": "suspended"})
+            continue
+        if daily_volume == 0:
+            quality_days.append({"date": str(day.date()), "mode": "no_trades"})
+            continue
+
+        part = groups.get(day, minute.iloc[0:0]).drop_duplicates("timestamp", keep="last")
+        slots = minute_slots(day)
+        indexed = part.set_index("timestamp").reindex(slots)
+        missing = indexed.close.isna().to_numpy()
+        auction_mask = _closing_auction_placeholders(
+            config.symbol, day, indexed, missing,
+        )
+        for position in np.flatnonzero(auction_mask):
+            earlier = indexed.close.iloc[:position].dropna()
+            if earlier.empty:
+                continue
+            previous_close = earlier.iloc[-1]
+            if pd.isna(previous_close) or not np.isfinite(float(previous_close)) or float(previous_close) <= 0:
+                continue
+            stamp = slots[position]
+            placeholders.append({
+                "timestamp": stamp, "open": float(previous_close),
+                "high": float(previous_close), "low": float(previous_close),
+                "close": float(previous_close), "volume": 0.0, "turnover": 0.0,
+                "source": "statistics_auction_placeholder",
+                "source_verified": True, "is_synthetic": False,
+                "is_auction_placeholder": True, "frequency": "1m",
+            })
+        if int(indexed.close.notna().sum()) + int(auction_mask.sum()) == 240:
+            try:
+                minute_volume = float(pd.to_numeric(part.volume, errors="coerce").sum())
+                comparable = np.isfinite(minute_volume) and np.isfinite(daily_volume) and daily_volume > 0
+            except (TypeError, ValueError):
+                comparable = False
+            if comparable:
+                volume_comparable_days += 1
+                if abs(minute_volume / daily_volume - 1.0) > 0.01:
+                    volume_unverified_days.append(str(day.date()))
+
+    if placeholders:
+        minute = pd.concat([minute, pd.DataFrame(placeholders)], ignore_index=True, sort=False)
+    if not minute.empty:
+        minute = minute[minute.timestamp.dt.normalize().isin(days)]
+        minute = minute.sort_values("timestamp", kind="stable").reset_index(drop=True)
+    metadata = _metadata(manifest, daily, "1min")
+    metadata["etf_volume_verified"] = volume_comparable_days > 0 and not volume_unverified_days
+    metadata["volume_unverified_days"] = volume_unverified_days
+    if volume_unverified_days:
+        metadata["etf_replay_blocked_reason"] = (
+            "分钟聚合成交量与日线不一致，价格统计可用；成交量分布和参数回放需先核对单位"
+        )
+    quality = {
+        "days": quality_days, "is_demo": bool(metadata.get("is_demo")),
+        "requested_frequency": "1min", "warnings": [],
+    }
+    return DataBundle(
+        symbol=config.symbol, bars=minute, daily=daily_window, actions=actions,
+        calendar=days, quality=quality, version=manifest["version"],
+        metadata=metadata, warnings=[],
     )
 
 

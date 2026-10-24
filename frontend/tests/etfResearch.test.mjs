@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  buildEtfResearchRequest, dataStatusLabel, etfDataStatusCounts, etfMetricRows, etfMetricText,
+  buildEtfResearchRequest, dataStatusLabel, dataStatusTone, etfDataStatusCounts, etfMetricRows, etfMetricText,
+  etfResearchStartCount, samplingCoverageText, samplingStatisticsText,
   etfSymbolValidationPath, executionError, executionFromBacktest, filterReasonLabel, filterReasonsText,
   gapText, isEtfResearchResult, isEtfValidationResult, itemsPageCount, parseSelectedEtfSymbols,
   resultStatusLabel, safeItemsOffset, scoreDisplay, settingsError, stopReasonLabel,
@@ -122,6 +123,8 @@ test('single-symbol cohorts display no invented score and pagination stays align
   assert.equal(itemsPageCount(101, 50), 3)
   assert.equal(safeItemsOffset(149, 101, 50), 100)
   assert.equal(dataStatusLabel('pending_validation'), '待校验')
+  assert.equal(dataStatusLabel('limited'), '统计可用（受限）')
+  assert.equal(dataStatusTone('limited'), 'amber')
   assert.equal(resultStatusLabel('failed'), '失败')
 })
 
@@ -140,15 +143,30 @@ test('saved rows translate filter reasons, data statuses, gaps and stop reasons'
 test('result counts separate ranking outcomes from dynamic data-status counts', () => {
   const counts = etfDataStatusCounts({
     total: 10, scored: 7, eligible: 4, validated: 3, recommended: 2,
-    ready: 5, pending_validation: 2, insufficient_history: 1, data_not_ready: 1, unavailable: 1,
+    ready: 5, limited: 1, pending_validation: 2, insufficient_history: 1, data_not_ready: 1, unavailable: 1,
   })
   assert.deepEqual(counts.map(item => [item.status, item.label, item.count]), [
     ['ready', '数据就绪', 5],
+    ['limited', '统计可用（受限）', 1],
     ['pending_validation', '待校验', 2],
     ['insufficient_history', '历史不足', 1],
     ['data_not_ready', '数据未就绪', 1],
     ['unavailable', '统计不可用', 1],
   ])
+})
+
+test('ETF research can start with limited-only availability and tolerates legacy missing limited count', () => {
+  assert.equal(etfResearchStartCount({ ready: 0, limited: 2 }), 2)
+  assert.equal(etfResearchStartCount({ ready: 3 }), 3)
+  assert.equal(etfResearchStartCount({ ready: 0 }), 0)
+})
+
+test('sampling labels show per-symbol complete coverage and actual common statistic days', () => {
+  const sampling = { expected_days: 120, valid_days: 117, coverage_ratio: .975, excluded_days: ['2026-01-02'], statistics_excluded_days: ['2026-01-02', '2026-01-05'], statistics_days: 115, comparable: true }
+  assert.equal(samplingCoverageText(sampling), '完整覆盖率 97.5%')
+  assert.equal(samplingStatisticsText(sampling), '统计样本 115 日')
+  assert.equal(samplingCoverageText(undefined), '覆盖率 —')
+  assert.equal(samplingStatisticsText(undefined), '统计样本 —')
 })
 
 test('ETF result kinds keep validation reports out of ranking rendering', () => {

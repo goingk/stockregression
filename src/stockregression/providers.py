@@ -123,6 +123,12 @@ def latest_closed_date():
     day = pd.Timestamp(now.date())
     if now.hour < 16:
         day -= pd.Timedelta(days=1)
+    # The cutoff is also the incremental checkpoint key.  Advancing onto a
+    # weekend would miss the completed Friday checkpoint and make a no-op
+    # update download the same overlap again.  Exchange holidays remain the
+    # calendar's responsibility during validation.
+    while day.weekday() >= 5:
+        day -= pd.Timedelta(days=1)
     return day
 
 

@@ -24,6 +24,7 @@ import pandas as pd
 from . import rules
 from . import price_basis
 from .models import DataBundle
+from .etf_models import MIN_COMPLETE_DAY_RATIO
 
 
 ANNUAL_TRADING_DAYS = 252.0
@@ -95,6 +96,10 @@ class _Context:
     points_1m: pd.DataFrame
     points_5m: pd.DataFrame
     points_30m: pd.DataFrame
+    sampling: dict | None = None
+    minute_integrity: dict | None = None
+    mddd_history_verified: bool = False
+    mddd_unavailable_reason: str | None = None
 
 
 def _finite(value: Any) -> float | None:
@@ -484,8 +489,12 @@ def _path_redundancy(points: pd.DataFrame) -> tuple[float | None, int, str | Non
     positions = np.flatnonzero(valid.to_numpy())
     if not len(positions) or length <= 1e-15:
         return None, int(usable.sum()), "全路径长度为零或没有相邻有效价格"
-    net = abs(float(close.iloc[positions[-1]] - close.iloc[positions[0]]))
-    return _finite(1.0 - net / length), int(usable.sum()), None
+    # Missing sessions break the path. Each continuous segment contributes its
+    # own net displacement; never connect prices across an omitted trading day.
+    starts = valid & ~usable
+    ends = valid & ~usable.shift(-1, fill_value=False)
+    net = float(np.abs(close[ends].to_numpy() - close[starts].to_numpy()).sum())
+    return _finite(max(0.0, min(1.0, 1.0 - net / length))), int(usable.sum()), None
 
 
 def _official_iovr(
@@ -1148,6 +1157,24 @@ def _prepare(data: DataBundle, as_of: pd.Timestamp, window_days: int) -> _Contex
     factors, factor_error = price_basis.action_factors(
         action_data, as_of, prices=action_prices if not action_prices.empty else None,
     )
+    mddd_warning = None
+    if factor_error and action_start < selected[0]:
+        # An unsupported older split can invalidate the independent 250-day
+        # risk metric without invalidating a later, already ex-action window.
+        short_data = copy(action_data)
+        short_data.daily = pd.concat([
+            action_daily[action_daily.date < selected[0]].tail(1),
+            action_daily[action_daily.date >= selected[0]],
+        ], ignore_index=True)
+        short_data.bars = action_bars[action_bars.timestamp.dt.normalize() >= selected[0]].copy()
+        if "ex_date" in short_data.actions:
+            short_data.actions = short_data.actions[pd.to_datetime(short_data.actions.ex_date).dt.normalize() >= selected[0]].copy()
+        short_prices = pd.concat([action_prices[action_prices.index < selected[0]].tail(1), action_prices[action_prices.index >= selected[0]]]) if not action_prices.empty else None
+        short_factors, short_error = price_basis.action_factors(short_data, as_of, prices=short_prices)
+        if not short_error:
+            mddd_warning = "独立250日日线存在无法处理的较早公司行动，MDDD不可用；当前分钟窗口不跨越该行动，保留分钟统计"
+            mddd_verified = False
+            factors, factor_error = short_factors, None
     if factor_error:
         raise _StatsError("data_not_ready", str(factor_error))
     if factors is None:
@@ -1171,6 +1198,8 @@ def _prepare(data: DataBundle, as_of: pd.Timestamp, window_days: int) -> _Contex
     bars_window = raw_bars[raw_bars.timestamp.dt.normalize().isin(selected)].copy()
     minute = bars_window[~bars_window.frequency.eq("1d")].copy()
     minute_kind = None
+    sampling = metadata.get("etf_sampling")
+    integrity = None
     if not minute.empty:
         if minute.frequency.eq("1m").any():
             minute_kind = "1m"
@@ -1180,6 +1209,29 @@ def _prepare(data: DataBundle, as_of: pd.Timestamp, window_days: int) -> _Contex
         points_1m = _expected_minutes(
             adjusted_bars[adjusted_bars.frequency.eq("1m")], selected, raw_bars,
         )
+        if sampling:
+            excluded = set(sampling.get("statistics_excluded_days") or [])
+            own_excluded = set(sampling.get("excluded_days") or [])
+            expected = {day.date().isoformat() for day in selected}
+            count = len(expected - excluded)
+            if (
+                sampling.get("expected_days") != window_days
+                or not own_excluded.issubset(excluded) or not excluded.issubset(expected)
+                or sampling.get("statistics_days") != count
+                or count / window_days + 1e-12 < MIN_COMPLETE_DAY_RATIO
+            ):
+                raise _StatsError("data_not_ready", "有效完整日统计样本不满足90%覆盖要求")
+            ignored = {
+                pd.Timestamp(item["date"]).normalize()
+                for item in (data.quality or {}).get("days", [])
+                if item.get("mode") in {"suspended", "no_trades"}
+            }
+            integrity = _minute_integrity(points_1m, selected, ignored)
+            omitted = points_1m.day.isin(pd.to_datetime(sorted(excluded)))
+            points_1m.loc[omitted, ["valid", "valid_ohlc"]] = False
+            # Keep the full trading clock, including invalid slots, so rolling
+            # returns cannot join the two sides of an omitted session.
+            profile_bars = profile_bars[~profile_bars.timestamp.dt.normalize().isin(pd.to_datetime(sorted(excluded)))].copy()
         points_5m = _expected_five_minutes(points_1m)
         points_30m = _expected_thirty_minutes(points_1m)
     elif minute_kind == "5m":
@@ -1192,6 +1244,8 @@ def _prepare(data: DataBundle, as_of: pd.Timestamp, window_days: int) -> _Contex
         points_30m = pd.DataFrame()
 
     warnings: list[str] = []
+    if mddd_warning:
+        warnings.append(mddd_warning)
     quality = data.quality if isinstance(data.quality, dict) else {}
     if quality.get("is_demo"):
         warnings.append("演示数据不可作为真实市场统计结论")
@@ -1202,6 +1256,8 @@ def _prepare(data: DataBundle, as_of: pd.Timestamp, window_days: int) -> _Contex
         warnings.append(
             f"窗口有{int(daily_only.timestamp.dt.normalize().nunique())}个整日降级行，未还原盘中路径",
         )
+    if sampling and sampling.get("statistics_excluded_days"):
+        warnings.append(f"分钟指标使用 {sampling['statistics_days']}/{window_days} 个完整交易日；缺口日整日排除，未用日线或合成分钟替代")
     return _Context(
         as_of=as_of, requested_window_days=window_days,
         calendar_days=calendar_days, days=selected, coverage_complete=coverage_complete,
@@ -1209,6 +1265,9 @@ def _prepare(data: DataBundle, as_of: pd.Timestamp, window_days: int) -> _Contex
         profile_bars=profile_bars, factors=factors, warnings=warnings,
         minute_kind=minute_kind, points_1m=points_1m, points_5m=points_5m,
         points_30m=points_30m,
+        sampling=sampling, minute_integrity=integrity,
+        mddd_history_verified=mddd_verified,
+        mddd_unavailable_reason=mddd_warning,
     )
 
 
@@ -1324,6 +1383,10 @@ def compute_etf_statistics(
         details: dict[str, Any] = {key: {} for key in METRIC_KEYS}
         tick = _price_tick(data)
         current_raw = _current_raw_close(context)
+        if context.sampling and stamp.normalize().date().isoformat() in context.sampling.get("statistics_excluded_days", []):
+            official = data.daily[pd.to_datetime(data.daily.date).dt.normalize().le(stamp.normalize())]
+            if not official.empty:
+                current_raw = _positive(official.sort_values("date").close.iloc[-1])
         mean_raw, raw_count, raw_days = _recent_raw_price(context)
 
         returns_1m = _within_session_returns(context.points_1m)
@@ -1338,7 +1401,7 @@ def compute_etf_statistics(
         path_value, path_count, path_error = _path_redundancy(context.points_1m)
         _set_metric(
             metrics, details, "path_redundancy", path_value, path_count,
-            reason="1分钟全路径含午休和隔夜；1-|首尾净位移|/相邻有效价格总路径",
+            reason="1分钟连续有效路径含午休和隔夜；1-各连续段净位移绝对值之和/有效总路径，缺口处断开",
             null_reason=path_error,
         )
 
@@ -1372,14 +1435,12 @@ def compute_etf_statistics(
             null_reason=rv5_error,
         )
 
-        mddd_verified = _verified(
-            data.metadata.get("mddd_history_verified")
-            if isinstance(data.metadata, dict) else None
-        )
+        mddd_verified = context.mddd_history_verified
         if mddd_verified:
             mddd, mddd_details, mddd_error = _mdDD(context.adjusted_daily)
         else:
             mddd, mddd_details, mddd_error = _mdDD_unverified(context.adjusted_daily)
+            mddd_error = context.mddd_unavailable_reason or mddd_error
         _set_metric(
             metrics, details, "max_drawdown_duration_days", mddd,
             int(mddd_details.get("mddd_days", 0)),
@@ -1427,7 +1488,10 @@ def compute_etf_statistics(
         atr, atr_count, atr_days, atr_error = _atr30(
             context.points_30m, context.days, context.adjusted_daily,
         )
-        profile, profile_error = _volume_profile(context.profile_bars, context.days)
+        if data.metadata.get("etf_volume_verified") is False:
+            profile, profile_error = {}, "分钟与日线成交量口径不一致；保留价格指标，成交量分布待核对单位后计算"
+        else:
+            profile, profile_error = _volume_profile(context.profile_bars, context.days)
         ou_center = _positive(ou_details.get("center_price"))
         ou_lower = _positive(ou_details.get("lower_price"))
         ou_upper = _positive(ou_details.get("upper_price"))
@@ -1483,11 +1547,13 @@ def compute_etf_statistics(
                 ignored_minute_days.add(pd.Timestamp(report.get("date")).normalize())
             except (TypeError, ValueError):
                 continue
-        integrity = _minute_integrity(
+        integrity = context.minute_integrity or _minute_integrity(
             context.points_1m, context.days, ignored_minute_days,
         )
         complete_minute_days = integrity["complete_days"]
         missing_minute_days = integrity["incomplete_days"]
+        excluded_days = set((context.sampling or {}).get("statistics_excluded_days") or [])
+        unexpected_missing = set(missing_minute_days) - excluded_days
 
         status = "completed"
         if not context.coverage_complete:
@@ -1495,14 +1561,14 @@ def compute_etf_statistics(
             context.warnings.append(
                 f"请求{context.requested_window_days}个交易日，交易日历仅覆盖{len(context.days)}个",
             )
-        elif context.minute_kind != "1m" or context.adjusted_daily.empty or missing_minute_days:
+        elif context.minute_kind != "1m" or context.adjusted_daily.empty or unexpected_missing:
             status = "data_not_ready"
             if context.adjusted_daily.empty:
                 context.warnings.append("窗口缺少日线开盘/前收盘历史，IOVR与MDDD不可评价")
-            if missing_minute_days:
-                preview = "、".join(missing_minute_days[:5])
+            if unexpected_missing:
+                preview = "、".join(sorted(unexpected_missing)[:5])
                 context.warnings.append(
-                    f"{len(missing_minute_days)}个应交易分钟的日期未满足240槽有效OHLC/校准要求：{preview}",
+                    f"{len(unexpected_missing)}个未排除日期未满足240槽有效OHLC/校准要求：{preview}",
                 )
         filter_reasons: list[str] = []
         if status != "completed":
@@ -1521,6 +1587,8 @@ def compute_etf_statistics(
         source_quality = _source_quality(
             context.raw_bars, context.days, context.adjusted_daily,
         )
+        source_quality["volume_verified"] = data.metadata.get("etf_volume_verified")
+        source_quality["volume_unverified_days"] = data.metadata.get("volume_unverified_days", [])
 
         diagnostics = {
             "as_of": stamp.date().isoformat(),
@@ -1532,6 +1600,7 @@ def compute_etf_statistics(
             "missing_window_days": int(max(0, context.requested_window_days - len(context.days))),
             "minute_days_covered": int(len(complete_minute_days)),
             "minute_missing_days": missing_minute_days,
+            "sampling": context.sampling,
             "minute_integrity": {
                 "expected_slots": integrity["expected_slots"],
                 "accepted_slots": integrity["accepted_slots"],
@@ -1638,6 +1707,8 @@ def score_etfs(rows: list[dict]) -> list[dict]:
     cohort: list[tuple[int, dict[str, float]]] = []
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
+            continue
+        if (row.get("sampling") or {}).get("comparable") is False:
             continue
         status = row.get("status")
         metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else row

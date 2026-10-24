@@ -112,7 +112,7 @@ def test_default_auto_validation_replays_only_top_ten_eligible_scores(monkeypatc
     replayed = []
     monkeypatch.setattr(
         research, "_bundle",
-        lambda _store, _market, _request, row, _universe: SimpleNamespace(symbol=row["symbol"]),
+        lambda _store, _market, _request, row, _universe, **_kwargs: SimpleNamespace(symbol=row["symbol"]),
     )
     _install_statistics(monkeypatch)
 
@@ -137,13 +137,39 @@ def test_default_auto_validation_replays_only_top_ten_eligible_scores(monkeypatc
     assert SYMBOLS[-1] not in replayed
 
 
+def test_price_only_volume_diagnostics_keep_scores_without_consuming_replay_slots(monkeypatch):
+    request = _request()
+    plan = _plan(request)
+    blocked = SYMBOLS[-2]
+    reason = "分钟与日线成交量单位待核对"
+    monkeypatch.setattr(research, "_bundle", lambda _store, _market, _request, row, _universe, **_kwargs: SimpleNamespace(
+        symbol=row["symbol"], metadata={"etf_replay_blocked_reason": reason} if row["symbol"] == blocked else {},
+    ))
+    _install_statistics(monkeypatch)
+    replayed = []
+
+    def validate(_request, row, _data, **_kwargs):
+        replayed.append(row["symbol"])
+        return {"status": "no_qualified", "candidates": [], "recommendation": None, "forward_config": None}
+
+    monkeypatch.setattr(research, "validate_candidates", validate)
+    result = _run(plan, request)
+    row = next(item for item in result["rows"] if item["symbol"] == blocked)
+    assert row["status"] == "completed" and row["data_status"] == "limited"
+    assert row["gss_score"] is not None
+    assert row["validation"]["status"] == "unavailable"
+    assert row["validation"]["reason"] == reason
+    assert reason in row["warnings"]
+    assert blocked not in replayed and len(replayed) == 10
+
+
 def test_statistics_cancellation_keeps_completed_metrics_without_publishing_scores(monkeypatch):
     state = {"cancelled": False}
     request = _request()
     plan = _plan(request)
     monkeypatch.setattr(
         research, "_bundle",
-        lambda _store, _market, _request, row, _universe: SimpleNamespace(symbol=row["symbol"]),
+        lambda _store, _market, _request, row, _universe, **_kwargs: SimpleNamespace(symbol=row["symbol"]),
     )
 
     def statistics(symbol):
@@ -176,7 +202,7 @@ def test_replay_cancellation_keeps_full_ranking_and_completed_candidates(monkeyp
     candidate = {"id": 1, "qualified": True, "reasons": []}
     monkeypatch.setattr(
         research, "_bundle",
-        lambda _store, _market, _request, row, _universe: SimpleNamespace(symbol=row["symbol"]),
+        lambda _store, _market, _request, row, _universe, **_kwargs: SimpleNamespace(symbol=row["symbol"]),
     )
     _install_statistics(monkeypatch)
 
@@ -231,7 +257,7 @@ def test_cleaned_frozen_version_marks_the_symbol_not_ready_with_a_clear_gap(monk
     plan = _plan(request)
     missing_symbol = SYMBOLS[4]
 
-    def bundle(_store, _market, _request, row, _universe):
+    def bundle(_store, _market, _request, row, _universe, **_kwargs):
         if row["symbol"] == missing_symbol:
             raise MarketDataError("DATA_VERSION_NOT_FOUND: 冻结的行情版本已不可用")
         return SimpleNamespace(symbol=row["symbol"])
@@ -265,7 +291,7 @@ def test_last_statistics_completion_cancel_prevents_score_publication(monkeypatc
     plan = _plan(request)
     monkeypatch.setattr(
         research, "_bundle",
-        lambda _store, _market, _request, row, _universe: SimpleNamespace(symbol=row["symbol"]),
+        lambda _store, _market, _request, row, _universe, **_kwargs: SimpleNamespace(symbol=row["symbol"]),
     )
 
     def compute(data, _as_of, _window_days):
@@ -298,7 +324,7 @@ def test_runtime_limit_after_last_statistics_keeps_metrics_and_returns_partial(m
     monkeypatch.setattr(research.time, "monotonic", lambda: next(clock))
     monkeypatch.setattr(
         research, "_bundle",
-        lambda _store, _market, _request, row, _universe: SimpleNamespace(symbol=row["symbol"]),
+        lambda _store, _market, _request, row, _universe, **_kwargs: SimpleNamespace(symbol=row["symbol"]),
     )
 
     def compute(data, _as_of, _window_days):

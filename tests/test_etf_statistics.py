@@ -152,6 +152,102 @@ def _assert_metric_contract(result: dict) -> None:
     } == set(result["grid_basis"])
 
 
+def _use_complete_days(data, excluded):
+    dates = [pd.Timestamp(day).date().isoformat() for day in excluded]
+    count = len(data.calendar)
+    data.metadata["etf_sampling"] = {
+        "expected_days": count, "valid_days": count - len(dates),
+        "coverage_ratio": (count - len(dates)) / count,
+        "excluded_days": dates, "statistics_excluded_days": dates,
+        "statistics_days": count - len(dates), "comparable": True,
+    }
+
+
+def test_complete_day_statistics_exclude_partial_sessions_without_fabricating_returns():
+    data = _synthetic_bundle()
+    excluded = data.calendar[-10]
+    context = statistics._prepare(data, data.calendar[-1], 120)
+    daily_rv = statistics._daily_rv(statistics._within_session_returns(context.points_1m))
+    expected_rv = math.sqrt(252 * daily_rv.drop(excluded).mean())
+    _use_complete_days(data, [excluded])
+    day_mask = data.bars.timestamp.dt.normalize().eq(excluded)
+    data.bars = data.bars.loc[~day_mask | data.bars.timestamp.dt.hour.ge(11)].copy()
+    result = compute_etf_statistics(data, data.calendar[-1], 120)
+    assert result["status"] == "completed", result["warnings"]
+    assert result["metric_details"]["rv_annualized"]["sample_count"] == 119
+    assert result["metrics"]["rv_annualized"] == pytest.approx(expected_rv, rel=1e-12)
+    assert result["diagnostics"]["sampling"]["statistics_days"] == 119
+    # Every minute on an excluded date is ignored, including large real moves
+    # that remain on the far side of that day's missing opening segment.
+    extreme = deepcopy(data)
+    mask = extreme.bars.timestamp.dt.normalize().eq(excluded)
+    extreme.bars.loc[mask, ["open", "high", "low", "close"]] *= 50
+    repeated = compute_etf_statistics(extreme, extreme.calendar[-1], 120)
+    assert repeated["metrics"] == result["metrics"]
+    assert repeated["grid_basis"] == result["grid_basis"]
+    # The frozen sample must not hide a new gap on a day claimed complete.
+    extra_gap = data.calendar[-2] + pd.Timedelta(hours=10, minutes=13)
+    data.bars = data.bars[data.bars.timestamp.ne(extra_gap)].copy()
+    assert compute_etf_statistics(data, data.calendar[-1], 120)["status"] == "data_not_ready"
+
+
+def test_path_redundancy_uses_segments_instead_of_crossing_an_omitted_day():
+    points = pd.DataFrame({
+        "day": pd.to_datetime(["2026-01-05"] * 2 + ["2026-01-06"] * 2 + ["2026-01-07"] * 2),
+        "session": 0, "slot": [0, 1] * 3,
+        "close_adj": [10., 12., 100., 101., 1000., 1002.],
+        "valid": [True, True, False, False, True, True],
+    })
+    value, count, error = statistics._path_redundancy(points)
+    assert value == 0 and count == 2 and error is None
+
+
+def test_sampling_below_90_percent_is_not_accepted_by_statistics():
+    data = _synthetic_bundle()
+    _use_complete_days(data, data.calendar[-14:-1])
+    assert compute_etf_statistics(data, data.calendar[-1], 120)["status"] == "data_not_ready"
+
+
+def test_incomparable_sampling_is_excluded_from_cross_section_scores():
+    keys = ["rv_annualized", "path_redundancy", "variance_ratio_240m", "iovr", "zero_crossing_rate", "jump_ratio"]
+    rows = [{"symbol": str(i), "status": "completed", "metrics": dict.fromkeys(keys, float(i))} for i in range(3)]
+    rows[-1]["sampling"] = {"comparable": False}
+    score_etfs(rows)
+    assert rows[0]["gss_score"] is not None and rows[1]["gss_score"] is not None
+    assert rows[2]["gss_score"] is None and rows[2]["rank"] is None
+    assert all(row["score_cohort_size"] == 2 for row in rows)
+
+
+@pytest.mark.parametrize("inside_window", [False, True])
+def test_unsupported_split_only_blocks_statistics_that_cross_its_date(inside_window):
+    data = _synthetic_bundle()
+    day = data.calendar[10] if inside_window else data.calendar[0] - pd.offsets.BDay(10)
+    data.actions = pd.concat([data.actions, pd.DataFrame([{
+        "ex_date": day, "cash_per_share": 0., "bonus_ratio": 1.,
+        "implemented": True, "unsupported_reason": "missing verified split settlement",
+    }])], ignore_index=True)
+    result = compute_etf_statistics(data, data.calendar[-1], 120)
+    if inside_window:
+        assert result["status"] == "data_not_ready"
+    else:
+        assert result["status"] == "completed", result["warnings"]
+        assert result["metrics"]["rv_annualized"] is not None
+        assert result["metrics"]["max_drawdown_duration_days"] is None
+        assert result["diagnostics"]["mddd_history_verified"] is False
+
+
+def test_volume_unit_mismatch_preserves_price_statistics_but_disables_profile():
+    data = _synthetic_bundle()
+    data.metadata["etf_volume_verified"] = False
+    data.metadata["volume_unverified_days"] = [data.calendar[-1].date().isoformat()]
+    result = compute_etf_statistics(data, data.calendar[-1], 120)
+    assert result["status"] == "completed"
+    assert result["metrics"]["rv_annualized"] > 0
+    assert result["diagnostics"]["source_quality"]["volume_verified"] is False
+    assert "peak" not in result["diagnostics"]["profile"]
+    assert any("成交量分布待核对单位" in warning for warning in result["warnings"])
+
+
 def test_compute_contract_uses_two_scale_minute_statistics_without_lookahead():
     data = _synthetic_bundle()
     as_of = data.calendar[-1]

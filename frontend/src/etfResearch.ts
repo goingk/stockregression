@@ -1,8 +1,18 @@
 import type { BacktestConfig, FeeConfig } from './types.ts'
 
 export type EtfScope = 'watchlist' | 'local' | 'selected'
-export type EtfPreflightStatus = 'ready' | 'pending_validation' | 'insufficient_history' | 'data_not_ready'
+export type EtfPreflightStatus = 'ready' | 'limited' | 'pending_validation' | 'insufficient_history' | 'data_not_ready'
 export type EtfDataStatus = EtfPreflightStatus | 'pending' | 'unavailable' | 'completed' | 'failed'
+
+export interface EtfSampling {
+  expected_days: number
+  valid_days: number
+  coverage_ratio: number
+  excluded_days: string[]
+  statistics_excluded_days: string[]
+  statistics_days: number
+  comparable: boolean
+}
 
 export interface EtfExecution {
   initial_shares: number
@@ -46,11 +56,13 @@ export interface EtfPreflightRow {
   version: string | null
   gaps: EtfGap[]
   warnings: string[]
+  sampling?: EtfSampling
 }
 
 export interface EtfPreflightCounts {
   total: number
   ready: number
+  limited?: number
   pending_validation: number
   insufficient_history: number
   data_not_ready: number
@@ -139,6 +151,7 @@ export interface EtfRow {
   symbol_name: string
   status: string
   data_status: string
+  sampling?: EtfSampling
   version: string
   window_start: string
   window_end: string
@@ -164,16 +177,17 @@ export interface EtfResearchResultCounts {
   validated: number
   recommended: number
   ready: number
+  limited?: number
   pending_validation: number
   insufficient_history: number
   data_not_ready: number
-  [dataStatus: string]: number
+  [dataStatus: string]: number | undefined
 }
 
 export interface EtfResearchResult {
   id: string
   kind: 'etf_research'
-  method_version: 'etf_min_grid_v1'
+  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2'
   result_schema_version: 1
   status: 'completed' | 'partial' | 'cancelled'
   as_of: string
@@ -207,7 +221,7 @@ export interface EtfValidationResultCounts {
 export interface EtfValidationResult {
   id: string
   kind: 'etf_validation'
-  method_version: 'etf_min_grid_v1'
+  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2'
   result_schema_version: 1
   status: 'completed' | 'partial' | 'cancelled' | 'failed'
   as_of: string
@@ -403,7 +417,7 @@ export function etfMetricText(key: string, value: number | null | undefined): st
 
 export function dataStatusLabel(status: string): string {
   return ({
-    ready: '数据就绪', pending_validation: '待校验', insufficient_history: '历史不足',
+    ready: '数据就绪', limited: '统计可用（受限）', pending_validation: '待校验', insufficient_history: '历史不足',
     data_not_ready: '数据未就绪', pending: '待计算', unavailable: '统计不可用',
     completed: '统计完成', failed: '失败',
   } as Record<string, string>)[status] ?? status
@@ -411,7 +425,7 @@ export function dataStatusLabel(status: string): string {
 
 export function dataStatusTone(status: string): 'neutral' | 'blue' | 'green' | 'red' | 'amber' {
   if (status === 'ready' || status === 'completed') return 'green'
-  if (status === 'pending_validation' || status === 'pending') return 'amber'
+  if (status === 'limited' || status === 'pending_validation' || status === 'pending') return 'amber'
   if (['insufficient_history', 'data_not_ready', 'unavailable', 'failed'].includes(status)) return 'red'
   return 'neutral'
 }
@@ -475,11 +489,11 @@ export function stopReasonLabel(reason: string): string {
 
 const NON_STATUS_COUNT_KEYS = new Set(['total', 'scored', 'eligible', 'validated', 'recommended'])
 const DATA_STATUS_ORDER = [
-  'ready', 'pending_validation', 'insufficient_history', 'data_not_ready',
+  'ready', 'limited', 'pending_validation', 'insufficient_history', 'data_not_ready',
   'pending', 'unavailable', 'completed', 'failed',
 ]
 
-export function etfDataStatusCounts(counts: Record<string, number>) {
+export function etfDataStatusCounts(counts: Record<string, number | undefined>) {
   const order = new Map(DATA_STATUS_ORDER.map((status, index) => [status, index]))
   return Object.entries(counts)
     .filter(([key, count]) => !NON_STATUS_COUNT_KEYS.has(key) && finite(count))
@@ -491,6 +505,19 @@ export function etfDataStatusCounts(counts: Record<string, number>) {
     .map(([status, count]) => ({
       status, count, label: dataStatusLabel(status), tone: dataStatusTone(status),
     }))
+}
+
+export function etfResearchStartCount(counts: Pick<EtfPreflightCounts, 'ready' | 'limited'>): number {
+  return (counts.ready ?? 0) + (counts.limited ?? 0)
+}
+
+export function samplingCoverageText(sampling?: EtfSampling): string {
+  if (!sampling || !finite(sampling.coverage_ratio)) return '覆盖率 —'
+  return `完整覆盖率 ${(sampling.coverage_ratio * 100).toFixed(1)}%`
+}
+
+export function samplingStatisticsText(sampling?: EtfSampling): string {
+  return sampling && Number.isFinite(sampling.statistics_days) ? `统计样本 ${sampling.statistics_days} 日` : '统计样本 —'
 }
 
 export function itemsPageCount(total: number, limit: number): number {

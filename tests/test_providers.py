@@ -53,6 +53,26 @@ def test_fetch_sina_rejects_non_positive_prices(monkeypatch):
         providers.fetch_sina("159611.SZ")
 
 
+@pytest.mark.parametrize(
+    ("now", "expected"),
+    [
+        ("2026-10-24 16:50", "2026-10-23"),  # Saturday after the close cutoff.
+        ("2026-10-25 16:50", "2026-10-23"),  # Sunday after the close cutoff.
+        ("2026-10-26 09:00", "2026-10-23"),  # Monday before the close cutoff.
+        ("2026-10-26 16:00", "2026-10-26"),  # A weekday session is closed.
+    ],
+)
+def test_latest_closed_date_never_advances_onto_a_weekend(monkeypatch, now, expected):
+    class FixedDateTime:
+        @classmethod
+        def now(cls, tz):
+            return pd.Timestamp(now, tz=str(tz))
+
+    monkeypatch.setattr(providers, "datetime", FixedDateTime)
+
+    assert providers.latest_closed_date() == pd.Timestamp(expected)
+
+
 def test_sina_minute_adapter_reuses_session_and_makes_one_request(monkeypatch):
     calls = []
 

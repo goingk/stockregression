@@ -1868,13 +1868,15 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         row = next((item for item in original.get("rows", []) if item.get("symbol") == symbol), None)
         if row is None:
             raise HTTPException(404, "该 ETF 不在原始候选池中")
+        if row.get("data_status") == "limited" or (row.get("sampling") or {}).get("excluded_days"):
+            raise HTTPException(409, {"code": "DATA_NOT_READY", "message": "此结果仅使用完整日统计；参数回放需先补齐分钟行情，再创建新的研究"})
         if not row.get("window_start") or not row.get("window_end"):
             raise HTTPException(409, {"code": "DATA_NOT_READY", "message": "原结果没有完整历史窗口；补齐数据后请创建新的研究"})
         frozen = original.get("universe", {}).get("versions", {}).get(symbol)
         if not frozen or store.snapshot(symbol, frozen["version"], persist=False) is None:
             raise HTTPException(409, {"code": "DATA_VERSION_NOT_FOUND", "message": "原始行情版本已清理或代际已改变，不能改用当前数据"})
         row = {key: value for key, value in row.items() if key in {
-            "symbol", "symbol_name", "window_start", "window_end", "daily_start", "version", "gaps", "warnings",
+            "symbol", "symbol_name", "window_start", "window_end", "daily_start", "version", "gaps", "warnings", "sampling",
         }}
         row.update(status="ready", version=frozen["version"])
         row.setdefault("gaps", [])

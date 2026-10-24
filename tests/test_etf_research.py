@@ -56,6 +56,9 @@ class CatalogOnlyRepository:
     read_frame = bars
     active_rows = bars
 
+    def day_validations(self, symbol, timeframe, *, start, end):
+        return []  # The fixture's full-range state already certifies every day.
+
 
 class CatalogStore:
     def __init__(self, repository):
@@ -104,7 +107,7 @@ def test_preflight_is_catalog_only_and_ready_index_does_not_bypass_ledger(catalo
     market.repository.pending.add("512880.SH")
     plan = research.preflight(store, EtfResearchRequest(), market=market)
     assert plan["as_of"] == "2024-12-31"
-    assert plan["counts"] == {"total": 2, "ready": 1, "pending_validation": 1, "insufficient_history": 0, "data_not_ready": 0}
+    assert plan["counts"] == {"total": 2, "ready": 1, "limited": 0, "pending_validation": 1, "insufficient_history": 0, "data_not_ready": 0}
     assert plan["symbols"] == ["159611.SZ", "512880.SH"]
     assert not store.persisted
     assert {item[1] for item in market.repository.checked_versions} == {"1day", "1min"}
@@ -470,3 +473,121 @@ def test_individual_validation_uses_original_versions_window_and_execution(tmp_p
         assert payload["plan"]["rows"][0]["window_start"] == plan["rows"][0]["window_start"]
         missing = client.post(f"/api/v1/etf-research/{result_id}/validate/512880.SH")
         assert missing.status_code == 409 and missing.json()["detail"]["code"] == "DATA_VERSION_NOT_FOUND"
+
+
+def _install_minute_failures(monkeypatch, market, failures, *, reason="存在 60 个未补齐的分钟缺口", pending=False, invalid=False):
+    original = market.repository.validation_state
+
+    def state(symbol, timeframe, **kwargs):
+        value = original(symbol, timeframe, **kwargs)
+        dates = failures.get(symbol, []) if timeframe == "1min" else []
+        if dates:
+            window = market.repository.days[(market.repository.days >= kwargs["start"]) & (market.repository.days <= kwargs["end"])]
+            value.update(
+                failed=dates, failed_count=len(dates), validated_days=len(window) - len(dates),
+                pending=[dates[0]] if pending else [], pending_count=int(pending),
+                verified_through=str((pd.Timestamp(dates[0]) - pd.offsets.BDay(1)).date()),
+            )
+        return value
+
+    monkeypatch.setattr(market.repository, "validation_state", state)
+    monkeypatch.setattr(market.repository, "day_validations", lambda symbol, *args, **kwargs: [
+        {"trade_date": day, "status": "failed", "row_count": 180,
+         "report": {"reason": reason, "pending_validation": [reason], "unfillable": 60, "blocked_price_rows": int(invalid)}}
+        for day in failures.get(symbol, [])
+    ], raising=False)
+
+
+def test_limited_preflight_uses_common_days_and_never_certifies_the_gap(catalog, monkeypatch):
+    from stockregression.snapshot_quality import frozen_quality_state
+
+    store, market = catalog
+    failed = "2024-12-05"
+    _install_minute_failures(monkeypatch, market, {"159611.SZ": [failed]})
+    manifests = []
+    monkeypatch.setattr(store, "remember_market_snapshots", lambda values: manifests.extend(deepcopy(values)))
+    plan = research.preflight(store, EtfResearchRequest(), market=market, persist=True)
+    limited, complete = plan["rows"]
+    assert plan["counts"]["limited"] == 1 and plan["counts"]["ready"] == 1
+    assert limited["status"] == "limited" and complete["status"] == "ready"
+    assert limited["sampling"]["valid_days"] == 119
+    assert complete["sampling"]["valid_days"] == 120
+    for row in plan["rows"]:
+        assert row["sampling"]["statistics_excluded_days"] == [failed]
+        assert row["sampling"]["statistics_days"] == 119
+        assert row["sampling"]["comparable"] is True
+    frozen = next(value for value in manifests if value["symbol"] == limited["symbol"])
+    assert frozen["etf_sampling"] == limited["sampling"]
+    assert frozen_quality_state(frozen, "1min", failed, failed) is None
+    assert frozen_quality_state(frozen, "1min", "2024-12-06", "2024-12-06")
+    assert frozen_quality_state(frozen, "1day", limited["window_start"], limited["window_end"])
+
+
+@pytest.mark.parametrize("options", [
+    {"pending": True}, {"invalid": True},
+    {"reason": "分钟来源标签或单位未校准"},
+])
+def test_pending_invalid_or_uncalibrated_data_is_not_admitted(catalog, monkeypatch, options):
+    store, market = catalog
+    _install_minute_failures(monkeypatch, market, {"159611.SZ": ["2024-12-05"]}, **options)
+    row = research.preflight(store, EtfResearchRequest(), market=market)["rows"][0]
+    assert row["status"] == "data_not_ready"
+    assert "sampling" not in row
+
+
+@pytest.mark.parametrize("failed_days,expected_status", [(12, "limited"), (13, "data_not_ready")])
+def test_minute_complete_day_threshold_is_inclusive_at_90_percent(catalog, monkeypatch, failed_days, expected_status):
+    store, market = catalog
+    dates = [day.date().isoformat() for day in market.repository.days[-20:-20 + failed_days]]
+    _install_minute_failures(monkeypatch, market, {"159611.SZ": dates})
+    row = research.preflight(store, EtfResearchRequest(), market=market)["rows"][0]
+    assert row["status"] == expected_status
+
+
+def test_incompatible_samples_keep_diagnostics_without_mixing_gss(catalog, monkeypatch):
+    store, market = catalog
+    dates = [day.date().isoformat() for day in market.repository.days[-20:-4]]
+    _install_minute_failures(monkeypatch, market, {"159611.SZ": dates[:8], "512880.SH": dates[8:]})
+    rows = research.preflight(store, EtfResearchRequest(), market=market)["rows"]
+    assert all(row["status"] == "limited" for row in rows)
+    assert all(row["sampling"]["comparable"] is False for row in rows)
+    assert all(row["sampling"]["statistics_days"] == 112 for row in rows)
+
+
+def test_individual_replay_cannot_bypass_limited_statistics_policy(tmp_path):
+    app = create_app(str(tmp_path), start_jobs=False)
+    store = Store(tmp_path)
+    result_id = store.save_result("etf_research", {
+        "kind": "etf_research", "result_schema_version": 1, "as_of": "2024-12-31",
+        "request": EtfResearchRequest().model_dump(mode="json"),
+        "rows": [{"symbol": "159611.SZ", "data_status": "limited"}],
+    }, "", "有缺口的统计")
+    with TestClient(app) as client:
+        response = client.post(f"/api/v1/etf-research/{result_id}/validate/159611.SZ")
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "DATA_NOT_READY"
+
+
+def test_short_filled_sessions_are_excluded_even_when_the_ledger_passed(catalog, monkeypatch):
+    store, market = catalog
+    dates = ["2024-12-05", "2024-12-06"]
+    monkeypatch.setattr(market.repository, "day_validations", lambda symbol, *args, **kwargs: [
+        {"trade_date": day, "status": "passed", "row_count": 238,
+         "report": {"synthetic_rows": 2, "auction_placeholders": 0}}
+        for day in (dates if symbol == "159611.SZ" else [])
+    ])
+    rows = research.preflight(store, EtfResearchRequest(), market=market)["rows"]
+    assert rows[0]["status"] == "limited"
+    assert rows[0]["sampling"]["excluded_days"] == dates
+    assert rows[1]["sampling"]["statistics_excluded_days"] == dates
+
+
+def test_whole_missing_sessions_must_also_pass_the_95_percent_minute_gate(catalog, monkeypatch):
+    store, market = catalog
+    dates = [day.date().isoformat() for day in market.repository.days[-20:-8]]
+    _install_minute_failures(monkeypatch, market, {"159611.SZ": dates})
+    monkeypatch.setattr(market.repository, "day_validations", lambda symbol, *args, **kwargs: [
+        {"trade_date": day, "status": "failed", "row_count": 0,
+         "report": {"reason": "交易日没有行情记录"}} for day in (dates if symbol == "159611.SZ" else [])
+    ])
+    assert research.preflight(store, EtfResearchRequest(), market=market)["rows"][0]["status"] == "data_not_ready"

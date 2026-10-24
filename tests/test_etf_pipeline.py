@@ -12,7 +12,7 @@ from stockregression.settings import Settings
 from stockregression.storage import Store, dumps
 
 
-def seed_market(tmp_path):
+def seed_market(tmp_path, *, gap_days=0):
     root = tmp_path / "data"
     settings = Settings(data_dir=str(root), package_dir=str(root / "package"), performance={"validation_workers": 1})
     store = Store(root, settings=settings)
@@ -36,11 +36,14 @@ def seed_market(tmp_path):
         volume = np.full(240, 1000.)
         turnover = (opening + high + low + close) / 4 * volume
         if index >= len(days) - 120:
-            minute.append(pd.DataFrame({
+            part = pd.DataFrame({
                 "timestamp": minute_slots(day), "open": opening, "high": high,
                 "low": low, "close": close, "volume": volume, "turnover": turnover,
                 "source": "import", "source_verified": True, "is_synthetic": False,
-            }))
+            })
+            if len(days) - 1 - gap_days <= index < len(days) - 1:
+                part = part.iloc[60:].copy()
+            minute.append(part)
         daily.append({
             "timestamp": day, "open": opening[0], "high": high.max(), "low": low.min(),
             "close": close[-1], "preclose": previous, "volume": volume.sum(),
@@ -103,3 +106,48 @@ def test_real_package_local_validation_statistics_and_frozen_auxiliary(tmp_path,
     assert repeated["rows"][0]["status"] == "completed", repeated["rows"][0]
     assert repeated["rows"][0]["metrics"] == row["metrics"]
     assert repeated["rows"][0]["validation"]["candidates"] == row["validation"]["candidates"]
+
+
+def test_real_partial_package_remains_statistics_only_and_reproducible(tmp_path, monkeypatch):
+    from copy import deepcopy
+    import pytest
+    from stockregression.market_data.models import MarketDataError
+    from stockregression.snapshot_quality import frozen_quality_state
+
+    store, market, days = seed_market(tmp_path, gap_days=1)
+    monkeypatch.setattr(research, "latest_closed_date", lambda: days[-1])
+    request = EtfResearchRequest()
+    before = research.preflight(store, request, market=market, persist=True)
+    assert research.run_local_validation(store, request, before, market=market)["status"] == "partial"
+    plan = research.preflight(store, request, market=market, persist=True)
+    assert plan["rows"][0]["status"] == "limited", plan["rows"]
+    assert plan["rows"][0]["sampling"]["statistics_days"] == 119
+    result = research.run_etf_research(store, request, plan, market=market)
+    row = result["rows"][0]
+    assert row["status"] == "completed", row
+    assert row["data_status"] == "limited"
+    assert row["validation"]["status"] == "unavailable"
+    assert row["validation"]["recommendation"] is None and not row["validation"]["candidates"]
+    assert row["metric_details"]["rv_annualized"]["sample_count"] == 119
+    frozen = store.snapshot(row["symbol"], row["version"], persist=False)
+    omitted = days[-2]
+    assert not frozen_quality_state(frozen, "1min", omitted, omitted)
+    assert frozen_quality_state(frozen, "1min", days[-1], days[-1])
+    # Reject a plan that tries to include a frozen excluded session.
+    tampered = deepcopy(plan["rows"][0])
+    tampered["sampling"]["statistics_excluded_days"] = []
+    with pytest.raises(MarketDataError, match="统计样本"):
+        research._bundle(store, market, request, tampered, plan["universe"])
+    auxiliary = market.repository.auxiliary
+    with monkeypatch.context() as patch:
+        patch.setattr(market.repository, "auxiliary", lambda symbol, kind, **kwargs: None if kind == "actions" else auxiliary(symbol, kind, **kwargs))
+        with pytest.raises(MarketDataError, match="公司行动"):
+            research._bundle(store, market, request, plan["rows"][0], plan["universe"], statistics_only=True)
+    # New data and ledger revisions cannot change the old complete-day sample.
+    changed = market.repository.bars(row["symbol"], "1min", start=days[-1], end=days[-1]).copy()
+    for column in ("open", "high", "low", "close", "turnover"):
+        changed[column] *= 1.1
+    market.repository.commit_bars(row["symbol"], "1min", changed, source="import")
+    repeated = research.run_etf_research(store, request, plan, market=market)
+    assert repeated["rows"][0]["status"] == "completed", repeated["rows"][0]
+    assert repeated["rows"][0]["metrics"] == row["metrics"]
