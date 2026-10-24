@@ -25,6 +25,7 @@ from .cache import cached
 from .models import DataVersionNotFound, MarketDataError
 from .package_layout import PackageLayout, asset_type_for_symbol, auxiliary_relative_path, resolve_package_root
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe
+from ..models import normalize_symbol
 from ..price_validation import details_to_rows, price_issue_details, split_invalid_prices
 
 
@@ -812,6 +813,7 @@ class MarketDataRepository:
     def rebuild_index(
         self, *, symbols: Sequence[str] | None = None,
         timeframes: Sequence[str] | None = None,
+        exclude_symbols: Sequence[str] | None = None,
     ) -> dict:
         """Rebuild market tables from published schema-2 dataset manifests."""
         package = self.package.manifest()
@@ -819,8 +821,10 @@ class MarketDataRepository:
             raise MarketDataError("只支持从 schema 2 分片包重建索引")
         wanted_symbols = set(symbols or ())
         wanted_timeframes = {normalize_timeframe(value) for value in timeframes or ()}
+        excluded_symbols = {normalize_symbol(value) for value in exclude_symbols or ()}
         heads = package.get("datasets") or {}
         selected = []
+        candidate_keys: set[tuple[str, str, str]] = set()
         for key, head in sorted(heads.items()):
             try:
                 symbol, timeframe, adjustment = str(key).split("|", 2)
@@ -831,8 +835,32 @@ class MarketDataRepository:
                 continue
             if wanted_timeframes and timeframe not in wanted_timeframes:
                 continue
+            candidate_keys.add((symbol, timeframe, adjustment))
+            if symbol in excluded_symbols:
+                continue
             selected.append((key, symbol, timeframe, adjustment, dict(head)))
         if not selected:
+            if candidate_keys:
+                with self._connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    if not wanted_symbols and not wanted_timeframes:
+                        for table in (
+                            "parquet_shards", "parquet_versions", "parquet_datasets",
+                            "parquet_derived", "parquet_coverage_days",
+                            "parquet_coverage_archives",
+                        ):
+                            db.execute(f"DELETE FROM {table}")
+                    else:
+                        for symbol, timeframe, adjustment in candidate_keys:
+                            for table in (
+                                "parquet_shards", "parquet_versions", "parquet_datasets",
+                                "parquet_derived", "parquet_coverage_days",
+                                "parquet_coverage_archives",
+                            ):
+                                db.execute(
+                                    f"DELETE FROM {table} WHERE symbol=? AND timeframe=? AND adjustment=?",
+                                    (symbol, timeframe, adjustment),
+                                )
             return {"status": "completed", "datasets": 0, "versions": 0, "shards": 0}
 
         prepared: list[tuple[str, str, str, int, dict, list[dict]]] = []
@@ -1816,8 +1844,11 @@ class MarketDataRepository:
         timeframe = normalize_timeframe(timeframe)
         with self._connect() as db:
             rows = db.execute(
-                "SELECT symbol FROM parquet_datasets WHERE timeframe=? "
-                "AND row_count>0 ORDER BY symbol",
+                "SELECT d.symbol FROM parquet_datasets d "
+                "LEFT JOIN instruments i ON i.symbol=d.symbol "
+                "WHERE d.timeframe=? AND d.row_count>0 "
+                "AND (i.delisting_date IS NULL OR i.delisting_date='') "
+                "ORDER BY d.symbol",
                 (timeframe,),
             ).fetchall()
         return [row[0] for row in rows]
@@ -3928,6 +3959,91 @@ class MarketDataRepository:
             "archived": bool(shards), "copied": 0, "reused": 0,
             "bytes": 0, "status": "completed",
             "reason": "内容摘要分片不可变，无需另存副本",
+        }
+
+    @_serialized_package
+    def purge_instruments(self, symbols: Sequence[str]) -> dict:
+        """Remove every market dataset for permanently excluded instruments."""
+        requested = {normalize_symbol(value) for value in symbols}
+        if not requested:
+            return {"symbols": 0, "datasets": 0, "files": 0, "bytes": 0}
+        package_root = self.package.root.resolve()
+        action_paths = {
+            auxiliary_relative_path(symbol, "actions") for symbol in requested
+        }
+        manifest = dict(self.package.manifest())
+        datasets = dict(manifest.get("datasets") or {})
+        removed_keys = []
+        removed_bytes = removed_shards = 0
+        for key, head in list(datasets.items()):
+            try:
+                symbol, _timeframe, _adjustment = str(key).split("|", 2)
+            except ValueError:
+                continue
+            if symbol not in requested:
+                continue
+            removed_keys.append(key)
+            removed_bytes += int(head.get("shard_bytes") or 0)
+            removed_shards += int(head.get("shard_count") or 0)
+            datasets.pop(key)
+        manifest["datasets"] = datasets
+        manifest["shard_count"] = max(
+            0, int(manifest.get("shard_count") or 0) - removed_shards
+        )
+        manifest["shard_bytes"] = max(
+            0, int(manifest.get("shard_bytes") or 0) - removed_bytes
+        )
+        manifest["auxiliary"] = {
+            key: value for key, value in (manifest.get("auxiliary") or {}).items()
+            if key not in action_paths
+        }
+        manifest["files"] = {
+            key: value for key, value in (manifest.get("files") or {}).items()
+            if not any(f"symbol={symbol}" in key for symbol in requested)
+        }
+        manifest["package_version"] = int(manifest.get("package_version") or 0) + 1
+        manifest["updated_at"] = utc_now()
+        self.package.publish(manifest)
+
+        removed_files = 0
+        for symbol in requested:
+            for timeframe in TIMEFRAMES:
+                for path in (
+                    self.package.partitions_dir / timeframe / f"symbol={symbol}",
+                    self.package.datasets_dir / timeframe / symbol,
+                ):
+                    resolved = path.resolve()
+                    if not resolved.is_relative_to(package_root):
+                        raise MarketDataError(f"拒绝删除数据包外路径：{resolved}")
+                    if resolved.is_dir():
+                        removed_files += sum(
+                            1 for item in resolved.rglob("*") if item.is_file()
+                        )
+                        shutil.rmtree(resolved)
+            action = self.package.absolute(auxiliary_relative_path(symbol, "actions"))
+            if action.is_file():
+                action.unlink()
+                removed_files += 1
+            for quality in self.package.quality_dir.glob(f"{symbol}-*.json"):
+                if quality.is_file():
+                    quality.unlink()
+                    removed_files += 1
+
+        tables = (
+            "parquet_shards", "parquet_versions", "parquet_datasets",
+            "parquet_derived", "parquet_day_validation", "parquet_imports",
+            "parquet_coverage", "parquet_coverage_days", "parquet_coverage_archives",
+            "parquet_auxiliary_history", "snapshots", "active_snapshots",
+            "market_auxiliary", "sync_items", "watchlist",
+        )
+        params = [(symbol,) for symbol in requested]
+        with self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for table in tables:
+                db.executemany(f"DELETE FROM {table} WHERE symbol=?", params)
+        return {
+            "symbols": len(requested), "datasets": len(removed_keys),
+            "files": removed_files, "bytes": removed_bytes,
         }
 
     def compact_dataset(

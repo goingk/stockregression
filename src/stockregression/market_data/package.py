@@ -183,22 +183,27 @@ def index_etf_package_direct(
         }
     repository.attach_package(root)
     basics = _basic_metadata(root / "etf_basic_data.parquet", "etf")
+    excluded_symbols = set(service.store.delisted_symbols())
     stock_basic = root / "stock_basic_data.parquet"
     if stock_basic.is_file():
         basics.update(_basic_metadata(stock_basic, "stock"))
     for index, (symbol, metadata) in enumerate(sorted(basics.items()), start=1):
-        if wanted is None or symbol in wanted:
+        if symbol not in excluded_symbols and (wanted is None or symbol in wanted):
             service.store.put_instrument(
                 symbol, metadata.get("name", symbol),
                 **{key: value for key, value in metadata.items() if key not in {"symbol", "name"}},
             )
         if index % 250 == 0:
             progress(0.05 + 0.15 * index / max(1, len(basics)), f"读取基本资料 {index}/{len(basics)}")
-    result = repository.rebuild_index(symbols=wanted, timeframes=selected)
+    result = repository.rebuild_index(
+        symbols=wanted, timeframes=selected, exclude_symbols=excluded_symbols,
+    )
     heads = json.loads((root / ".stockregression" / "manifest.json").read_text(encoding="utf-8")).get("datasets", {})
     selected_heads = {}
     for key, head in heads.items():
         symbol, timeframe, _adjustment = key.split("|", 2)
+        if symbol in excluded_symbols:
+            continue
         if wanted is not None and symbol not in wanted:
             continue
         if selected is not None and normalize_timeframe(timeframe) not in selected:

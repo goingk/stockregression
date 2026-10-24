@@ -11,27 +11,41 @@ from stockregression.settings import Settings
 from stockregression.storage import Store
 
 SYMBOL = "600000.SH"
+ETF_SYMBOL = "159001.SZ"
 
 
-def seed(tmp_path, count=10, start="2026-01-05"):
+def seed(tmp_path, count=10, start="2026-01-05", symbol=SYMBOL):
     settings = Settings(data_dir=str(tmp_path / "data"), package_dir=str(tmp_path / "package"),
                         performance={"cpu_budget_mode": "custom", "cpu_budget": 2})
     service = MarketDataService(Store(settings.data_dir, settings=settings),
                                 package_dir=settings.package_dir, settings=settings)
+    asset_type = "etf" if symbol.startswith(("1", "5")) else "stock"
     days = pd.bdate_range(start, periods=count)
     frame = pd.DataFrame({"timestamp": days, "open": 10., "high": 11., "low": 9.,
                           "close": 10., "preclose": 10., "tradestatus": 1, "is_st": False,
                           "volume": 1000., "turnover": 10000., "source": "fixture",
                           "source_verified": True, "is_synthetic": False,
                           "is_auction_placeholder": False})
-    service.repository.commit_bars(SYMBOL, "1day", frame, source="fixture", metadata={"asset_type": "stock"})
-    service.repository.save_auxiliary(SYMBOL, "calendar", pd.DataFrame({"date": days}).to_dict("records"), verified=True)
-    service.store.put_instrument(SYMBOL, name="fixture", asset_type="stock")
+    service.repository.commit_bars(symbol, "1day", frame, source="fixture", metadata={"asset_type": asset_type})
+    service.repository.save_auxiliary(symbol, "calendar", pd.DataFrame({"date": days}).to_dict("records"), verified=True)
+    service.store.put_instrument(symbol, name="fixture", asset_type=asset_type)
     return service, days, frame
 
 
 def run_key(service, cutoff):
     return f"market-sync:{service.repository.package_id}:1day:incremental:{cutoff}:{SOURCE_VERSION}"
+
+
+def coverage_reports(service, symbol):
+    with service.repository._connect() as db:
+        return [
+            row[0] for row in db.execute(
+                "SELECT report FROM parquet_coverage "
+                "WHERE symbol=? AND timeframe='1day' AND adjustment='none' "
+                "ORDER BY end_time",
+                (symbol,),
+            ).fetchall()
+        ]
 
 
 def test_legacy_completed_without_ledger_bootstraps_locally(tmp_path, monkeypatch):
@@ -56,6 +70,28 @@ def test_market_download_tail_is_independent_of_missing_ledger(tmp_path):
     assert lower == days[-1] - pd.Timedelta(days=3)
     assert upper == pd.Timestamp("2026-01-19")
     assert CoverageArchive(service.repository).load_head(SYMBOL, "1day") is None
+
+
+def test_incremental_skips_stale_local_history_without_network(tmp_path, monkeypatch):
+    service, days, frame = seed(tmp_path, start="2025-01-06", symbol=ETF_SYMBOL)
+    cutoff = "2026-10-23"
+    sync = MarketDataSyncService(service, cutoff_date=cutoff)
+    monkeypatch.setattr(sync, "_fetch", lambda *_: pytest.fail("stale incremental history must not call network"))
+    key = run_key(service, cutoff)
+    service.store.sync_item(key, ETF_SYMBOL, status="failed", error="previous empty response")
+
+    result = sync.sync([ETF_SYMBOL], "1day", "incremental", resume=True)
+
+    assert result["status"] == "completed", result
+    assert result["failures"] == []
+    assert len(result["skipped"]) == 1
+    skipped = result["skipped"][0]
+    assert skipped["incremental_stale"] is True
+    assert "缺口修补" in skipped["message"]
+    assert service.repository.dataset(ETF_SYMBOL, "1day")["last_time"] == str(days[-1])
+    state = service.store.sync_item(key, ETF_SYMBOL)
+    assert state["status"] == "completed"
+    assert state["error"] is None
 
 
 def test_preparation_returns_auxiliary_without_writing_package(tmp_path, monkeypatch):
@@ -93,13 +129,13 @@ def test_cancel_local_validation_preserves_published_batch_and_resumes(tmp_path,
     monkeypatch.setattr(validation, "_DAILY_COMMIT_BATCH_SIZE", 5)
     stopped = False
     details = []
-    original_commit = CoverageArchive.commit_rows
-    def stop_after_first_publication(archive, *args, **kwargs):
+    original_commit = CoverageArchive.commit_rows_many
+    def stop_after_first_publication(archive, chunks):
         nonlocal stopped
-        result = original_commit(archive, *args, **kwargs)
+        result = original_commit(archive, chunks)
         stopped = True
         return result
-    monkeypatch.setattr(CoverageArchive, "commit_rows", stop_after_first_publication)
+    monkeypatch.setattr(CoverageArchive, "commit_rows_many", stop_after_first_publication)
     sync = MarketDataSyncService(service, cutoff_date=cutoff, detail=details.append)
     monkeypatch.setattr(sync, "_fetch", lambda *_: pytest.fail("must validate local history"))
     with pytest.raises(MarketSyncCancelled) as captured:
@@ -107,16 +143,19 @@ def test_cancel_local_validation_preserves_published_batch_and_resumes(tmp_path,
                   cancelled=lambda: stopped)
     partial = captured.value.report
     assert partial["status"] == "cancelled"
-    assert partial["published_quality_pending"][0]["symbol"] == SYMBOL
-    assert len(CoverageArchive(service.repository).rows(SYMBOL, "1day")) == 5
+    assert partial["symbols"] == []
+    assert [item["symbol"] for item in partial["published_quality_pending"]] == [SYMBOL]
+    assert len(CoverageArchive(service.repository).rows(SYMBOL, "1day")) == 30
     assert any(item.get("total_days") == 30 for item in details)
-    monkeypatch.setattr(CoverageArchive, "commit_rows", original_commit)
+    monkeypatch.setattr(CoverageArchive, "commit_rows_many", original_commit)
+    reports_before_resume = coverage_reports(service, SYMBOL)
     resumed = MarketDataSyncService(service, cutoff_date=cutoff)
     monkeypatch.setattr(resumed, "_fetch", lambda *_: pytest.fail("resume must read local history"))
     result = resumed.sync([SYMBOL], "1day", "incremental", resume=True)
     assert result["status"] == "completed"
     assert len(CoverageArchive(service.repository).rows(SYMBOL, "1day")) == 30
-    assert result["symbols"][0]["metrics"]["validated_days"] == 25
+    assert result["skipped"][0]["metrics"]["validated_days"] == 0
+    assert coverage_reports(service, SYMBOL) == reports_before_resume
 
 
 def test_checked_but_invalid_history_remains_partial(tmp_path, monkeypatch):

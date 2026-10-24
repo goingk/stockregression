@@ -769,13 +769,33 @@ class Store:
                 dumps(merged),
             ))
 
-    def instruments(self, query: str = "", limit: int | None = 100, asset_type: str | None = None, offset: int = 0) -> list[dict]:
+    def instruments(
+        self, query: str = "", limit: int | None = 100,
+        asset_type: str | None = None, offset: int = 0,
+        *, include_delisted: bool = False,
+    ) -> list[dict]:
+        where = "(symbol LIKE ? OR name LIKE ?)"
+        args: list[Any] = [f"%{query}%", f"%{query}%"]
+        if not include_delisted:
+            where += " AND (delisting_date IS NULL OR delisting_date='')"
         with self.db() as db:
-            rows = db.execute("SELECT * FROM instruments WHERE symbol LIKE ? OR name LIKE ? ORDER BY symbol", (f"%{query}%", f"%{query}%")).fetchall()
+            rows = db.execute(
+                f"SELECT * FROM instruments WHERE {where} ORDER BY symbol",
+                args,
+            ).fetchall()
         items = [self._instrument(row) for row in rows]
         if asset_type:
             items = [item for item in items if item["asset_type"] == asset_type]
         return items[offset:] if limit is None else items[offset:offset + limit]
+
+    def delisted_symbols(self) -> list[str]:
+        with self.db() as db:
+            rows = db.execute(
+                "SELECT symbol FROM instruments "
+                "WHERE delisting_date IS NOT NULL AND delisting_date!='' "
+                "ORDER BY symbol"
+            ).fetchall()
+        return [str(row[0]) for row in rows]
 
     @staticmethod
     def _instrument(row):

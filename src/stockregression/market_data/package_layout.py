@@ -367,42 +367,83 @@ class PackageLayout:
         package head.  The monthly archive files themselves are immutable and
         content addressed; only this small reference advances.
         """
+        return self.publish_quality_archives([{
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "adjustment": adjustment,
+            "reference": reference,
+            "expected_data_version": expected_data_version,
+            "expected_revision": expected_revision,
+        }])
+
+    def publish_quality_archives(
+        self, entries: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Publish archive references for several datasets as one head switch.
+
+        Every entry has ``symbol``, ``timeframe``, ``adjustment``, ``reference``,
+        ``expected_data_version`` and ``expected_revision``. Validation and
+        immutable payload checks happen before any entry is applied, so a
+        conflict cannot advance only part of a batch.
+        """
+        if not entries:
+            return self.manifest()
         self.check_publication()
-        timeframe = normalize_timeframe(timeframe)
-        key = self.dataset_key(symbol, timeframe, adjustment)
-        relative = str(reference.get("path") or "").replace("\\", "/")
-        path = self.absolute(relative)
-        if not path.is_file():
-            raise ValueError(f"覆盖档案文件不存在：{relative}")
         with self._manifest_guard():
             package = self._fresh_manifest(self._load_manifest())
-            current = dict(package["datasets"].get(key) or {})
-            if not current:
-                raise ValueError(f"覆盖档案没有对应的数据集：{key}")
-            if int(current.get("version") or 0) != int(expected_data_version):
-                raise ValueError(
-                    f"覆盖档案的数据版本冲突：{key}，预期 {expected_data_version}，"
-                    f"当前 {current.get('version')}"
-                )
-            previous = dict(current.get("quality_archive") or {})
-            current_revision = int(previous.get("revision") or 0)
-            if current_revision != int(expected_revision):
-                if (
-                    current_revision == int(reference.get("revision") or 0)
-                    and previous.get("path") == reference.get("path")
-                    and previous.get("sha256") == reference.get("sha256")
-                    and int(previous.get("data_version") or 0) == int(reference.get("data_version") or 0)
-                ):
-                    return package
-                raise ValueError(
-                    f"覆盖档案修订冲突：{key}，预期 {expected_revision}，"
-                    f"当前 {current_revision}"
-                )
-            current["quality_archive"] = {
-                **reference,
-                "updated_at": utc_now(),
-            }
-            package["datasets"][key] = current
+            prepared: dict[str, dict[str, Any]] = {}
+            changed = False
+            for entry in entries:
+                symbol = str(entry["symbol"])
+                timeframe = normalize_timeframe(str(entry["timeframe"]))
+                adjustment = str(entry.get("adjustment") or "none")
+                reference = dict(entry.get("reference") or {})
+                expected_data_version = int(entry["expected_data_version"])
+                expected_revision = int(entry["expected_revision"])
+                key = self.dataset_key(symbol, timeframe, adjustment)
+                if key in prepared:
+                    raise ValueError(f"覆盖档案批次包含重复数据集：{key}")
+                relative = str(reference.get("path") or "").replace("\\", "/")
+                path = self.absolute(relative)
+                if not path.is_file():
+                    raise ValueError(f"覆盖档案文件不存在：{relative}")
+                current = dict(package["datasets"].get(key) or {})
+                if not current:
+                    raise ValueError(f"覆盖档案没有对应的数据集：{key}")
+                if int(current.get("version") or 0) != expected_data_version:
+                    raise ValueError(
+                        f"覆盖档案的数据版本冲突：{key}，预期 {expected_data_version}，"
+                        f"当前 {current.get('version')}"
+                    )
+                previous = dict(current.get("quality_archive") or {})
+                current_revision = int(previous.get("revision") or 0)
+                if current_revision != expected_revision:
+                    already_published = (
+                        current_revision == int(reference.get("revision") or 0)
+                        and previous.get("path") == reference.get("path")
+                        and previous.get("sha256") == reference.get("sha256")
+                        and int(previous.get("data_version") or 0)
+                        == int(reference.get("data_version") or 0)
+                    )
+                    if already_published:
+                        prepared[key] = current
+                        continue
+                    raise ValueError(
+                        f"覆盖档案修订冲突：{key}，预期 {expected_revision}，"
+                        f"当前 {current_revision}"
+                    )
+                prepared[key] = {
+                    **current,
+                    "quality_archive": {
+                        **reference,
+                        "updated_at": utc_now(),
+                    },
+                }
+                changed = True
+            if not changed:
+                return package
+            for key, current in prepared.items():
+                package["datasets"][key] = current
             package["package_version"] = int(package.get("package_version", 0)) + 1
             package["schema_version"] = PACKAGE_SCHEMA_VERSION
             package["updated_at"] = utc_now()

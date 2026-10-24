@@ -99,13 +99,26 @@ class DataService:
         records = fetch_instruments(
             network_timeout=self.market_settings.network_timeout_seconds,
         )
+        excluded = 0
         for record in records:
             if cancelled():
                 raise InterruptedError("任务已取消")
+            existing = self.store.instrument(record["symbol"])
+            if existing and existing.get("delisting_date"):
+                excluded += 1
+                continue
             self.store.put_instrument(**record)
         warnings = sorted({warning for record in records for warning in record.get("catalog_warnings", [])})
         self.store.state("catalog:latest", {"count": len(records), "warnings": warnings})
-        return {"count": len(records), "warnings": warnings, "message": f"已更新 {len(records)} 只股票及 ETF；保留来源覆盖的 ST 与退市历史"}
+        return {
+            "count": len(records) - excluded,
+            "excluded": excluded,
+            "warnings": warnings,
+            "message": (
+                f"已更新 {len(records) - excluded} 只股票及 ETF；"
+                f"跳过 {excluded} 只已退市或永久排除的标的"
+            ),
+        }
 
     def sync(self, symbols: list[str], mode: str, progress=lambda *_: None, cancelled=lambda: False, scope: str | None = None, resume: bool = False, retry_failed: bool = False, workers: int = 2):
         """Compatibility entry point that always writes the managed ETF package."""

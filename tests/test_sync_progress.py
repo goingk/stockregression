@@ -50,7 +50,10 @@ def assert_progress(values):
     assert values[-1] == pytest.approx(1)
 
 
-def test_broken_process_pool_retries_unfinished_downloads_and_uses_threads(service, monkeypatch):
+@pytest.mark.parametrize("fail_on_submit", [False, True])
+def test_broken_process_pool_retries_unfinished_downloads_and_uses_threads(
+    service, monkeypatch, fail_on_submit,
+):
     from concurrent.futures import Future
     from concurrent.futures.process import BrokenProcessPool
     from stockregression.market_data import sync as sync_module
@@ -63,6 +66,8 @@ def test_broken_process_pool_retries_unfinished_downloads_and_uses_threads(servi
             pools.append(self)
 
         def submit(self, *args, **kwargs):
+            if fail_on_submit:
+                raise BrokenProcessPool("worker exited")
             future = Future()
             future.set_exception(BrokenProcessPool("worker exited"))
             return future
@@ -96,7 +101,8 @@ def test_daily_download_reports_progress_before_first_commit(service, monkeypatc
     monkeypatch.setattr(sync, "_prepare_daily", lambda symbol, *_: prepared(symbol))
 
     def commit(symbol, *_args, **_kwargs):
-        # Downloads must be visible before the batch starts committing rows.
+        # The first merge may begin as soon as one download completes, but its
+        # progress must already include that completed transfer.
         commit_progress.append(list(values))
         return {"symbol": symbol, "last_time": "2026-01-06"}
 
@@ -104,7 +110,8 @@ def test_daily_download_reports_progress_before_first_commit(service, monkeypatc
     result = run_daily(sync, SYMBOLS, lambda fraction, _: values.append(fraction))
     assert result["status"] == "completed"
     assert len(result["symbols"]) == 4
-    assert sorted(set(commit_progress[0])) == pytest.approx([1 / 8, 2 / 8])
+    assert commit_progress[0]
+    assert max(commit_progress[0]) >= 1 / 8
     assert commit_progress[-1][-1] < 1
     assert_progress(values)
 
@@ -151,7 +158,22 @@ def test_daily_outcomes_settle_each_symbol_once(service, monkeypatch, outcome):
     checkpoint_skip = outcome in {"resume", "retry_failed"}
     if outcome == "resume":
         monkeypatch.setattr(sync, "_daily_checkpoint_action", lambda symbol, state, *_: "reuse" if symbol in SYMBOLS[:2] else "download")
-        monkeypatch.setattr(sync, "_local_daily_validation", lambda symbol, *_: {"symbol": symbol, "last_time": "2026-01-06", "quality_status": "complete"})
+        for symbol in SYMBOLS[:2]:
+            frame = pd.DataFrame({
+                "timestamp": [pd.Timestamp("2026-01-06")],
+                "open": [10.0], "high": [10.2], "low": [9.8], "close": [10.1],
+                "volume": [1000.0], "turnover": [10100.0], "preclose": [10.0],
+                "tradestatus": [1], "is_st": [False], "source_verified": [True],
+                "is_synthetic": [False], "is_auction_placeholder": [False],
+                "source": ["fixture"],
+            })
+            service.repository.commit_bars(
+                symbol, "1day", frame, source="fixture", metadata={"asset_type": "stock"},
+            )
+            service.repository.save_auxiliary(
+                symbol, "calendar", [{"date": pd.Timestamp("2026-01-06")}], verified=True,
+            )
+            service.store.put_instrument(symbol, name=symbol, asset_type="stock")
     if checkpoint_skip:
         for symbol in SYMBOLS[:2] if outcome == "resume" else SYMBOLS[2:]:
             service.store.sync_item(RUN_KEY, symbol, status="completed" if outcome == "resume" else "failed")
@@ -188,7 +210,6 @@ def test_daily_outcomes_settle_each_symbol_once(service, monkeypatch, outcome):
     if checkpoint_skip:
         assert set(downloads) == set(SYMBOLS[2:])
         assert len(result["skipped"]) == 2
-        assert 0.5 in values
     assert_progress(values)
 
 

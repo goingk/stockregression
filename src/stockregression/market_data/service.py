@@ -38,7 +38,7 @@ from .timeframes import MINUTE_TIMEFRAMES, TIMEFRAMES, normalize_timeframe, time
 from .coverage_index import CoverageArchive
 from .validation import (
     VALIDATION_RULES_VERSION, _read_daily_dependencies,
-    validate_incremental, validation_targets,
+    finalize_validation_publication, validate_incremental, validation_targets,
 )
 
 
@@ -726,6 +726,7 @@ class MarketDataService:
         source_metadata: dict | None = None,
         calendar_frame: pd.DataFrame | None = None,
         import_mode: str = "merge",
+        defer_validation: bool = False,
     ) -> dict:
         started_at = time.perf_counter()
         if import_mode not in {"merge", "snapshot"}:
@@ -857,6 +858,29 @@ class MarketDataService:
             # Selection reads ledger metadata; only absent/dirty target days read bars.
             # A partial prior bootstrap must finish even when recent bars are unchanged.
             task_start = current_dataset.get("first_time") or task_start
+        if defer_validation:
+            result.pop("_preloaded_months", None)
+            self.store.put_instrument(
+                symbol, **{key: value for key, value in metadata.items()
+                           if key not in {"symbol", "name"}}
+            )
+            self.repository.save_basic_info(symbol, metadata)
+            return {
+                "symbol": symbol, "timeframe": timeframe, "version": result["version"],
+                "_deferred_validation": {
+                    "symbol": symbol, "timeframe": timeframe, "adjustment": adjustment,
+                    "start": str(pd.Timestamp(task_start).date()),
+                    "end": str(pd.Timestamp(task_end).date()),
+                    "expected_data_version": int(result["version"]),
+                    "had_archive": had_archive, "merge_seconds": merge_seconds,
+                    "started_at": started_at, "result": result,
+                    "report": report, "pending": list(validation.pending),
+                    "metadata": metadata, "changed_dates": changed_dates,
+                    "import_mode": import_mode,
+                    "fingerprint": fingerprint,
+                    "coverage_start": coverage_start, "coverage_end": coverage_end,
+                },
+            }
         history_started = time.perf_counter()
         ledger = validate_incremental(
             self, symbol, timeframe, mode="incremental",
@@ -906,6 +930,76 @@ class MarketDataService:
                        "quality_status": ledger["status"],
                        "quality_revision": ledger.get("archive_revision"),
                        "verified_through": ledger.get("verified_through")}
+
+    def _finalize_deferred_commit(
+        self, context: dict[str, Any], ledger: dict[str, Any], publication: dict[str, Any],
+        *, validation_seconds: float, publication_seconds: float,
+    ) -> dict:
+        symbol = str(context["symbol"])
+        timeframe = str(context["timeframe"])
+        adjustment = str(context.get("adjustment") or "none")
+        start = pd.Timestamp(context["start"])
+        end = pd.Timestamp(context["end"])
+        final = finalize_validation_publication(
+            self, symbol, timeframe, adjustment=adjustment,
+            lower=start, upper=end, ledger=ledger, archive_head=publication,
+        )
+        metadata = dict(context.get("metadata") or {})
+        self.store.put_instrument(
+            symbol, **{key: value for key, value in metadata.items()
+                       if key not in {"symbol", "name"}}
+        )
+        self.repository.save_basic_info(symbol, metadata)
+        snapshot_started = time.perf_counter()
+        self.refresh_snapshot(symbol)
+        snapshot_seconds = time.perf_counter() - snapshot_started
+        record_seconds("snapshot", snapshot_seconds)
+        result = dict(context["result"])
+        pending = list(context.get("pending") or [])
+        for value in final.get("pending_validation") or []:
+            text = str(value)
+            if not any(text == str(existing) for existing in pending):
+                pending.append(text)
+        metrics = {
+            "merge_seconds": round(float(context.get("merge_seconds") or 0), 6),
+            "ledger_publication_seconds": round(max(0.0, publication_seconds), 6),
+            "history_validation_seconds": round(max(0.0, validation_seconds), 6),
+            "seconds": round(time.perf_counter() - float(context["started_at"]), 4),
+            "rows_read": int(result.get("rows_read") or 0),
+            "bytes_written": int(result.get("bytes") or 0),
+            "written_shards": int(result.get("shard_count") or 0),
+            "validated_days": int(ledger.get("checked_days") or 0),
+            "reused_days": int(ledger.get("reused_days") or 0),
+            "archive_hit": bool(ledger.get("archive_hit")),
+            "scanned_months": int(ledger.get("scanned_months") or 0),
+            "scanned_shards": int(ledger.get("scanned_shards") or ledger.get("scanned_months") or 0),
+            "snapshot_seconds": round(snapshot_seconds, 6),
+        }
+        current = self.repository.dataset(symbol, timeframe, adjustment) or {}
+        message = (
+            f"新增 {result.get('inserted', 0)} 行，修正 {result.get('updated', 0)} 行，"
+            f"未变化 {result.get('unchanged', 0)} 行"
+            + ("；有待核验事项" if pending else "")
+            + (f"；合规截至 {final.get('verified_through')}"
+               if final.get("verified_through") else "")
+        )
+        return FileImportResult(
+            symbol, timeframe, result.get("status", "ready"), version=result["version"],
+            rows_read=result.get("rows_read", 0), inserted=result.get("inserted", 0),
+            updated=result.get("updated", 0), unchanged=result.get("unchanged", 0),
+            synthetic=result.get("synthetic", 0),
+            gap_count=int((context.get("report") or {}).get("gap_count") or 0),
+            pending_validation=pending, message=message,
+            fingerprint=context.get("fingerprint"), import_mode=context.get("import_mode", "merge"),
+            changed_dates=list(context.get("changed_dates") or []),
+            shard_count=int(result.get("shard_count") or 0), layout=result.get("layout"),
+            metrics=metrics,
+        ).as_dict() | {
+            "last_time": current.get("last_time"),
+            "quality_status": final["status"],
+            "quality_revision": final.get("archive_revision"),
+            "verified_through": final.get("verified_through"),
+        }
 
     def _verify_volume_units(self, symbol, timeframe, frame):
         daily = self.repository.active_rows(

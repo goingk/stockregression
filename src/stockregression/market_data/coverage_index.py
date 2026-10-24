@@ -709,6 +709,28 @@ class CoverageArchive:
         finally:
             record_seconds("ledger_publication", time.perf_counter() - started)
 
+    def commit_rows_many(
+        self, chunks: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Publish independent symbol ledgers with one package head switch.
+
+        Each chunk accepts ``rows``, ``validation_rows``,
+        ``expected_data_version`` and ``changed_months``. All immutable month
+        pages and heads are written first, then all package references advance
+        atomically, and finally every SQLite mirror is updated in one
+        transaction. A conflict therefore publishes none of the batch.
+        """
+        import time
+        from ..performance import record_seconds
+
+        if not chunks:
+            return []
+        started = time.perf_counter()
+        try:
+            return self._commit_rows_many_impl(chunks)
+        finally:
+            record_seconds("ledger_publication", time.perf_counter() - started)
+
     def _commit_rows_impl(
         self, rows: Sequence[dict[str, Any]], *, validation_rows=(),
         expected_data_version: int | None = None, changed_months=None,
@@ -726,9 +748,14 @@ class CoverageArchive:
                         "_evidence_read_calls": evidence_reads}
             current = self.current_data_version(symbol, timeframe, adjustment)
             months = {_month_key(row["trade_date"]) for row in accepted}
-            head = self.persist(
+            head, reference = self._prepare_publication(
                 symbol, timeframe, adjustment, expected_data_version=current,
-                changed_months=months, _updates=accepted, _record_mirror=False,
+                changed_months=months, _updates=accepted,
+            )
+            self.package.publish_quality_archive(
+                symbol, timeframe, adjustment, reference,
+                expected_data_version=int(head["data_version"]),
+                expected_revision=int(head["revision"]) - 1,
             )
             # The package head is published before its SQLite projection. Make
             # the projection match every touched month from that exact head,
@@ -765,6 +792,108 @@ class CoverageArchive:
             return {**head, "_stale_dates": sorted(stale),
                     "_accepted_dates": sorted(accepted_dates),
                     "_evidence_read_calls": evidence_reads}
+
+    def _commit_rows_many_impl(self, chunks: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        prepared = []
+        with self.package.transaction_guard():
+            seen: set[tuple[str, str, str]] = set()
+            for chunk in chunks:
+                rows = list(chunk.get("rows") or [])
+                if not rows:
+                    prepared.append({"rows": [], "accepted": [], "stale": set(),
+                                     "evidence_reads": 0})
+                    continue
+                symbol = str(rows[0]["symbol"])
+                timeframe = str(rows[0]["timeframe"])
+                adjustment = str(rows[0].get("adjustment") or "none")
+                key = (symbol, timeframe, adjustment)
+                if key in seen:
+                    raise ValueError(f"覆盖档案批次包含重复数据集：{key}")
+                seen.add(key)
+                accepted, stale, evidence_reads = self._current_rows(
+                    rows, chunk.get("expected_data_version")
+                )
+                item = {
+                    "rows": rows, "accepted": accepted, "stale": stale,
+                    "evidence_reads": evidence_reads, "symbol": symbol,
+                    "timeframe": timeframe, "adjustment": adjustment,
+                }
+                if accepted:
+                    months = {_month_key(row["trade_date"]) for row in accepted}
+                    current = self.current_data_version(symbol, timeframe, adjustment)
+                    head, reference = self._prepare_publication(
+                        symbol, timeframe, adjustment, expected_data_version=current,
+                        changed_months=months, _updates=accepted,
+                    )
+                    item.update(
+                        months=months, head=head, reference=reference,
+                        month_rows=self._published_month_rows(head, months),
+                    )
+                prepared.append(item)
+
+            publishable = [item for item in prepared if item.get("head")]
+            if publishable:
+                self.package.publish_quality_archives([{
+                    "symbol": item["symbol"],
+                    "timeframe": item["timeframe"],
+                    "adjustment": item["adjustment"],
+                    "reference": item["reference"],
+                    "expected_data_version": int(item["head"]["data_version"]),
+                    "expected_revision": int(item["head"]["revision"]) - 1,
+                } for item in publishable])
+
+                with self.repository._connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    for item in publishable:
+                        symbol = item["symbol"]
+                        timeframe = item["timeframe"]
+                        adjustment = item["adjustment"]
+                        for month in sorted(item["months"]):
+                            start = pd.Period(month, freq="M").start_time.strftime("%Y-%m-%d")
+                            end = pd.Period(month, freq="M").end_time.strftime("%Y-%m-%d")
+                            db.execute(
+                                "DELETE FROM parquet_coverage_days WHERE symbol=? AND timeframe=? "
+                                "AND adjustment=? AND trade_date>=? AND trade_date<=?",
+                                (symbol, timeframe, adjustment, start, end),
+                            )
+                            db.execute(
+                                "DELETE FROM parquet_day_validation WHERE symbol=? AND timeframe=? "
+                                "AND adjustment=? AND trade_date>=? AND trade_date<=?",
+                                (symbol, timeframe, adjustment, start, end),
+                            )
+                            month_entries = item["month_rows"].get(month, [])
+                            self.save_rows(month_entries, db=db)
+                            self._write_validations(
+                                [row for row in month_entries if not row.get("dirty_reason")], db,
+                            )
+                        self.record_archive(item["head"], item["reference"], db=db)
+
+            output = []
+            for item in prepared:
+                head = item.get("head")
+                if head is None:
+                    rows = item["rows"]
+                    if rows:
+                        head = self.load_head(
+                            item["symbol"], item["timeframe"], item["adjustment"],
+                        ) or {}
+                    else:
+                        head = {}
+                accepted_dates = {
+                    _day_text(row["trade_date"]) for row in item["accepted"]
+                }
+                if item.get("reference"):
+                    head = dict(head)
+                    head["_reference"] = dict(item["reference"])
+                    head["_pending_updates"] = list(
+                        item["reference"].get("pending_updates") or []
+                    )
+                output.append({
+                    **head, "_stale_dates": sorted(item["stale"]),
+                    "_accepted_dates": sorted(accepted_dates),
+                    "_evidence_read_calls": int(item["evidence_reads"]),
+                })
+            return output
 
     @staticmethod
     def _write_validations(rows, db) -> None:
@@ -874,20 +1003,26 @@ class CoverageArchive:
         _record_mirror: bool = True,
     ) -> dict[str, Any]:
         with self.package.transaction_guard():
-            return self._persist_locked(
+            head, reference = self._prepare_publication(
                 symbol, timeframe, adjustment, expected_data_version=expected_data_version,
                 changed_months=changed_months, _updates=_updates,
-                _record_mirror=_record_mirror,
             )
+            self.package.publish_quality_archive(
+                symbol, timeframe, adjustment, reference,
+                expected_data_version=int(head["data_version"]),
+                expected_revision=int(head["revision"]) - 1,
+            )
+            if _record_mirror:
+                self.record_archive(head, reference)
+            return head
 
-    def _persist_locked(
+    def _prepare_publication(
         self, symbol: str, timeframe: str, adjustment: str = "none", *,
         expected_data_version: int | None = None,
         changed_months: Iterable[str] | None = None,
         _updates: Sequence[dict[str, Any]] = (),
-        _record_mirror: bool = True,
-    ) -> dict[str, Any]:
-        """Publish all current day records as reusable monthly package files."""
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Write immutable month pages and a head without advancing its reference."""
         from .repository import VALIDATION_RULES_VERSION, utc_now
 
         timeframe = normalize_timeframe(timeframe)
@@ -1136,15 +1271,7 @@ class CoverageArchive:
                 for reason, days in sorted(pending_groups.items())
             ],
         }
-        self.package.publish_quality_archive(
-            symbol, timeframe, adjustment,
-            published_reference,
-            expected_data_version=data_version,
-            expected_revision=int((reference or {}).get("revision") or 0),
-        )
-        if _record_mirror:
-            self.record_archive(head, published_reference)
-        return head
+        return head, published_reference
 
     def record_archive(self, head: dict[str, Any], reference: dict[str, Any], *, db=None) -> None:
         from .repository import utc_now

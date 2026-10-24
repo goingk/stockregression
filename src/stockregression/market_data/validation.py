@@ -546,6 +546,79 @@ def _empty_day_gaps(timeframe: str, day: pd.Timestamp) -> list[dict[str, Any]]:
     return [{"start": day.date().isoformat(), "end": day.date().isoformat(), "missing": 1}]
 
 
+def finalize_validation_publication(
+    service, symbol: str, timeframe: str, *, adjustment: str = "none",
+    lower, upper, ledger: dict[str, Any], archive_head: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Commit one already-published read-only validation result to SQLite.
+
+    The package head is authoritative. This projection runs only after every
+    evidence row in a publication batch has passed its version/dependency
+    checks, and it never changes the archive reference itself.
+    """
+    repository = service.repository
+    head = dict(archive_head or {})
+    pending_by_day: dict[str, str] = {}
+    for item in head.get("months") or []:
+        summary = item.get("summary") if isinstance(item, dict) else None
+        if isinstance(summary, dict):
+            pending_by_day.update({
+                str(day): str(reason)
+                for day, reason in (summary.get("pending_dates") or {}).items()
+            })
+    for update in head.get("_pending_updates") or []:
+        for day in update.get("dates") or []:
+            pending_by_day.setdefault(str(day), str(update.get("reason") or "待重新检查"))
+    pending = sorted(pending_by_day)
+    stale = list((archive_head or {}).get("_stale_dates") or [])
+    pending.extend(value for value in stale if value not in pending)
+    failed = int(head.get("failed_count") or 0)
+    pending_count = int(head.get("pending_count") or 0)
+    verified_through = head.get("verified_through")
+    final_status = "complete" if (
+        not failed and not pending and verified_through
+        and not pending_count
+    ) else "partial"
+    if final_status == "complete":
+        reason = None
+    elif failed:
+        reason = f"{failed} 个交易日未通过校验"
+    else:
+        reason = f"{max(len(pending), pending_count)} 个交易日待复核"
+    checked_days = int(ledger.get("checked_days") or 0)
+    if checked_days:
+        repository.save_coverage(
+            symbol, timeframe, adjustment, lower, upper,
+            {
+                "status": final_status,
+                "expected_rows": int(ledger.get("expected_rows") or 0),
+                "observed_rows": int(ledger.get("observed_rows") or 0),
+                "synthetic_rows": int(ledger.get("synthetic_rows") or 0),
+                "gap_count": int(ledger.get("gap_count") or 0),
+                "checked_days": checked_days,
+                "failed_days": failed,
+                "calendar_available": bool(ledger.get("calendar_available")),
+                "coverage_status": final_status,
+                "reason": reason,
+                "archive_hit": bool(ledger.get("archive_hit")),
+                "reused_days": int(ledger.get("reused_days") or 0),
+            },
+        )
+        repository.update_dataset_status(
+            symbol, timeframe, adjustment,
+            "ready" if final_status == "complete" else "partial",
+            reason,
+        )
+    return {
+        "status": final_status,
+        "pending_validation": pending,
+        "failed_days": failed,
+        "verified_from": head.get("scanned_start") or head.get("first_time"),
+        "verified_through": verified_through,
+        "archive_revision": int((archive_head or {}).get("revision") or 0),
+    }
+
+
 def validate_incremental(
     service,
     symbol: str,
@@ -1113,6 +1186,8 @@ def validate_incremental(
             "evidence_read_calls": evidence_read_calls,
             "daily_dependency_read_calls": daily_read_metrics["calls"],
             "daily_dependency_shard_reads": len(daily_read_metrics.get("periods", set())),
+            "expected_rows": expected_rows, "observed_rows": observed_rows,
+            "synthetic_rows": synthetic_rows, "gap_count": gap_count,
         }
     state = repository.validation_state(
         symbol, timeframe, adjustment=adjustment, start=lower, end=upper,

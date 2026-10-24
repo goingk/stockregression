@@ -558,6 +558,39 @@ def test_daily_sync_commits_many_symbols_as_independent_year_shards(tmp_path, mo
     assert len(list(service.repository.package.partitions_dir.rglob("*.parquet"))) == 4
 
 
+def test_purged_delisted_instrument_cannot_reenter_market_sync_scope(tmp_path):
+    service = MarketDataService(Store(tmp_path / "data"))
+    days = _days()
+    calendar = _calendar(tmp_path, days)
+    path = tmp_path / "159001_daily.csv"
+    _daily(days).to_csv(path, index=False)
+    symbol = "159001.SZ"
+    service.import_file(symbol, "1day", path, calendar_path=calendar)
+    service.store.put_instrument(
+        symbol, "历史基金", asset_type="etf",
+        delisting_date=str(days[-1].date()),
+        permanent_exclusion="test-cleanup",
+    )
+
+    assert service.store.delisted_symbols() == [symbol]
+    assert service.store.instruments() == []
+    assert service.repository.symbols_for_timeframe("1day") == []
+    service.repository.rebuild_index(
+        symbols=[symbol], exclude_symbols=[symbol],
+    )
+    assert service.repository.dataset(symbol, "1day") is None
+
+    result = service.repository.purge_instruments([symbol])
+
+    assert result["symbols"] == 1
+    assert result["datasets"] >= 1
+    assert service.repository.dataset(symbol, "1day") is None
+    assert not (
+        service.repository.package.partitions_dir / "1day" / f"symbol={symbol}"
+    ).exists()
+    assert service.store.instrument(symbol)["permanent_exclusion"] == "test-cleanup"
+
+
 def test_market_data_api_imports_and_defaults_sync_to_base_timeframes(tmp_path):
     root = tmp_path / "data"
     days = _days(2)
