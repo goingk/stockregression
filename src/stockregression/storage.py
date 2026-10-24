@@ -728,6 +728,23 @@ class Store:
                 CREATE INDEX IF NOT EXISTS research_registry_symbol ON research_registry(symbol,created_at);
             """)
             registry_columns = {row[1] for row in db.execute("PRAGMA table_info(research_registry)")}
+            # Older catalogs used the protocol-specific name.  CREATE TABLE IF
+            # NOT EXISTS leaves those databases untouched, so rename the column
+            # here before any code queries the current name.
+            if "validation_intervals" in registry_columns:
+                if "evaluation_intervals" not in registry_columns:
+                    db.execute(
+                        "ALTER TABLE research_registry "
+                        "RENAME COLUMN validation_intervals TO evaluation_intervals"
+                    )
+                else:
+                    db.execute(
+                        "UPDATE research_registry SET evaluation_intervals=validation_intervals "
+                        "WHERE evaluation_intervals IS NULL OR evaluation_intervals IN ('', '[]')"
+                    )
+                    db.execute("ALTER TABLE research_registry DROP COLUMN validation_intervals")
+                registry_columns.discard("validation_intervals")
+                registry_columns.add("evaluation_intervals")
             for column in ("overlapping_prior_studies", "exact_repeat_prior_studies"):
                 if column not in registry_columns:
                     db.execute(f"ALTER TABLE research_registry ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")

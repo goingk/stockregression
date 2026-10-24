@@ -31,6 +31,14 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return record(value) !== null
 }
 
+/** Strip server-derived metadata so it never enters an editable patch. */
+function withoutServerFields(patch: Patch): Patch {
+  if (!('config_revision' in patch)) return structuredClone(patch)
+  const result = structuredClone(patch)
+  delete result.config_revision
+  return result
+}
+
 function deepMerge(target: unknown, patch: unknown): unknown {
   if (!isObject(patch)) return structuredClone(patch)
   const result: Document = isObject(target) ? structuredClone(target) : {}
@@ -92,7 +100,7 @@ function readDraft(): { pending: Patch; revision: string } {
   try {
     const parsed = JSON.parse(localStorage.getItem(CACHE_KEY) ?? 'null')
     if (Number(parsed?.version) >= 3 && typeof parsed.revision === 'string' && isObject(parsed.pending)) {
-      return { pending: parsed.pending, revision: parsed.revision }
+      return { pending: withoutServerFields(parsed.pending), revision: parsed.revision }
     }
   } catch { /* A damaged draft never replaces the file-backed configuration. */ }
   return { pending: {}, revision: '' }
@@ -166,7 +174,9 @@ function publishMerged(response: ConfigurationResponse) {
 }
 
 async function resolveExternalChange(response: ConfigurationResponse, message: string) {
-  const serverChanges = diffLeaves(snapshot.serverDocument, response.config)
+  const serverChanges = diffLeaves(
+    withoutServerFields(snapshot.serverDocument), withoutServerFields(response.config),
+  )
   if (Object.keys(pending).length && overlaps(pending, serverChanges)) {
     const desired = mergePatch(response.config, pending)
     publish({
@@ -186,7 +196,8 @@ function flush(keepalive = false) {
   clearTimeout(saveTimer)
   saveTimer = undefined
   saveChain = saveChain.catch(() => undefined).then(async () => {
-    const patch = structuredClone(pending)
+    const patch = withoutServerFields(pending)
+    pending = patch
     if (!Object.keys(patch).length) return
     const version = draftVersion
     try {
@@ -200,7 +211,10 @@ function flush(keepalive = false) {
         pending = {}
         applyResponse(response)
       } else {
-        const desired = snapshot.document
+        // The edit made while this request was in flight belongs to the new
+        // server revision.  Align the derived revision before diffing, or the
+        // next autosave sends config_revision as if it were a user setting.
+        const desired = { ...snapshot.document, config_revision: response.config.config_revision }
         pending = diffLeaves(response.config, desired)
         publish({ ...responseSnapshot(response, desired), value: workbenchFromDocument(desired) })
         writeDraft()
@@ -266,7 +280,9 @@ async function initialize() {
 }
 
 export function rememberConfigurationPatch(patch: Patch) {
-  if (!isObject(patch) || !Object.keys(patch).length) return
+  if (!isObject(patch)) return
+  patch = withoutServerFields(patch)
+  if (!Object.keys(patch).length) return
   pending = deepMerge(pending, patch) as Patch
   draftVersion += 1
   const desired = mergePatch(snapshot.document, patch)

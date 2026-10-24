@@ -162,12 +162,15 @@ def optimize_v5(
     adaptive_result = None
     schedule: list[dict[str, Any]] = []
     selection_count = 0
+    # Every research decision is anchored to the evaluation start.  The last
+    # close before that date is the price anchor; using the evaluation end
+    # here would select parameters with hindsight and would let the current
+    # recommendation's training window overlap the out-of-sample period.
+    prior = dates[dates < eval_dates[0]]
+    selection_asof = prior[-1] if len(prior) else eval_dates[0] - pd.Timedelta(days=1)
 
     if target in ("fixed", "both"):
-        asof = eval_dates[0] - pd.Timedelta(days=1)
-        prior = dates[dates < eval_dates[0]]
-        if len(prior):
-            asof = prior[-1]
+        asof = selection_asof
         _emit(progress, .02, "选择固定样本外参数")
         fixed_selection = select_robust_at(
             config, base, data, asof, progress=progress, cancelled=cancelled,
@@ -268,11 +271,16 @@ def optimize_v5(
     else:
         adaptive = {"status": "not_requested", "schedule": [], "test_result": None}
 
-    _emit(progress, .95, "按最后收盘选择当前参数")
-    current = select_robust_at(
-        config, base, data, eval_dates[-1], progress=progress, cancelled=cancelled,
-        progress_start=.95, progress_width=.04, runtime=runtime, budget=task_budget,
-    )
+    _emit(progress, .95, "按评估开始日前收盘生成参数建议")
+    if fixed_selection is not None:
+        # The fixed and current branches deliberately share the same causal
+        # anchor, so the second search would reproduce the first result.
+        current = deepcopy(fixed_selection)
+    else:
+        current = select_robust_at(
+            config, base, data, selection_asof, progress=progress, cancelled=cancelled,
+            progress_start=.95, progress_width=.04, runtime=runtime, budget=task_budget,
+        )
     selection_count += 1
     archives["current"] = current.get("candidate_archive", [])
     trials["current"] = current.get("trial_archive", [])

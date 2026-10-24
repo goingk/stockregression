@@ -2263,14 +2263,17 @@ class MarketDataService:
             return None
         return state
 
-    def load_backtest_bundle(self, config: BacktestConfig, version: str | None = None):
+    def load_backtest_bundle(
+        self, config: BacktestConfig, version: str | None = None, *,
+        summary_only: bool = False,
+    ):
         target = normalize_timeframe(config.frequency)
         if version is None and target in DERIVED_SOURCES:
             self.ensure_timeframe(
                 config.symbol, target, start=config.start_date, end=config.end_date,
             )
         from .consumer import load_native_bundle
-        return load_native_bundle(self, config, version)
+        return load_native_bundle(self, config, version, summary_only=summary_only)
 
     def refresh_snapshot(self, symbol: str) -> dict | None:
         market = self.repository.active_manifest(symbol)

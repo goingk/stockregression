@@ -273,6 +273,10 @@ def configuration_schema() -> dict[str, Any]:
 def validate_configuration_patch(patch: dict[str, Any], *, base_revision: str | None = None) -> dict[str, Any]:
     if not isinstance(patch, dict):
         raise ValueError("配置补丁必须是对象")
+    # The revision is derived from the document and returned alongside it.
+    # It is never editable, but a browser draft saved while another autosave
+    # was in flight can still carry the old value in its patch.
+    patch = {key: value for key, value in patch.items() if key != "config_revision"}
     unknown = sorted(set(patch) - _PATCH_GROUPS)
     if unknown:
         raise ValueError("不支持的配置分组：" + "、".join(unknown))
@@ -290,6 +294,7 @@ def validate_configuration_patch(patch: dict[str, Any], *, base_revision: str | 
 def patch_configuration(patch: dict[str, Any], *, base_revision: str) -> dict[str, Any]:
     if not base_revision:
         raise ValueError("保存配置必须提供 base_revision")
+    patch = {key: value for key, value in patch.items() if key != "config_revision"}
     try:
         document, _ = save_configuration_document(
             _merge(current_configuration(), patch), base_revision=base_revision,

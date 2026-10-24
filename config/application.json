@@ -12,17 +12,17 @@
   "backtest": {
     "grid": {
       "grid_mode": "geometric",
-      "buy_step": 0.015,
-      "sell_step": 0.015,
+      "buy_step": 0.065,
+      "sell_step": 0.065,
       "lower_price": null,
       "upper_price": null
     },
     "position": {
-      "initial_shares": 10000,
+      "initial_shares": 20000,
       "min_shares": 0,
-      "max_shares": 30000,
-      "buy_shares": 1200,
-      "sell_shares": 1000
+      "max_shares": null,
+      "buy_shares": 2000,
+      "sell_shares": 2000
     },
     "dca": {
       "frequency": "monthly",
@@ -42,7 +42,7 @@
       "rebalance_days": 63,
       "seed": 42,
       "top_candidates": 100,
-      "max_principal_drawdown": 0.2,
+      "max_principal_drawdown": 0.25,
       "min_trades": 10,
       "min_history_days": 504,
       "min_minute_ratio": 0.95,
@@ -50,8 +50,8 @@
       "strategy_version": 5,
       "hypercube_edge": 3,
       "granularity": {
-        "buy_step": 0.001,
-        "sell_step": 0.001,
+        "buy_step": 0.005,
+        "sell_step": 0.005,
         "sell_shares": 100.0,
         "buy_shares": 100.0
       },
@@ -79,22 +79,22 @@
       "ranges": {
         "buy_step": {
           "low": 0.005,
-          "high": 0.055,
+          "high": 0.08,
           "step": null
         },
         "sell_step": {
           "low": 0.005,
-          "high": 0.055,
+          "high": 0.08,
           "step": null
         },
         "buy_shares": {
-          "low": 2500.0,
-          "high": 7500.0,
+          "low": 1500.0,
+          "high": 2500.0,
           "step": null
         },
         "sell_shares": {
-          "low": 2500.0,
-          "high": 7500.0,
+          "low": 1500.0,
+          "high": 2500.0,
           "step": null
         }
       },
@@ -102,11 +102,11 @@
       "alpha": 0.3,
       "beta": 1.0,
       "tau": 0.05,
-      "eta_limit": 2.0,
+      "eta_limit": 1.8,
       "eta_hard_cap": 3.5,
-      "gamma_max": 0.5,
-      "eta_floor": 0.02,
-      "gamma_min": 1.0,
+      "gamma_max": 2.0,
+      "eta_floor": 0.2,
+      "gamma_min": 10.0,
       "floor_k_ref": 10.0,
       "training_min_days": 250,
       "training_max_days": 500,
@@ -183,5 +183,5 @@
     "subprocess_timeout_seconds": 45,
     "lock_timeout_seconds": 30
   },
-  "config_revision": "c32af51f0652482ac72f6ac04d34230322a495943ef0a60eaf10b55980fe334a"
+  "config_revision": "806f0394c23bdacff68bca911111963c63f49b58541751119b680faffc030528"
 }

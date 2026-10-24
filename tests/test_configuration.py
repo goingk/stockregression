@@ -71,6 +71,29 @@ def test_patch_round_trips_zero_false_and_null_with_a_stable_revision(config_fil
     assert reread["research"]["defaults"]["seed"] == 0
 
 
+def test_config_revision_metadata_is_ignored_in_patches(config_file):
+    load_settings()
+    document = current_configuration()
+    patch = {
+        "config_revision": "stale-browser-revision",
+        "research": {"defaults": {"alpha": 0.31}},
+    }
+
+    validated = validate_configuration_patch(patch, base_revision=document["config_revision"])
+    assert validated["research"]["defaults"]["alpha"] == 0.31
+    assert validated["config_revision"] != "stale-browser-revision"
+
+    unchanged = validate_configuration_patch(
+        {"config_revision": "stale-browser-revision"},
+        base_revision=document["config_revision"],
+    )
+    assert unchanged["config_revision"] == document["config_revision"]
+
+    updated = patch_configuration(patch, base_revision=document["config_revision"])
+    assert updated["research"]["defaults"]["alpha"] == 0.31
+    assert updated["config_revision"] != "stale-browser-revision"
+
+
 def test_invalid_patch_reports_path_and_does_not_touch_the_file(config_file):
     load_settings()
     before = config_file.read_bytes()

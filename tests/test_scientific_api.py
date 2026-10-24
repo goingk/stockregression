@@ -7,6 +7,7 @@ result_schema_version=2；旧的 v1/v2 模型默认值、旧版研究偏好迁�
 
 from __future__ import annotations
 
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 
@@ -196,6 +197,41 @@ def test_research_registry_counts_overlap_even_after_seed_or_snapshot_changes(tm
     assert replay["overlapping_prior_studies"] == 1
     assert replay["human_untouched_verified"] is False
     assert replay["recorded_overlap_status"] == "overlap_detected"
+
+
+def test_research_registry_migrates_legacy_validation_intervals_column(tmp_path):
+    database = tmp_path / "catalog.sqlite"
+    with sqlite3.connect(database) as db:
+        db.executescript(
+            """
+            CREATE TABLE research_registry(
+                registry_id TEXT PRIMARY KEY,
+                protocol_hash TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                input_start TEXT,
+                input_end TEXT,
+                data_version TEXT,
+                validation_intervals TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO research_registry VALUES(
+                'legacy', 'protocol', '600000.SH', '2024-01-02', '2024-03-29',
+                'snapshot', '[{"start": "2024-01-02", "end": "2024-03-29"}]',
+                '2024-04-01T00:00:00+00:00'
+            );
+            """
+        )
+
+    store = Store(tmp_path)
+
+    with store.db() as db:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(research_registry)")}
+        row = db.execute(
+            "SELECT evaluation_intervals FROM research_registry WHERE registry_id='legacy'"
+        ).fetchone()
+    assert "evaluation_intervals" in columns
+    assert "validation_intervals" not in columns
+    assert row["evaluation_intervals"] == '[{"start": "2024-01-02", "end": "2024-03-29"}]'
 
 
 def test_research_registry_serializes_concurrent_overlap_checks(tmp_path):

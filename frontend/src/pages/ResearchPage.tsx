@@ -606,7 +606,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const fixedMetrics = record(fixed?.oos_metrics) ?? record(fixed?.test_result?.strategies?.grid?.metrics)
   const adaptiveMetrics = record(adaptive?.oos_metrics) ?? record(adaptive?.test_result?.strategies?.grid?.metrics)
   const landscapeDecisions = [
-    { value: 'current:0', label: '当前建议决策的训练候选' },
+    { value: 'current:0', label: '评估起点建议的训练候选' },
     ...(adaptive?.schedule ?? []).map((item, index) => ({ value: `adaptive:${index}`, label: `自适应 ${item.effective_date ?? index + 1} 的训练候选` })),
     ...(fixed?.as_of ? [{ value: 'fixed:0', label: '固定方案决策的训练候选' }] : []),
   ]
@@ -620,7 +620,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     : completionDecisionKind === 'fixed' ? record(fixed) : record(current)
   const completionDecisionEligibility = eligibleOf(completionDecisionBranch, completionDecisionBranch?.diagnostics)
   const completionBlockedReasons = Array.from(new Set(reasonsOf(completionDecisionBranch)))
-  const completionDecisionLabel = landscapeDecisions.find(item => item.value === completionDecisionValue)?.label ?? '当前建议决策'
+  const completionDecisionLabel = landscapeDecisions.find(item => item.value === completionDecisionValue)?.label ?? '评估起点建议'
   const previewTraining = record(preflight.preview?.training_window)
   const preflightReady = preflight.status === 'ready'
   const rangesSummary = robustFields.map(name => labels[name] + ' ' + rangeValue(name, ranges[name].low) + '–' + rangeValue(name, ranges[name].high)).join(' · ')
@@ -788,7 +788,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
             {isDemoResearch && <div className='demo-callout'>此研究使用演示行情生成，不能代表真实历史数据或投资结论。</div>}
             <div className='research-summary-states'>
               <div><small>训练时段</small><strong>{trainStart && trainEnd ? trainStart + ' 至 ' + trainEnd : `评估日前 ${trainingMinDays}–${trainingMaxDays} 个交易日`}</strong></div>
-              <div><small>当前推荐状态</small><Badge tone={currentRecommendationStatus === 'qualified' ? 'green' : 'amber'}>{currentRecommendationStatus === 'qualified' ? '按 J 排名推荐参数' : '暂无合格推荐'}</Badge></div>
+              <div><small>评估起点推荐状态</small><Badge tone={currentRecommendationStatus === 'qualified' ? 'green' : 'amber'}>{currentRecommendationStatus === 'qualified' ? '按 J 排名推荐参数' : '暂无合格推荐'}</Badge></div>
               <div><small>协议统计状态</small><Badge tone='neutral'>暂不提供显著性判断</Badge></div>
             </div>
             {researchWarnings.length > 0 && <div className='warning-list'>{researchWarnings.map((warning, index) => <div key={index}><span className='warning-dot' />{warning}</div>)}</div>}

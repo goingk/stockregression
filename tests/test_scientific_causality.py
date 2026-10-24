@@ -297,6 +297,12 @@ def test_v5_decisions_are_invariant_to_future_data_and_snapshot_boundaries(monke
 
     fixed = full["fixed"]
     adaptive = full["adaptive"]
+    current = fixed["current"]
+    assert current["as_of"] == fixed["as_of"]
+    assert current["diagnostics"]["training_window"] == fixed["diagnostics"]["training_window"]
+    assert pd.Timestamp(current["diagnostics"]["training_window"]["end"]) < pd.Timestamp(
+        full["config"]["base"]["start_date"]
+    )
     # 各个决策的训练时段与分数必须互不相同，否则上面的不变性断言会退化为
     # 空断言：真正泄漏未来数据时，决策会随窗口一起改变。
     windows = [row["diagnostics"]["training_window"]["end"] for row in full["evidence"]["decisions"]]
@@ -318,6 +324,23 @@ def test_v5_decisions_are_invariant_to_future_data_and_snapshot_boundaries(monke
     assert metrics["risk_basis"] == "principal_profit_drawdown"
     assert metrics["matched_funding_hold_return"] is not None
     assert full["outer_validation"]["status"] == "not_applicable"
+
+
+def test_v5_current_recommendation_uses_evaluation_start_without_a_fixed_branch(monkeypatch):
+    monkeypatch.setattr(robust_research, "BatchEvaluator", WindowSensitiveEvaluator)
+    data = _daily_bundle(720)
+    eval_start = 504
+    config = _config(data).model_copy(update={
+        "selection_target": "adaptive", "rebalance_days": 10_000,
+    })
+
+    result = optimize_v5(config, data)
+
+    current = result["fixed"]["current"]
+    expected_asof = data.calendar[eval_start - 1].date().isoformat()
+    assert current["as_of"] == expected_asof
+    assert current["diagnostics"]["training_window"]["end"] == expected_asof
+    assert pd.Timestamp(expected_asof) < pd.Timestamp(result["config"]["base"]["start_date"])
 
 
 def test_v5_first_adaptive_decision_uses_the_existing_valuation_anchor(monkeypatch):

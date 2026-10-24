@@ -118,6 +118,19 @@ def test_default_bundle_keeps_minutes_for_volume_mismatch():
     assert set(bundle.bars.frequency) == {"1m"}
 
 
+def test_preflight_summary_reads_daily_but_not_minute_bodies():
+    manifest, minute, daily = _frames()
+    service = _service([(manifest, minute, daily)])
+
+    bundle = load_native_bundle(service, _config(), summary_only=True)
+
+    assert bundle.bars.empty
+    assert len(bundle.daily) == 1
+    assert list(bundle.calendar) == [DAY]
+    assert service.repository.bar_versions == [("1day", 4)]
+    assert bundle.metadata["preflight_summary"] is True
+
+
 def test_statistics_bundle_preserves_raw_prices_and_reports_volume_mismatch():
     manifest, minute, daily = _frames(minute_volume=100.0)
     manifest["metadata"]["etf_replay_blocked_reason"] = "旧版本因成交量差异阻断回放"

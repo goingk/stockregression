@@ -1088,7 +1088,10 @@ def _cancelled_selection(
     }
 
 
-def estimate_robust_search(config: OptimizationConfig, data: DataBundle) -> dict[str, Any]:
+def estimate_robust_search(
+    config: OptimizationConfig, data: DataBundle, *,
+    bars_memory_bytes: int | None = None,
+) -> dict[str, Any]:
     if config.protocol_version != 5 or config.strategy.strategy_version != 5:
         raise ValueError("稳健 J 预检需要 protocol_version=5 和 strategy_version=5")
     natural = _base_natural(config, config.base)
@@ -1123,8 +1126,13 @@ def estimate_robust_search(config: OptimizationConfig, data: DataBundle) -> dict
     )
     memory_mb = total * bytes_per_point / (1024 * 1024)
     sampled_memory_mb = candidate_upper * bytes_per_point / (1024 * 1024)
-    frame_bytes = 0
-    for frame in (data.bars, data.daily, data.actions, pd.DataFrame({"date": data.calendar})):
+    # Preflight can omit minute bodies while retaining a conservative estimate
+    # of the frame that the production loader will materialize.
+    frame_bytes = max(0, int(bars_memory_bytes or 0))
+    frames = (data.daily, data.actions, pd.DataFrame({"date": data.calendar}))
+    if bars_memory_bytes is None:
+        frames = (data.bars, *frames)
+    for frame in frames:
         if isinstance(frame, pd.DataFrame) and not frame.empty:
             frame_bytes += int(frame.memory_usage(index=True, deep=True).sum())
     # One native batch holds its daily x candidate result plus the paired

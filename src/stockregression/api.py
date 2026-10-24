@@ -1336,6 +1336,44 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
                               "start": str(config.start_date), "end": str(config.end_date)},
         })
 
+    def _preflight_bar_memory_bytes(manifest, bundle, frequency):
+        """Bound the minute frame without materialising it for a preview."""
+        target = normalize_timeframe(frequency)
+        versions = (manifest or {}).get("market_versions") or {}
+        total_rows = int((versions.get(target) or {}).get("rows") or 0)
+        if total_rows <= 0 or not len(bundle.calendar):
+            return 0
+        total_days = int((versions.get("1day") or {}).get("rows") or 0) or len(bundle.daily)
+        estimated_rows = max(1, math.ceil(
+            total_rows * len(bundle.calendar) / max(1, total_days)
+        ))
+        # Bars carry a timestamp, seven price/volume columns and replay flags.
+        # 256 bytes per row is deliberately conservative for the preflight guard.
+        return int(estimated_rows * 256)
+
+    def _research_preflight(config):
+        if config.protocol_version != 5:
+            raise HTTPException(422, "旧研究协议已移除；请使用 protocol_version=5")
+        manifest = store.snapshot(config.base.symbol)
+        version = str(manifest["version"]) if manifest else None
+        prepared = preparation_config(
+            store, config.base, version=version,
+            lookback_days=int(config.strategy.training_max_days),
+        )
+        version = require_ready(prepared, version)
+        bundle = DataService(store).load_bundle(prepared, version, summary_only=True)
+        from .research.robust import estimate_robust_search
+        try:
+            preview = estimate_robust_search(
+                config, bundle,
+                bars_memory_bytes=_preflight_bar_memory_bytes(
+                    manifest, bundle, prepared.frequency,
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return preview, version
+
     @app.get("/api/v1/health")
     def health():
         return {
@@ -1964,17 +2002,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     def optimization(config: OptimizationConfig | ResearchRequestV5):
         if isinstance(config, ResearchRequestV5):
             config = config.to_optimization()
-        prepared = preparation_config(store, config.base, lookback_days=int(config.strategy.training_max_days))
-        version = require_ready(prepared)
-        bundle = DataService(store).load_bundle(prepared, version)
-        if config.protocol_version == 5:
-            from .research.robust import estimate_robust_search
-            try:
-                preview = estimate_robust_search(config, bundle)
-            except ValueError as exc:
-                raise HTTPException(422, str(exc)) from exc
-        else:
-            raise HTTPException(422, "旧研究协议已移除；请使用 protocol_version=5")
+        preview, version = _research_preflight(config)
         if preview.get("status") == "budget_exceeded":
             reason = next((value for value in preview.get("reasons", []) if "超正方体" in str(value) or "预算" in str(value)), None)
             raise HTTPException(422, {
@@ -2000,16 +2028,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     def optimization_preview(config: OptimizationConfig | ResearchRequestV5):
         if isinstance(config, ResearchRequestV5):
             config = config.to_optimization()
-        prepared = preparation_config(store, config.base, lookback_days=int(config.strategy.training_max_days))
-        version = require_ready(prepared)
-        bundle = DataService(store).load_bundle(prepared, version)
-        if config.protocol_version == 5:
-            from .research.robust import estimate_robust_search
-            try:
-                return json_safe(estimate_robust_search(config, bundle))
-            except ValueError as exc:
-                raise HTTPException(422, str(exc)) from exc
-        raise HTTPException(422, "旧研究协议已移除；请使用 protocol_version=5")
+        preview, _ = _research_preflight(config)
+        return json_safe(preview)
 
     @app.get("/api/v1/research/strategies")
     def research_strategies():

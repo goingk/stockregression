@@ -16,6 +16,7 @@ from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe, timeframe_spec
 def load_native_bundle(
     service, config: BacktestConfig, version: str | None = None, *,
     statistics_only: bool = False,
+    summary_only: bool = False,
 ) -> DataBundle:
     """Read an immutable snapshot from the frequency databases.
 
@@ -74,13 +75,17 @@ def load_native_bundle(
     if end < start:
         raise DataQualityError("所选区间没有本地已收盘数据")
     target = normalize_timeframe(config.frequency)
+    if target != "1day" and (target not in MINUTE_TIMEFRAMES or target not in versions):
+        raise DataQualityError(f"当前版本没有 {target} 行情")
+    if summary_only:
+        return _preflight_bundle(
+            config, daily, actions, calendar, manifest, target, start, end,
+        )
     if target == "1day":
         return prepare_bundle(
             config.symbol, pd.DataFrame(), daily, actions, calendar, start, end,
             "1d", manifest["version"], _metadata(manifest, daily, target), manifest.get("profiles", {}),
         )
-    if target not in MINUTE_TIMEFRAMES or target not in versions:
-        raise DataQualityError(f"当前版本没有 {target} 行情")
     _reject_reported_price_anomalies(
         service.repository, config.symbol, target, int(versions[target]["version"]),
         start=start, end=end, context=target,
@@ -106,6 +111,33 @@ def load_native_bundle(
         )
     return _native_coarse_bundle(
         config, target, minute, daily, actions, calendar, manifest
+    )
+
+
+def _preflight_bundle(config, daily, actions, calendar, manifest, target, start, end):
+    """Return the daily evidence needed for a read-only search preflight.
+
+    The production bundle materializes every minute bar for replay.  Budget,
+    training-window and memory estimates only need the locked daily series,
+    actions and calendar; callers supply the minute-frame bytes separately.
+    """
+    days = pd.DatetimeIndex(
+        pd.to_datetime(calendar.date, errors="coerce")
+    ).dropna().normalize().unique().sort_values()
+    days = days[(days >= start) & (days <= end)]
+    daily_window = daily[daily.date.between(start, end)].copy().reset_index(drop=True)
+    metadata = _metadata(manifest, daily, target)
+    metadata["preflight_summary"] = True
+    warnings = list((manifest.get("metadata") or {}).get("warnings") or [])
+    return DataBundle(
+        symbol=config.symbol, bars=pd.DataFrame(), daily=daily_window,
+        actions=actions, calendar=days,
+        quality={
+            "days": [], "requested_frequency": target,
+            "summary_only": True, "is_demo": bool(metadata.get("is_demo")),
+            "warnings": warnings,
+        },
+        version=manifest["version"], metadata=metadata, warnings=warnings,
     )
 
 

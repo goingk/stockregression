@@ -696,13 +696,18 @@ class DataService:
             raise DataQualityError("候选行情公司行动异常：" + "；".join(issues[:8]))
         return candidate.quality
 
-    def load_bundle(self, config: BacktestConfig, version: str | None = None):
+    def load_bundle(
+        self, config: BacktestConfig, version: str | None = None, *,
+        summary_only: bool = False,
+    ):
         manifest = self.store.snapshot(config.symbol, version)
         if not manifest:
             raise DataQualityError("DATA_VERSION_NOT_FOUND: 该数据版本不存在或已清理")
         if manifest.get("market_data"):
             from .market_data import MarketDataService
-            return MarketDataService(self.store, settings=self.settings).load_backtest_bundle(config, version or manifest["version"])
+            return MarketDataService(self.store, settings=self.settings).load_backtest_bundle(
+                config, version or manifest["version"], summary_only=summary_only,
+            )
         raise DataQualityError("旧 Parquet 快照已取消兼容，请从当前 ETF 数据包读取行情")
         files, metadata = manifest["files"], manifest["metadata"]
         daily_all = self.store.read_files(files["daily"])
