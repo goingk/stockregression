@@ -180,36 +180,60 @@ def _legacy_fee_warnings(config: BacktestConfig, end: date) -> list[str]:
 
 def _prepare_actions(data: DataBundle, start: date, end: date) -> list[_Action]:
     actions = data.actions
+    from .corporate_actions import action_issues, resolve_actions
+    tick = float((data.metadata or {}).get("price_tick", 0.01))
+    action_daily = data.daily
+    issues = action_issues(actions, action_daily, start, end, settlement=False, price_tick=tick)
+    if issues:
+        raise ValueError(f"公司行动数据无效：{issues[0]}")
     if actions is None or actions.empty:
         return []
+    actions = resolve_actions(actions, action_daily, tick)
+    resolved_records = actions.to_dict("records")
+    by_ex_date: dict[date, set[date]] = {}
+    for row in resolved_records:
+        ex_date = _date_or_none(_value(row, "ex_date"))
+        if ex_date is None or ex_date < start or ex_date > end:
+            continue
+        bonus = float(_value(row, "bonus_ratio", 0.0) or 0.0)
+        stock_date = _date_or_none(_value(row, "stock_date"))
+        if ex_date is not None and bonus != 0 and stock_date is not None:
+            by_ex_date.setdefault(ex_date, set()).add(stock_date)
+    for ex_date, stock_dates in by_ex_date.items():
+        if len(stock_dates) > 1:
+            raise ValueError(
+                f"{ex_date}：同日份额行动的可交易日不一致，无法确定合并及解锁时点"
+            )
     required = {"record_date", "ex_date", "cash_per_share", "bonus_ratio"}
     missing = required.difference(actions.columns)
     if missing:
         raise ValueError(f"公司行动数据缺少字段：{', '.join(sorted(missing))}")
     result: list[_Action] = []
     for i, row in enumerate(actions.to_dict("records")):
+        record_date = _date_or_none(_value(row, "record_date"))
+        ex_date = _date_or_none(_value(row, "ex_date"))
+        if record_date is not None and ex_date is not None and (record_date > end or ex_date < start):
+            continue
         reason = str(_value(row, "unsupported_reason", "") or "").strip()
         if reason:
             raise ValueError(f"公司行动第 {i + 1} 条暂不支持：{reason}")
         implemented = _value(row, "implemented", True)
-        if not bool(implemented):
+        if str(implemented).strip().lower() in {"false", "0", "no", "否"}:
             raise ValueError(f"公司行动第 {i + 1} 条未确认已实施，无法准确回测")
-        record_date = _date_or_none(_value(row, "record_date"))
-        ex_date = _date_or_none(_value(row, "ex_date"))
         cash = float(_value(row, "cash_per_share", 0.0) or 0.0)
         bonus = float(_value(row, "bonus_ratio", 0.0) or 0.0)
+        if not math.isfinite(bonus) or 1.0 + bonus <= 0:
+            raise ValueError(f"公司行动第 {i + 1} 条送转比例必须满足 1+bonus_ratio>0")
         pay_date = _date_or_none(_value(row, "pay_date"))
         stock_date = _date_or_none(_value(row, "stock_date"))
         if record_date is None or ex_date is None:
             raise ValueError(f"公司行动第 {i + 1} 条缺少登记日或除权除息日")
-        if cash > 0 and pay_date is None:
+        if record_date > ex_date:
+            raise ValueError(f"公司行动第 {i + 1} 条登记日晚于除权除息日")
+        if cash > 0 and (pay_date is None or pay_date < ex_date):
             raise ValueError(f"公司行动第 {i + 1} 条有现金红利但缺少派息日")
-        if bonus > 0 and stock_date is None:
+        if bonus != 0 and (stock_date is None or stock_date < ex_date):
             raise ValueError(f"公司行动第 {i + 1} 条有送转股份但缺少可交易日")
-        if pay_date is not None and pay_date < ex_date:
-            raise ValueError(f"公司行动第 {i + 1} 条派息日早于除权除息日")
-        if stock_date is not None and stock_date < ex_date:
-            raise ValueError(f"公司行动第 {i + 1} 条股份可交易日早于除权除息日")
         if record_date <= end and ex_date >= start:
             result.append(_Action(i, record_date, ex_date, pay_date, stock_date, cash, bonus))
     return result

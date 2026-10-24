@@ -113,6 +113,13 @@ test('metric rows preserve declared sampling labels, values and missing reasons'
   assert.equal(rows.find(row => row.key === 'ou_half_life_days').value, '14.5 日')
   assert.equal(rows.find(row => row.key === 'ou_half_life_days').detail.reason, '样本不足')
   assert.equal(etfMetricText('missing', null), '—')
+  const v3Rows = etfMetricRows({ path_redundancy_daily_mean: .41, path_redundancy_5d_mean: .52, path_redundancy_20d_mean: .63, path_redundancy_daily_mean_1m: .44 }, {})
+  assert.deepEqual(v3Rows.map(row => row.key), ['path_redundancy_daily_mean', 'path_redundancy_5d_mean', 'path_redundancy_20d_mean', 'path_redundancy_daily_mean_1m'])
+  assert.equal(v3Rows[0].label, '日均路径冗余（5m 采样）')
+  assert.equal(v3Rows[0].value, '41.00%')
+  const legacyRows = etfMetricRows({ path_redundancy: .7 }, {})
+  assert.deepEqual(legacyRows.map(row => row.key), ['path_redundancy'])
+  assert.match(legacyRows[0].label, /历史全窗口/)
 })
 
 test('single-symbol cohorts display no invented score and pagination stays aligned', () => {

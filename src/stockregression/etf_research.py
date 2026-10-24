@@ -331,13 +331,25 @@ def preflight(
                 row["gaps"].append(_gap("range", f"{timeframe} 截止未达到 {end.date()}", timeframe))
         actions_version = manifest.get("auxiliary_versions", {}).get("actions")
         actions = market.repository.auxiliary(symbol, "actions", version=actions_version) if actions_version is not None else None
-        if not actions or not actions.get("verified"):
-            row["gaps"].append(_gap("actions", "ETF 分红或拆分资料未完成核验"))
-        for action in (actions or {}).get("payload") or []:
-            reason = str(action.get("unsupported_reason") or "").strip()
-            ex_date = pd.to_datetime(action.get("ex_date"), errors="coerce")
-            if reason and pd.notna(ex_date) and start <= _date(ex_date) <= end:
-                row["gaps"].append(_gap("actions", f"窗口内公司行动 {_date(ex_date).date()} 无法处理：{reason}"))
+        from .corporate_actions import action_issues, resolve_actions
+        action_frame = pd.DataFrame((actions or {}).get("payload") or [])
+        tick = float(instrument.get("price_tick") or 0.001)
+        normalized_actions = resolve_actions(action_frame, pd.DataFrame(), tick)
+        # Ordinary preflight remains catalog-only. A vendor fold date with a
+        # usable ratio needs just its nearby daily reference prices to resolve.
+        unresolved = normalized_actions.get("date_unresolved", pd.Series(False, index=normalized_actions.index)).fillna(False)
+        ratios = pd.to_numeric(normalized_actions.get("bonus_ratio"), errors="coerce")
+        usable_ratio = ratios.notna() & ratios.ne(0) & ratios.gt(-1)
+        nearby_daily = pd.DataFrame()
+        if (unresolved & usable_ratio).any():
+            folds = pd.to_datetime(normalized_actions.loc[unresolved & usable_ratio, "ex_date"], errors="coerce").dropna()
+            if len(folds):
+                nearby_daily = market.repository.bars(
+                    symbol, "1day", version=int(references["1day"]["version"]),
+                    start=folds.min() - pd.Timedelta(days=30), end=folds.max() + pd.Timedelta(days=10),
+                )
+        for reason in action_issues(action_frame, nearby_daily, start, end, price_tick=tick):
+            row["gaps"].append(_gap("actions", reason))
         if row["gaps"]:
             continue
         states = {timeframe: _validation_state(market, symbol, timeframe, manifest, start, end) for timeframe in ("1day", "1min")}
@@ -435,8 +447,8 @@ def _bundle(store, market, request, row, universe, *, statistics_only=False) -> 
         actions = market.repository.auxiliary(
             row["symbol"], "actions", version=manifest.get("auxiliary_versions", {}).get("actions"),
         )
-        if not actions or not actions.get("verified"):
-            raise MarketDataError("冻结的公司行动核验资料不可用，不能用于完整日统计")
+        if actions is None:
+            raise MarketDataError("冻结的公司行动资料已不可用，请重新预检")
         calendar = _calendar(market, row["symbol"], manifest)
         window = calendar[(calendar >= _date(row["window_start"])) & (calendar <= _date(row["window_end"]))]
         excluded = set(sampling["excluded_days"])
@@ -450,7 +462,7 @@ def _bundle(store, market, request, row, universe, *, statistics_only=False) -> 
         ):
             raise MarketDataError("冻结的完整分钟交易日质量凭证不可用，请重新预检")
     else:
-        readiness = market.readiness(config, row["version"])
+        readiness = market.readiness(config, row["version"], settlement=not statistics_only)
         if not readiness["ready"] or readiness.get("degraded_days"):
             raise MarketDataError("请求窗口不满足严格分钟计算条件：" + "；".join(gap.get("message", "") for gap in readiness.get("gaps", [])))
     if statistics_only:
@@ -630,11 +642,6 @@ def run_etf_research(
         if row["data_status"] in {"ready", "limited"}:
             try:
                 data = _bundle(store, market, request, row, plan["universe"], statistics_only=True)
-                replay_blocked = getattr(data, "metadata", {}).get("etf_replay_blocked_reason")
-                if replay_blocked:
-                    row["data_status"] = "limited"
-                    row["warnings"].append(replay_blocked)
-                    row["validation"].update(status="unavailable", reason=replay_blocked)
                 statistics = compute_etf_statistics(data, row["window_end"], request.window_days)
                 statistics["warnings"] = list(dict.fromkeys([*row["warnings"], *statistics.get("warnings", [])]))
                 row.update(statistics)
@@ -776,6 +783,6 @@ def run_local_validation(store, request, plan, *, market=None, progress=None, ca
 
 def request_fingerprint(request, plan) -> str:
     return hashlib.sha256(json.dumps(
-        {"request": request.model_dump(mode="json"), "universe": plan["universe"]},
+        {"method_version": METHOD_VERSION, "request": request.model_dump(mode="json"), "universe": plan["universe"]},
         sort_keys=True, ensure_ascii=False, default=str,
     ).encode()).hexdigest()

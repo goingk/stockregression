@@ -136,7 +136,10 @@ def _synthetic_bundle(
 
 def _assert_metric_contract(result: dict) -> None:
     assert {
-        "rv_annualized", "path_redundancy", "iovr", "variance_ratio_60m",
+        "rv_annualized", "path_redundancy_daily_mean", "path_redundancy_5d_mean",
+        "path_redundancy_20d_mean", "path_redundancy_daily_mean_1m",
+        "path_redundancy_5d_mean_1m", "path_redundancy_20d_mean_1m",
+        "iovr", "variance_ratio_60m",
         "variance_ratio_240m", "variance_ratio_1200m", "ou_half_life_days",
         "zero_crossing_rate", "jump_ratio", "max_drawdown_duration_days",
         "tick_to_price_ratio", "rv_5m_annualized", "mean_raw_price",
@@ -202,6 +205,133 @@ def test_path_redundancy_uses_segments_instead_of_crossing_an_omitted_day():
     assert value == 0 and count == 2 and error is None
 
 
+def _path_points(days, day_closes, *, interval=5, day_opens=None):
+    """Construct full trading-day slot tables for independent PR calculations."""
+    clock = statistics._slot_table(pd.DatetimeIndex(days))
+    clock = clock[clock.slot.mod(interval).eq(interval - 1)].reset_index(drop=True)
+    n = 240 // interval
+    assert len(clock) == len(days) * n
+    clock["open"] = np.nan
+    clock["close_adj"] = np.nan
+    clock["valid"] = True
+    for i, day in enumerate(days):
+        mask = clock.day.eq(pd.Timestamp(day))
+        closes = np.asarray(day_closes[i], dtype=float)
+        assert closes.size == n
+        clock.loc[mask, "close_adj"] = closes
+        clock.loc[mask, "open"] = day_opens[i] if day_opens else closes[0]
+    return clock
+
+
+def _hand_pr(prices):
+    distance = sum(abs(b-a) for a,b in zip(prices, prices[1:]))
+    return None if distance == 0 else 1 - abs(prices[-1]-prices[0]) / distance
+
+
+def test_path_redundancy_hand_calculated_monotone_and_reversal():
+    days = pd.bdate_range("2026-01-05", periods=1)
+    trend = _path_points(days, [np.linspace(10, 20, 48)])
+    value, count, error = statistics._path_redundancy_means(trend, days)["path_redundancy_daily_mean"]
+    assert value == pytest.approx(0.0, abs=1e-14) and count == 1 and error is None
+    reversal_closes = np.r_[np.linspace(10, 20, 24), np.linspace(20, 10, 24)]
+    reversal = _path_points(days, [reversal_closes])
+    value, count, error = statistics._path_redundancy_means(reversal, days)["path_redundancy_daily_mean"]
+    assert value == pytest.approx(1.0)
+    assert count == 1 and error is None
+
+
+def test_path_redundancy_window_bridges_days_and_recomputes_five_day_path():
+    days = pd.bdate_range("2026-01-05", periods=6)
+    closes = [np.linspace(10+i, 11+i, 48) for i in range(6)]
+    closes[2] = np.r_[np.linspace(12, 20, 24), np.linspace(20, 13, 24)]
+    points = _path_points(days, closes)
+    got = statistics._path_redundancy_means(points, days)["path_redundancy_5d_mean"]
+    expected = []
+    for start in range(2):
+        path = [10.+start]
+        for j in range(start, start+5):
+            path.extend(closes[j])
+        expected.append(_hand_pr(path))
+    assert got[0] == pytest.approx(sum(expected)/2) and got[1] == 2
+    # A steady trend in both days remains a trend after the real close/open bridge.
+    two = _path_points(days[:2], closes[:2])
+    daily_values = statistics._path_redundancy_means(two, days[:2])
+    assert daily_values["path_redundancy_daily_mean"][0] == pytest.approx(0, abs=1e-14)
+    assert daily_values["path_redundancy_5d_mean"][1] == 0
+
+
+def test_path_redundancy_twenty_day_windows_are_recomputed_over_real_calendar():
+    days = pd.bdate_range("2026-01-05", periods=22)
+    opens = [10.0 + 2.0*i for i in range(len(days))]
+    closes = [opens[i] + np.sin(np.linspace(0, 2*np.pi, 48)) for i in range(len(days))]
+    points = _path_points(days, closes, day_opens=opens)
+    result = statistics._path_redundancy_means(points, days)
+
+    expected = []
+    for start in range(3):
+        path = [opens[start]]
+        for day_index in range(start, start + 20):
+            if day_index > start:
+                path.append(opens[day_index])
+            path.extend(closes[day_index])
+        expected.append(_hand_pr(path))
+    expected = [value for value in expected if value is not None]
+    assert result["path_redundancy_20d_mean"][0] == pytest.approx(sum(expected)/3)
+    assert result["path_redundancy_20d_mean"][1] == 3
+    assert result["path_redundancy_5d_mean"][1] == 18
+    assert result["path_redundancy_daily_mean"][0] > result["path_redundancy_20d_mean"][0]
+
+
+def test_daily_high_redundancy_can_differ_from_five_and_twenty_day_path():
+    days = pd.bdate_range("2026-01-05", periods=20)
+    opens = [10.0 + 4.0*i for i in range(20)]
+    closes = [opens[i] + np.sin(np.linspace(0, 2*np.pi, 48)) for i in range(20)]
+    points = _path_points(days, closes, day_opens=opens)
+    result = statistics._path_redundancy_means(points, days)
+    assert result["path_redundancy_daily_mean"][0] > .95
+    assert result["path_redundancy_5d_mean"][0] < result["path_redundancy_daily_mean"][0]
+    assert result["path_redundancy_20d_mean"][0] < result["path_redundancy_daily_mean"][0]
+
+
+def test_path_redundancy_invalid_calendar_day_discards_every_crossing_window():
+    days = pd.bdate_range("2026-01-05", periods=6)
+    closes = [np.linspace(10+i, 11+i, 48) for i in range(6)]
+    points = _path_points(days, closes)
+    points.loc[points.day.eq(days[2]), "valid"] = False
+    result = statistics._path_redundancy_means(points, days)
+    assert result["path_redundancy_5d_mean"][1] == 0
+
+
+def test_path_redundancy_flat_day_excluded_daily_but_kept_in_long_window():
+    days = pd.bdate_range("2026-01-05", periods=5)
+    closes = [np.full(48, 10.), *[np.linspace(10+i, 11+i, 48) for i in range(1, 5)]]
+    points = _path_points(days, closes)
+    result = statistics._path_redundancy_means(points, days)
+    assert result["path_redundancy_daily_mean"][1] == 4
+    assert result["path_redundancy_5d_mean"][1] == 1
+
+
+def test_path_redundancy_equal_window_weight_short_20d_and_one_minute_contract():
+    days = pd.bdate_range("2026-01-05", periods=6)
+    closes = [np.full(48, 10.) for _ in days]
+    closes[0] = np.linspace(10, 11, 48)
+    closes[1] = np.r_[np.linspace(10, 20, 24), np.linspace(20, 10, 24)]
+    points = _path_points(days, closes)
+    result = statistics._path_redundancy_means(points, days)
+    individual = [_hand_pr([10., *row]) for row in closes]
+    individual = [v for v in individual if v is not None]
+    assert result["path_redundancy_daily_mean"][0] == pytest.approx(sum(individual)/len(individual))
+    assert result["path_redundancy_daily_mean"][1] == len(individual)
+    assert result["path_redundancy_20d_mean"][0] is None
+    assert result["path_redundancy_20d_mean"][1] == 0
+    minute = _path_points(days[:2], [np.linspace(10, 11, 240), np.linspace(11, 12, 240)], interval=1)
+    one_minute = statistics._path_redundancy_means(minute, days[:2], sampling_minutes=1)
+    assert set(one_minute) == {"path_redundancy_daily_mean", "path_redundancy_5d_mean", "path_redundancy_20d_mean"}
+    assert one_minute["path_redundancy_daily_mean"][0] == pytest.approx(0, abs=1e-14)
+    future = _path_points([*days[:2], days[2]], [np.linspace(10,11,240), np.linspace(11,12,240), np.full(240, 999.)], interval=1)
+    assert statistics._path_redundancy_means(future, days[:2], sampling_minutes=1) == one_minute
+
+
 def test_sampling_below_90_percent_is_not_accepted_by_statistics():
     data = _synthetic_bundle()
     _use_complete_days(data, data.calendar[-14:-1])
@@ -209,7 +339,7 @@ def test_sampling_below_90_percent_is_not_accepted_by_statistics():
 
 
 def test_incomparable_sampling_is_excluded_from_cross_section_scores():
-    keys = ["rv_annualized", "path_redundancy", "variance_ratio_240m", "iovr", "zero_crossing_rate", "jump_ratio"]
+    keys = ["rv_annualized", "path_redundancy_daily_mean", "path_redundancy_5d_mean", "variance_ratio_240m", "iovr", "zero_crossing_rate", "jump_ratio"]
     rows = [{"symbol": str(i), "status": "completed", "metrics": dict.fromkeys(keys, float(i))} for i in range(3)]
     rows[-1]["sampling"] = {"comparable": False}
     score_etfs(rows)
@@ -221,6 +351,7 @@ def test_incomparable_sampling_is_excluded_from_cross_section_scores():
 @pytest.mark.parametrize("inside_window", [False, True])
 def test_unsupported_split_only_blocks_statistics_that_cross_its_date(inside_window):
     data = _synthetic_bundle()
+    data.metadata["etf_volume_verified"] = False
     day = data.calendar[10] if inside_window else data.calendar[0] - pd.offsets.BDay(10)
     data.actions = pd.concat([data.actions, pd.DataFrame([{
         "ex_date": day, "cash_per_share": 0., "bonus_ratio": 1.,
@@ -236,16 +367,22 @@ def test_unsupported_split_only_blocks_statistics_that_cross_its_date(inside_win
         assert result["diagnostics"]["mddd_history_verified"] is False
 
 
-def test_volume_unit_mismatch_preserves_price_statistics_but_disables_profile():
+@pytest.mark.parametrize("volume_multiplier", [0.01, 1.0, 100.0])
+def test_volume_unit_mismatch_preserves_price_statistics_and_profile(volume_multiplier):
     data = _synthetic_bundle()
+    baseline = compute_etf_statistics(data, data.calendar[-1], 120)
+    data.bars["volume"] *= volume_multiplier
     data.metadata["etf_volume_verified"] = False
     data.metadata["volume_unverified_days"] = [data.calendar[-1].date().isoformat()]
     result = compute_etf_statistics(data, data.calendar[-1], 120)
     assert result["status"] == "completed"
     assert result["metrics"]["rv_annualized"] > 0
     assert result["diagnostics"]["source_quality"]["volume_verified"] is False
-    assert "peak" not in result["diagnostics"]["profile"]
-    assert any("成交量分布待核对单位" in warning for warning in result["warnings"])
+    assert result["diagnostics"]["profile"]["peak"] == pytest.approx(
+        baseline["diagnostics"]["profile"]["peak"],
+    )
+    assert result["grid_basis"] == baseline["grid_basis"]
+    assert any("仍按分钟成交量及份额折算计算" in warning for warning in result["warnings"])
 
 
 def test_compute_contract_uses_two_scale_minute_statistics_without_lookahead():
@@ -268,12 +405,7 @@ def test_compute_contract_uses_two_scale_minute_statistics_without_lookahead():
     assert result["metrics"]["variance_ratio_60m"] is not None
     assert result["metrics"]["variance_ratio_1200m"] is not None
     assert 0.0 <= result["metrics"]["zero_crossing_rate"] <= 1.0
-    assert result["metrics"]["path_redundancy"] == pytest.approx(
-        1.0 - abs(
-            data.bars.close.iloc[-1] - data.bars.close.iloc[0]
-        ) / data.bars.close.diff().abs().sum(),
-        rel=1e-9,
-    )
+    assert "path_redundancy" not in result["metrics"]
     basis = result["grid_basis"]
     assert basis["lower_price"] < basis["reference_price"] < basis["upper_price"]
     assert result["actions_applied"] == []
@@ -438,8 +570,10 @@ def test_mddd_requires_verification_is_censored_and_does_not_null_other_metrics(
     assert blocked["metrics"]["max_drawdown_duration_days"] is None
     assert "校验账本" in blocked["metric_details"]["max_drawdown_duration_days"]["reason"]
     for key in (
-        "rv_annualized", "path_redundancy", "iovr", "variance_ratio_240m",
-        "zero_crossing_rate", "jump_ratio",
+        "rv_annualized", "path_redundancy_daily_mean", "path_redundancy_5d_mean",
+        "path_redundancy_20d_mean", "path_redundancy_daily_mean_1m",
+        "path_redundancy_5d_mean_1m", "path_redundancy_20d_mean_1m",
+        "iovr", "variance_ratio_240m", "zero_crossing_rate", "jump_ratio",
     ):
         assert blocked["metrics"][key] == checked["metrics"][key]
 
@@ -757,7 +891,8 @@ def test_source_quality_marks_ths_amount_estimates_and_never_infers_amount_from_
 def _score_row(symbol: str, *, eligible: bool = True, complete: bool = True) -> dict:
     metrics = {
         "rv_annualized": 0.20,
-        "path_redundancy": 0.90,
+        "path_redundancy_daily_mean": 0.90,
+        "path_redundancy_5d_mean": 0.90,
         "variance_ratio_240m": 1.0,
         "iovr": 2.0,
         "zero_crossing_rate": 0.10,
@@ -779,7 +914,8 @@ def test_score_etfs_uses_average_tie_ranks_and_keeps_eligibility_separate():
             **_score_row("C"),
             "metrics": {
                 "rv_annualized": 0.30,
-                "path_redundancy": 0.95,
+                "path_redundancy_daily_mean": 0.95,
+                "path_redundancy_5d_mean": 0.95,
                 "variance_ratio_240m": 0.80,
                 "iovr": 4.0,
                 "zero_crossing_rate": 0.20,
@@ -800,6 +936,39 @@ def test_score_etfs_uses_average_tie_ranks_and_keeps_eligibility_separate():
     assert rows[0]["rank"] == 3
     assert sum(rows[0]["score_contributions"].values()) == pytest.approx(25.0, abs=1e-6)
     assert rows[0]["eligible"] is False and rows[0]["gss_score"] is not None
+
+
+def test_score_etfs_uses_only_daily_and_five_day_path_metrics_at_ten_points_each():
+    first = _score_row("A")
+    second = _score_row("B")
+    first["metrics"].update({
+        "path_redundancy_20d_mean": 0.0,
+        "path_redundancy_daily_mean_1m": 0.0,
+        "path_redundancy_5d_mean_1m": 0.0,
+        "path_redundancy_20d_mean_1m": 0.0,
+    })
+    second["metrics"].update({
+        "path_redundancy_20d_mean": 1.0,
+        "path_redundancy_daily_mean_1m": 1.0,
+        "path_redundancy_5d_mean_1m": 1.0,
+        "path_redundancy_20d_mean_1m": 1.0,
+    })
+    # Make all other score components identical so only the two path means rank.
+    first["metrics"].update({"rv_annualized": .2, "variance_ratio_240m": 1., "iovr": 2., "zero_crossing_rate": .1, "jump_ratio": .1})
+    second["metrics"].update(first["metrics"])
+    second["metrics"].update({"path_redundancy_daily_mean": .95, "path_redundancy_5d_mean": .95})
+    second["metrics"].update({"path_redundancy_20d_mean": 0.0, "path_redundancy_daily_mean_1m": 0.0, "path_redundancy_5d_mean_1m": 0.0, "path_redundancy_20d_mean_1m": 0.0})
+    score_etfs([first, second])
+    assert first["score_contributions"]["path_redundancy_daily_mean"] == 0
+    assert second["score_contributions"]["path_redundancy_daily_mean"] == pytest.approx(10)
+    assert first["score_contributions"]["path_redundancy_5d_mean"] == 0
+    assert second["score_contributions"]["path_redundancy_5d_mean"] == pytest.approx(10)
+    assert all(first["score_contributions"][key] <= 10 for key in ("path_redundancy_daily_mean", "path_redundancy_5d_mean"))
+    baseline = [row["gss_score"] for row in (first, second)]
+    for row in (first, second):
+        row["metrics"].update({"path_redundancy_20d_mean": 1., "path_redundancy_daily_mean_1m": 1., "path_redundancy_5d_mean_1m": 1., "path_redundancy_20d_mean_1m": 1.})
+    score_etfs([first, second])
+    assert [row["gss_score"] for row in (first, second)] == baseline
 
 
 def test_score_etfs_has_no_percentile_for_a_single_row_cohort():

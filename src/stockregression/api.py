@@ -1917,7 +1917,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             raise HTTPException(422, str(exc)) from exc
 
     @app.get("/api/v1/market/bars/{symbol}")
-    def market_bars(symbol: str, frequency: str = "1d", start_date: str | None = None, end_date: str | None = None, before: str | None = None, limit: int = Query(600, ge=1, le=5000), ma: str = "5,10,20,60"):
+    def market_bars(symbol: str, frequency: str = "1d", start_date: str | None = None, end_date: str | None = None, before: str | None = None, limit: int = Query(600, ge=1, le=5000), ma: str = "5,10,20,60", adjustment: Literal["none", "qfq"] = "none", adjustment_anchor: str | None = None):
         try:
             timeframe = normalize_timeframe(frequency)
             market = MarketDataService(store)
@@ -1925,6 +1925,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
                 symbol, timeframe, start=start_date, end=end_date, before=before,
                 limit=limit, ma_periods=[int(value) for value in ma.split(",") if value.strip()],
                 materialize=False,
+                adjustment=adjustment, adjustment_anchor=adjustment_anchor,
             ))
         except MarketDataError as exc:
             raise HTTPException(409, {"code": "MARKET_DATA_UNAVAILABLE", "message": str(exc)}) from exc

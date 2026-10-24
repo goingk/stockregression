@@ -287,6 +287,7 @@ def simulate(
     cash = initial_equities.copy()
     shares = np.zeros(4, dtype=np.int64)
     sellable = np.zeros(4, dtype=np.int64)
+    share_locked = np.zeros(4, dtype=np.int64)
     cash_receivable = np.zeros(4, dtype=np.float64)
     share_receivable = np.zeros(4, dtype=np.float64)
     started = np.zeros(4, dtype=np.bool_)
@@ -307,6 +308,7 @@ def simulate(
     accrued_exists = np.zeros((4, action_count), dtype=np.bool_)
     action_paid = np.zeros((4, action_count), dtype=np.bool_)
     action_stock_issued = np.zeros((4, action_count), dtype=np.bool_)
+    action_locked_quantity = np.zeros((4, action_count), dtype=np.int64)
     prior_close = 0.0
     trade_count = np.zeros(4, dtype=np.int64)
     buy_count = np.zeros(4, dtype=np.int64)
@@ -350,6 +352,9 @@ def simulate(
     day_external_flow = 0.0
     parameter_index = 0
     params_paused = False
+    buy_shares_exact = float(buy_shares)
+    sell_shares_exact = float(sell_shares)
+    dca_shares_exact = float(dca_shares)
     last_grid_price = reference_price
     prior_signal_allowed = False
     if keep_details:
@@ -462,6 +467,7 @@ def simulate(
                            or sell_shares != int(values[6]) or params_paused != next_paused)
                 min_shares, max_shares = values[0], values[1]
                 buy_step, sell_step, grid_step = values[2], values[3], values[4]
+                buy_shares_exact, sell_shares_exact = float(values[5]), float(values[6])
                 buy_shares, sell_shares = int(values[5]), int(values[6])
                 params_paused = next_paused
                 if changed and not passive_grid:
@@ -486,7 +492,7 @@ def simulate(
                 parameter_index += 1
             for slot in range(active_count):
                 account = active_accounts[slot]
-                sellable[account] = shares[account]
+                sellable[account] = max(0, shares[account] - share_locked[account])
             cash_delta = 0.0
             bonus_delta = 0.0
             has_ex_action = False
@@ -495,9 +501,13 @@ def simulate(
                     has_ex_action = True
                     cash_delta += action_cash_per_share[action]
                     bonus_delta += action_bonus_ratio[action]
+            # Same-date rows are components of one corporate action; their
+            # bonus ratios add against the same record-date share basis.
+            # Multipliers compound only as separate ex-dates are processed.
+            bonus_multiplier = 1.0 + bonus_delta
             factor = 1.0
             if has_ex_action and prior_close > 0:
-                implied_close = prior_close * (1.0 + bonus_delta)
+                implied_close = prior_close * bonus_multiplier
                 implied_factor = max(
                     0.0,
                     (prior_close - cash_delta) / implied_close
@@ -518,30 +528,85 @@ def simulate(
                     raise ValueError("公司行动除权参考价无效")
             for slot in range(active_count):
                 account = active_accounts[slot]
-                if has_ex_action and factor != 1.0 and account == 0:
-                    if reference[account] > 0:
+                if has_ex_action and account == 0:
+                    # Convert share-denominated strategy settings from the
+                    # pre-action basis exactly once, retaining fractional
+                    # precision until the kernel's existing order rules apply.
+                    ratio = bonus_multiplier
+                    min_shares *= ratio
+                    if math.isfinite(max_shares):
+                        max_shares *= ratio
+                    floor_limit *= ratio
+                    buy_shares_exact *= ratio
+                    sell_shares_exact *= ratio
+                    dca_shares_exact *= ratio
+                    buy_shares = int(math.floor(buy_shares_exact + 1e-10))
+                    sell_shares = int(math.floor(sell_shares_exact + 1e-10))
+                    dca_shares = int(math.floor(dca_shares_exact + 1e-10))
+                    grid_step *= factor
+                    if pending_side[0] != 0:
+                        pending_quantity[0] = int(math.floor(pending_quantity[0] * ratio + 1e-10))
+                        if pending_quantity[0] <= 0:
+                            pending_side[0], pending_reason[0] = 0, 0
+                    if factor != 1.0 and reference[account] > 0:
                         reference[account] *= factor
-                    if fixed_anchor[account] > 0:
+                    if factor != 1.0 and fixed_anchor[account] > 0:
                         fixed_anchor[account] *= factor
-                    if lower_price > 0:
+                    if factor != 1.0 and lower_price > 0:
                         lower_price *= factor
-                    if upper_price > 0:
+                    if factor != 1.0 and upper_price > 0:
                         upper_price *= factor
-                    last_grid_price *= factor
+                    if factor != 1.0:
+                        last_grid_price *= factor
                     if floor_active:
+                        floor_anchor *= factor
+                        floor_high *= factor
+                    # A floor episode may not have started yet; its price
+                    # threshold still follows the adjusted price basis.
+                    if not floor_active and floor_anchor > 0:
                         floor_anchor *= factor
                         floor_high *= factor
                 for action in range(action_count):
                     if action_ex_day[action] == day_id:
-                        cash_claim = entitlement_cash[account, action]
-                        bonus_claim = entitlement_bonus[account, action]
-                        cash_receivable[account] += cash_claim
-                        share_receivable[account] += bonus_claim
-                        accrued_cash[account, action] = cash_claim
-                        accrued_bonus[account, action] = bonus_claim
-                        accrued_exists[account, action] = True
-                        entitlement_cash[account, action] = 0.0
-                        entitlement_bonus[account, action] = 0.0
+                        first_same_ex_date = True
+                        for prior_action in range(action):
+                            if action_ex_day[prior_action] == day_id:
+                                first_same_ex_date = False
+                                break
+                        if first_same_ex_date:
+                            total_cash_claim = 0.0
+                            total_bonus_claim = 0.0
+                            total_bonus_ratio = 0.0
+                            for grouped_action in range(action_count):
+                                if action_ex_day[grouped_action] == day_id:
+                                    cash_claim = entitlement_cash[account, grouped_action]
+                                    bonus_claim = entitlement_bonus[account, grouped_action]
+                                    total_cash_claim += cash_claim
+                                    total_bonus_claim += bonus_claim
+                                    total_bonus_ratio += action_bonus_ratio[grouped_action]
+                                    accrued_cash[account, grouped_action] = cash_claim
+                                    accrued_bonus[account, grouped_action] = bonus_claim
+                                    accrued_exists[account, grouped_action] = True
+                                    entitlement_cash[account, grouped_action] = 0.0
+                                    entitlement_bonus[account, grouped_action] = 0.0
+                            cash_receivable[account] += total_cash_claim
+                            if total_bonus_claim >= 0:
+                                share_receivable[account] += total_bonus_claim
+                            else:
+                                old_shares = shares[account]
+                                ratio = max(0.0, 1.0 + total_bonus_ratio)
+                                shares[account] = int(math.floor(old_shares * ratio + 1e-10))
+                                converted = shares[account]
+                                unlock_day = action_stock_day[action]
+                                if unlock_day > day_id:
+                                    # The reverse-converted position is not
+                                    # sellable until the exchange delivers it.
+                                    share_locked[account] = converted
+                                    action_locked_quantity[account, action] = converted
+                                    sellable[account] = 0
+                                else:
+                                    share_locked[account] = 0
+                                    sellable[account] = converted
                 for action in range(action_count):
                     if action_pay_day[action] == day_id and accrued_exists[account, action] and not action_paid[account, action]:
                         amount = accrued_cash[account, action]
@@ -549,12 +614,35 @@ def simulate(
                         cash[account] = _nb_round_money(cash[account] + amount)
                         action_paid[account, action] = True
                     if action_stock_day[action] == day_id and accrued_exists[account, action] and not action_stock_issued[account, action]:
-                        amount = accrued_bonus[account, action]
-                        share_receivable[account] = max(0.0, share_receivable[account] - amount)
-                        issued = int(round(amount))
-                        shares[account] += issued
-                        sellable[account] += issued
-                        action_stock_issued[account, action] = True
+                        first_same_issue = True
+                        total_issue = 0.0
+                        for other_action in range(action_count):
+                            if (action_stock_day[other_action] == day_id
+                                    and action_ex_day[other_action] == action_ex_day[action]
+                                    and accrued_exists[account, other_action]
+                                    and not action_stock_issued[account, other_action]):
+                                if other_action < action:
+                                    first_same_issue = False
+                                total_issue += accrued_bonus[account, other_action]
+                        if first_same_issue:
+                            if total_issue > 0:
+                                issued = int(math.floor(total_issue + 1e-10))
+                                share_receivable[account] = max(0.0, share_receivable[account] - total_issue)
+                                if share_receivable[account] < 1e-9:
+                                    share_receivable[account] = 0.0
+                                shares[account] += issued
+                                sellable[account] += issued
+                            locked_release = 0
+                            for other_action in range(action_count):
+                                if (action_stock_day[other_action] == day_id
+                                        and action_ex_day[other_action] == action_ex_day[action]
+                                        and accrued_exists[account, other_action]):
+                                    locked_release += action_locked_quantity[account, other_action]
+                                    action_locked_quantity[account, other_action] = 0
+                                    action_stock_issued[account, other_action] = True
+                            if locked_release > 0:
+                                share_locked[account] = max(0, share_locked[account] - locked_release)
+                                sellable[account] = min(shares[account], sellable[account] + locked_release)
                 if account == 0:
                     current_position = float(shares[0] + share_receivable[0])
                     actual_min_position = min(actual_min_position, current_position)

@@ -13,6 +13,7 @@ from typing import Any
 import pandas as pd
 
 from .models import DataBundle
+from .corporate_actions import resolve_actions
 
 
 _PRICE_COLUMNS = ("open", "high", "low", "close", "preclose")
@@ -36,8 +37,8 @@ def _daily_prices(data: DataBundle) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame(columns=["close", "high", "low", "preclose"])
     values = frame.copy()
-    if "date" in values.columns:
-        index = pd.to_datetime(values.pop("date"), errors="coerce")
+    if "date" in values.columns or "timestamp" in values.columns:
+        index = pd.to_datetime(values.pop("date" if "date" in values else "timestamp"), errors="coerce")
     else:
         index = pd.to_datetime(values.index, errors="coerce")
     values.index = index
@@ -101,6 +102,7 @@ def action_factors(
     data: DataBundle,
     anchor: pd.Timestamp,
     prices: pd.DataFrame | None = None,
+    *, start=None, allow_reference_only: bool = False,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Return verified ex-date factors effective through ``anchor``.
 
@@ -116,9 +118,8 @@ def action_factors(
     if anchor_day is None:
         return [], "除权锚点日期无效，无法计算公司行动价格因子"
     raw = _normalise_prices(prices, data)
-    actions = data.actions if isinstance(data.actions, pd.DataFrame) else pd.DataFrame()
-    if actions.empty or "ex_date" not in actions.columns:
-        return [], None
+    actions = resolve_actions(data.actions, raw, _price_tick(data))
+    lower = _normalise_day(start) if start is not None else None
 
     rows = actions.copy()
     for column, default in (
@@ -130,9 +131,12 @@ def action_factors(
         if column not in rows:
             rows[column] = default
     rows["ex_date"] = pd.to_datetime(rows["ex_date"], errors="coerce").dt.normalize()
-    rows = rows[rows["ex_date"].notna() & (rows["ex_date"] <= anchor_day)].copy()
-    if rows.empty:
-        return [], None
+    invalid_dates = rows["ex_date"].isna()
+    if invalid_dates.any() and not allow_reference_only:
+        return [], "公司行动缺少有效除权日"
+    rows = rows[~invalid_dates & (rows["ex_date"] <= anchor_day)].copy()
+    if lower is not None:
+        rows = rows[rows.ex_date >= lower]
 
     applied: list[dict[str, Any]] = []
     tick = _price_tick(data)
@@ -143,6 +147,8 @@ def action_factors(
             _explicitly_not_implemented(getattr(row, "implemented", True))
             for row in action_rows
         ):
+            if allow_reference_only:
+                continue
             return applied, (
                 f"选窗遇到未确认已实施的公司行动（{ex_date:%Y-%m-%d}）："
                 "除权事实无法核实，训练窗口不可用"
@@ -152,10 +158,14 @@ def action_factors(
             for row in action_rows
             if str(getattr(row, "unsupported_reason", "") or "").strip()
         ]
-        if reasons:
+        if reasons and not allow_reference_only:
             return applied, f"选窗遇到未支持的公司行动（{ex_date:%Y-%m-%d}）：{reasons[0]}"
 
         ex_day = pd.Timestamp(ex_date).normalize()
+        if allow_reference_only and any(bool(getattr(row, "date_unresolved", False)) for row in action_rows):
+            # The fold date is not an ex-date. The reference-only pass below
+            # finds the real jump without consuming this placeholder date.
+            continue
         before = raw.index[raw.index < ex_day]
         if not len(before):
             continue
@@ -171,9 +181,17 @@ def action_factors(
                 f"选窗公司行动 {ex_day.date()} 的除权因子无效："
                 "除权日前一交易日缺少有效收盘价"
             )
-        if 1.0 + bonus <= 0:
+        if not math.isfinite(bonus) or not math.isfinite(cash) or cash < 0 or 1.0 + bonus <= 0:
+            if allow_reference_only and math.isfinite(reference) and reference > 0:
+                applied.append({"ex_date": ex_day, "factor": reference / prior_close,
+                                "source": "preclose", "bonus_ratio": 0.0, "action_count": len(action_rows)})
+                continue
             return applied, f"选窗公司行动 {ex_day.date()} 的除权因子无效：送转比例不可用"
         implied_reference = (prior_close - cash) / (1.0 + bonus)
+        if allow_reference_only and reasons:
+            if not math.isfinite(reference) or reference <= 0:
+                return applied, f"{ex_day.date()} 缺少有效除权参考价"
+            implied_reference = reference
         if not math.isfinite(implied_reference) or implied_reference <= 0:
             return applied, f"选窗公司行动 {ex_day.date()} 的除权因子无效：除权参考价不可用"
 
@@ -208,6 +226,21 @@ def action_factors(
             "implied_reference": float(implied_reference),
             "preclose_mismatch": mismatch,
         })
+    if allow_reference_only and not raw.empty:
+        prior = pd.to_numeric(raw.close, errors="coerce").shift(1)
+        known = {item["ex_date"] for item in applied}
+        for stamp in raw.index:
+            if stamp > anchor_day or (lower is not None and stamp < lower) or stamp in known:
+                continue
+            previous, reference = prior.loc[stamp], raw.loc[stamp, "preclose"]
+            if not math.isfinite(previous) or previous <= 0:
+                continue
+            if not math.isfinite(reference) or reference <= 0:
+                return applied, f"{stamp.date()} 缺少有效前收盘价，无法计算前复权"
+            if abs(reference - previous) > tolerance:
+                applied.append({"ex_date": stamp, "factor": reference / previous,
+                                "source": "preclose", "bonus_ratio": 0.0, "action_count": 0})
+        applied.sort(key=lambda item: item["ex_date"])
     return applied, None
 
 

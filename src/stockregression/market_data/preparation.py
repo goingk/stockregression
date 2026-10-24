@@ -182,15 +182,14 @@ class MarketPreparationService:
         )
         if calendar is None or calendar.empty:
             raise MarketDataError("交易日历来源未返回数据")
-        self.repository.save_auxiliary(
-            symbol, "calendar", calendar.to_dict("records"),
-            version="preparation-v1", verified=True,
-        )
-        self.repository.save_auxiliary(
-            symbol, "actions", actions.to_dict("records"),
-            version="preparation-v1",
-            verified=bool(metadata.get("actions_verified", False)),
-        )
+        # Preparation and ordinary synchronization share event normalization,
+        # history merging and content-based versions. A short preparation
+        # window must not discard earlier events or reintroduce placeholders.
+        from .sync_auxiliary import persist_sync_auxiliary
+        with self.repository.package.transaction_guard():
+            persist_sync_auxiliary(self.service, symbol, {
+                **metadata, "calendar": calendar, "actions": actions,
+            })
         if metadata.get("name"):
             self.service.store.put_instrument(
                 symbol, metadata["name"],

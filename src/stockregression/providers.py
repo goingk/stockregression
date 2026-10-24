@@ -10,24 +10,56 @@ import io
 import json
 import re
 import threading
+import time
 from functools import wraps, lru_cache
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+from filelock import FileLock
 
 from .models import normalize_symbol
+from .corporate_actions import resolve_actions, split_record
 from .quality import canonical_frame
 from .settings import load_settings
 
 _BAOSTOCK_LOCK = threading.RLock()
 _AKSHARE_HTTP_LOCK = threading.RLock()
+_API_REQUEST_LOCK = threading.RLock()
+_API_REQUEST_LOCAL = threading.local()
 _SINA_LOCAL = threading.local()
 _BAOSTOCK_LOCAL = threading.local()
 _THS_LOCAL = threading.local()
 _MARKET_CALENDAR_CACHE: dict[tuple[int, str, str], pd.DataFrame] = {}
 _SINA_MINUTE_URL = "https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataService.getKLineData"
 _THS_MINUTE_URL = "https://d.10jqka.com.cn/v6/line/hs_{code}/61/all.js"
+API_REQUEST_INTERVAL_SECONDS = 1.5
+
+
+@contextlib.contextmanager
+def paced_api_request():
+    """Serialize provider requests across workers and pause 1.5s between them."""
+    with _API_REQUEST_LOCK:
+        depth = getattr(_API_REQUEST_LOCAL, "depth", 0)
+        if depth:
+            _API_REQUEST_LOCAL.depth = depth + 1
+            try:
+                yield
+            finally:
+                _API_REQUEST_LOCAL.depth = depth
+            return
+
+        root = Path(load_settings().data_dir)
+        slots = root / ".resource-slots"
+        slots.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(slots / "upstream-api-request.lock")):
+            _API_REQUEST_LOCAL.depth = 1
+            try:
+                yield
+            finally:
+                _API_REQUEST_LOCAL.depth = 0
+                time.sleep(API_REQUEST_INTERVAL_SECONDS)
 
 
 class EmptyUnresolvedError(RuntimeError):
@@ -79,7 +111,8 @@ def _baostock_session():
     active = getattr(_BAOSTOCK_LOCAL, "module", None)
     if active is not bs or not getattr(_BAOSTOCK_LOCAL, "logged_in", False):
         with contextlib.redirect_stdout(io.StringIO()):
-            login = bs.login()
+            with paced_api_request():
+                login = bs.login()
         if login.error_code != "0":
             raise RuntimeError("BaoStock 登录失败：" + login.error_msg)
         _BAOSTOCK_LOCAL.module = bs
@@ -109,7 +142,8 @@ def bounded_akshare_http(timeout: float | None = None):
     with _AKSHARE_HTTP_LOCK:
         def request_with_timeout(session, *args, **kwargs):
             kwargs.setdefault("timeout", timeout)
-            return original(session, *args, **kwargs)
+            with paced_api_request():
+                return original(session, *args, **kwargs)
 
         requests.sessions.Session.request = request_with_timeout
         try:
@@ -139,7 +173,8 @@ def fetch_latest_trading_date(as_of: str):
     end = pd.Timestamp(as_of)
     try:
         bs = _baostock_session()
-        result = bs.query_trade_dates(str((end - pd.Timedelta(days=40)).date()), str(end.date()))
+        with paced_api_request():
+            result = bs.query_trade_dates(str((end - pd.Timedelta(days=40)).date()), str(end.date()))
         if result.error_code != "0":
             raise RuntimeError("交易日历查询失败：" + result.error_msg)
         dates = []
@@ -204,14 +239,17 @@ def fetch_tdx(
             raise InterruptedError("任务已取消")
         api = TdxHq_API(heartbeat=False, auto_retry=False, raise_exception=True)
         try:
-            if not api.connect(host, port, time_out=int(max(1, round(_network_timeout(network_timeout))))):
+            with paced_api_request():
+                connected = api.connect(host, port, time_out=int(max(1, round(_network_timeout(network_timeout)))))
+            if not connected:
                 failures.append(f"{host}:{port}连接失败")
                 continue
             bars = []
             for offset in range(0, 24800, 800):
                 if cancelled():
                     raise InterruptedError("任务已取消")
-                batch = api.get_security_bars(8, market, code, offset, 800)
+                with paced_api_request():
+                    batch = api.get_security_bars(8, market, code, offset, 800)
                 if not batch:
                     break
                 bars.extend(batch)
@@ -278,11 +316,12 @@ def _decode_sina_payload(text: str) -> list[dict]:
 
 
 def _fetch_sina_minute(sina_symbol: str, network_timeout: float | None = None) -> pd.DataFrame:
-    response = _sina_session().get(
-        _SINA_MINUTE_URL,
-        params={"symbol": sina_symbol, "scale": "1", "ma": "no", "datalen": "1970"},
-        timeout=_network_timeout(network_timeout),
-    )
+    with paced_api_request():
+        response = _sina_session().get(
+            _SINA_MINUTE_URL,
+            params={"symbol": sina_symbol, "scale": "1", "ma": "no", "datalen": "1970"},
+            timeout=_network_timeout(network_timeout),
+        )
     response.raise_for_status()
     payload = _decode_sina_payload(response.text)
     frame = pd.DataFrame(payload)
@@ -356,10 +395,11 @@ def fetch_ths(
     amount field.
     """
     code, _exchange = normalize_symbol(symbol).split(".")
-    response = _ths_session().get(
-        _THS_MINUTE_URL.format(code=code),
-        timeout=_network_timeout(network_timeout),
-    )
+    with paced_api_request():
+        response = _ths_session().get(
+            _THS_MINUTE_URL.format(code=code),
+            timeout=_network_timeout(network_timeout),
+        )
     response.raise_for_status()
     payload = _decode_ths_payload(response.text)
     dates = [value for value in str(payload.get("dates") or "").split(",") if value]
@@ -447,9 +487,10 @@ def fetch_reference_5m(symbol: str, start, end) -> pd.DataFrame:
     code, exchange = normalize_symbol(symbol).split(".")
     try:
         bs = _baostock_session()
-        result = bs.query_history_k_data_plus(exchange.lower() + "." + code,
-            "date,time,open,high,low,close,volume,amount", start_date=str(pd.Timestamp(start).date()),
-            end_date=str(pd.Timestamp(end).date()), frequency="5", adjustflag="3")
+        with paced_api_request():
+            result = bs.query_history_k_data_plus(exchange.lower() + "." + code,
+                "date,time,open,high,low,close,volume,amount", start_date=str(pd.Timestamp(start).date()),
+                end_date=str(pd.Timestamp(end).date()), frequency="5", adjustflag="3")
         if result.error_code != "0":
             raise RuntimeError("BaoStock 参考分钟失败：" + result.error_msg)
         output = []
@@ -484,16 +525,20 @@ def fetch_stock_daily(symbol: str, start, end, cancelled=lambda: False):
 
     try:
         bs = _baostock_session()
-        basic = rows(bs.query_stock_basic(code=bs_code))
+        with paced_api_request():
+            basic_result = bs.query_stock_basic(code=bs_code)
+        basic = rows(basic_result)
         metadata = {}
         if not basic.empty:
             row = basic.iloc[0]
             metadata = {"name": row.get("code_name", symbol), "listing_date": row.get("ipoDate") or None, "delisting_date": row.get("outDate") or None}
             if metadata.get("listing_date"):
                 start = max(start, str(metadata["listing_date"]))
-        daily = rows(bs.query_history_k_data_plus(bs_code,
-            "date,open,high,low,close,preclose,volume,amount,tradestatus,isST",
-            start_date=start, end_date=end, frequency="d", adjustflag="3"))
+        with paced_api_request():
+            daily_result = bs.query_history_k_data_plus(bs_code,
+                "date,open,high,low,close,preclose,volume,amount,tradestatus,isST",
+                start_date=start, end_date=end, frequency="d", adjustflag="3")
+        daily = rows(daily_result)
         if daily.empty:
             raise RuntimeError("BaoStock 未返回所选股票的日线")
         daily = canonical_frame(daily, daily=True)
@@ -532,12 +577,13 @@ def fetch_etf_daily(
         raise ValueError("未知 ETF 日线来源：" + source)
     try:
         bs = _baostock_session()
-        result = bs.query_history_k_data_plus(
-            exchange.lower() + "." + code,
-            "date,open,high,low,close,preclose,volume,amount,tradestatus",
-            start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date()),
-            frequency="d", adjustflag="3",
-        )
+        with paced_api_request():
+            result = bs.query_history_k_data_plus(
+                exchange.lower() + "." + code,
+                "date,open,high,low,close,preclose,volume,amount,tradestatus",
+                start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date()),
+                frequency="d", adjustflag="3",
+            )
         if result.error_code != "0":
             raise RuntimeError("BaoStock ETF 日线失败：" + result.error_msg)
         rows = []
@@ -623,12 +669,12 @@ def fetch_etf_auxiliary(
             for row in dividends.loc[dividends["基金代码"].astype(str).str.zfill(6) == code].to_dict("records"):
                 records.append({"record_date": row["权益登记日"], "ex_date": row["除息日期"], "pay_date": row["分红发放日"], "cash_per_share": row["分红"], "bonus_ratio": 0})
             for row in splits.loc[splits["基金代码"].astype(str).str.zfill(6) == code].to_dict("records"):
-                records.append({"record_date": row["拆分折算日"], "ex_date": row["拆分折算日"], "stock_date": row["拆分折算日"], "cash_per_share": 0, "bonus_ratio": 0, "unsupported_reason": "ETF 拆分资料缺少登记日及精确份额处理，请导入核实后的公司行动"})
+                records.append(split_record(row))
         except Exception as exc:
             warnings.append(f"{year} ETF 分红/拆分资料未核验：{exc}")
             unverified.append(year)
     metadata = {"actions_verified": not warnings, "actions_checked_years": list(range(daily.date.min().year, pd.Timestamp(end).year + 1)), "actions_unverified_years": unverified, "warnings": [*daily_notes, *warnings]}
-    return daily, normalize_actions(pd.DataFrame(records)), calendar, metadata
+    return daily, resolve_actions(normalize_actions(pd.DataFrame(records)), daily), calendar, metadata
 
 
 @serialized_baostock
@@ -647,10 +693,11 @@ def fetch_market_calendar(start, end, cancelled=lambda: False) -> pd.DataFrame:
     if cached is not None:
         return cached.copy()
     try:
-        result = bs.query_trade_dates(
-            start_date=str(pd.Timestamp(start).date()),
-            end_date=str(pd.Timestamp(end).date()),
-        )
+        with paced_api_request():
+            result = bs.query_trade_dates(
+                start_date=str(pd.Timestamp(start).date()),
+                end_date=str(pd.Timestamp(end).date()),
+            )
         if result.error_code != "0":
             raise RuntimeError("交易日历失败：" + result.error_msg)
         records = []
@@ -708,12 +755,7 @@ def fetch_market_actions(
                 for row in splits.loc[
                     splits["基金代码"].astype(str).str.zfill(6) == code
                 ].to_dict("records"):
-                    records.append({
-                        "record_date": row["拆分折算日"], "ex_date": row["拆分折算日"],
-                        "stock_date": row["拆分折算日"], "cash_per_share": 0,
-                        "bonus_ratio": 0,
-                        "unsupported_reason": "ETF 拆分资料缺少登记日及精确份额处理，请导入核实后的公司行动",
-                    })
+                    records.append(split_record(row))
             except Exception as exc:
                 warnings.append(f"{year} ETF 分红/拆分资料未核验：{exc}")
     else:
@@ -723,9 +765,10 @@ def fetch_market_actions(
             for year in years:
                 if cancelled():
                     raise InterruptedError("任务已取消")
-                result = bs.query_dividend_data(
-                    bs_code, year=str(year), yearType="operate"
-                )
+                with paced_api_request():
+                    result = bs.query_dividend_data(
+                        bs_code, year=str(year), yearType="operate"
+                    )
                 if result.error_code != "0":
                     warnings.append(f"{year} 公司行动失败：{result.error_msg}")
                     continue
@@ -758,10 +801,13 @@ def normalize_actions(frame: pd.DataFrame) -> pd.DataFrame:
     frame["cash_per_share"] = pd.to_numeric(frame.cash_per_share, errors="coerce").fillna(0)
     if "bonus_ratio" not in frame:
         frame["bonus_ratio"] = pd.to_numeric(frame.get("dividStocksPs", 0), errors="coerce") + pd.to_numeric(frame.get("dividReserveToStockPs", 0), errors="coerce")
-    frame["bonus_ratio"] = pd.to_numeric(frame.bonus_ratio, errors="coerce").fillna(0)
+    frame["bonus_ratio"] = pd.to_numeric(frame.bonus_ratio, errors="coerce")
+    is_split = frame.get("action_type", pd.Series("", index=frame.index)).eq("split")
+    frame.loc[~is_split, "bonus_ratio"] = frame.loc[~is_split, "bonus_ratio"].fillna(0)
     frame["implemented"] = frame.get("implemented", frame.ex_date.notna())
     if "unsupported_reason" not in frame:
         frame["unsupported_reason"] = ""
     description = frame.get("dividCashStock", pd.Series("", index=frame.index)).fillna("").astype(str)
-    frame.loc[description.str.contains("配股|合并|拆股", regex=True), "unsupported_reason"] = "存在首版未建模的特殊公司行动"
-    return frame[columns].drop_duplicates(["ex_date", "cash_per_share", "bonus_ratio"]).sort_values("ex_date").reset_index(drop=True)
+    frame.loc[description.str.contains("配股", regex=False), "unsupported_reason"] = "配股缺少认购结算模型"
+    extras = [name for name in ("action_type", "split_date", "date_unresolved") if name in frame]
+    return frame[columns + extras].drop_duplicates().sort_values("ex_date").reset_index(drop=True)

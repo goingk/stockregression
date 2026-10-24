@@ -63,6 +63,14 @@ def load_native_bundle(
     end = pd.Timestamp(config.end_date) if config.end_date else daily.date.max()
     end = min(end, daily.date.max())
     start = pd.Timestamp(config.start_date)
+    if not statistics_only:
+        from ..corporate_actions import action_issues
+        issues = action_issues(
+            actions, daily, start, end, settlement=True,
+            price_tick=float((manifest.get("metadata") or {}).get("price_tick", 0.01)),
+        )
+        if issues:
+            raise DataQualityError("公司行动资料无法用于结算：" + "；".join(issues[:8]))
     if end < start:
         raise DataQualityError("所选区间没有本地已收盘数据")
     target = normalize_timeframe(config.frequency)
@@ -115,6 +123,13 @@ def _statistics_bundle(config, minute, daily, actions, calendar, manifest):
     start = pd.Timestamp(config.start_date).normalize()
     end = pd.Timestamp(config.end_date).normalize() if config.end_date else daily.date.max()
     end = min(end, daily.date.max())
+    from ..corporate_actions import action_issues
+    issues = action_issues(
+        actions, daily, start, end, settlement=False,
+        price_tick=float((manifest.get("metadata") or {}).get("price_tick", 0.01)),
+    )
+    if issues:
+        raise DataQualityError("公司行动资料存在窗口内问题：" + "；".join(issues[:8]))
     days = pd.DatetimeIndex(pd.to_datetime(calendar.date)).normalize().sort_values().unique()
     days = days[(days >= start) & (days <= end)]
     daily_window = daily[daily.date.isin(days)].copy()
@@ -198,18 +213,22 @@ def _statistics_bundle(config, minute, daily, actions, calendar, manifest):
     metadata = _metadata(manifest, daily, "1min")
     metadata["etf_volume_verified"] = volume_comparable_days > 0 and not volume_unverified_days
     metadata["volume_unverified_days"] = volume_unverified_days
+    # Older snapshots used volume disagreement as a replay veto. Keep the
+    # evidence, but ordinary research assumes the supplied minute weights.
+    metadata.pop("etf_replay_blocked_reason", None)
+    warnings = []
     if volume_unverified_days:
-        metadata["etf_replay_blocked_reason"] = (
-            "分钟聚合成交量与日线不一致，价格统计可用；成交量分布和参数回放需先核对单位"
+        warnings.append(
+            "分钟聚合成交量与日线不一致；按分钟成交量继续理想化统计和参数回放"
         )
     quality = {
         "days": quality_days, "is_demo": bool(metadata.get("is_demo")),
-        "requested_frequency": "1min", "warnings": [],
+        "requested_frequency": "1min", "warnings": warnings,
     }
     return DataBundle(
         symbol=config.symbol, bars=minute, daily=daily_window, actions=actions,
         calendar=days, quality=quality, version=manifest["version"],
-        metadata=metadata, warnings=[],
+        metadata=metadata, warnings=warnings,
     )
 
 

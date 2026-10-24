@@ -77,7 +77,10 @@ def test_real_package_local_validation_statistics_and_frozen_auxiliary(tmp_path,
     row = result["rows"][0]
     assert row["status"] == "completed", row
     assert row["metrics"]["rv_annualized"] > 0
-    assert 0 <= row["metrics"]["path_redundancy"] <= 1
+    assert "path_redundancy" not in row["metrics"]
+    for key in ("path_redundancy_daily_mean", "path_redundancy_5d_mean", "path_redundancy_20d_mean",
+                "path_redundancy_daily_mean_1m", "path_redundancy_5d_mean_1m", "path_redundancy_20d_mean_1m"):
+        assert row["metrics"][key] is None or 0 <= row["metrics"][key] <= 1
     assert row["gss_score"] is None  # one instrument cannot form a cross-section
     assert row["eligible"], row["filter_reasons"]
     assert row["validation"]["status"] in {"completed", "no_qualified"}, row["validation"]

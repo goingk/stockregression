@@ -584,11 +584,15 @@ class MarketDataService:
         }
 
     def market_bars(self, symbol: str, timeframe: str, *, start=None, end=None, before=None,
-                    limit=600, ma_periods=(5, 10, 20, 60), materialize: bool = True) -> dict:
+                    limit=600, ma_periods=(5, 10, 20, 60), materialize: bool = True,
+                    adjustment="none", adjustment_anchor=None) -> dict:
         symbol, timeframe = normalize_symbol(symbol), normalize_timeframe(timeframe)
-        if timeframe in DERIVED_SOURCES and materialize:
+        if timeframe in DERIVED_SOURCES and materialize and timeframe not in {"1week", "1month"}:
             self.ensure_timeframe(symbol, timeframe, start=start, end=end or before)
         dataset = self.repository.dataset(symbol, timeframe)
+        daily_base_chart = timeframe in {"1week", "1month"}
+        if not dataset and daily_base_chart:
+            dataset = self.repository.dataset(symbol, "1day")
         if not dataset:
             raise MarketDataError(f"{symbol} 尚无 {timeframe} 数据")
         periods = sorted({int(value) for value in ma_periods if 1 <= int(value) <= 500})
@@ -598,14 +602,65 @@ class MarketDataService:
             pd.Timestamp(before) if before is not None
             else pd.Timestamp(end).normalize() + pd.Timedelta(days=1) if end is not None else None
         )
-        fetched = self.repository.last_bars(
-            symbol, timeframe, before=upper_exclusive,
-            limit=limit + warmup + 1,
-        )
+        if daily_base_chart:
+            from .chart_adjustment import aggregate_daily_chart
+            # Apply the request boundary to daily rows before period grouping;
+            # otherwise a month/week can include sessions beyond the boundary.
+            daily_cutoff = end
+            if adjustment == "qfq":
+                from ..providers import latest_closed_date
+                qfq_cutoff = pd.Timestamp(latest_closed_date()).normalize()
+                if adjustment_anchor is not None:
+                    qfq_cutoff = min(qfq_cutoff, pd.Timestamp(adjustment_anchor).normalize())
+                if end is not None:
+                    qfq_cutoff = min(qfq_cutoff, pd.Timestamp(end).normalize())
+                daily_cutoff = min(pd.Timestamp(daily_cutoff).normalize(), qfq_cutoff) if daily_cutoff is not None else qfq_cutoff
+            fetched = aggregate_daily_chart(
+                self, symbol, timeframe,
+                end=daily_cutoff,
+            )
+            if before is not None:
+                fetched = fetched[fetched.timestamp < pd.Timestamp(before)]
+            # Keep the pre-start buckets for MA warmup; the common tailing and
+            # final start filter below run after the rolling calculations.
+            fetched = fetched.copy()
+        else:
+            fetched = self.repository.last_bars(
+                symbol, timeframe, before=upper_exclusive,
+                limit=limit + warmup + 1,
+            )
+        adjustment_version = None
+        anchor = None
+        if adjustment == "qfq":
+            if fetched.empty:
+                raise MarketDataError("复权失败：所选区间没有可展示的本地行情")
+            from ..providers import latest_closed_date
+            from .chart_adjustment import apply_chart_adjustment
+            closed = pd.Timestamp(latest_closed_date()).normalize()
+            requested_anchor = min(closed, pd.Timestamp(adjustment_anchor).normalize()) if adjustment_anchor else closed
+            if end is not None:
+                requested_anchor = min(requested_anchor, pd.Timestamp(end).normalize())
+            local_daily = self.repository.last_bars(
+                symbol, "1day", before=requested_anchor + pd.Timedelta(days=1), limit=1,
+            )
+            if local_daily.empty:
+                raise MarketDataError("复权失败：锚点前没有本地日线")
+            anchor = pd.Timestamp(local_daily.timestamp.iloc[-1]).normalize()
+            source_lower = pd.Timestamp(fetched.timestamp.min()) if not fetched.empty else None
+            source_upper = pd.Timestamp(fetched.timestamp.max()) if not fetched.empty else None
+            fetched, adjustment_error, adjustment_version = apply_chart_adjustment(
+                self, symbol, timeframe, fetched, anchor=anchor, start=start,
+            )
+            if adjustment_error:
+                raise MarketDataError(adjustment_error)
+            fetched = fetched[fetched.timestamp < anchor + pd.Timedelta(days=1)].copy()
+            if daily_base_chart and source_upper is not None:
+                fetched = fetched[
+                    (fetched.timestamp <= source_upper)
+                    & (fetched.timestamp >= source_lower)
+                ].copy()
         price_anomalies = _price_anomaly_rows(fetched, start=start, end=upper)
         frame = fetched
-        if start:
-            frame = frame[frame.timestamp >= pd.Timestamp(start)]
         calculation = frame.copy()
         if not price_anomalies.empty:
             gaps = price_anomalies[[column for column in ("timestamp",) if column in price_anomalies]].copy()
@@ -619,18 +674,21 @@ class MarketDataService:
             ).sort_values("timestamp")
         for period in periods:
             calculation[f"ma{period}"] = calculation.close.rolling(period, min_periods=period).mean()
-        if not price_anomalies.empty:
-            moving_columns = [f"ma{period}" for period in periods]
-            frame = frame.drop(columns=[column for column in moving_columns if column in frame], errors="ignore").merge(
-                calculation[["timestamp", *moving_columns]], on="timestamp", how="left"
-            )
+        moving_columns = [f"ma{period}" for period in periods]
+        frame = frame.drop(columns=[column for column in moving_columns if column in frame], errors="ignore").merge(
+            calculation[["timestamp", *moving_columns]], on="timestamp", how="left"
+        )
+        if start:
+            frame = frame[frame.timestamp >= pd.Timestamp(start)]
         more = len(frame) > limit
         frame = frame.tail(limit).copy()
         daily_upper = (
             pd.Timestamp(upper).normalize() + pd.Timedelta(days=1)
             if upper is not None and before is None else upper
         )
-        if timeframe == "1day" and not frame.empty:
+        if adjustment == "qfq":
+            quote = None  # derive chart change from the same adjusted candles
+        elif timeframe == "1day" and not frame.empty:
             # The requested candles already are the daily series. Reusing its
             # latest row avoids a second DuckDB scan that could not share the
             # cache because the two reads use different limits.
@@ -658,6 +716,9 @@ class MarketDataService:
             "next_before": str(frame.timestamp.iloc[0]) if more and len(frame) else None,
             "is_demo": False, "warnings": warnings, "quality_flags": warnings,
             "price_quality": quality,
+            "adjustment": adjustment,
+            "adjustment_anchor": anchor.date().isoformat() if anchor is not None else None,
+            "adjustment_version": adjustment_version,
             "diagnostics": {}, "source_events": [], "storage": dataset.get("storage", "parquet"),
             "instrument": self.store.instrument(symbol) or instrument_terms(symbol, {"name": symbol}),
         }
@@ -693,7 +754,7 @@ class MarketDataService:
         progress(0.05, f"读取 {Path(path).name}")
         frame, fingerprint, encoding, batches = read_file(path)
         params_hash = hashlib.sha256(
-            f"{timeframe}|{label_convention}|{adjustment}|{source}|{PARSER_VERSION}|{import_mode}".encode()
+            f"{timeframe}|{label_convention}|{adjustment}|{source}|{PARSER_VERSION}|{import_mode}|quality-q{QUALITY_RULES_VERSION}|price-q{PRICE_VALIDATION_VERSION}".encode()
         ).hexdigest()
         old_import = self.repository.fingerprint_seen(symbol, timeframe, adjustment, fingerprint, params_hash)
         if old_import and old_import.get("status") == "completed":
@@ -1006,21 +1067,22 @@ class MarketDataService:
             symbol, "1day", start=frame.timestamp.min().normalize(),
             end=frame.timestamp.max().normalize() + pd.Timedelta(days=1),
         )
-        if daily.empty:
-            return frame, "分钟成交量单位缺少日线核验依据"
-        daily = daily[(pd.to_numeric(daily.tradestatus, errors="coerce") == 1) & (pd.to_numeric(daily.volume, errors="coerce") > 0)].copy()
-        if daily.empty:
-            return frame, "日线没有可用成交量，无法核验分钟成交量单位"
-        daily["day"] = pd.to_datetime(daily.timestamp).dt.normalize()
-        observed_days = pd.DatetimeIndex(frame.timestamp.dt.normalize().unique())
-        matched_daily = daily.set_index("day").reindex(observed_days)
         result = frame.copy()
+        if not daily.empty:
+            daily["day"] = pd.to_datetime(daily.timestamp).dt.normalize()
+        volume_daily = daily
+        if not daily.empty:
+            volume_daily = daily[
+                (pd.to_numeric(daily.tradestatus, errors="coerce") == 1)
+                & (pd.to_numeric(daily.volume, errors="coerce") > 0)
+            ].copy()
+        observed_days = pd.DatetimeIndex(frame.timestamp.dt.normalize().unique())
+        matched_daily = daily.set_index("day").reindex(observed_days) if not daily.empty else pd.DataFrame(index=observed_days)
+        matched_volume = volume_daily.set_index("day").reindex(observed_days) if not volume_daily.empty else pd.DataFrame(index=observed_days)
         pending = []
-        convertible_days = matched_daily.index[
-            pd.to_numeric(matched_daily.volume, errors="coerce").gt(0)
+        convertible_days = matched_volume.index[
+            pd.to_numeric(matched_volume.get("volume", pd.Series(index=matched_volume.index, dtype=float)), errors="coerce").gt(0)
         ]
-        if not len(convertible_days):
-            return frame, "分钟记录日期没有对应日线成交量"
 
         def choose_factor(column, candidates):
             totals = frame.loc[
@@ -1028,9 +1090,7 @@ class MarketDataService:
             ].groupby(frame.timestamp.dt.normalize()).agg(
                 total=(column, "sum"),
             )
-            reference = pd.to_numeric(
-                matched_daily.reindex(totals.index)[column], errors="coerce"
-            )
+            reference = pd.to_numeric(matched_volume.reindex(totals.index)[column], errors="coerce") if column in matched_volume else pd.Series(index=totals.index, dtype=float)
             valid = totals.total.gt(0) & reference.gt(0)
             ratios = (totals.loc[valid, "total"] / reference.loc[valid]).to_numpy()
             if not len(ratios):
@@ -1044,30 +1104,20 @@ class MarketDataService:
             if len(ratios) >= 3:
                 required = max(3, required)
             if best_matches < required:
-                return None, best_matches, len(ratios)
+                return 1.0, best_matches, len(ratios)
             return best_factor, best_matches, len(ratios)
 
-        volume_factor, volume_matches, volume_total = choose_factor("volume", (1, 100))
-        if volume_factor is None:
-            return frame, (
-                f"分钟成交量聚合与日线偏差超过 1%（{volume_matches}/{volume_total} 日一致）"
-            )
+        volume_factor, volume_matches, volume_total = choose_factor("volume", (1, 100)) if len(convertible_days) else (1.0, 0, 0)
         if volume_factor != 1:
             result["volume"] = pd.to_numeric(result.volume, errors="coerce") * volume_factor
         if "turnover" in frame and frame.turnover.notna().any():
             turnover_factor, turnover_matches, turnover_total = choose_factor(
                 "turnover", (1, 100, 1000)
-            )
+            ) if len(convertible_days) else (1.0, 0, 0)
             if turnover_factor is None:
-                pending.append(
-                    f"分钟成交额聚合与日线偏差超过 1%（{turnover_matches}/{turnover_total} 日一致）"
-                )
+                turnover_factor = 1.0
             elif turnover_factor not in (None, 1):
                 result["turnover"] = pd.to_numeric(result.turnover, errors="coerce") * turnover_factor
-        if len(convertible_days) < math.ceil(len(observed_days) * 0.95):
-            pending.append(
-                f"分钟日期缺少对应日线成交量（{len(convertible_days)}/{len(observed_days)} 日可核验）"
-            )
         tick = float(instrument_terms(symbol).get("price_tick", 0.01))
         expected_bars = 240 // (timeframe_spec(timeframe).minutes or 1)
         price_checked = price_matched = 0
@@ -1081,8 +1131,7 @@ class MarketDataService:
             if isinstance(row, pd.DataFrame):
                 row = row.iloc[-1]
             status = pd.to_numeric(row.get("tradestatus"), errors="coerce")
-            daily_volume = pd.to_numeric(row.get("volume"), errors="coerce")
-            if pd.isna(status) or int(status) != 1 or pd.isna(daily_volume) or float(daily_volume) <= 0:
+            if pd.isna(status) or int(status) != 1:
                 continue
             ordered = part.sort_values("timestamp")
             if pd.Timestamp(ordered.timestamp.max()).time() != pd.Timestamp("15:00").time():
@@ -1102,12 +1151,12 @@ class MarketDataService:
                 f"分钟价格聚合与日线不一致（{len(price_mismatches)}/{price_checked} 日）："
                 + ", ".join(price_mismatches[:8])
             )
-        elif len(convertible_days) and price_checked == 0:
-            pending.append("没有完整交易日可用于核验分钟价格聚合")
         metadata = {
             "unit_verification": {
                 "volume_factor": volume_factor,
                 "volume_verified_days": volume_matches,
+                "volume_compared_days": int(volume_total),
+                "volume_diagnostic": None if volume_total and volume_matches == volume_total else "量比不一致或缺少日线成交量依据；不影响分钟数据可用性",
                 "turnover_factor": turnover_factor if "turnover_factor" in locals() else 1,
                 "turnover_verified_days": locals().get("turnover_matches", 0),
                 "price_checked_days": price_checked,
@@ -1213,7 +1262,7 @@ class MarketDataService:
                 combined = _merge_input_frames(frames)
                 fingerprint = hashlib.sha256("".join(item[1] for item in fingerprints).encode()).hexdigest()
                 params_hash = hashlib.sha256(
-                    f"{timeframe}|{label_convention}|{adjustment}|import|{PARSER_VERSION}|{import_mode}".encode()
+                    f"{timeframe}|{label_convention}|{adjustment}|import|{PARSER_VERSION}|{import_mode}|quality-q{QUALITY_RULES_VERSION}|price-q{PRICE_VALIDATION_VERSION}".encode()
                 ).hexdigest()
                 old = self.repository.fingerprint_seen(symbol, timeframe, adjustment, fingerprint, params_hash)
                 if resume and old and old.get("status") == "completed":
@@ -1298,7 +1347,7 @@ class MarketDataService:
                         "".join(item[1] for item in fingerprints).encode()
                     ).hexdigest()
                     params_hash = hashlib.sha256(
-                        f"1day|{label_convention}|none|import|{PARSER_VERSION}|merge".encode()
+                        f"1day|{label_convention}|none|import|{PARSER_VERSION}|merge|quality-q{QUALITY_RULES_VERSION}|price-q{PRICE_VALIDATION_VERSION}".encode()
                     ).hexdigest()
                     old = self.repository.fingerprint_seen(
                         symbol, "1day", "none", fingerprint, params_hash
@@ -1842,7 +1891,7 @@ class MarketDataService:
             "market_shard_reads": shard_reads,
         }
 
-    def readiness(self, config: BacktestConfig, version: str | None = None) -> dict:
+    def readiness(self, config: BacktestConfig, version: str | None = None, *, settlement: bool = True) -> dict:
         symbol = normalize_symbol(config.symbol)
         gaps = []
         instrument = self.store.instrument(symbol) or {}
@@ -2011,11 +2060,7 @@ class MarketDataService:
             actions = self.repository.auxiliary(
                 symbol, "actions", version=auxiliary_versions.get("actions")
             )
-            action_days = set()
-            if actions:
-                action_frame = pd.DataFrame(actions["payload"])
-                if not action_frame.empty and "ex_date" in action_frame:
-                    action_days = set(pd.to_datetime(action_frame.ex_date, errors="coerce").dropna().dt.normalize())
+            action_frame = pd.DataFrame((actions or {}).get("payload") or [])
             observed = daily_rows[(pd.to_numeric(daily_rows.tradestatus, errors="coerce") == 1) & (pd.to_numeric(daily_rows.volume, errors="coerce") > 0)].copy()
             if not observed.empty:
                 observed["date"] = pd.to_datetime(observed.timestamp).dt.normalize()
@@ -2023,15 +2068,15 @@ class MarketDataService:
                 if prior.empty:
                     gaps.append({"kind": "reference_price", "timeframe": "1day",
                                  "message": "开始日期前缺少有效交易日收盘价，请补足前置历史"})
-                observed["previous_close"] = observed.close.shift(1)
-                tick = float(self.store.instrument(symbol).get("price_tick", 0.01)) if self.store.instrument(symbol) else 0.01
-                unexplained = (observed.preclose - observed.previous_close).abs() > tick * 1.1
-                unknown = [str(day.date()) for day in observed.loc[unexplained.fillna(False), "date"] if day not in action_days]
-                if unknown:
-                    gaps.append({"kind": "actions", "timeframe": "1day",
-                                 "message": "除权参考价发生变化但缺少公司行动资料：" + ", ".join(unknown[:8])})
-            if asset_type == "etf" and not (actions and actions.get("verified")):
-                gaps.append({"kind": "actions", "timeframe": "1day", "message": "ETF 分红或拆分资料未完成核验"})
+            tick = float(self.store.instrument(symbol).get("price_tick", 0.01)) if self.store.instrument(symbol) else 0.01
+            from ..corporate_actions import action_issues
+            issues = action_issues(
+                action_frame, daily_rows, requested_start, requested_end,
+                settlement=settlement, price_tick=tick,
+            )
+            if issues:
+                gaps.append({"kind": "actions", "timeframe": "1day",
+                             "message": "公司行动或除权参考价存在窗口内问题：" + "；".join(issues[:8])})
         if target != "1day":
             target_dataset = minute
             if target_dataset:
@@ -2261,7 +2306,7 @@ class MarketDataService:
 
 def _params_hash(timeframe, label_convention, adjustment, source, parser_version) -> str:
     return hashlib.sha256(
-        f"{timeframe}|{label_convention}|{adjustment}|{source}|{parser_version}|price-q{PRICE_VALIDATION_VERSION}".encode()
+        f"{timeframe}|{label_convention}|{adjustment}|{source}|{parser_version}|quality-q{QUALITY_RULES_VERSION}|price-q{PRICE_VALIDATION_VERSION}".encode()
     ).hexdigest()
 
 

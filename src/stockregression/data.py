@@ -687,13 +687,13 @@ class DataService:
             profiles,
         )
         observed = daily[(daily.tradestatus == 1) & (daily.volume > 0)].sort_values("date").copy()
-        previous_close = observed.close.shift(1)
-        unexplained = (observed.preclose - previous_close).abs() > float(metadata.get("price_tick", 0.01)) * 1.1
-        action_days = set(actions.ex_date.dt.normalize()) if not actions.empty and "ex_date" in actions else set()
-        unexplained &= observed.date.between(start, end)
-        unknown = [str(day.date()) for day in observed.loc[unexplained, "date"] if day not in action_days]
-        if unknown:
-            raise DataQualityError("候选行情存在未解释的除权参考价变化：" + ", ".join(unknown[:20]))
+        from .corporate_actions import action_issues
+        issues = action_issues(
+            actions, daily, start, end,
+            price_tick=float(metadata.get("price_tick", 0.01)),
+        )
+        if issues:
+            raise DataQualityError("候选行情公司行动异常：" + "；".join(issues[:8]))
         return candidate.quality
 
     def load_bundle(self, config: BacktestConfig, version: str | None = None):
@@ -724,16 +724,6 @@ class DataService:
             metadata["warnings"] = [warning for warning in (metadata.get("warnings") or []) if not str(warning).startswith("请求截至 ")]
             if end < expected_end:
                 metadata["warnings"] = [*metadata.get("warnings", []), f"请求截至 {requested_end.date()}，实际本地已收盘数据截至 {end.date()}"]
-            unverified = metadata.get("actions_unverified_years")
-            if unverified is None:
-                missing_actions = metadata.get("actions_verified") is False
-            else:
-                unverified_years = [int(year) for year in unverified if str(year).isdigit()]
-                missing_actions = any(config.start_date.year <= year <= end.year for year in unverified_years)
-                if not unverified_years and metadata.get("actions_verified") is False:
-                    missing_actions = True
-            if metadata.get("asset_type") == "etf" and missing_actions:
-                raise DataQualityError("ETF 分红或拆分资料未完成核验，请补齐资料后回测；行情浏览仍可使用")
         elif end > daily_all.date.max():
             raise DataQualityError(f"日线完整截止到 {daily_all.date.max().date()}，请补数或缩短结束日期")
         minute = self.store.read_files(files["minute"], "timestamp", config.start_date, end)
@@ -743,9 +733,8 @@ class DataService:
         observed = daily_all[(daily_all.tradestatus == 1) & (daily_all.volume > 0)].copy()
         previous_close = observed.close.shift(1)
         unexplained = (observed.preclose - previous_close).abs() > float(metadata.get("price_tick", 0.01)) * 1.1
-        action_days = set(actions.ex_date.dt.normalize()) if not actions.empty else set()
-        unexplained &= observed.date.between(pd.Timestamp(config.start_date), end)
-        unknown = [str(day.date()) for day in observed.loc[unexplained, "date"] if day not in action_days]
+        from .corporate_actions import action_issues
+        unknown = action_issues(actions, daily_all, config.start_date, end, settlement=True, price_tick=float(metadata.get("price_tick", 0.01)))
         if unknown:
             raise DataQualityError("除权参考价发生变化但缺少公司行动资料：" + ", ".join(unknown[:20]))
         bundle = prepare_bundle(config.symbol, minute, daily_all, actions, calendar, config.start_date, end, config.frequency, manifest["version"], metadata, manifest["profiles"])
@@ -901,8 +890,6 @@ class DataService:
             missing_days = set(calendar.date) - set(days) if not calendar.empty else set()
             if missing_days:
                 flags.append(f"显示区间缺少 {len(missing_days)} 个交易日的所选周期行情")
-        if snapshot_metadata.get("actions_verified") is False:
-            flags.append("公司行动资料未完成核验，补齐前仅浏览价格")
         saved_diagnostics = snapshot_metadata.get("diagnostics") or {}
         projection = project_data_diagnostics(
             snapshot_metadata, saved_diagnostics,

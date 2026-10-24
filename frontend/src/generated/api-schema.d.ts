@@ -4245,6 +4245,8 @@ export interface operations {
                 before?: string | null;
                 limit?: number;
                 ma?: string;
+                adjustment?: "none" | "qfq";
+                adjustment_anchor?: string | null;
             };
             header?: never;
             path: {

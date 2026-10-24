@@ -33,7 +33,12 @@ PROFILE_BINS = 200
 
 METRIC_KEYS = (
     "rv_annualized",
-    "path_redundancy",
+    "path_redundancy_daily_mean",
+    "path_redundancy_5d_mean",
+    "path_redundancy_20d_mean",
+    "path_redundancy_daily_mean_1m",
+    "path_redundancy_5d_mean_1m",
+    "path_redundancy_20d_mean_1m",
     "iovr",
     "variance_ratio_60m",
     "variance_ratio_240m",
@@ -495,6 +500,84 @@ def _path_redundancy(points: pd.DataFrame) -> tuple[float | None, int, str | Non
     ends = valid & ~usable.shift(-1, fill_value=False)
     net = float(np.abs(close[ends].to_numpy() - close[starts].to_numpy()).sum())
     return _finite(max(0.0, min(1.0, 1.0 - net / length))), int(usable.sum()), None
+
+
+def _path_redundancy_means(
+    points: pd.DataFrame, days: pd.DatetimeIndex, *, sampling_minutes: int = 5,
+) -> dict[str, tuple[float | None, int, str | None]]:
+    """Equal-weight means of independently computed 1/5/20-day path ratios.
+
+    The caller supplies the full selected trading calendar, including excluded
+    days. A missing day invalidates every window containing it. Each daily path
+    starts at its first sampled bar's open and visits the sampled closes; a
+    multi-day path also includes the true close-to-next-open displacement.
+    Flat days remain valid inside longer windows, but zero-length windows have
+    no defined ratio and do not contribute to the mean.
+    """
+    windows = (
+        ("path_redundancy_daily_mean", 1),
+        ("path_redundancy_5d_mean", 5),
+        ("path_redundancy_20d_mean", 20),
+    )
+    calendar = pd.DatetimeIndex(days).normalize().unique().sort_values()
+    close_column = "close" if "close" in points else "close_adj"
+    required = {"day", "session", "slot", "valid", "open", close_column}
+    if sampling_minutes not in (1, 5):
+        raise ValueError("路径冗余仅支持1分钟或5分钟采样")
+    if points.empty or not required.issubset(points.columns) or not len(calendar):
+        return {key: (None, 0, "没有完整的采样价格路径") for key, _ in windows}
+
+    frame = points.copy()
+    frame["day"] = pd.to_datetime(frame.day, errors="coerce").dt.normalize()
+    grouped = {day: part for day, part in frame.groupby("day", sort=False)}
+    expected_slots = np.tile(np.arange(sampling_minutes - 1, 120, sampling_minutes), 2)
+    expected_sessions = np.repeat([0, 1], 120 // sampling_minutes)
+    opening = np.full(len(calendar), np.nan)
+    closing = np.full(len(calendar), np.nan)
+    lengths = np.full(len(calendar), np.nan)
+    complete = np.zeros(len(calendar), dtype=bool)
+    for index, day in enumerate(calendar):
+        part = grouped.get(day)
+        if part is None or len(part) != len(expected_slots):
+            continue
+        part = part.sort_values(["session", "slot"], kind="stable")
+        if (
+            not np.array_equal(part.slot.to_numpy(), expected_slots)
+            or not np.array_equal(part.session.to_numpy(), expected_sessions)
+            or not bool(part.valid.fillna(False).astype(bool).all())
+        ):
+            continue
+        prices = pd.to_numeric(part[close_column], errors="coerce").to_numpy(dtype=float)
+        first_open = _positive(part.open.iloc[0])
+        if first_open is None or not np.all(np.isfinite(prices) & (prices > 0)):
+            continue
+        opening[index], closing[index] = first_open, prices[-1]
+        lengths[index] = abs(prices[0] - first_open) + float(np.abs(np.diff(prices)).sum())
+        complete[index] = True
+
+    result = {}
+    for key, width in windows:
+        ratios = []
+        complete_windows = 0
+        for start in range(len(calendar) - width + 1):
+            stop = start + width
+            if not complete[start:stop].all():
+                continue
+            complete_windows += 1
+            length = float(lengths[start:stop].sum())
+            if width > 1:
+                length += float(np.abs(opening[start + 1:stop] - closing[start:stop - 1]).sum())
+            if length <= 1e-15:
+                continue
+            net = abs(closing[stop - 1] - opening[start])
+            ratios.append(max(0.0, min(1.0, 1.0 - net / length)))
+        if ratios:
+            result[key] = (_finite(float(np.mean(ratios))), len(ratios), None)
+        elif complete_windows:
+            result[key] = (None, 0, f"连续{width}日窗口的有效总路径均为零")
+        else:
+            result[key] = (None, 0, f"没有连续完整的{width}个交易日窗口")
+    return result
 
 
 def _official_iovr(
@@ -1398,12 +1481,16 @@ def compute_etf_statistics(
             null_reason=rv_1m_error,
         )
 
-        path_value, path_count, path_error = _path_redundancy(context.points_1m)
-        _set_metric(
-            metrics, details, "path_redundancy", path_value, path_count,
-            reason="1分钟连续有效路径含午休和隔夜；1-各连续段净位移绝对值之和/有效总路径，缺口处断开",
-            null_reason=path_error,
-        )
+        for frequency, points, suffix in (
+            (5, context.points_5m, ""), (1, context.points_1m, "_1m"),
+        ):
+            path_means = _path_redundancy_means(points, context.days, sampling_minutes=frequency)
+            for key, (path_value, path_count, path_error) in path_means.items():
+                _set_metric(
+                    metrics, details, key + suffix, path_value, path_count,
+                    reason=f"{frequency}分钟采样；先独立计算每个连续完整交易日窗口的1-|末收-首开|/累计价格路程，再等权平均；跨日含真实隔夜位移，缺口整窗剔除，零路程不计入，样本数为有效窗口数",
+                    null_reason=path_error,
+                )
 
         iovr_value, iovr_count, iovr_error = _official_iovr(
             context.adjusted_daily, returns_1m, context.days,
@@ -1489,9 +1576,10 @@ def compute_etf_statistics(
             context.points_30m, context.days, context.adjusted_daily,
         )
         if data.metadata.get("etf_volume_verified") is False:
-            profile, profile_error = {}, "分钟与日线成交量口径不一致；保留价格指标，成交量分布待核对单位后计算"
-        else:
-            profile, profile_error = _volume_profile(context.profile_bars, context.days)
+            context.warnings.append(
+                "分钟成交量未通过日线一致性核验；成交量分布仍按分钟成交量及份额折算计算"
+            )
+        profile, profile_error = _volume_profile(context.profile_bars, context.days)
         ou_center = _positive(ou_details.get("center_price"))
         ou_lower = _positive(ou_details.get("lower_price"))
         ou_upper = _positive(ou_details.get("upper_price"))
@@ -1611,12 +1699,20 @@ def compute_etf_statistics(
                 "incomplete_days": integrity["failures"],
             },
             "sampling_frequencies": {
-                "rv": "1m", "path_redundancy": "1m", "volume_profile": "1m OHLC4",
+                "rv": "1m", "path_redundancy": "5m", "path_redundancy_comparison": "1m", "volume_profile": "1m OHLC4",
                 "variance_ratio": "5m", "zero_crossing": "5m", "jump_ratio": "5m",
                 "svr": "5m", "realized_moments": "5m", "ou": "30m",
                 "atr": "30m", "tick_to_price": "20-day raw 1m close", "mddd": "1d",
             },
             "source_quality": source_quality,
+            "path_redundancy": {
+                "window_days": [1, 5, 20], "sampling": "5m", "comparison_sampling": "1m",
+                "averaging": "equal_weight_valid_window_ratios", "rolling_step_days": 1,
+                "includes_overnight": True, "daily_includes_overnight": False,
+                "start_price": "first_sampled_bar_open",
+                "missing_day_policy": "exclude_whole_window", "zero_path_policy": "exclude_window",
+                "gss_weights": {"path_redundancy_daily_mean": 0.10, "path_redundancy_5d_mean": 0.10},
+            },
             "profile": {
                 "bins": PROFILE_BINS, "price_basis": "adjusted OHLC4",
                 "price_proxy": "1m OHLC4 arithmetic proxy; not traded VWAP",
@@ -1692,13 +1788,14 @@ def _average_ranks(values: Sequence[float]) -> list[float]:
 def score_etfs(rows: list[dict]) -> list[dict]:
     """Write cross-sectional GSS fields into ``rows`` (completed rows only).
 
-    Eligibility is independent of scoring: a completed row with all six
+    Eligibility is independent of scoring: a completed row with all seven
     statistical inputs receives a score even if a hard filter makes it
     ineligible. A one-row cohort has no meaningful percentile and gets null.
     """
     score_specs = (
         ("rv_annualized", 0.25, 1.0),
-        ("path_redundancy", 0.20, 1.0),
+        ("path_redundancy_daily_mean", 0.10, 1.0),
+        ("path_redundancy_5d_mean", 0.10, 1.0),
         ("variance_ratio_240m", 0.20, -1.0),
         ("iovr", 0.15, 1.0),
         ("zero_crossing_rate", 0.10, 1.0),

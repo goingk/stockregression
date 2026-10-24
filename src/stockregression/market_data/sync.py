@@ -23,7 +23,7 @@ from ..performance import (
 )
 from ..providers import (
     _baostock_reset, _baostock_session, fetch_sina, fetch_tdx, fetch_ths,
-    latest_closed_date, serialized_baostock,
+    latest_closed_date, paced_api_request, serialized_baostock,
 )
 from ..settings import Settings
 from ..source_health import SourceFailure, SourceRouter, classify_source_error, fetch_auxiliary_routed, market_for_symbol
@@ -709,7 +709,7 @@ class MarketDataSyncService:
             with self._publication_guard(symbol):
                 if checked_cancel(symbol):
                     raise InterruptedError("任务已取消")
-                auxiliary_status = self._persist_auxiliary(symbol, source.get("auxiliary") or {})
+                auxiliary_status = self._persist_auxiliary(symbol, source.get("auxiliary") or {}, daily=source["frame"])
                 source.setdefault("metadata", {}).update(auxiliary_status)
                 quality_started.add(symbol)
                 result = self.service._commit_frame(
@@ -1015,9 +1015,9 @@ class MarketDataSyncService:
                 else:
                     executor.shutdown(wait=True, cancel_futures=True)
 
-    def _persist_auxiliary(self, symbol, metadata):
+    def _persist_auxiliary(self, symbol, metadata, *, daily=None):
         from .sync_auxiliary import persist_sync_auxiliary
-        return persist_sync_auxiliary(self.service, symbol, metadata)
+        return persist_sync_auxiliary(self.service, symbol, metadata, daily=daily)
 
     def _prepare_daily(self, symbol, mode, start, end, cancelled):
         dataset = self.repository.dataset(symbol, "1day")
@@ -1183,7 +1183,7 @@ class MarketDataSyncService:
         with self._publication_guard(symbol):
             if cancelled():
                 raise InterruptedError("任务已取消")
-            metadata.update(self._persist_auxiliary(symbol, metadata))
+            metadata.update(self._persist_auxiliary(symbol, metadata, daily=normalized if timeframe == "1day" else None))
             result = self.service._commit_frame(
                 symbol, timeframe, normalized, fingerprint=frame_hash,
                 file_name=f"sync:{source}:{mode}", params_hash=hashlib.sha256(f"{SOURCE_VERSION}|{mode}|{source}".encode()).hexdigest(),
@@ -1406,9 +1406,10 @@ class MarketDataSyncService:
     def _trade_calendar(start, end):
         try:
             bs = _baostock_session()
-            result = bs.query_trade_dates(
-                start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date())
-            )
+            with paced_api_request():
+                result = bs.query_trade_dates(
+                    start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date())
+                )
             if result.error_code != "0":
                 raise MarketDataError("BaoStock 日历失败：" + result.error_msg)
             rows = []
@@ -1435,11 +1436,12 @@ class MarketDataSyncService:
             fields = "date,open,high,low,close,volume,amount,pctChg"
         try:
             bs = _baostock_session()
-            result = bs.query_history_k_data_plus(
-                exchange.lower() + "." + code, fields,
-                start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date()),
-                frequency=frequency, adjustflag="3",
-            )
+            with paced_api_request():
+                result = bs.query_history_k_data_plus(
+                    exchange.lower() + "." + code, fields,
+                    start_date=str(pd.Timestamp(start).date()), end_date=str(pd.Timestamp(end).date()),
+                    frequency=frequency, adjustflag="3",
+                )
             if result.error_code != "0":
                 raise MarketDataError("BaoStock 行情失败：" + result.error_msg)
             rows = []

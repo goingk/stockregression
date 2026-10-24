@@ -94,6 +94,27 @@ def test_action_factors_adjust_prices_and_only_share_bonus_for_volume():
     pd.testing.assert_series_equal(adjusted["turnover"], before["turnover"])
 
 
+@pytest.mark.parametrize("share_ratio", [2.0, 0.5])
+def test_volume_diagnostics_do_not_skip_split_or_consolidation_adjustment(share_ratio):
+    days = pd.bdate_range("2024-01-02", periods=2)
+    daily = _daily_frame(days, [10.0, 10.0 / share_ratio], [10.0, 10.0 / share_ratio])
+    bundle = DataBundle(
+        symbol="510050.SH", bars=pd.DataFrame(), daily=daily,
+        actions=_actions({
+            "record_date": days[0], "ex_date": days[1],
+            "bonus_ratio": share_ratio - 1.0,
+        }),
+        calendar=days, version="fixture",
+        metadata={"asset_type": "etf", "etf_volume_verified": False},
+    )
+    factors, issue = action_factors(bundle, days[-1])
+    assert issue is None
+    frame = daily.rename(columns={"date": "timestamp"}).assign(volume=100.0)
+    adjusted = adjust_frame(frame, factors, adjust_volume=True)
+    assert adjusted.volume.tolist() == pytest.approx([100.0 * share_ratio, 100.0])
+    assert adjusted.close.tolist() == pytest.approx([10.0 / share_ratio] * 2)
+
+
 def _share_bundle(days, closes, precloses, action):
     bars = []
     daily = []

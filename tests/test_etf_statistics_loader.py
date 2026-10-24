@@ -106,18 +106,21 @@ def _config(symbol="159611.SZ"):
     )
 
 
-def test_default_bundle_keeps_legacy_daily_degradation_for_volume_mismatch():
+def test_default_bundle_keeps_minutes_for_volume_mismatch():
     manifest, minute, daily = _frames(minute_volume=100.0)
     service = _service([(manifest, minute, daily)])
 
     bundle = load_native_bundle(service, _config())
 
-    assert bundle.quality["daily_days"] == 1
-    assert set(bundle.bars.frequency) == {"1d"}
+    assert bundle.quality["minute_days"] == 1
+    assert bundle.quality["daily_days"] == 0
+    assert len(bundle.bars) == 240
+    assert set(bundle.bars.frequency) == {"1m"}
 
 
 def test_statistics_bundle_preserves_raw_prices_and_reports_volume_mismatch():
     manifest, minute, daily = _frames(minute_volume=100.0)
+    manifest["metadata"]["etf_replay_blocked_reason"] = "旧版本因成交量差异阻断回放"
     service = _service([(manifest, minute, daily)])
 
     bundle = load_native_bundle(service, _config(), statistics_only=True)
@@ -128,9 +131,9 @@ def test_statistics_bundle_preserves_raw_prices_and_reports_volume_mismatch():
     assert not bundle.bars.is_synthetic.any()
     assert bundle.metadata["etf_volume_verified"] is False
     assert bundle.metadata["volume_unverified_days"] == [str(DAY.date())]
-    assert bundle.metadata["etf_replay_blocked_reason"] == (
-        "分钟聚合成交量与日线不一致，价格统计可用；成交量分布和参数回放需先核对单位"
-    )
+    assert "etf_replay_blocked_reason" not in bundle.metadata
+    assert any("按分钟成交量继续" in warning for warning in bundle.warnings)
+    assert bundle.bars.volume.sum() == pytest.approx(minute.volume.sum())
 
 
 def test_statistics_bundle_leaves_ordinary_small_gap_missing():
@@ -180,6 +183,7 @@ def test_statistics_bundle_keeps_a_whole_missing_session_on_the_calendar():
     second_day = DAY + pd.offsets.BDay(1)
     extra = daily.copy()
     extra["timestamp"] = second_day
+    extra["preclose"] = daily.iloc[-1].close
     service = _service([(manifest, minute, pd.concat([daily, extra], ignore_index=True))])
     config = _config().model_copy(update={"end_date": second_day.date()})
     bundle = load_native_bundle(service, config, statistics_only=True)

@@ -354,7 +354,7 @@ def test_skip_invalid_rows_removes_zero_price_source_placeholders(tmp_path):
     assert any("已跳过 1 条" in item for item in result["pending_validation"])
 
 
-def test_local_revalidation_promotes_pending_minutes_after_daily_arrives(tmp_path):
+def test_minutes_without_daily_volume_evidence_are_usable_and_revalidate(tmp_path):
     service = MarketDataService(Store(tmp_path / "data"))
     days = _days(3)
     calendar = _calendar(tmp_path, days)
@@ -362,11 +362,34 @@ def test_local_revalidation_promotes_pending_minutes_after_daily_arrives(tmp_pat
     _daily(days).to_csv(daily_path, index=False)
     _minute(days).to_csv(minute_path, index=False)
     first = service.import_file("600000.SH", "1min", minute_path, calendar_path=calendar, label_convention="end")
-    assert first["status"] == "pending_validation"
+    assert first["status"] == "ready"
+    assert not first["pending_validation"]
     service.import_file("600000.SH", "1day", daily_path, calendar_path=calendar)
     result = service.revalidate("600000.SH", "1min")
     assert result["report"]["status"] == "complete"
     assert service.repository.dataset("600000.SH", "1min")["status"] == "ready"
+
+
+def test_volume_unit_calibration_corrects_clear_100x_ratio_without_vetoing_other_ratios(tmp_path, monkeypatch):
+    service = MarketDataService(Store(tmp_path / "data"))
+    day = pd.Timestamp("2026-01-05")
+    frame = _minute_rows(day, minute_slots(day))
+    frame["volume"] = 1.0
+    daily = pd.DataFrame({
+        "timestamp": [day], "tradestatus": [1], "volume": [24000.0],
+        "open": [1.0], "high": [1.01], "low": [0.99], "close": [1.0],
+    })
+    monkeypatch.setattr(service.repository, "active_rows", lambda *_args, **_kwargs: daily)
+    corrected, pending = service._verify_volume_units("600000.SH", "1min", frame)
+    assert corrected.volume.sum() == pytest.approx(24000)
+    assert corrected.attrs["unit_verification"]["volume_factor"] == 100
+    assert pending is None
+
+    daily.loc[0, "volume"] = 50000
+    corrected, pending = service._verify_volume_units("600000.SH", "1min", frame)
+    assert corrected.volume.sum() == pytest.approx(240)
+    assert corrected.attrs["unit_verification"]["volume_diagnostic"]
+    assert pending is None
 
 
 def test_source_revision_marks_derived_dataset_stale(tmp_path):

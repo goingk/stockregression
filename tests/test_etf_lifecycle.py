@@ -13,7 +13,8 @@ from stockregression.market_data.models import MarketDataError
 SYMBOLS = [f"510{i:03d}.SH" for i in range(1, 13)]
 SCORE_METRICS = (
     "rv_annualized",
-    "path_redundancy",
+    "path_redundancy_daily_mean",
+    "path_redundancy_5d_mean",
     "variance_ratio_240m",
     "iovr",
     "zero_crossing_rate",
@@ -137,7 +138,7 @@ def test_default_auto_validation_replays_only_top_ten_eligible_scores(monkeypatc
     assert SYMBOLS[-1] not in replayed
 
 
-def test_price_only_volume_diagnostics_keep_scores_without_consuming_replay_slots(monkeypatch):
+def test_legacy_volume_diagnostics_do_not_block_replay(monkeypatch):
     request = _request()
     plan = _plan(request)
     blocked = SYMBOLS[-2]
@@ -155,12 +156,10 @@ def test_price_only_volume_diagnostics_keep_scores_without_consuming_replay_slot
     monkeypatch.setattr(research, "validate_candidates", validate)
     result = _run(plan, request)
     row = next(item for item in result["rows"] if item["symbol"] == blocked)
-    assert row["status"] == "completed" and row["data_status"] == "limited"
+    assert row["status"] == "completed" and row["data_status"] == "ready"
     assert row["gss_score"] is not None
-    assert row["validation"]["status"] == "unavailable"
-    assert row["validation"]["reason"] == reason
-    assert reason in row["warnings"]
-    assert blocked not in replayed and len(replayed) == 10
+    assert row["validation"]["status"] == "no_qualified"
+    assert blocked in replayed and len(replayed) == 10
 
 
 def test_statistics_cancellation_keeps_completed_metrics_without_publishing_scores(monkeypatch):

@@ -129,7 +129,7 @@ def test_qualification_rejects_payload_from_another_policy_version(tmp_path, mon
 
 
 @pytest.mark.parametrize("cache_kind", ["legacy", "expired"])
-def test_legacy_or_expired_pass_does_not_trigger_eastmoney(
+def test_legacy_or_expired_pass_still_allows_eastmoney_attempt(
     tmp_path, monkeypatch, cache_kind,
 ):
     store = make_store(tmp_path)
@@ -151,12 +151,11 @@ def test_legacy_or_expired_pass_does_not_trigger_eastmoney(
         return daily_frame()
 
     monkeypatch.setattr(providers, "fetch_etf_daily", fetch)
-    with pytest.raises(EmptyUnresolvedError) as caught:
-        fetch_auxiliary_routed(store, "510300.SH", DATE, DATE)
+    _daily, _actions, _calendar, metadata = fetch_auxiliary_routed(store, "510300.SH", DATE, DATE)
 
-    assert calls == ["baostock"]
-    assert caught.value.fallback_attempted is False
-    assert caught.value.fallback_status == "not_eligible"
+    assert calls == ["baostock", "eastmoney"]
+    assert metadata["etf_daily_route"]["fallback_attempted"] is True
+    assert metadata["etf_daily_route"]["fallback_status"] == "succeeded"
 
 
 @pytest.mark.parametrize(
@@ -211,7 +210,7 @@ def test_non_etf_product_requires_its_own_probe_and_then_can_fallback(
 
 
 @pytest.mark.parametrize("product_type", ["unknown", "lof", "reit"])
-def test_unqualified_or_unknown_metadata_never_calls_eastmoney(
+def test_unqualified_or_unknown_metadata_still_attempts_eastmoney(
     tmp_path, monkeypatch, product_type,
 ):
     store = make_store(tmp_path)
@@ -228,9 +227,9 @@ def test_unqualified_or_unknown_metadata_never_calls_eastmoney(
     with pytest.raises(EmptyUnresolvedError) as caught:
         fetch_auxiliary_routed(store, "510300.SH", DATE, DATE)
 
-    assert calls == ["baostock"]
+    assert calls == ["baostock", "eastmoney"]
     assert caught.value.product_type == product_type
-    assert caught.value.fallback_status == "not_eligible"
+    assert caught.value.fallback_status == "failed"
 
 
 def test_empty_both_sources_is_typed_and_does_not_cool_down_source_health(

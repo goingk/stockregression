@@ -197,13 +197,9 @@ def _inputs(config, data):
     closes = pd.to_numeric(frame.close, errors="coerce").to_numpy(dtype=np.float64)
     if np.any(tradable & (~np.isfinite(opens) | ~np.isfinite(closes) | (opens <= 0) | (closes <= 0))):
         raise ValueError("行情价格无效")
-    action_data = data
-    if not data.actions.empty:
-        record_dates = pd.to_datetime(data.actions.record_date, errors="coerce")
-        ex_dates = pd.to_datetime(data.actions.ex_date, errors="coerce")
-        relevant = (record_dates.isna() | (record_dates <= end)) & (ex_dates.isna() | (ex_dates >= start))
-        action_data = replace(data, actions=data.actions.loc[relevant])
-    actions = _prepare_actions(action_data, config.start_date, end.date())
+    # Resolve split fold dates before window filtering: the vendor fold can
+    # precede the actual ex-date while the requested window starts in between.
+    actions = _prepare_actions(data, config.start_date, end.date())
     day_ids = {day.date(): index for index, day in enumerate(days)}
     frequency_column = frame.get("frequency")
     frequencies = (
@@ -221,6 +217,12 @@ def _inputs(config, data):
 
 def _parameter_arrays(config, prepared, parameter_schedule):
     days, values, normalized = [], [], []
+    ex_days = prepared["arrays"][18]
+    action_bonus = prepared["arrays"][22]
+    ex_groups = {}
+    for action_index, ex_index in enumerate(ex_days):
+        if ex_index >= 0:
+            ex_groups.setdefault(int(ex_index), []).append(action_index)
     for row in parameter_schedule or []:
         effective = pd.Timestamp(row["effective_date"]).normalize()
         decision = pd.Timestamp(row["decision_date"]).normalize()
@@ -240,9 +242,37 @@ def _parameter_arrays(config, prepared, parameter_schedule):
             raise ValueError("换参不能改变初始持股")
         from .models import BacktestConfig
         candidate = BacktestConfig.model_validate({**config.model_dump(mode="python"), **params})
+        share_scale, price_scale = 1.0, 1.0
+        first_post_decision = decision + pd.Timedelta(days=1)
+        last_pre_effective = prepared["days"][index] - pd.Timedelta(days=1)
+        action_price_factors = {}
+        if first_post_decision <= last_pre_effective:
+            from .price_basis import action_factors
+            action_price_factors, issue = action_factors(
+                prepared["data"], last_pre_effective,
+                start=first_post_decision,
+            )
+            if issue:
+                raise ValueError(f"换参日期之间的公司行动无效：{issue}")
+            action_price_factors = {
+                pd.Timestamp(item["ex_date"]).normalize(): float(item["factor"])
+                for item in action_price_factors
+            }
+        for ex_index, action_indices in ex_groups.items():
+            ex_date = prepared["days"][ex_index]
+            # The effective day's conversion is still applied in the kernel
+            # after schedule activation, so only intervening sessions count.
+            if decision < ex_date < prepared["days"][index]:
+                ratio = 1.0 + math.fsum(float(action_bonus[i]) for i in action_indices)
+                share_scale *= ratio
+                price_scale *= action_price_factors.get(ex_date, 1.0)
+        min_value = candidate.min_shares * share_scale
+        max_value = np.inf if candidate.max_shares is None else candidate.max_shares * share_scale
         days.append(index)
-        values.append([candidate.min_shares, np.inf if candidate.max_shares is None else candidate.max_shares, candidate.buy_step,
-                       candidate.sell_step, candidate.grid_step, candidate.buy_shares, candidate.sell_shares,
+        values.append([min_value, max_value, candidate.buy_step,
+                       candidate.sell_step, candidate.grid_step * price_scale,
+                       candidate.buy_shares * share_scale,
+                       candidate.sell_shares * share_scale,
                        1.0 if row.get("paused") else 0.0])
         normalized.append({**row, "effective_date": str(prepared["days"][index].date())})
     return np.asarray(days, dtype=np.int64), np.asarray(values, dtype=np.float64).reshape((-1, 8)), normalized

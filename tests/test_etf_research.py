@@ -16,6 +16,18 @@ from stockregression.market_data.models import MarketDataError
 from stockregression.storage import Store
 
 
+def test_request_fingerprint_changes_with_method_version(monkeypatch):
+    request = EtfResearchRequest(scope="selected", symbols=["159611.SZ"])
+    plan = {
+        "universe": {"package_id": "package-a", "generation": "generation-a", "symbols": ["159611.SZ"]}
+    }
+    monkeypatch.setattr(research, "METHOD_VERSION", "etf_min_grid_v2")
+    previous = research.request_fingerprint(request, plan)
+    monkeypatch.setattr(research, "METHOD_VERSION", "etf_min_grid_v3")
+    current = research.request_fingerprint(request, plan)
+    assert current != previous
+
+
 class CatalogOnlyRepository:
     """Fails if preflight tries to read OHLC bodies or prepare/download data."""
     def __init__(self):

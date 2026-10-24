@@ -329,7 +329,7 @@ def data_probe(
     capability: str = typer.Option("recent_minute", "--capability"),
     market: str = typer.Option("all", "--market"),
 ):
-    """只探测数据源，不写入行情；检测通过后可切换为该能力的可选来源。"""
+    """只探测数据源，不写入行情；探测结果仅用于显示诊断状态。"""
     pairs = {"recent_minute": {"sina", "tdx"}, "etf_daily": {"baostock", "eastmoney"}}
     if capability not in pairs or source not in pairs[capability]:
         raise typer.BadParameter("capability 为 recent_minute/etf_daily，且 source 必须匹配该能力")

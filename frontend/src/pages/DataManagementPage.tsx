@@ -572,9 +572,15 @@ export default function DataManagementPage({
   const refreshAll = useCallback(async () => {
     await Promise.allSettled([loadInventory(), loadPackage(), loadSources(), loadConfiguration(), loadPlan()])
   }, [loadConfiguration, loadInventory, loadPackage, loadPlan, loadSources])
+  const refreshInstrumentCatalog = () => void run(
+    '刷新证券清单',
+    () => post('/instruments/refresh'),
+    '证券清单刷新任务已提交；完成后会自动更新本地证券名称。',
+    false,
+  )
 
   return <>
-    <PageHeader eyebrow="DATA PACKAGE" title="数据管理" description="当前数据包是唯一正式行情来源；同步、导入、聚合、来源、路径与运行设置都集中在这里。" action={<div className="button-row"><Button variant="secondary" busy={busy === '刷新'} onClick={() => void run('刷新', refreshAll, '数据包、来源与运行设置已刷新。')}><RefreshCw size={15} />刷新</Button><Button variant="quiet" onClick={tasks.showHistory}><Database size={15} />任务记录</Button></div>} />
+    <PageHeader eyebrow="DATA PACKAGE" title="数据管理" description="当前数据包是唯一正式行情来源；同步、导入、聚合、来源、路径与运行设置都集中在这里。" action={<div className="button-row"><Button variant="secondary" busy={busy === '刷新证券清单'} onClick={refreshInstrumentCatalog}><RefreshCw size={15} />刷新证券清单</Button><Button variant="secondary" busy={busy === '刷新'} onClick={() => void run('刷新', refreshAll, '数据包、来源与运行设置已刷新。')}><RefreshCw size={15} />刷新</Button><Button variant="quiet" onClick={tasks.showHistory}><Database size={15} />任务记录</Button></div>} />
     {error && <ErrorBox message={error} onClose={() => setError('')} />}
     {notice && <div className="notice success"><span>{notice}</span><button className="text-link" onClick={() => setNotice('')}>收起</button></div>}
     {reportError && <ErrorBox message={reportError} onClose={() => setReportError('')} onRetry={requestedReport ? () => setReportRetryToken(token => token + 1) : undefined} />}
@@ -594,7 +600,7 @@ export default function DataManagementPage({
       {packageError && <ErrorBox message={'数据包信息读取失败：' + packageError} onRetry={() => void loadPackage()} />}
       {packageLoading && packageInfo && <p className="inline-warning">正在刷新数据包信息，当前显示上次成功结果。</p>}
       <div className="package-summary"><div><small>当前路径 · {packageInfo?.storage_layout || '—'}</small><strong>{packageInfo?.path || configurationRead.active_package_dir || '未配置'}</strong></div><div><small>包身份 · generation</small><strong>{packageInfo?.package_id || '—'} · {packageInfo?.generation || '—'}</strong></div><div><small>有效基础分片 · 索引</small><strong>{compact(packageInfo?.shard_count ?? 0)} 个 · {formatBytes(packageInfo?.shard_bytes || 0)} · {packageInfo?.index_status === 'ready' ? '一致' : '待重建'}</strong></div></div>
-      <div className="source-panel-head"><div><strong>在线数据源</strong><span>可选来源须通过探测才可启用；失败来源会冷却 {sources?.cooldown_hours ?? 24} 小时。近期分钟行情可按来源策略回退到同花顺，ETF 日线使用下方独立备用开关。</span></div><Button variant="quiet" busy={sourcesLoading} onClick={() => void loadSources()}><RefreshCw size={14} />刷新状态</Button></div>
+      <div className="source-panel-head"><div><strong>在线数据源</strong><span>可选来源可直接启用；探测状态仅供参考，实际失败来源会冷却 {sources?.cooldown_hours ?? 24} 小时。近期分钟行情可按来源策略回退到同花顺，ETF 日线使用下方独立备用开关。</span></div><Button variant="quiet" busy={sourcesLoading} onClick={() => void loadSources()}><RefreshCw size={14} />刷新状态</Button></div>
       {sourcesError && <ErrorBox message={'数据源状态读取失败：' + sourcesError} onRetry={() => void loadSources()} />}
       {sourcesLoading && sources && <p className="inline-warning">正在刷新来源状态，当前显示上次成功结果。</p>}
       {!sources && sourcesLoading ? <Loading label="读取来源状态…" /> : sources ? <div className="source-grid">{sources.capabilities.map(capability => <div className="source-panel" key={capability.capability}>
@@ -604,7 +610,7 @@ export default function DataManagementPage({
           return <div className="source-option" key={option.source}>
             <div><strong>{option.label}</strong><small>{option.role === 'default' ? '默认来源' : option.role === 'fallback' ? '自动回退来源' : '可选来源'}</small></div>
             <div className="source-state-list">{option.states.map(state => <span key={state.market} title={state.error || ''}><b>{state.market === 'etf' ? 'ETF' : '股票'}</b><Badge tone={state.status === 'passed' ? 'green' : state.status === 'failed' ? 'red' : 'neutral'}>{state.status === 'passed' ? '通过' : state.status === 'failed' ? '失败' : '未检测'}</Badge><small>{state.rows ? `${compact(state.rows)} 行` : ''}{state.coverage_end ? ` · ${dateText(state.coverage_end)}` : ''}{state.qualification != null ? ` · ${typeof state.qualification === 'string' ? state.qualification : JSON.stringify(state.qualification)}` : ''}</small></span>)}</div>
-            <div className="button-row"><Button variant="quiet" busy={busy === '探测数据源'} onClick={() => probeSource(option.source, capability.capability)}>检测</Button>{option.role === 'fallback' ? <Badge tone="neutral">自动回退</Badge> : !option.selected && <Button variant="secondary" disabled={!option.selectable || busy === '切换来源'} onClick={() => void chooseSource(capability.capability, option.source)}>{option.selectable ? '启用' : '检测通过后启用'}</Button>}</div>
+            <div className="button-row"><Button variant="quiet" busy={busy === '探测数据源'} onClick={() => probeSource(option.source, capability.capability)}>检测</Button>{option.role === 'fallback' ? <Badge tone="neutral">自动回退</Badge> : !option.selected && <Button variant="secondary" disabled={!option.selectable || busy === '切换来源'} onClick={() => void chooseSource(capability.capability, option.source)}>启用</Button>}</div>
           </div>
         })}</div>
       </div>)}</div> : !sourcesError ? <Empty title="暂无来源状态" detail="刷新后会显示来源检测与回退状态。" /> : null}

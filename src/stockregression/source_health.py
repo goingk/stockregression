@@ -26,14 +26,14 @@ SOURCE_CAPABILITIES = {
         "optional": "tdx",
         "fallback": "ths",
         "markets": ("stock", "etf"),
-        "description": "新浪提供近期分钟行情；通达信为检测通过后可选的来源；两者都失败时自动转同花顺。",
+        "description": "新浪提供近期分钟行情；通达信可直接启用，来源失败时按冷却策略回退，两者都失败时自动转同花顺。",
     },
     "etf_daily": {
         "label": "ETF 日线",
         "default": "baostock",
         "optional": "eastmoney",
         "markets": ("etf",),
-        "description": "BaoStock 为默认日线来源；东方财富为检测通过后可选的来源。",
+        "description": "BaoStock 为默认日线来源；东方财富可直接启用，实际失败后按冷却策略回退。",
     },
 }
 
@@ -339,14 +339,13 @@ class SourceRouter:
             type_qualification = source_qualification(
                 self.store, optional, product_type or "unknown",
             )
-        qualified = type_qualification is None or type_qualification["status"] == "passed"
-        effective = optional if qualified and (state["status"] == "passed" or _recovery_due(state)) else default
+        # Qualification probes describe historical confidence, not current
+        # availability. Let real requests establish health; honor failure cooldown.
+        qualified = True
+        effective = optional if (state["status"] == "passed" or state["status"] == "unknown" or _recovery_due(state)) else default
         reason = None
         if effective == default and optional == configured:
-            if not qualified:
-                reason = f"Eastmoney 未通过 {product_type or 'unknown'} 类型的 24 小时资格探测"
-            else:
-                reason = "可选来源尚未通过检测" if state["status"] == "unknown" else state.get("error") or "可选来源暂不可用"
+            reason = state.get("error") or "可选来源暂不可用"
         return {
             "configured": configured, "effective": effective,
             "fallback": effective != configured, "reason": reason,
@@ -525,9 +524,9 @@ def configured_sources(store: Store) -> dict:
                 "label": SOURCE_LABELS.get(source, source),
                 "role": "default" if source == spec["default"] else "fallback" if source == fallback else "optional",
                 "selected": configured == source,
-                "selectable": source != fallback and (
-                    source == spec["default"] or all(state["status"] == "passed" for state in states)
-                ),
+                # Probe state is diagnostic only; a request itself determines
+                # availability, with actual failures enforced by cooldown.
+                "selectable": source != fallback,
                 "states": states,
             })
         capabilities.append({
@@ -549,12 +548,7 @@ def configured_sources(store: Store) -> dict:
 
 
 def validate_source_settings(store: Store, values: dict) -> None:
-    if values.get("recent_minute_source") == "tdx" and not source_is_ready(store, "tdx", "recent_minute"):
-        raise ValueError("通达信尚未通过股票和 ETF 的近期分钟检测，暂不能设为默认来源")
-    if values.get("etf_daily_source") == "eastmoney":
-        qualification = source_qualification(store, "eastmoney", "etf")
-        if qualification["status"] != "passed":
-            raise ValueError("东方财富尚未通过 24 小时内的 ETF 类型探测，暂不能设为默认来源")
+    return None
 
 
 def _component_call(
@@ -618,16 +612,13 @@ def fetch_auxiliary_routed(
         fallback_allowed = (
             configured_source == "baostock"
             and market_settings.etf_daily_fallback_enabled
-            and product_type in {"etf", "lof", "reit"}
-            and fallback_qualification["status"] == "passed"
+            and product_type in {"etf", "lof", "reit", "unknown"}
         )
         fallback_reasons = []
         if not market_settings.etf_daily_fallback_enabled:
             fallback_reasons.append("ETF 日线备用来源已关闭")
         elif product_type == "unknown":
             fallback_reasons.append("证券产品类型未能从元数据确认")
-        elif fallback_qualification["status"] != "passed":
-            fallback_reasons.append("Eastmoney 未通过该产品类型的 24 小时探测")
         fallbacks = ("eastmoney",) if fallback_allowed else ()
         try:
             daily, daily_source, route = router.call(

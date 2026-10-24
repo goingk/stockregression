@@ -6,7 +6,7 @@ import pandas as pd
 from .models import DataBundle
 from .price_validation import price_issue_details
 
-QUALITY_RULES_VERSION = 3
+QUALITY_RULES_VERSION = 4
 
 MINUTE_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume", "turnover", "source"]
 
@@ -127,6 +127,7 @@ def infer_profile(frame: pd.DataFrame, daily: pd.DataFrame, source: str, referen
         for multiplier in (1, 100):
             aligned = align_minutes(frame, convention, multiplier)
             good = 0
+            volume_matches = 0
             for day, part in aligned.groupby(aligned["timestamp"].dt.normalize()):
                 if not 235 <= len(part) <= 240 or daily_lookup.empty or day not in daily_lookup.index:
                     continue
@@ -136,10 +137,12 @@ def infer_profile(frame: pd.DataFrame, daily: pd.DataFrame, source: str, referen
                 if row["volume"] <= 0:
                     continue
                 vol_error = abs(part.volume.sum() / row.volume - 1)
+                if vol_error <= 0.01:
+                    volume_matches += 1
                 close_error = abs(float(part.iloc[-1].close) - float(row.close))
                 high_error = abs(float(part.high.max()) - float(row.high))
                 low_error = abs(float(part.low.min()) - float(row.low))
-                if vol_error <= 0.005 and max(close_error, high_error, low_error) <= price_tick * 1.1:
+                if max(close_error, high_error, low_error) <= price_tick * 1.1:
                     good += 1
             score = None
             volume_score = None
@@ -167,22 +170,27 @@ def infer_profile(frame: pd.DataFrame, daily: pd.DataFrame, source: str, referen
                     for field in ("open", "high", "low", "close"):
                         price_ok &= (joined[field] - joined[field + "_ref"]).abs().to_numpy() <= price_tick * 1.1
                     volume_ok = (joined.volume - joined.volume_ref).abs() <= np.maximum(1, joined.volume_ref * 0.005)
-                    # Labels are established by price paths; volume units already
-                    # require three daily-total checks. Auction allocation may
+                    # Labels are established by price paths; volume similarity
+                    # is retained as a diagnostic only. Auction allocation may
                     # differ between independent vendors at the five-minute edge.
-                    score = float(price_ok.mean()) if reference_frequency != "1m" else float((price_ok & volume_ok).mean())
+                    score = float(price_ok.mean())
                     volume_score = float(volume_ok.mean())
-            possibilities.append({"convention": convention, "volume_multiplier": multiplier, "verified_days": good, "match_score": score, "reference_volume_score": volume_score, "overlap_bars": overlap})
-    possibilities.sort(key=lambda p: (p["match_score"] or 0, p["verified_days"]), reverse=True)
+            possibilities.append({"convention": convention, "volume_multiplier": multiplier, "verified_days": good, "volume_verified_days": volume_matches, "match_score": score, "reference_volume_score": volume_score, "overlap_bars": overlap})
+    possibilities.sort(key=lambda p: (p["match_score"] or 0, p["verified_days"], p["volume_verified_days"]), reverse=True)
     best = possibilities[0]
     credible_labels = bool(declared) or (source == "tdx" and best["convention"] == "end")
     if reference is not None and best["overlap_bars"] >= (120 if reference_frequency == "5m" else 600):
         alternate = next((p for p in possibilities if p["convention"] != best["convention"]), None)
         margin = (best["match_score"] or 0) - ((alternate or {}).get("match_score") or 0)
-        credible_labels = (best["match_score"] or 0) >= 0.9 and margin >= 0.03
-    verified = credible_labels and best["verified_days"] >= 3
+        # A declared/known timestamp convention is authoritative; independent
+        # vendor disagreement is diagnostic and cannot revoke that declaration.
+        if not declared and source != "tdx":
+            credible_labels = (best["match_score"] or 0) >= 0.9 and margin >= 0.03
+    # Daily volume is useful for diagnosing a likely 100x unit mismatch, but
+    # cannot establish timestamp labels or veto otherwise sound price bars.
+    verified = credible_labels
     return {**best, "source": source, "verified": verified,
-            "reason": "时段、量额与日线/参考分钟核验通过" if verified else "分钟标签或成交量单位尚未获得充分核验，按日线处理",
+            "reason": "时间标签及价格路径核验通过" if verified else "分钟时间标签未校准，按日线处理",
             "declared_convention": declared, "reference_frequency": reference_frequency}
 
 
@@ -296,6 +304,7 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
         part = groups.get(day, pd.DataFrame())
         slots = minute_slots(day)
         reason = ""
+        volume_ratio_error = None
         missing = len(slots)
         missing_data = missing
         auction_count = 0
@@ -313,20 +322,19 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
             source_verified = part.get("source_verified", pd.Series(False, index=slots)).eq(True)
             observed = part[~part.close.isna()]
             price_issues = price_issue_details(observed)
-            unit_error = abs(observed.volume.sum() / row.volume - 1) if row.volume else 0
             if not source_verified.loc[observed.index].all():
-                reason = "来源分钟标签/单位未校准"
+                reason = "来源分钟时间标签未校准"
             elif not price_issues.empty:
                 reason = "分钟 OHLC/量额校验失败"
             elif missing_data > 5 or _max_run(data_missing_mask[:120]) > 3 or _max_run(data_missing_mask[120:]) > 3:
                 reason = "分钟缺口超过连续3根或全日5根阈值"
             elif missing_mask[0] or missing_mask[120]:
                 reason = "交易时段首分钟缺失，无法因果补齐"
-            elif missing_data == 0 and unit_error > 0.01:
-                reason = "完整分钟聚合成交量与日线偏差超过1%"
             elif max(abs(float(observed.high.max()) - row.high), abs(float(observed.low.min()) - row.low), abs(float(observed.iloc[-1].close) - row.close)) > float(metadata.get("price_tick", 0.01)) * 1.1 and missing_data == 0:
                 reason = "完整分钟价格聚合与日线不符"
             else:
+                if missing_data == 0 and np.isfinite(row.volume) and row.volume > 0:
+                    volume_ratio_error = abs(float(observed.volume.sum()) / float(row.volume) - 1)
                 previous = part.close.groupby(np.repeat([0, 1], 120)).ffill()
                 for price in ("open", "high", "low", "close"):
                     part.loc[missing_mask, price] = previous.loc[missing_mask]
@@ -361,22 +369,37 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
         for field in ("preclose", "is_st", "limit_up", "limit_down", "no_price_limit"):
             filled[field] = row.get(field, False if field == "is_st" else np.nan)
         output.append(filled)
+        report_reason = reason
+        if not report_reason:
+            if missing_data and mode == "minute":
+                report_reason = "少量缺口因果补齐"
+            elif auction_count and mode == "minute":
+                report_reason = "收盘集合竞价无逐分钟成交，占位保留"
+            else:
+                report_reason = "完整"
+        volume_diagnostic = None
+        if volume_ratio_error is not None and volume_ratio_error > 0.01:
+            volume_diagnostic = f"分钟与日线成交量比差异 {volume_ratio_error:.1%}；已保留分钟数据"
         reports.append({"date": str(day.date()), "mode": mode, "missing_minutes": missing if frequency != "1d" else 0,
                         "missing_data_minutes": missing_data if frequency != "1d" else 0,
                         "auction_placeholders": auction_count, "download_needed": download_needed,
-                        "reason": reason or ("少量缺口因果补齐" if missing_data and mode == "minute" else "收盘集合竞价无逐分钟成交，占位保留" if auction_count and mode == "minute" else "完整")})
+                        "volume_ratio_error": volume_ratio_error,
+                        "volume_diagnostic": volume_diagnostic, "reason": report_reason})
     bars = pd.concat(output, ignore_index=True).sort_values("timestamp").reset_index(drop=True) if output else pd.DataFrame(columns=MINUTE_COLUMNS + ["frequency", "tradable", "is_synthetic"])
     minute_days = sum(report["mode"] == "minute" for report in reports)
     daily_days = sum(report["mode"] == "daily" for report in reports)
     suspended_days = sum(report["mode"] == "suspended" for report in reports)
     no_trade_days = sum(report["mode"] == "no_trades" for report in reports)
-    pending_calibration_days = sum(report["mode"] == "daily" and report["reason"] == "来源分钟标签/单位未校准" and not report.get("download_needed", False) for report in reports)
+    pending_calibration_days = sum(report["mode"] == "daily" and report["reason"] == "来源分钟时间标签未校准" and not report.get("download_needed", False) for report in reports)
     quality = {"pending_calibration_days": pending_calibration_days, "days": reports, "minute_days": minute_days, "daily_days": daily_days, "suspended_days": suspended_days, "no_trade_days": no_trade_days, "total_days": len(days), "minute_ratio": minute_days / max(1, minute_days + daily_days),
                "synthetic_bars": sum(report["missing_minutes"] for report in reports if report["mode"] == "minute"),
                "auction_placeholders": sum(report.get("auction_placeholders", 0) for report in reports if report["mode"] == "minute"),
                "is_demo": bool(metadata.get("is_demo")), "requested_frequency": frequency, "warnings": warnings}
     if pending_calibration_days:
-        warnings.append(f"{pending_calibration_days} 个交易日已有本地分钟数据，但时间标签/单位尚未校准；重复下载不能解决此状态。请核对数据源说明，确认开始或结束时间标签后重新导入，或提供独立参考行情核验。")
+        warnings.append(f"{pending_calibration_days} 个交易日已有本地分钟数据，但时间标签尚未校准；重复下载不能解决此状态。请核对数据源说明，确认开始或结束时间标签后重新导入，或提供独立参考行情核验。")
+    volume_mismatch_days = sum(report.get("volume_ratio_error") is not None and report["volume_ratio_error"] > 0.01 for report in reports)
+    if volume_mismatch_days:
+        warnings.append(f"{volume_mismatch_days} 个交易日分钟与日线成交量比存在偏差；分钟数据已保留，请核对来源单位或成交量口径。")
     if daily_days and frequency != "1d":
         warnings.append(f"{daily_days} 个交易日已整日降级为日线；不还原盘中路径")
     if metadata.get("is_demo"):

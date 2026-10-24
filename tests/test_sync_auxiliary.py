@@ -222,3 +222,37 @@ def test_identical_actions_payload_and_verified_state_skip_auxiliary_write(tmp_p
     assert calls == []
     assert result["actions_persisted"] is False
     assert result["actions_auxiliary_version"] == "actions-v4"
+
+
+def test_split_placeholder_does_not_replace_complete_event(tmp_path):
+    service = make_service(tmp_path)
+    complete = {
+        "record_date": "2026-03-27", "ex_date": "2026-03-30", "stock_date": "2026-03-30",
+        "cash_per_share": 0, "bonus_ratio": 1, "action_type": "split",
+        "split_date": "2026-03-27", "implemented": True, "unsupported_reason": "",
+    }
+    seed_actions(service, [complete], verified=True)
+    set_action_state(service, checked=[2026], verified=True)
+    incoming = {**complete, "ex_date": None, "stock_date": None, "bonus_ratio": float("nan")}
+    persist_sync_auxiliary(service, SYMBOL, {
+        "actions": [incoming], "actions_checked_years": [2026], "actions_verified": True,
+    })
+    result = service.repository.auxiliary(SYMBOL, "actions")["payload"]
+    assert len(result) == 1
+    assert result[0]["ex_date"] == "2026-03-30"
+    assert result[0]["bonus_ratio"] == 1
+
+
+def test_split_resolution_repeated_sync_is_noop(tmp_path):
+    service = make_service(tmp_path)
+    daily = pd.DataFrame({
+        "timestamp": pd.to_datetime(["2026-03-26", "2026-03-27", "2026-03-30"]),
+        "close": [10., 10., 5.], "preclose": [10., 10., 5.],
+    })
+    metadata = {"actions": [{"split_date": "2026-03-27", "action_type": "split", "bonus_ratio": 1., "cash_per_share": 0.}],
+                "actions_checked_years": [2026], "actions_verified": True}
+    first = persist_sync_auxiliary(service, SYMBOL, metadata, daily=daily)
+    second = persist_sync_auxiliary(service, SYMBOL, metadata, daily=daily)
+    assert first["actions_persisted"]
+    assert not second["actions_persisted"]
+    assert first["actions_auxiliary_version"] == second["actions_auxiliary_version"]

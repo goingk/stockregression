@@ -14,7 +14,7 @@ import {
 } from '../components'
 import type { BacktestConfig, FeeConfig, ResultSummary } from '../types'
 import {
-  buildEtfResearchRequest, dataStatusLabel, dataStatusTone, etfDataStatusCounts, etfMetricRows, etfMetricText,
+  ETF_METRIC_DEFINITIONS, buildEtfResearchRequest, dataStatusLabel, dataStatusTone, etfDataStatusCounts, etfMetricRows, etfMetricText,
   etfResearchStartCount, samplingCoverageText, samplingStatisticsText,
   etfRequestKey, etfSymbolValidationPath, executionFromBacktest, filterReasonsText, gapText, itemsPageCount,
   parseSelectedEtfSymbols, resultStatusLabel, resultStatusTone, safeItemsOffset, scoreDisplay, settingsError,
@@ -67,6 +67,30 @@ function jsonText(value: unknown) {
 function ValidationBadge({ status }: { status: string }) {
   const tone = status === 'completed' ? 'green' : status === 'no_qualified' ? 'amber' : status === 'partial' ? 'amber' : status === 'cancelled' ? 'neutral' : status === 'unavailable' ? 'red' : 'neutral'
   return <Badge tone={tone}>{validationStatusLabel(status)}</Badge>
+}
+
+const gridBasisHelp = [
+  { label: '参考价 / 上下轨', text: '参考价是网格中心，上下轨限定候选价格范围；由成交量分布与均值回归估计共同生成。' },
+  { label: 'ATR30', text: '30 分钟真实波幅相对价格的平均比例，用于设置网格步长下限；数值越大，通常需要更宽的网格。' },
+  { label: 'SVR', text: '上涨半方差与下跌半方差之比；大于 1 表示上涨波动更强，小于 1 表示下跌波动更强，与偏度共同判断是否生成非对称网格。' },
+  { label: '已实现偏度', text: '衡量 5 分钟收益分布的左右不对称程度；正值偏向较大的上涨，负值偏向较大的下跌，用于调整买卖步长。' },
+  { label: '已实现峰度', text: '这里使用超额峰度，正态分布为 0；越高通常表示尾部极端波动更突出，用于观察尾部风险。' },
+  { label: '最小报价', text: '价格每次允许变动的最小金额（元）；用于将网格价格对齐合法档位，避免相邻网格落在同一报价上。' },
+]
+
+const candidateHelp = [
+  { label: '基准 / 买入 / 卖出步长', text: '相邻网格的价格间距比例；基准步长用于生成候选，买卖步长分别控制下跌买入与上涨卖出的触发间距。' },
+  { label: '网格上下格数', text: '参考价到上轨、下轨分别可容纳的网格数量，用于查看两侧交易空间。' },
+  { label: '峰值本金收益', text: '期末累计盈利 ÷ 区间峰值累计外部投入，费用已计入；“峰值”指投入本金，用于比较资金使用后的整体收益。' },
+  { label: '同资金持有', text: '与网格从相同初始资产出发，并在相同补款时点获得相同金额的被动持有收益，用作资金条件相配的比较基准。' },
+  { label: '差值超额', text: '网格收益率减去同资金持有收益率；例如 8% − 5% = 3 个百分点，用于判断网格是否优于被动持有。' },
+  { label: '最大回撤', text: '累计盈利从此前高点（至少为 0）到后续低点的最大回落 ÷ 峰值本金；越小表示样本内回落越轻，用于筛选风险。' },
+  { label: '成交 / 买卖', text: '实际成交总笔数、买入笔数和卖出笔数；用于检查交易是否充分、是否形成双向买卖，未成交信号不计入。' },
+  { label: '费用', text: '回放中累计手续费（元）；用于评估交易成本，滑点通过成交价格影响收益。' },
+]
+
+function MetricHelpList({ items }: { items: readonly { label: string; text: string }[] }) {
+  return <dl className='etf-help-list'>{items.map(item => <div key={item.label}><dt>{item.label}</dt><dd>{item.text}</dd></div>)}</dl>
 }
 
 export default function EtfResearchPage({ requestedResult, onSelectedResultChange, onLoadBacktest }: Props) {
@@ -405,6 +429,10 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
   const pageCount = itemsPageCount(visibleItemsTotal, pageSize)
   const currentPage = Math.floor(safeItemsOffset(itemsOffset, visibleItemsTotal, pageSize) / pageSize) + 1
   const metricRows = detail ? etfMetricRows(detail.metrics ?? {}, detail.metric_details ?? {}) : []
+  const isV3 = researchResult?.method_version === 'etf_min_grid_v3'
+  const redundancyDaily = (row: typeof items[number]) => row.metrics.path_redundancy_daily_mean
+  const redundancy5d = (row: typeof items[number]) => row.metrics.path_redundancy_5d_mean
+  const redundancy20d = (row: typeof items[number]) => row.metrics.path_redundancy_20d_mean
   const detailValidation = detail?.validation
   const detailCandidates = detailValidation?.candidates ?? []
   const gridBasis = detail?.grid_basis
@@ -429,6 +457,14 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
       action={<div className='button-row'><Button variant='quiet' busy={historyLoading} onClick={() => { void tasks.refresh(); void loadHistory(0, false) }}><RefreshCw size={14} />刷新历史</Button><Button variant='secondary' disabled={!selectedResultId} onClick={() => void exportResult()}><Download size={14} />导出 JSON</Button></div>}
     />
     <div className='etf-sample-banner'><Badge tone='blue'>样本内</Badge><span>排名与候选回放均为样本内；截止日后的区间可在回测页另行回测。</span></div>
+    <Disclosure id='etf-metric-guide' title='指标含义与用途' summary='查看统计指标、GSS 评分和网格参数的简要说明' className='etf-metric-guide'>
+      <p className='etf-help-intro'>GSS 是 0–100 分的网格适用性相对评分，分数越高表示在本次候选池中更符合评分偏好的波动与往返特征。它用于初筛，不代表预期收益；不同候选池的分数不宜直接比较。v3 使用 5 分钟作为主采样，1 分钟仅作采样敏感性对照，按相同窗口尺度分别比较；高路径冗余不证明盈利。</p><p className='etf-help-intro'>路径冗余先分别计算每个日、5 日或 20 日窗口的 PR，再对有效窗口等权平均，不是先把日 PR 平滑。日窗口从当天首个采样 bar 开盘到收盘；滚动窗口每日推进，遇到缺口整窗剔除，跨日计算保留真实隔夜位移。0 路程窗口无效。</p>
+      <div className='etf-help-metrics'>{ETF_METRIC_DEFINITIONS.map(metric => <div key={metric.key}><h3>{metric.label}</h3><p><b>含义：</b>{metric.meaning}</p><p><b>用途：</b>{metric.usage}</p></div>)}</div>
+      <h3 className='etf-help-heading'>网格参数</h3>
+      <MetricHelpList items={gridBasisHelp} />
+      <h3 className='etf-help-heading'>候选回测指标</h3>
+      <MetricHelpList items={candidateHelp} />
+    </Disclosure>
     {error && <ErrorBox message={error} onClose={() => setError('')} />}
     {notice && <div className='notice success'><span>{notice}</span><button className='text-link' onClick={() => setNotice('')}>收起</button></div>}
     <div className='etf-research-layout'>
@@ -509,24 +545,25 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
             {resultDataStatusCounts.length > 0 && <div className='stat-grid four etf-data-status-stats'>{resultDataStatusCounts.map(item => <Stat key={item.status} label={item.label} value={item.count} tone={item.tone} />)}</div>}
             <div className='etf-result-actions'><Button variant='quiet' busy={historyLoading || resultLoading} onClick={() => { void tasks.refresh(); setRefreshToken(token => token + 1) }}><RefreshCw size={14} />刷新结果</Button><Button variant='quiet' onClick={() => void exportResult()}><Download size={14} />导出 JSON</Button><span>{scopeLabel(researchResult.request.scope)} · {researchResult.request.window_days} 日窗口 · 自动核验前 {researchResult.request.validation_top_k} 名 · 最少成交 {researchResult.request.min_trades}</span></div>
 
-            <div className='table-wrap scroll-table etf-ranking-table'><table><thead><tr><th>排名</th><th>ETF</th><th>GSS</th><th>可入选</th><th>状态 / 覆盖</th><th>RV</th><th>路径冗余</th><th>IOVR</th><th>VR 240m</th><th>跳跃</th><th>核验</th><th>操作</th></tr></thead><tbody>{items.map(row => <tr key={row.symbol} className={selectedSymbol === row.symbol ? 'selected-row' : ''}><td>{row.rank ?? '—'}</td><td><strong>{row.symbol_name || row.symbol}</strong><small>{row.symbol} · 横截面 n={row.score_cohort_size}</small></td><td><strong className='etf-score'>{scoreDisplay(row)}</strong></td><td><Badge tone={row.eligible ? 'green' : 'red'}>{row.eligible ? '符合硬过滤' : '已过滤'}</Badge></td><td><Badge tone={dataStatusTone(row.data_status || row.status)}>{dataStatusLabel(row.data_status || row.status)}</Badge>{row.sampling && <small>{samplingCoverageText(row.sampling)} · {samplingStatisticsText(row.sampling)}</small>}{row.data_status === 'limited' && <small>数据受限，参数核验不可用</small>}</td><td>{etfMetricText('rv_annualized', row.metrics.rv_annualized)}</td><td>{etfMetricText('path_redundancy', row.metrics.path_redundancy)}</td><td>{etfMetricText('iovr', row.metrics.iovr)}</td><td>{etfMetricText('variance_ratio_240m', row.metrics.variance_ratio_240m)}</td><td>{etfMetricText('jump_ratio', row.metrics.jump_ratio)}</td><td><ValidationBadge status={row.validation.status} /></td><td><Button variant='quiet' busy={detailLoading && selectedSymbol === row.symbol} onClick={() => void openSymbol(row.symbol)}>诊断</Button></td></tr>)}</tbody></table></div>
+            <div className='table-wrap scroll-table etf-ranking-table'><table><thead><tr><th>排名</th><th>ETF</th><th>GSS</th><th>可入选</th><th>状态 / 覆盖</th><th>RV</th>{isV3 ? <><th>日均路径冗余（5m）</th><th>5 日均路径冗余（5m）</th><th>20 日均路径冗余（5m）</th></> : <th>历史全窗口 PR（1m）</th>}<th>IOVR</th><th>VR 240m</th><th>跳跃</th><th>核验</th><th>操作</th></tr></thead><tbody>{items.map(row => <tr key={row.symbol} className={selectedSymbol === row.symbol ? 'selected-row' : ''}><td>{row.rank ?? '—'}</td><td><strong>{row.symbol_name || row.symbol}</strong><small>{row.symbol} · 横截面 n={row.score_cohort_size}</small></td><td><strong className='etf-score'>{scoreDisplay(row)}</strong></td><td><Badge tone={row.eligible ? 'green' : 'red'}>{row.eligible ? '符合硬过滤' : '已过滤'}</Badge></td><td><Badge tone={dataStatusTone(row.data_status || row.status)}>{dataStatusLabel(row.data_status || row.status)}</Badge>{row.sampling && <small>{samplingCoverageText(row.sampling)} · {samplingStatisticsText(row.sampling)}</small>}{row.data_status === 'limited' && <small>数据受限，参数核验不可用</small>}</td><td>{etfMetricText('rv_annualized', row.metrics.rv_annualized)}</td>{isV3 ? <><td>{etfMetricText('path_redundancy_daily_mean', redundancyDaily(row))}<small>1m 对照 {etfMetricText('path_redundancy_daily_mean_1m', row.metrics.path_redundancy_daily_mean_1m)}</small></td><td>{etfMetricText('path_redundancy_5d_mean', redundancy5d(row))}<small>1m 对照 {etfMetricText('path_redundancy_5d_mean_1m', row.metrics.path_redundancy_5d_mean_1m)}</small></td><td>{etfMetricText('path_redundancy_20d_mean', redundancy20d(row))}<small>1m 对照 {etfMetricText('path_redundancy_20d_mean_1m', row.metrics.path_redundancy_20d_mean_1m)}</small></td></> : <td>{etfMetricText('path_redundancy', row.metrics.path_redundancy)}</td>}<td>{etfMetricText('iovr', row.metrics.iovr)}</td><td>{etfMetricText('variance_ratio_240m', row.metrics.variance_ratio_240m)}</td><td>{etfMetricText('jump_ratio', row.metrics.jump_ratio)}</td><td><ValidationBadge status={row.validation.status} /></td><td><Button variant='quiet' busy={detailLoading && selectedSymbol === row.symbol} onClick={() => void openSymbol(row.symbol)}>诊断</Button></td></tr>)}</tbody></table></div>
             {itemsLoading && <Loading label='读取排名行…' />}
             {!itemsLoading && !items.length && <Empty title='没有排名行' detail='当前研究范围可能全部历史不足或数据未就绪。' />}
             <div className='pagination-row etf-ranking-pagination'><span>第 {currentPage} / {pageCount} 页 · 共 {itemsTotal} 行</span><div><Button variant='quiet' disabled={itemsOffset <= 0 || itemsLoading} onClick={() => setItemsOffset(current => safeItemsOffset(current - pageSize, itemsTotal, pageSize))}>上一页</Button><Button variant='quiet' disabled={itemsOffset + pageSize >= itemsTotal || itemsLoading} onClick={() => setItemsOffset(current => safeItemsOffset(current + pageSize, itemsTotal, pageSize))}>下一页</Button></div></div>
             {detail && <section className='etf-detail-section'>
               <div className='etf-detail-heading'><div><h2>{detail.symbol_name || detail.symbol}</h2><span>{detail.symbol} · {dateText(detail.window_start)} 至 {dateText(detail.window_end)} · 数据版本 {detail.version || '—'}</span></div><div><Badge tone={dataStatusTone(detail.data_status)}>{dataStatusLabel(detail.data_status)}</Badge><Badge tone={detail.eligible ? 'green' : 'red'}>{detail.eligible ? '符合硬过滤' : '未通过硬过滤'}</Badge><Badge tone='blue'>样本内</Badge></div></div>
               {(detailFilterReasons.length > 0 || detailGaps.length > 0 || detailWarnings.length > 0) && <div className='etf-filter-reasons'>{detailFilterReasons.length > 0 && <p><strong>过滤原因：</strong>{filterReasonsText(detailFilterReasons)}</p>}{detailGaps.length > 0 && <div className='etf-gap-list'><strong>数据缺口：</strong><ul>{detailGaps.map((gap, index) => <li key={`${gap.timeframe ?? ''}-${gap.kind}-${index}`}>{gapText(gap)}</li>)}</ul></div>}{detailWarnings.length > 0 && <p><strong>数据提示：</strong>{detailWarnings.join('；')}</p>}</div>}
-              <div className='etf-detail-score-row'><div><small>GSS 横截面评分</small><strong>{scoreDisplay(detail)}</strong><span>样本数 {detail.score_cohort_size}{detail.rank != null ? ` · 排名 ${detail.rank}` : ''}</span></div><div><small>网格基准</small><strong>{money(gridBasis?.reference_price, 3)} 元</strong><span>当前 {money(gridBasis?.current_raw_price, 3)} · 下轨 {money(gridBasis?.lower_price, 3)} · 上轨 {money(gridBasis?.upper_price, 3)}</span></div><div><small>网格参数核验</small><ValidationBadge status={detailValidation?.status ?? 'not_selected'} /><span>{detailCandidates.length} 个候选</span></div></div>
+              <div className='etf-detail-score-row'><div><small>GSS 横截面评分</small><strong>{scoreDisplay(detail)}</strong><span>样本数 {detail.score_cohort_size}{detail.rank != null ? ` · 排名 ${detail.rank}` : ''}</span><span>本次候选池内的相对适用性评分，越高越符合网格特征。</span></div><div><small>网格基准</small><strong>{money(gridBasis?.reference_price, 3)} 元</strong><span>当前 {money(gridBasis?.current_raw_price, 3)} · 下轨 {money(gridBasis?.lower_price, 3)} · 上轨 {money(gridBasis?.upper_price, 3)}</span><span>参考价为网格中心，上下轨限定候选价格范围。</span></div><div><small>网格参数核验</small><ValidationBadge status={detailValidation?.status ?? 'not_selected'} /><span>{detailCandidates.length} 个候选</span></div></div>
               {detail.sampling && <Disclosure id='etf-statistical-sample' title='统计样本与排除日期' summary={samplingStatisticsText(detail.sampling)}>
                 <p>{samplingCoverageText(detail.sampling)} · {samplingStatisticsText(detail.sampling)} · {detail.sampling.comparable ? '同池统计日期已对齐' : '仅诊断，不参与 GSS'}</p>
                 <p>统计排除日期：{detail.sampling.statistics_excluded_days.join('、') || '无'}。缺口处断开计算，未用日线或合成分钟替代。</p>
               </Disclosure>}
-              <div className='etf-metric-grid'>{metricRows.map(metric => <div key={metric.key}><small>{metric.label}</small><strong>{metric.value}</strong>{metric.detail?.reason && <span>{metric.detail.reason}</span>}{metric.detail?.sample_count != null && <span>样本 {metric.detail.sample_count}</span>}</div>)}</div>
-              <div className='etf-grid-basis-grid'><span><small>ATR30</small><strong>{percent(gridBasis?.atr30_pct)}</strong></span><span><small>SVR</small><strong>{money(gridBasis?.svr, 3)}</strong></span><span><small>已实现偏度</small><strong>{money(gridBasis?.realized_skewness, 3)}</strong></span><span><small>已实现峰度</small><strong>{money(gridBasis?.realized_kurtosis, 3)}</strong></span><span><small>最小报价</small><strong>{money(gridBasis?.price_tick, 3)}</strong></span></div>
-              {Object.keys(detail.score_contributions ?? {}).length > 0 && <Disclosure id='etf-score-contributions' title='GSS 分项贡献' summary={`${Object.keys(detail.score_contributions).length} 项`}><div className='etf-contribution-grid'>{Object.entries(detail.score_contributions).map(([key, value]) => <span key={key}><small>{key.replaceAll('_', ' ')}</small><strong>{value.toFixed(4)}</strong></span>)}</div></Disclosure>}
+              <div className='etf-metric-grid'>{metricRows.map(metric => <div key={metric.key}><small>{metric.label}</small><strong>{metric.value}</strong>{metric.meaning && <p className='etf-metric-copy'><b>含义：</b>{metric.meaning}</p>}{metric.usage && <p className='etf-metric-copy'><b>用途：</b>{metric.usage}</p>}{metric.detail?.reason && <span>{metric.detail.reason}</span>}{metric.detail?.sample_count != null && <span>{metric.key.startsWith('path_redundancy_') && metric.key !== 'path_redundancy' ? `有效窗口 ${metric.detail.sample_count} 个` : `样本 ${metric.detail.sample_count}`}</span>}</div>)}</div>
+              <div className='etf-grid-basis-grid'><span><small>ATR30</small><strong>{percent(gridBasis?.atr30_pct)}</strong></span><span><small>SVR</small><strong>{money(gridBasis?.svr, 3)}</strong></span><span><small>已实现偏度</small><strong>{money(gridBasis?.realized_skewness, 3)}</strong></span><span><small>已实现峰度</small><strong>{money(gridBasis?.realized_kurtosis, 3)}</strong></span><span><small>最小报价</small><strong>{money(gridBasis?.price_tick, 3)} 元</strong></span></div><Disclosure id='etf-grid-basis-help' title='网格参数说明' summary='ATR30、SVR、偏度、峰度与报价单位'><MetricHelpList items={gridBasisHelp} /></Disclosure>
+              {Object.keys(detail.score_contributions ?? {}).length > 0 && <Disclosure id='etf-score-contributions' title='GSS 分项贡献' summary={`${Object.keys(detail.score_contributions).length} 项`}><p className='etf-help-intro'>各项为加权后的得分贡献（分），相加得到 GSS。{isV3 ? 'v3 权重：RV 25%、日均 PR 10%、5 日 PR 10%、反向 VR240 20%、IOVR 15%、过零率 10%、反向跳跃占比 10%；20 日 PR 与 1 分钟对照不计分。' : '历史 v1/v2 权重：RV 25%、全窗口路径冗余 20%、反向 VR240 20%、IOVR 15%、过零率 10%、反向跳跃占比 10%。'}反向表示原值越低，得分越高。</p><div className='etf-contribution-grid'>{Object.entries(detail.score_contributions).map(([key, value]) => <span key={key}><small>{ETF_METRIC_DEFINITIONS.find(metric => metric.key === key)?.label ?? key.replaceAll('_', ' ')}</small><strong>{value.toFixed(4)} 分</strong></span>)}</div></Disclosure>}
               <div className='etf-validation-section'><div className='etf-validation-title'><div><h3>参数核验与候选</h3><p>候选指标为样本内自动回放；GSS 与硬过滤资格独立展示。</p></div><ValidationBadge status={detailValidation?.status ?? 'not_selected'} /></div>
                 {detailValidation?.reason && <p className='inline-warning'>核验原因：{detailValidation.reason}</p>}
                 {detailValidation?.stop_reason && <p className='inline-warning'>核验停止原因：{stopReasonLabel(detailValidation.stop_reason)}</p>}
+                <Disclosure id='etf-candidate-metrics-help' title='候选指标说明' summary='步长、收益、超额、回撤、成交和费用'><MetricHelpList items={candidateHelp} /></Disclosure>
                 {detailCandidates.length ? <div className='table-wrap scroll-table etf-candidate-table'><table><thead><tr><th>候选</th><th>基准 / 买入 / 卖出步长</th><th>参考 / 上下轨</th><th>网格上下格数</th><th>峰值本金收益</th><th>同资金持有</th><th>差值超额</th><th>最大回撤</th><th>成交 / 买卖</th><th>费用</th><th>资格</th><th>操作</th></tr></thead><tbody>{detailCandidates.map(candidate => <tr key={String(candidate.id)}><td><strong>#{String(candidate.id)}</strong>{detailValidation?.recommendation?.id === candidate.id && <Badge tone='blue'>推荐</Badge>}{candidate.asymmetric && <Badge tone='amber'>非对称</Badge>}</td><td>{percent(candidate.base_step)} / {percent(candidate.buy_step)} / {percent(candidate.sell_step)}</td><td>{money(candidate.reference_price, 3)} / {money(candidate.lower_price, 3)} / {money(candidate.upper_price, 3)}</td><td>{candidate.grids_down_count} / {candidate.grids_up_count}</td><td>{percent(candidate.metrics.peak_principal_return)}</td><td>{percent(candidate.metrics.matched_funding_hold_return)}</td><td>{percent(candidate.metrics.excess_return)}</td><td>{percent(candidate.metrics.max_principal_drawdown)}</td><td>{candidate.metrics.trade_count ?? '—'} / {candidate.metrics.buy_count ?? '—'} / {candidate.metrics.sell_count ?? '—'}</td><td>{money(candidate.metrics.total_fees)}</td><td><Badge tone={candidate.qualified ? 'green' : 'amber'}>{candidate.qualified ? '合格' : '未合格'}</Badge>{candidate.reasons.length > 0 && <small>{candidate.reasons.join('；')}</small>}</td><td><div className='button-row etf-candidate-actions'><Button variant='quiet' busy={rowBusy === 'replay:' + String(candidate.id)} onClick={() => void replayCandidate(detail, candidate)}>按此复现</Button></div></td></tr>)}</tbody></table></div> : <Empty title='没有参数候选' detail={validationStatusLabel(detailValidation?.status ?? 'not_selected')} />}
                 <div className='etf-detail-actions'><Button variant='secondary' busy={rowBusy === detail.symbol} disabled={detail.data_status === 'limited'} onClick={() => void validateSingleSymbol(detail)}><SearchCheck size={15} />按原数据核验此 ETF</Button>{detail.data_status === 'limited' && <span>统计可用（受限）：请处理诊断原因后再进行参数核验。</span>}<Button variant='quiet' disabled={!detail.validation.forward_config} onClick={() => loadForwardConfig(detail)}>载入截止日后回测草稿</Button>{!detail.validation.forward_config && <span>尚无选参截止日后的回测配置。</span>}</div>
               </div>

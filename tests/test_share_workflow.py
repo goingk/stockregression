@@ -309,6 +309,267 @@ def test_initial_holding_receives_first_day_dividend_without_nav_jump():
     assert hold["equity"][1]["cash"] == 600
 
 
+@pytest.mark.parametrize("bonus_ratio,expected_position,price_factor", [(1.0, 200, .5), (-.5, 50, 2.0)])
+def test_share_conversion_updates_position_and_preserves_nav(bonus_ratio, expected_position, price_factor, monkeypatch):
+    config, bundle = fixture(days=3)
+    dates = bundle.calendar
+    prices = np.array([10.0, 10.0, 10.0 * price_factor, 10.0 * price_factor])
+    for name, values in (("open", prices), ("close", prices), ("high", prices + .01),
+                         ("low", prices - .01), ("preclose", np.r_[10.0, prices[:-1]]),
+                         ("turnover", prices * 100000)):
+        bundle.daily[name] = values
+    bundle.bars = bundle.daily.iloc[1:].copy()
+    bundle.bars["timestamp"] = bundle.bars.date + pd.Timedelta(hours=15)
+    bundle.bars["frequency"], bundle.bars["tradable"], bundle.bars["is_synthetic"] = "1d", True, False
+    bundle.actions = normalize_actions(pd.DataFrame([{
+        "record_date": dates[0], "ex_date": dates[1], "stock_date": dates[1],
+        "cash_per_share": 0, "bonus_ratio": bonus_ratio,
+    }]))
+    config = config.model_copy(update={
+        "schema_version": 3, "initial_shares": 100, "min_shares": 0,
+        "max_shares": None, "buy_shares": 0, "sell_shares": 0,
+        "buy_step": 1., "sell_step": 1., "reference_price_mode": "manual",
+        "reference_price": 10., "fees": FeeConfig(commission_rate=0, min_commission=0, slippage_bps=0),
+    })
+    result = engine.run_backtest(config, bundle)["strategies"]["grid"]
+    monkeypatch.setattr(engine, "_NUMBA_FASTPATH_ENABLED", False)
+    interpreted = engine.run_backtest(config, bundle)["strategies"]["grid"]
+    converted = next(row for row in result["equity"] if row["timestamp"][:10] == str(dates[1].date()))
+    assert converted["position"] == expected_position
+    assert converted["equity"] == pytest.approx(1000, abs=.02)
+    assert [row["position"] for row in interpreted["equity"]] == [row["position"] for row in result["equity"]]
+    assert [row["equity"] for row in interpreted["equity"]] == pytest.approx([row["equity"] for row in result["equity"]])
+
+
+def _share_action_market(bundle, actions, prices):
+    dates = bundle.calendar
+    prices = np.asarray(prices, dtype=float)
+    for name, values in (("open", prices), ("close", prices), ("high", prices + .001),
+                         ("low", prices - .001), ("preclose", np.r_[prices[0], prices[:-1]]),
+                         ("turnover", prices * 100000)):
+        bundle.daily[name] = values
+    bundle.bars = bundle.daily.iloc[1:].copy()
+    bundle.bars["timestamp"] = bundle.bars.date + pd.Timedelta(hours=15)
+    bundle.bars["frequency"], bundle.bars["tradable"], bundle.bars["is_synthetic"] = "1d", True, False
+    bundle.actions = normalize_actions(pd.DataFrame([
+        {"record_date": dates[record], "ex_date": dates[ex], "stock_date": dates[stock],
+         "pay_date": dates[ex] if cash else None,
+         "cash_per_share": cash, "bonus_ratio": ratio}
+        for item in actions
+        for record, ex, stock, ratio, cash in [(*item, 0) if len(item) == 4 else item]
+    ]))
+
+
+def test_pending_order_quantity_and_execution_price_follow_split_once(monkeypatch):
+    config, bundle = fixture(days=3)
+    # Prior close signals a 100 share buy; the split is effective before the
+    # next open, so its pending amount becomes 200 and fills at half price.
+    _share_action_market(bundle, [(0, 1, 1, 1.0)], [10, 9, 5, 5])
+    config = config.model_copy(update={
+        "schema_version": 3, "initial_shares": 100, "buy_shares": 100,
+        "sell_shares": 100, "min_shares": 0, "max_shares": None,
+        "buy_step": .05, "sell_step": 1., "reference_price_mode": "manual",
+        "reference_price": 10., "fees": FeeConfig(commission_rate=0, min_commission=0, slippage_bps=0),
+    })
+    grid = engine.run_backtest(config, bundle)["strategies"]["grid"]
+    monkeypatch.setattr(engine, "_NUMBA_FASTPATH_ENABLED", False)
+    interpreted = engine.run_backtest(config, bundle)["strategies"]["grid"]
+    fill = next(trade for trade in grid["trades"] if trade["timestamp"][:10] == str(bundle.calendar[1].date()))
+    assert fill["quantity"] == 200
+    assert fill["price"] == pytest.approx(5)
+    py_fill = next(trade for trade in interpreted["trades"] if trade["timestamp"][:10] == str(bundle.calendar[1].date()))
+    assert (py_fill["quantity"], py_fill["price"]) == pytest.approx((fill["quantity"], fill["price"]))
+
+
+def test_dca_share_amount_is_converted_before_ex_date_purchase():
+    config, bundle = fixture(days=3)
+    _share_action_market(bundle, [(1, 2, 2, 1.0)], [10, 10, 5, 5])
+    config = config.model_copy(update={
+        "schema_version": 3, "initial_shares": 100, "buy_shares": 100,
+        "sell_shares": 100, "min_shares": 0, "max_shares": None,
+        "buy_step": 1., "sell_step": 1., "reference_price_mode": "manual",
+        "reference_price": 10., "dca": DcaConfig(frequency="daily", shares=100),
+        "fees": FeeConfig(commission_rate=0, min_commission=0, slippage_bps=0),
+    })
+    dca = engine.run_backtest(config, bundle)["strategies"]["dca"]
+    ex_fill = next(trade for trade in dca["trades"] if trade["timestamp"][:10] == str(bundle.calendar[2].date()))
+    assert ex_fill["quantity"] == 200
+    assert ex_fill["price"] == pytest.approx(5)
+
+
+def test_continuous_splits_compound_and_execute_on_latest_share_basis():
+    config, bundle = fixture(days=4)
+    # 200 * 1.0025 * 2.495 = 500.2475, so one final floor produces 500.
+    # Flooring after the first action would instead produce a 400 share lot.
+    _share_action_market(bundle, [(0, 1, 1, .0025), (1, 2, 2, 1.495)], [10, 10, 9.975, 3.5, 3.5])
+    config = config.model_copy(update={
+        "schema_version": 3, "initial_shares": 100, "buy_shares": 200,
+        "sell_shares": 200, "min_shares": 0, "max_shares": None,
+        "buy_step": .05, "sell_step": 1., "reference_price_mode": "manual",
+        "reference_price": 10., "fees": FeeConfig(commission_rate=0, min_commission=0, slippage_bps=0),
+    })
+    grid = engine.run_backtest(config, bundle)["strategies"]["grid"]
+    fill = next(trade for trade in grid["trades"] if trade["timestamp"][:10] == str(bundle.calendar[3].date()))
+    assert fill["quantity"] == 500
+    assert fill["price"] == pytest.approx(3.5)
+
+
+def test_parameter_schedule_uses_decision_basis_and_does_not_double_scale_ex_date():
+    from stockregression.share_engine import _inputs, _parameter_arrays
+
+    config, bundle = fixture(days=4)
+    _share_action_market(bundle, [(1, 2, 2, 1.0)], [10, 10, 5, 5, 5])
+    config = config.model_copy(update={
+        "schema_version": 3, "initial_shares": 100, "buy_shares": 100,
+        "sell_shares": 100, "min_shares": 0, "max_shares": None,
+        "reference_price_mode": "manual", "reference_price": 10.,
+    })
+    prepared = _inputs(config, bundle)
+    same_day = [{"decision_date": str(bundle.calendar[1].date()),
+                 "effective_date": str(bundle.calendar[2].date()),
+                 "params": {"buy_shares": 200, "sell_shares": 200}}]
+    next_day = [{"decision_date": str(bundle.calendar[2].date()),
+                 "effective_date": str(bundle.calendar[3].date()),
+                 "params": {"buy_shares": 200, "sell_shares": 200}}]
+    decided_before_split = [{"decision_date": str(bundle.calendar[1].date()),
+                             "effective_date": str(bundle.calendar[3].date()),
+                             "params": {"buy_shares": 200, "sell_shares": 200}}]
+    same_values = _parameter_arrays(config, prepared, same_day)[1]
+    next_values = _parameter_arrays(config, prepared, next_day)[1]
+    prior_basis_values = _parameter_arrays(config, prepared, decided_before_split)[1]
+    # On the ex-date, the kernel converts these values once after applying the
+    # schedule. On the following day the decision already uses post-split units.
+    assert same_values[0, 5:7].tolist() == [200, 200]
+    assert next_values[0, 5:7].tolist() == [200, 200]
+    assert prior_basis_values[0, 5:7].tolist() == [400, 400]
+
+
+def test_parameter_arrays_keep_fractional_share_basis_for_a_later_split():
+    from stockregression.share_engine import _inputs, _parameter_arrays
+
+    config, bundle = fixture(days=5)
+    _share_action_market(
+        bundle, [(0, 1, 1, -2 / 3), (2, 3, 3, 2.0)],
+        [10, 10, 30, 30, 10, 10],
+    )
+    config = config.model_copy(update={
+        "schema_version": 3, "initial_shares": 100, "min_shares": 0,
+        "max_shares": None, "buy_shares": 100, "sell_shares": 100,
+        "reference_price_mode": "manual", "reference_price": 10.,
+    })
+    prepared = _inputs(config, bundle)
+    schedule = [{
+        "decision_date": str(bundle.calendar[0].date()),
+        "effective_date": str(bundle.calendar[2].date()),
+        "params": {
+            "min_shares": 100, "max_shares": 400,
+            "buy_shares": 100, "sell_shares": 100,
+        },
+    }]
+    _, values, _ = _parameter_arrays(config, prepared, schedule)
+    # The decision basis passes through a 1-for-3 reverse split. Preserve the
+    # fractional schedule value so a later 3-for-1 action restores it exactly.
+    assert values[0, 0] == pytest.approx(100 / 3)
+    assert values[0, 1] == pytest.approx(400 / 3)
+    assert values[0, 5] == pytest.approx(100 / 3)
+    assert values[0, 6] == pytest.approx(100 / 3)
+    assert values[0, 5] * 3 == pytest.approx(100)
+    assert values[0, 6] * 3 == pytest.approx(100)
+
+
+def test_delayed_reverse_split_settles_once_and_never_oversells():
+    config, bundle = fixture(days=6)
+    _share_action_market(bundle, [(1, 2, 4, -.5)], [10, 10, 10, 22, 24, 26, 26])
+    config = config.model_copy(update={
+        "schema_version": 3, "initial_shares": 200, "buy_shares": 100,
+        "sell_shares": 200, "min_shares": 0, "max_shares": None,
+        "buy_step": 1., "sell_step": .05, "reference_price_mode": "manual",
+        "reference_price": 10., "fees": FeeConfig(commission_rate=0, min_commission=0, slippage_bps=0),
+    })
+    grid = engine.run_backtest(config, bundle)["strategies"]["grid"]
+    ex_point = next(row for row in grid["equity"] if row["timestamp"][:10] == str(bundle.calendar[2].date()))
+    pre_stock_point = next(row for row in grid["equity"] if row["timestamp"][:10] == str(bundle.calendar[3].date()))
+    assert ex_point["position"] == 100
+    assert pre_stock_point["position"] == 100
+    sells = [trade for trade in grid["trades"] if trade["side"] == "sell"]
+    assert [trade["quantity"] for trade in sells] == [100]
+    assert sells[0]["timestamp"][:10] == str(bundle.calendar[4].date())
+    ex_date = pd.Timestamp(bundle.actions.iloc[0]["ex_date"]).date()
+    stock_date = pd.Timestamp(bundle.actions.iloc[0]["stock_date"]).date()
+    pre_stock_rejections = [
+        rejection for rejection in grid["rejections"]
+        if rejection["reason"] == "t_plus_1"
+        and ex_date < pd.Timestamp(rejection["timestamp"]).date() < stock_date
+    ]
+    assert pre_stock_rejections, grid["rejections"]
+    assert all(row["position"] >= 0 for row in grid["equity"])
+
+
+def test_same_ex_date_positive_and_negative_claims_with_different_unlock_dates_are_rejected():
+    config, bundle = fixture(days=4)
+    ex = bundle.calendar[1]
+    bundle.actions = normalize_actions(pd.DataFrame([
+        {"record_date": bundle.calendar[0], "ex_date": ex,
+         "stock_date": bundle.calendar[2], "cash_per_share": 0, "bonus_ratio": .5},
+        {"record_date": bundle.calendar[0], "ex_date": ex,
+         "stock_date": bundle.calendar[3], "cash_per_share": 0, "bonus_ratio": -.25},
+    ]))
+    with pytest.raises(ValueError, match="可交易日不一致"):
+        engine._prepare_actions(bundle, config.start_date, config.end_date)
+
+
+def test_same_day_actions_sum_bonus_and_cash_before_calculating_one_price_factor():
+    config, bundle = fixture(days=3)
+    # Two simultaneous 1-for-2 entitlements combine to r=2 (not 2.25),
+    # while distinct cash distributions add per pre-action share.
+    _share_action_market(bundle, [(0, 1, 1, .5, .2), (0, 1, 1, .5, .3)], [10, 10, 4.75, 4.75])
+    config = config.model_copy(update={
+        "schema_version": 3, "initial_shares": 100, "buy_shares": 100,
+        "sell_shares": 100, "min_shares": 0, "max_shares": None,
+        "buy_step": 1., "sell_step": .05, "reference_price_mode": "manual",
+        "reference_price": 10., "fees": FeeConfig(commission_rate=0, min_commission=0, slippage_bps=0),
+    })
+    grid = engine.run_backtest(config, bundle)["strategies"]["grid"]
+    ex_point = next(row for row in grid["equity"] if row["timestamp"][:10] == str(bundle.calendar[1].date()))
+    assert ex_point["position"] == 200
+    assert ex_point["cash"] == pytest.approx(50)
+    assert ex_point["equity"] == pytest.approx(1000)
+    assert grid["trades"] == []
+
+    from stockregression.share_engine import _inputs, _parameter_arrays
+    prepared = _inputs(config, bundle)
+    schedule = [{"decision_date": str(bundle.calendar[0].date()),
+                 "effective_date": str(bundle.calendar[2].date()),
+                 "params": {"buy_shares": 100, "sell_shares": 100}}]
+    _, values, _ = _parameter_arrays(config, prepared, schedule)
+    # Schedule scaling uses the same per-ex-date sum as price_basis; cash is
+    # aggregated once and the price spacing follows the resulting 0.475 factor.
+    assert values[0, 5:7].tolist() == [200, 200]
+    assert values[0, 4] == pytest.approx(config.grid_step * .475)
+
+
+def test_fractional_entitlements_are_floored_after_same_day_bonus_aggregation(monkeypatch):
+    config, bundle = fixture(days=3)
+    # The two same-day claims are 0.4 and 0.6 shares. They jointly issue one
+    # share; flooring each claim independently would lose both fractions.
+    _share_action_market(bundle, [(0, 1, 1, .004), (0, 1, 1, .006)], [100, 100, 99.01, 99.01])
+    config = config.model_copy(update={
+        "schema_version": 3, "initial_shares": 100, "buy_shares": 100,
+        "sell_shares": 100, "min_shares": 0, "max_shares": None,
+        "buy_step": 1., "sell_step": 1., "reference_price_mode": "manual",
+        "reference_price": 100., "fees": FeeConfig(commission_rate=0, min_commission=0, slippage_bps=0),
+    })
+    compiled = engine.run_backtest(config, bundle)["strategies"]["grid"]
+    monkeypatch.setattr(engine, "_NUMBA_FASTPATH_ENABLED", False)
+    interpreted = engine.run_backtest(config, bundle)["strategies"]["grid"]
+    compiled_ex = next(row for row in compiled["equity"] if row["timestamp"][:10] == str(bundle.calendar[1].date()))
+    interpreted_ex = next(row for row in interpreted["equity"] if row["timestamp"][:10] == str(bundle.calendar[1].date()))
+    assert compiled_ex["position"] == 101
+    assert compiled_ex["equity"] == pytest.approx(10000, abs=.02)
+    assert interpreted_ex["position"] == compiled_ex["position"]
+    assert interpreted_ex["equity"] == pytest.approx(compiled_ex["equity"])
+
+
 
 
 @pytest.mark.parametrize("frequency", ["weekly", "monthly"])
@@ -322,6 +583,10 @@ def test_dca_first_available_day_once_per_period(frequency):
     blocked = set(bundle.calendar[:3])
     bundle.daily.loc[bundle.daily.date.isin(blocked), ["tradestatus", "volume"]] = 0
     bundle.bars.loc[bundle.bars.date.isin(blocked), "volume"] = 0
+    # The next observed session's preclose refers to the last traded close,
+    # not the final synthetic quote from the suspended fixture dates.
+    resume = bundle.daily.date == bundle.calendar[3]
+    bundle.daily.loc[resume, "preclose"] = bundle.daily.loc[bundle.daily.date == bundle.calendar[0] - pd.Timedelta(days=1), "close"].iloc[0]
     result = engine.run_backtest(config, bundle)["strategies"]["dca"]
     expected = {}
     for day in bundle.calendar:

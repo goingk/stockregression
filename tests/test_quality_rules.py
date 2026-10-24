@@ -1,9 +1,10 @@
+import numpy as np
 import pandas as pd
 import pytest
 
 from stockregression.data import DataService
 from stockregression.market_data.models import MarketDataError
-from stockregression.quality import DataQualityError, apply_price_limits, canonical_frame, minute_slots
+from stockregression.quality import DataQualityError, apply_price_limits, canonical_frame, infer_profile, minute_slots
 from stockregression.storage import Store
 
 
@@ -70,6 +71,21 @@ def test_unnamed_datetime_index_is_promoted_to_timestamp():
     assert frame.timestamp.tolist() == list(stamps)
 
 
+def test_independent_minute_reference_price_match_calibrates_labels_despite_volume_mismatch():
+    days = pd.bdate_range("2026-01-05", periods=3)
+    minute = canonical_frame(pd.concat([index_clock_minute(pd.DatetimeIndex([day])) for day in days]), source="vendor")
+    phase = np.tile(np.arange(240), len(days))
+    minute["open"] = minute["close"] = 10 + phase * 0.005
+    minute["high"] = minute["close"] + 0.001
+    minute["low"] = minute["close"] - 0.001
+    reference = minute[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+    reference["volume"] = 7
+    profile = infer_profile(minute, daily_fixture(days), "vendor", reference=reference, reference_frequency="1m", price_tick=0.001)
+    assert profile["verified"] is True
+    assert profile["convention"] == "end"
+    assert profile["reference_volume_score"] == 0
+
+
 
 
 
@@ -122,3 +138,21 @@ def test_minute_high_low_check_tolerates_only_float_noise(error, expected):
                             pd.DataFrame({"date": [day]}), day, day, "1m", "test",
                             {"asset_type": "etf", "price_tick": 0.001}, {})
     assert bundle.quality["days"][0]["mode"] == expected
+
+
+def test_minute_volume_mismatch_is_reported_but_does_not_degrade_valid_bars():
+    from stockregression.quality import prepare_bundle
+    from stockregression.providers import normalize_actions
+    day = pd.Timestamp("2026-01-05")
+    minute = canonical_frame(index_clock_minute(pd.DatetimeIndex([day])))
+    minute["source_verified"] = True
+    minute["volume"] *= 3
+    daily = daily_fixture(pd.DatetimeIndex([day]))
+    bundle = prepare_bundle("159611.SZ", minute, daily, normalize_actions(pd.DataFrame()),
+                            pd.DataFrame({"date": [day]}), day, day, "1m", "test",
+                            {"asset_type": "etf", "price_tick": 0.001}, {})
+    report = bundle.quality["days"][0]
+    assert report["mode"] == "minute"
+    assert report["volume_ratio_error"] == pytest.approx(2)
+    assert report["volume_diagnostic"]
+    assert any("成交量比存在偏差" in warning for warning in bundle.quality["warnings"])

@@ -187,7 +187,7 @@ export interface EtfResearchResultCounts {
 export interface EtfResearchResult {
   id: string
   kind: 'etf_research'
-  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2'
+  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2' | 'etf_min_grid_v3'
   result_schema_version: 1
   status: 'completed' | 'partial' | 'cancelled'
   as_of: string
@@ -221,7 +221,7 @@ export interface EtfValidationResultCounts {
 export interface EtfValidationResult {
   id: string
   kind: 'etf_validation'
-  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2'
+  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2' | 'etf_min_grid_v3'
   result_schema_version: 1
   status: 'completed' | 'partial' | 'cancelled' | 'failed'
   as_of: string
@@ -256,22 +256,30 @@ export interface EtfMetricDefinition {
   key: string
   label: string
   unit: 'percent' | 'ratio' | 'days' | 'price' | 'number'
+  meaning: string
+  usage: string
 }
 
 export const ETF_METRIC_DEFINITIONS: readonly EtfMetricDefinition[] = [
-  { key: 'rv_annualized', label: '1 分钟年化已实现波动率', unit: 'percent' },
-  { key: 'rv_5m_annualized', label: '5 分钟年化已实现波动率', unit: 'percent' },
-  { key: 'path_redundancy', label: '1 分钟路径冗余度', unit: 'percent' },
-  { key: 'iovr', label: '日内 / 隔夜方差比', unit: 'ratio' },
-  { key: 'variance_ratio_60m', label: '5 分钟采样 · 60 分钟方差比', unit: 'ratio' },
-  { key: 'variance_ratio_240m', label: '5 分钟采样 · 240 分钟方差比', unit: 'ratio' },
-  { key: 'variance_ratio_1200m', label: '5 分钟采样 · 1200 分钟方差比', unit: 'ratio' },
-  { key: 'ou_half_life_days', label: '30 分钟采样 · OU 半衰期', unit: 'days' },
-  { key: 'zero_crossing_rate', label: '5 分钟采样 · 滚动中枢过零率', unit: 'number' },
-  { key: 'jump_ratio', label: '5 分钟采样 · 跳跃方差占比', unit: 'percent' },
-  { key: 'max_drawdown_duration_days', label: '最长水下持续期', unit: 'days' },
-  { key: 'tick_to_price_ratio', label: '最小报价 / 均价', unit: 'percent' },
-  { key: 'mean_raw_price', label: '平均不复权价格', unit: 'price' },
+  { key: 'rv_annualized', label: '1 分钟年化已实现波动率', unit: 'percent', meaning: '根据 1 分钟日内收益估算价格波动，并按 252 个交易日换算为年化水平，午休与隔夜不计。', usage: '衡量短周期价格波动，越高通常意味着更多网格触发机会，也伴随更大的波动风险。' },
+  { key: 'rv_5m_annualized', label: '5 分钟年化已实现波动率', unit: 'percent', meaning: '根据 5 分钟日内收益估算价格波动，并按 252 个交易日换算为年化水平，午休与隔夜不计。', usage: '作为 1 分钟波动率的采样对照，数值越高表示观测到的日内波动越大。' },
+  { key: 'path_redundancy', label: '历史全窗口路径冗余（1 分钟）', unit: 'percent', meaning: '旧版 v1/v2 在全 120/250 日窗口上计算的路径冗余度。', usage: '仅作历史结果展示；不同于 v3 的逐日及滚动窗口均值，不可当作新日均指标。' },
+  { key: 'path_redundancy_daily_mean', label: '日均路径冗余（5m 采样）', unit: 'percent', meaning: '逐日计算首个采样 bar 开盘至当日收盘的路径冗余，再对有效日等权平均。', usage: '计入 v3 GSS 10%。先算各日 PR 再等权平均，不是对日 PR 平滑；高 PR 不代表盈利。' },
+  { key: 'path_redundancy_5d_mean', label: '5 日均路径冗余（5m 采样）', unit: 'percent', meaning: '每日推进一个窗口，计算连续 5 个交易日 PR 后对有效窗口等权平均；跨缺口窗口整窗剔除，隔夜保留真实位移。', usage: 'v3 GSS 路径分项的一半权重。先算各窗口 PR 再平均，不是日 PR 平滑；高 PR 不代表盈利。' },
+  { key: 'path_redundancy_20d_mean', label: '20 日均路径冗余（5m 采样）', unit: 'percent', meaning: '每日推进一个窗口，计算连续 20 个交易日 PR 后对有效窗口等权平均；跨缺口窗口整窗剔除，隔夜保留真实位移。', usage: '描述较长窗口，不计入 GSS；高 PR 不代表盈利。' },
+  { key: 'path_redundancy_daily_mean_1m', label: '日均路径冗余（1 分钟对照）', unit: 'percent', meaning: '按逐日窗口定义计算的 1 分钟采样对照值。', usage: '用于观察采样敏感性，不计入 GSS；日、5 日、20 日各尺度应分别比较；高 PR 不代表盈利。' },
+  { key: 'path_redundancy_5d_mean_1m', label: '5 日均路径冗余（1 分钟对照）', unit: 'percent', meaning: '按滚动 5 日窗口定义计算的 1 分钟采样对照值。', usage: '用于观察采样敏感性，不计入 GSS；日、5 日、20 日各尺度应分别比较；高 PR 不代表盈利。' },
+  { key: 'path_redundancy_20d_mean_1m', label: '20 日均路径冗余（1 分钟对照）', unit: 'percent', meaning: '按滚动 20 日窗口定义计算的 1 分钟采样对照值。', usage: '用于观察采样敏感性，不计入 GSS；日、5 日、20 日各尺度应分别比较；高 PR 不代表盈利。' },
+  { key: 'iovr', label: '日内 / 隔夜方差比', unit: 'ratio', meaning: '日内 1 分钟实现方差均值除以官方开盘相对前收盘隔夜平方收益均值。', usage: '比较波动发生在日内还是隔夜，越高表示相对更多方差来自日内。' },
+  { key: 'variance_ratio_60m', label: '5 分钟采样 · 60 分钟方差比', unit: 'ratio', meaning: '以 5 分钟收益为基频，比较聚合至 60 分钟的方差与基频方差的线性缩放值。', usage: '描述该时间尺度的收益延续性，约为 1 接近随机游走，高于 1 偏持续、低于 1 偏反转。' },
+  { key: 'variance_ratio_240m', label: '5 分钟采样 · 240 分钟方差比', unit: 'ratio', meaning: '以 5 分钟收益为基频，比较聚合至 240 分钟的方差与基频方差的线性缩放值。', usage: '描述较长日内尺度的收益延续性，约为 1 接近随机游走，高于 1 偏持续、低于 1 偏反转。' },
+  { key: 'variance_ratio_1200m', label: '5 分钟采样 · 1200 分钟方差比', unit: 'ratio', meaning: '以 5 分钟收益为基频，比较聚合至 1200 分钟的方差与基频方差的线性缩放值。', usage: '描述跨日较长尺度的收益延续性，约为 1 接近随机游走，高于 1 偏持续、低于 1 偏反转。' },
+  { key: 'ou_half_life_days', label: '30 分钟采样 · OU 半衰期', unit: 'days', meaning: '用 30 分钟价格拟合均值回归模型，估计价格偏离中枢的幅度缩小一半所需的交易日数。', usage: '用于描述拟合模型中的回归速度，半衰期越短表示回归越快，模型无效时不提供数值。' },
+  { key: 'zero_crossing_rate', label: '5 分钟采样 · 滚动中枢过零率', unit: 'number', meaning: '5 分钟价格从过去约 5 日均线的一侧穿到另一侧的次数，占有效相邻价格对的比例。', usage: '越高表示围绕中枢往返更频繁，可辅助判断网格交易机会；显示为 0–1 比率。' },
+  { key: 'jump_ratio', label: '5 分钟采样 · 跳跃方差占比', unit: 'percent', meaning: '按日计算 5 分钟实现方差中超出双幂变差估计部分的占比，双幂变差不跨午休、隔夜或缺失段。', usage: '衡量方差中跳跃成分占比，越高表示极端跳动贡献越大。' },
+  { key: 'max_drawdown_duration_days', label: '最长水下持续期', unit: 'days', meaning: '取独立最近 250 日日线窗口内，从峰值到恢复此前高点的最长交易日数，期末未恢复时计入未完成区间。', usage: '衡量回撤后恢复所需时间，数值越大表示历史水下持续更久。' },
+  { key: 'tick_to_price_ratio', label: '最小报价 / 均价', unit: 'percent', meaning: '最小价格单位除以最近 20 个有分钟数据交易日的未复权分钟收盘均价。', usage: '衡量最小报价单位相对价格的粗细，越高表示报价刻度相对更粗。' },
+  { key: 'mean_raw_price', label: '平均不复权价格', unit: 'price', meaning: '最近 20 个有分钟数据交易日的未复权分钟收盘均价。', usage: '用于描述近期原始成交价格水平并参与适用性筛选，低于 0.5 元会被过滤。' },
 ]
 
 const defaultFees: Required<FeeConfig> = {
@@ -396,9 +404,9 @@ export function etfMetricRows(metrics: Record<string, number | null>, details: R
   const known = new Set(ETF_METRIC_DEFINITIONS.map(item => item.key))
   const definitions = [
     ...ETF_METRIC_DEFINITIONS,
-    ...Object.keys(metrics).filter(key => !known.has(key)).sort().map(key => ({ key, label: key.replaceAll('_', ' '), unit: 'number' as const })),
+    ...Object.keys(metrics).filter(key => !known.has(key)).sort().map(key => ({ key, label: key.replaceAll('_', ' '), unit: 'number' as const, meaning: '', usage: '' })),
   ]
-  return definitions.map(definition => ({
+  return definitions.filter(definition => Object.prototype.hasOwnProperty.call(metrics, definition.key)).map(definition => ({
     ...definition,
     value: etfMetricText(definition.key, metrics[definition.key]),
     detail: details[definition.key],

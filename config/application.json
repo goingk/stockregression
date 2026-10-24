@@ -130,7 +130,7 @@
   },
   "market_data": {
     "cache_mb": 256,
-    "recent_minute_source": "sina",
+    "recent_minute_source": "tdx",
     "etf_daily_source": "baostock",
     "etf_daily_fallback_enabled": true,
     "network_timeout_seconds": 15.0,
@@ -183,5 +183,5 @@
     "subprocess_timeout_seconds": 45,
     "lock_timeout_seconds": 30
   },
-  "config_revision": "ed68030af10b5ff2442b65afe8bce4227d23b7a66125f87fb894ebd1514a6af1"
+  "config_revision": "c32af51f0652482ac72f6ac04d34230322a495943ef0a60eaf10b55980fe334a"
 }

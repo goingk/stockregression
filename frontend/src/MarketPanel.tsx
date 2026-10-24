@@ -8,11 +8,12 @@ import type { Frequency, Instrument, WatchItem } from './types'
 import Disclosure, { usePersistentFlag } from './Disclosure'
 import { useTasks } from './TaskCenter'
 import { chartValue, priceText, validPrice, validVolume } from './marketValues'
+import { adjustmentPageParams, appendMarketPage } from './marketPagination'
 import { useWorkbenchDefaults } from './useWorkbenchDefaults'
 
 type Bar = { timestamp: string; open: number; close: number; high: number; low: number; volume: number; [key: string]: unknown }
 type MarketFrequency = Frequency | '1week' | '1month'
-type MarketData = { quote?: { close: number; preclose: number }; symbol: string; version?: string; bars: Bar[]; has_more?: boolean; next_before?: string; warnings?: string[]; quality_flags?: string[]; is_demo?: boolean; instrument?: Instrument }
+type MarketData = { quote?: { close: number; preclose: number }; symbol: string; version?: string; bars: Bar[]; has_more?: boolean; next_before?: string; adjustment?: 'none' | 'qfq'; adjustment_anchor?: string | null; adjustment_version?: string | null; warnings?: string[]; quality_flags?: string[]; is_demo?: boolean; instrument?: Instrument }
 
 export default function MarketPanel({ onSelect, requestedReport, onReportHandled }: { onSelect?: (symbol: string) => void; requestedReport?: string | null; onReportHandled?: () => void }) {
   const tasks = useTasks()
@@ -31,6 +32,7 @@ export default function MarketPanel({ onSelect, requestedReport, onReportHandled
   const [found, setFound] = useState<Instrument[]>([])
   const [active, setActive] = useState<Instrument | null>(null)
   const [frequency, setFrequency] = useState<MarketFrequency>('1d')
+  const [adjustment, setAdjustment] = useState<'none' | 'qfq'>(() => localStorage.getItem('market-adjustment') === 'none' ? 'none' : 'qfq')
   const [maDraft, setMaDraft] = useState(() => localStorage.getItem('market-ma') ?? configuredMa.join(','))
   const [periods, setPeriods] = useState(() => {
     const values = [...new Set(maDraft.split(/[,，\s]+/).filter(Boolean).map(Number))]
@@ -80,9 +82,9 @@ export default function MarketPanel({ onSelect, requestedReport, onReportHandled
     let valid = true
     chartRevision.current += 1
     setLoading(true); setError(''); setMarket(null)
-    get<MarketData>(`/market/bars/${encodeURIComponent(active.symbol)}?frequency=${frequency}&limit=${chartPoints}&ma=${periods.join(',')}`).then(value => { if (valid) setMarket(value) }).catch(error => { if (valid) { setMarket(null); setError(String(error)) } }).finally(() => { if (valid) setLoading(false) })
+    get<MarketData>(`/market/bars/${encodeURIComponent(active.symbol)}?frequency=${frequency}&limit=${chartPoints}&ma=${periods.join(',')}&adjustment=${adjustment}`).then(value => { if (valid) setMarket(value) }).catch(error => { if (valid) { setMarket(null); setError(String(error)) } }).finally(() => { if (valid) setLoading(false) })
     return () => { valid = false }
-  }, [active?.symbol, frequency, periods, finished, refreshToken, chartPoints])
+  }, [active?.symbol, frequency, periods, finished, refreshToken, chartPoints, adjustment])
   const update = async (scope: string) => {
     setBusy(true); setError('')
     try { await tasks.run(scope === 'market' ? '全市场行情更新' : scope === 'watchlist' ? '自选行情更新' : '当前标的更新', () => post('/data/sync', { scope, mode: 'incremental', frequency, resume: true, symbols: scope === 'selected' && active ? [active.symbol] : [] })); await refresh() }
@@ -98,8 +100,16 @@ export default function MarketPanel({ onSelect, requestedReport, onReportHandled
     const revision = chartRevision.current
     setLoading(true)
     try {
-      const previous = await get<MarketData>(`/market/bars/${active.symbol}?frequency=${frequency}&ma=${periods.join(',')}&before=${encodeURIComponent(market.next_before)}`)
-      if (revision === chartRevision.current) setMarket(current => current?.symbol === previous.symbol ? { ...previous, quote: current.quote, bars: [...previous.bars, ...current.bars] } : current)
+      const identityParams = adjustmentPageParams(adjustment, market.adjustment_anchor)
+      const previous = await get<MarketData>(`/market/bars/${active.symbol}?frequency=${frequency}&ma=${periods.join(',')}&${identityParams}&before=${encodeURIComponent(market.next_before)}`)
+      if (revision === chartRevision.current) {
+        const appended = appendMarketPage(market, previous)
+        if (appended === null) {
+          setRefreshToken(value => value + 1)
+        } else setMarket(current => current?.symbol === previous.symbol
+          ? { ...appended, quote: current.quote }
+          : current)
+      }
     } catch (error) { if (revision === chartRevision.current) setError(String(error)) } finally { if (revision === chartRevision.current) setLoading(false) }
   }
   const bars = market?.bars ?? []
@@ -143,7 +153,7 @@ export default function MarketPanel({ onSelect, requestedReport, onReportHandled
       <div className="market-filter"><SelectInput value={kind} onChange={event => setKind(event.target.value)}><option value="">全部类型</option><option value="stock">股票</option><option value="etf">ETF</option></SelectInput></div>
       {!items.length ? <Empty title="暂无证券" detail="先更新证券清单，或在数据管理中导入行情。" /> : <div className="market-symbol-list">{items.map(item => <div key={item.symbol} className={item.symbol === active?.symbol ? 'active' : ''}><button className="market-symbol" onClick={() => setActive(item)}><strong>{item.name}</strong><small>{item.symbol} · {item.asset_type === 'etf' ? 'ETF' : '股票'}</small></button><button className="icon-button" aria-label={watchlist.some(watch => watch.symbol === item.symbol) ? '移除自选' : '加入自选'} onClick={() => void toggle(item)}>{watchlist.some(watch => watch.symbol === item.symbol) ? <Star size={15} fill="#d6a13a" color="#d6a13a" /> : <Plus size={15} />}</button></div>)}</div>}
     </Card>}<Card title={active ? `${active.name} · ${active.symbol}` : '本地行情'} subtitle="已收盘行情 · 股票和 ETF · 红涨绿跌" className="market-chart-card" action={<div className="button-row"><Button variant="quiet" onClick={() => setSidebarCollapsed(!sidebarCollapsed)} aria-expanded={!sidebarCollapsed}>{sidebarCollapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}自选列表</Button><Button busy={busy} onClick={() => void update('market')}><RefreshCw size={14} />更新数据包已有证券</Button></div>}>
-      <div className="market-toolbar"><Field label="周期"><SelectInput value={frequency} onChange={event => setFrequency(event.target.value as Frequency)}>{['1month', '1week', '1d', '1m', '5m', '15m', '30m', '60m'].map(value => <option key={value}>{value}</option>)}</SelectInput></Field><Field label="均线周期（逗号分隔，留空关闭）"><TextInput value={maDraft} onChange={event => setMaDraft(event.target.value)} onBlur={() => { const next = [...new Set(maDraft.split(/[,，\s]+/).filter(Boolean).map(Number))]; if (next.every(value => Number.isInteger(value) && value > 0 && value <= 500)) { setPeriods(next); localStorage.setItem('market-ma', next.join(',')) } else setError('均线周期须为 1–500 的整数') }} /></Field><Button variant="quiet" disabled={!active || busy} onClick={() => void update('selected')}>更新当前</Button><Button variant="quiet" disabled={!watchlist.length || busy} onClick={() => void update('watchlist')}>更新自选</Button></div>
+      <div className="market-toolbar"><Field label="周期"><SelectInput value={frequency} onChange={event => setFrequency(event.target.value as Frequency)}>{['1month', '1week', '1d', '1m', '5m', '15m', '30m', '60m'].map(value => <option key={value}>{value}</option>)}</SelectInput></Field><Field label="复权"><SelectInput value={adjustment} onChange={event => { const value = event.target.value as 'none' | 'qfq'; setAdjustment(value); localStorage.setItem('market-adjustment', value) }}><option value="qfq">前复权</option><option value="none">不复权</option></SelectInput></Field><Field label="均线周期（逗号分隔，留空关闭）"><TextInput value={maDraft} onChange={event => setMaDraft(event.target.value)} onBlur={() => { const next = [...new Set(maDraft.split(/[,，\s]+/).filter(Boolean).map(Number))]; if (next.every(value => Number.isInteger(value) && value > 0 && value <= 500)) { setPeriods(next); localStorage.setItem('market-ma', next.join(',')) } else setError('均线周期须为 1–500 的整数') }} /></Field><Button variant="quiet" disabled={!active || busy} onClick={() => void update('selected')}>更新当前</Button><Button variant="quiet" disabled={!watchlist.length || busy} onClick={() => void update('watchlist')}>更新自选</Button></div>
       {latest && <div className="quote-strip"><strong className={change != null && change < 0 ? 'loss' : 'gain'}>{priceText(latest.close, market?.instrument?.asset_type === 'etf' ? 3 : 2)}</strong><span className={change != null ? (change < 0 ? 'quote-change loss' : 'quote-change gain') : 'quote-change'}>{change == null ? '—' : `${change >= 0 ? '+' : ''}${change.toFixed(2)}%`}</span><span>开 {priceText(latest.open, market?.instrument?.asset_type === 'etf' ? 3 : 2)}</span><span>高 {priceText(latest.high, market?.instrument?.asset_type === 'etf' ? 3 : 2)}</span><span>低 {priceText(latest.low, market?.instrument?.asset_type === 'etf' ? 3 : 2)}</span><span>量 {validVolume(latest.volume) == null ? '—' : compact(validVolume(latest.volume))}</span><span>{latest.timestamp.slice(0, 16).replace('T', ' ')}</span>{market?.is_demo && <Badge tone="amber">历史结果来源含演示数据</Badge>}</div>}
       {loading && <div className="market-loading">正在读取行情…</div>}
       {bars.length ? <ChartView option={chart} height={370} stretch /> : <Empty title={loading ? '正在读取行情' : error ? '行情读取失败' : '该标的尚无所选周期的行情'} detail={error ? '请查看上方错误详情；修复后可刷新本地视图。' : '可更新当前标的，或在数据管理中执行历史同步 / 导入。'} />}

@@ -1821,6 +1821,36 @@
               "default": "5,10,20,60",
               "title": "Ma"
             }
+          },
+          {
+            "name": "adjustment",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "none",
+                "qfq"
+              ],
+              "type": "string",
+              "default": "none",
+              "title": "Adjustment"
+            }
+          },
+          {
+            "name": "adjustment_anchor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Adjustment Anchor"
+            }
           }
         ],
         "responses": {

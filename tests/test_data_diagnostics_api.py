@@ -183,7 +183,7 @@ def test_public_v5_result_moves_old_provider_warnings_but_keeps_current_risks_an
     ]
     assert diagnostics["auction_placeholders"] == 1
     assert diagnostics["missing_raw_minutes"] == 1
-    assert any("公司行动" in warning for warning in public["warnings"])
+    assert not any("公司行动" in warning for warning in public["warnings"])
     assert any("未校准" in warning for warning in public["warnings"])
     assert any("分钟数据当前缺口" in warning for warning in public["warnings"])
     assert any("因果前值补齐" in warning for warning in public["warnings"])

@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from ..corporate_actions import resolve_actions, day, number
 
 
 _SYNC_AUXILIARY_VERSION = "market-sync-v2-package"
@@ -27,6 +29,8 @@ def _records(value: Any) -> list[dict]:
 
 def _clean(value: Any) -> Any:
     if value is None or value is pd.NA:
+        return None
+    if value is pd.NaT:
         return None
     if isinstance(value, (pd.Timestamp,)):
         return None if pd.isna(value) else value.isoformat()
@@ -111,7 +115,7 @@ def _expected_dataset_years(service, symbol: str) -> set[int]:
 
 
 def _merge_actions(
-    service, symbol: str, metadata: dict, incoming_rows: list[dict],
+    service, symbol: str, metadata: dict, incoming_rows: list[dict], daily=None,
 ) -> dict:
     repository = service.repository
     existing = repository.auxiliary(symbol, "actions") or {}
@@ -141,7 +145,44 @@ def _merge_actions(
         row for row in incoming_rows
         if _year(row.get("ex_date")) not in unverified_now
     ]
-    merged_rows = _dedupe([*retained, *accepted_incoming])
+    if daily is None:
+        daily = pd.DataFrame()
+    split_rows = [row for row in accepted_incoming if row.get("action_type") == "split"
+                  or day(row.get("split_date")) is not None or "ETF 拆分资料" in str(row.get("unsupported_reason") or "")]
+    fold_days = [day(row.get("split_date")) or day(row.get("ex_date")) for row in split_rows]
+    fold_days = [value for value in fold_days if value is not None]
+    if fold_days:
+        local = repository.read_frame(
+            symbol, "1day", start=min(fold_days) - pd.Timedelta(days=30),
+            end=max(fold_days) + pd.Timedelta(days=10),
+        )
+        if not local.empty:
+            daily = local if daily.empty else pd.concat([local, daily], ignore_index=True)
+    tick = float(instrument.get("price_tick") or 0.001)
+    if split_rows:
+        accepted_incoming = resolve_actions(pd.DataFrame(accepted_incoming), daily, tick).to_dict("records")
+    # A less complete refresh cannot replace a usable split with a placeholder.
+    protected = []
+    for previous in old_rows:
+        if previous.get("action_type") != "split" and day(previous.get("split_date")) is None:
+            continue
+        if number(previous.get("bonus_ratio")) == 0 or previous.get("unsupported_reason"):
+            continue
+        previous_fold = day(previous.get("split_date")) or day(previous.get("record_date"))
+        for index, incoming in enumerate(accepted_incoming):
+            if incoming.get("action_type") != "split" and day(incoming.get("split_date")) is None:
+                continue
+            incoming_fold = day(incoming.get("split_date")) or day(incoming.get("record_date"))
+            if previous_fold is not None and previous_fold == incoming_fold:
+                if incoming.get("unsupported_reason") or number(incoming.get("bonus_ratio")) == 0:
+                    accepted_incoming[index] = previous
+                break
+        else:
+            # A successful empty response is still authoritative for ordinary
+            # actions. Retain resolved split events: providers may omit them.
+            if previous.get("action_type") == "split" or previous.get("split_date"):
+                protected.append(previous)
+    merged_rows = _dedupe([*retained, *protected, *accepted_incoming])
 
     old_checked = _years(instrument.get("actions_checked_years"))
     old_unverified = _years(instrument.get("actions_unverified_years"))
@@ -189,7 +230,8 @@ def _merge_actions(
         if has_evidence and (
             not same_payload or bool(existing.get("verified", False)) != target_verified
         ):
-            version = str(metadata.get("auxiliary_version") or _SYNC_AUXILIARY_VERSION)
+            digest = hashlib.sha256(json.dumps(merged_rows, sort_keys=True, default=str).encode()).hexdigest()[:16]
+            version = str(metadata.get("auxiliary_version") or f"{_SYNC_AUXILIARY_VERSION}-{digest}")
             repository.save_auxiliary(
                 symbol, "actions", merged_rows,
                 version=version, verified=target_verified,
@@ -216,7 +258,7 @@ def _merge_actions(
     return changes
 
 
-def persist_sync_auxiliary(service, symbol: str, metadata: dict) -> dict:
+def persist_sync_auxiliary(service, symbol: str, metadata: dict, *, daily=None) -> dict:
     """Persist sync calendar/actions without shrinking auxiliary history.
 
     Returns the actions coverage fields to merge into the sync's source metadata.
@@ -240,7 +282,8 @@ def persist_sync_auxiliary(service, symbol: str, metadata: dict) -> dict:
                 calendar_verified = old_verified or old_dates.issubset(incoming_dates)
                 same_payload = old_dates == merged_dates
                 if not (same_payload and old_verified == calendar_verified):
-                    version = str(metadata.get("auxiliary_version") or _SYNC_AUXILIARY_VERSION)
+                    digest = hashlib.sha256(json.dumps(merged_payload, sort_keys=True).encode()).hexdigest()[:16]
+                    version = str(metadata.get("auxiliary_version") or f"{_SYNC_AUXILIARY_VERSION}-{digest}")
                     repository.save_auxiliary(
                         symbol, "calendar", merged_payload,
                         version=version, verified=calendar_verified,
@@ -255,6 +298,6 @@ def persist_sync_auxiliary(service, symbol: str, metadata: dict) -> dict:
 
     if "actions" in metadata and metadata["actions"] is not None:
         incoming_actions = _records(metadata["actions"])
-        output.update(_merge_actions(service, symbol, metadata, incoming_actions))
+        output.update(_merge_actions(service, symbol, metadata, incoming_actions, daily=daily))
 
     return output

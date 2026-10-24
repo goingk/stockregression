@@ -1248,10 +1248,24 @@ td small.table-sub, .muted-cell { color:#64748b; }
 .etf-detail-score-row small, .etf-metric-grid small, .etf-grid-basis-grid small, .etf-contribution-grid small { display:block; color:#64748b; font-size:11px; }
 .etf-detail-score-row strong { display:block; margin:5px 0 3px; color:#27384f; font-size:17px; overflow-wrap:anywhere; }
 .etf-detail-score-row span { display:block; color:#64748b; font-size:11px; line-height:1.6; }
-.etf-metric-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:9px; margin-bottom:14px; }
+.etf-metric-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr)); gap:9px; margin-bottom:14px; }
 .etf-metric-grid > div { padding:10px 11px; border:1px solid #e7edf4; border-radius:8px; background:#fff; }
 .etf-metric-grid strong { display:block; margin:4px 0 2px; color:#334155; font-size:13px; }
 .etf-metric-grid span { display:block; color:#748196; font-size:10px; line-height:1.55; }
+.etf-metric-copy { margin:7px 0 0; color:#526179; font-size:12px; line-height:1.7; overflow-wrap:anywhere; }
+.etf-metric-copy b, .etf-help-metrics b { font-weight:600; color:#475569; }
+.etf-metric-guide { margin-bottom:16px; }
+.etf-help-intro { margin:0 0 12px; color:#526179; font-size:12px; line-height:1.8; }
+.etf-help-metrics { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,260px),1fr)); gap:10px; }
+.etf-help-metrics > div { min-width:0; padding:12px; border:1px solid #e7edf4; border-radius:8px; background:#fff; }
+.etf-help-metrics h3, .etf-help-heading { margin:0 0 8px; color:#334155; font-size:13px; }
+.etf-help-metrics p { margin:5px 0 0; color:#526179; font-size:12px; line-height:1.7; }
+.etf-help-heading { margin-top:18px; }
+.etf-help-list { margin:0; color:#526179; font-size:12px; line-height:1.75; }
+.etf-help-list > div { padding:8px 0; border-bottom:1px solid #e7edf4; }
+.etf-help-list > div:last-child { border-bottom:0; }
+.etf-help-list dt { color:#334155; font-weight:600; }
+.etf-help-list dd { margin:3px 0 0; }
 .etf-grid-basis-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:8px; margin-bottom:14px; }
 .etf-grid-basis-grid > span { min-width:0; padding:9px 10px; border-radius:7px; background:#f1f5f9; }
 .etf-grid-basis-grid strong { display:block; margin-top:4px; color:#475569; font-size:12px; }

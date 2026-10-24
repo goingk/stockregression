@@ -323,23 +323,11 @@ def project_data_diagnostics(
         events.append(_event(str(error), kind="source_error"))
 
     current_warnings = []
-    action_years = metadata.get("actions_unverified_years")
-    verification_state = metadata.get("actions_verified")
-    action_risk = verification_state is False
-    if action_years is not None:
-        years = []
-        for year in action_years:
-            try:
-                years.append(int(year))
-            except (TypeError, ValueError):
-                continue
-        if lower is not None and upper is not None:
-            if years:
-                action_risk = any(lower.year <= year <= upper.year for year in years)
-            else:
-                action_risk = verification_state is not True
-        elif years:
-            action_risk = True
+    # Global/yearly verification flags are not request-scoped evidence. Action
+    # warnings are emitted only by the window's concrete event validation.
+    action_risk = False
+    verification_state = None
+    action_years = None
 
     for warning in metadata.get("warnings") or []:
         message = str(warning).strip()
@@ -360,12 +348,6 @@ def project_data_diagnostics(
         else:
             current_warnings.append(message)
 
-    if action_risk and not any(_is_action_warning(message) for message in current_warnings):
-        years = metadata.get("actions_unverified_years") or []
-        if years:
-            current_warnings.append("公司行动资料尚未完成核验：" + ", ".join(str(year) for year in years) + "；请核对分红、拆分及除权记录。")
-        else:
-            current_warnings.append("公司行动资料尚未完成核验；请核对分红、拆分及除权记录。")
 
     for warning in quality.get("warnings") or []:
         message = str(warning).strip()

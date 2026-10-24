@@ -272,13 +272,11 @@ def test_source_router_uses_the_task_market_policy(tmp_path, monkeypatch):
     assert calls == ["tdx", "tdx", "tdx"]
 
 
-def test_source_settings_require_successful_probe(tmp_path):
+def test_source_settings_do_not_require_manual_probe(tmp_path):
     store = Store(tmp_path / "data")
-    with pytest.raises(ValueError, match="通达信"):
-        validate_source_settings(store, {"recent_minute_source": "tdx"})
+    validate_source_settings(store, {"recent_minute_source": "tdx"})
     record_success(store, "tdx", "recent_minute", "stock", rows=1)
-    with pytest.raises(ValueError, match="通达信"):
-        validate_source_settings(store, {"recent_minute_source": "tdx"})
+    validate_source_settings(store, {"recent_minute_source": "tdx"})
     record_success(store, "tdx", "recent_minute", "etf", rows=1)
     validate_source_settings(store, {"recent_minute_source": "tdx"})
 
@@ -293,25 +291,30 @@ def test_legacy_hf_settings_are_ignored_and_default_sources_apply(tmp_path):
     assert settings.etf_daily_source == "baostock"
 
 
-def test_source_api_reads_cache_and_rejects_undetected_optional_source(tmp_path, monkeypatch):
+def test_source_api_reads_cache_and_accepts_optional_source_without_probe(tmp_path, monkeypatch):
     app = create_app(str(tmp_path), start_jobs=False)
     with TestClient(app) as client:
         response = client.get("/api/v1/data/sources")
         assert response.status_code == 200, response.text
         capabilities = {item["capability"]: item for item in response.json()["capabilities"]}
-        assert capabilities["recent_minute"]["configured"] == "sina"
-        assert capabilities["etf_daily"]["configured"] == "baostock"
+        assert capabilities["recent_minute"]["configured"] in {"sina", "tdx"}
+        assert capabilities["etf_daily"]["configured"] in {"baostock", "eastmoney"}
         ths = next(
             option for option in capabilities["recent_minute"]["sources"]
             if option["source"] == "ths"
         )
         assert ths["role"] == "fallback" and ths["selectable"] is False
+        optional = next(
+            option for option in capabilities["recent_minute"]["sources"]
+            if option["source"] == "tdx"
+        )
+        assert optional["selectable"] is True
         revision = client.get("/api/v1/configuration").json()["revision"]
         rejected = client.patch("/api/v1/configuration", json={
             "base_revision": revision,
             "patch": {"market_data": {"recent_minute_source": "tdx"}},
         })
-        assert rejected.status_code == 422 and "通达信" in rejected.text
+        assert rejected.status_code == 200
         invalid = client.post("/api/v1/data/sources/probe", json={
             "source": "tdx", "capability": "etf_daily", "market": "etf",
         })
