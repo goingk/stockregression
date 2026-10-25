@@ -121,6 +121,7 @@ def _align_sampling(rows, windows) -> None:
     scoring_group = []
     for row in usable:
         sampling = row["sampling"]
+        sampling["comparable"] = True
         own = {day.date().isoformat() for day in windows[row["symbol"]]} - set(sampling["excluded_days"])
         if len(own) / max(1, sampling["expected_days"]) + 1e-12 >= MIN_COMPLETE_DAY_RATIO:
             scoring_group.append((row, own))
@@ -131,24 +132,62 @@ def _align_sampling(rows, windows) -> None:
             )
     if not scoring_group:
         return
-    common = set.intersection(*(sample for _, sample in scoring_group))
-    aligned = all(
-        len(common) / max(1, row["sampling"]["expected_days"]) + 1e-12 >= MIN_COMPLETE_DAY_RATIO
-        for row, _ in scoring_group
-    )
-    for row, _ in scoring_group:
-        sampling = row["sampling"]
-        if aligned:
-            expected = {day.date().isoformat() for day in windows[row["symbol"]]}
-            sampling.update(statistics_excluded_days=sorted(expected - common), statistics_days=len(common))
-            if sampling["statistics_excluded_days"]:
-                row["warnings"].append(
-                    f"GSS共同样本使用 {len(common)}/{sampling['expected_days']} 个完整分钟交易日；跨缺口窗口整段排除",
-                )
-        else:
+
+    def common_for(group):
+        if len(group) < 2:
+            return None
+        common = set.intersection(*(sample for _, sample in group))
+        ratio = min(
+            len(common) / max(1, row["sampling"]["expected_days"])
+            for row, _ in group
+        )
+        return common if ratio + 1e-12 >= MIN_COMPLETE_DAY_RATIO else None
+
+    active = list(scoring_group)
+    excluded = []
+    common = common_for(active)
+    while common is None and len(active) > 2:
+        best = None
+        for index, (row, own) in enumerate(active):
+            trial = active[:index] + active[index + 1:]
+            trial_common = set.intersection(*(sample for _, sample in trial))
+            ratio = min(
+                len(trial_common) / max(1, item["sampling"]["expected_days"])
+                for item, _ in trial
+            )
+            # Prefer the largest remaining common sample. Ties remove the
+            # least complete row first, then preserve input order.
+            candidate = (ratio, len(trial_common), -len(own), -index, index)
+            if best is None or candidate > best[0]:
+                best = (candidate, index)
+        if best is None:
+            break
+        excluded.append(active.pop(best[1]))
+        common = common_for(active)
+
+    if common is None:
+        for row, _ in scoring_group:
+            sampling = row["sampling"]
             sampling["comparable"] = False
             row["warnings"].append(
-                "高覆盖标的之间的公共完整分钟样本不足90%；保留本标的统计和试算，不参与GSS横向评分",
+                "高覆盖标的之间无法形成至少两只、共同完整分钟样本达到90%的GSS样本组；保留本标的统计和试算，不参与GSS横向评分",
+            )
+        return
+
+    for row, _ in excluded:
+        sampling = row["sampling"]
+        sampling["comparable"] = False
+        row["warnings"].append(
+            f"GSS样本对齐后剩余共同完整分钟 {len(common)}/{sampling['expected_days']} 日，"
+            "本标的与主样本组不兼容，已从横向评分组排除",
+        )
+    for row, _ in active:
+        sampling = row["sampling"]
+        expected = {day.date().isoformat() for day in windows[row["symbol"]]}
+        sampling.update(statistics_excluded_days=sorted(expected - common), statistics_days=len(common))
+        if sampling["statistics_excluded_days"]:
+            row["warnings"].append(
+                f"GSS共同样本使用 {len(common)}/{sampling['expected_days']} 个完整分钟交易日；跨缺口窗口整段排除",
             )
 
 
@@ -329,6 +368,19 @@ def preflight(
         except (ValueError, MarketDataError) as exc:
             row["status"] = "data_not_ready"
             row["gaps"].append(_gap("data_resolution", str(exc)))
+            continue
+        pending_validation = data_resolution.get("pending_validation") or {}
+        if any(pending_validation.values()):
+            row.update(status="pending_validation", replay_allowed=False)
+            for timeframe, pending_days in pending_validation.items():
+                if pending_days:
+                    row["gaps"].append(_gap(
+                        "pending_validation",
+                        f"{len(pending_days)} 个交易日需先本地校验"
+                        f"（{pending_days[0]} 至 {pending_days[-1]}）；"
+                        "请点击“校验待处理数据”后重新预检",
+                        timeframe,
+                    ))
             continue
         row["data_resolution"] = data_resolution
         row["sampling"] = resolution_sampling(data_resolution)

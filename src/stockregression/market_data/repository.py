@@ -44,6 +44,16 @@ def validation_rules_version(timeframe: str) -> int:
     )
 
 
+def minute_grid_report_stale(timeframe: str, row: dict) -> bool:
+    """Detect reports made when a minute session was cut off at midnight."""
+    if timeframe not in MINUTE_TIMEFRAMES:
+        return False
+    report = row.get("report") or {}
+    if row.get("status") == "suspended" or report.get("non_trading") or report.get("no_trades"):
+        return False
+    return report.get("expected_rows") == 0 and int(row.get("row_count") or 0) > 0
+
+
 # Reconciliation walks every published dataset and stats each immutable
 # manifest. It repairs index/manifest disagreement, so it only needs to run
 # when either side changes. API handlers construct a repository per request;
@@ -3542,6 +3552,7 @@ class MarketDataRepository:
                     item.get("dirty_reason")
                     or not item.get("scanned", True)
                     or int(item.get("rules_version") or 0) < rules_version
+                    or minute_grid_report_stale(timeframe, item)
                 )
                 if stale:
                     continue
@@ -3564,6 +3575,7 @@ class MarketDataRepository:
                     or row.get("dirty_reason")
                     or not row.get("scanned", True)
                     or int(row.get("rules_version") or 0) < rules_version
+                    or minute_grid_report_stale(timeframe, row)
                 ):
                     pending.append(str(day.date()))
                 elif row["status"] == "failed":
@@ -3587,6 +3599,7 @@ class MarketDataRepository:
                     and row.get("scanned", True)
                     and not row.get("dirty_reason")
                     and int(row.get("rules_version") or 0) >= rules_version
+                    and not minute_grid_report_stale(timeframe, row)
                 )
                 if not started:
                     if index == 0 and not passed:
@@ -3608,6 +3621,7 @@ class MarketDataRepository:
                 and row.get("scanned", True)
                 and not row.get("dirty_reason")
                 and int(row.get("rules_version") or 0) >= rules_version
+                and not minute_grid_report_stale(timeframe, row)
             ),
             "failed": failed, "pending": pending,
             "failed_count": failed_count, "pending_count": pending_count,

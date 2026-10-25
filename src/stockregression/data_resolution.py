@@ -77,7 +77,9 @@ def _state(repository, symbol, timeframe, manifest, start, end) -> dict:
 
 def build_data_resolution(market, symbol: str, manifest: dict, days) -> dict:
     """Choose daily fallbacks/skip independently, with no cohort ratio gate."""
-    from .market_data.repository import VALIDATION_RULES_VERSION, validation_rules_version
+    from .market_data.repository import (
+        VALIDATION_RULES_VERSION, minute_grid_report_stale, validation_rules_version,
+    )
 
     dates = sorted({_date(day) for day in days})
     if not dates:
@@ -128,6 +130,35 @@ def build_data_resolution(market, symbol: str, manifest: dict, days) -> dict:
             "status", "row_count", "source_hash", "dependency_hash", "rules_version", "report",
         )})
 
+    def needs_validation(timeframe, day):
+        reference = manifest.get("market_versions", {}).get(timeframe)
+        if not reference:
+            return False
+        if ((reference.get("first") and day < _date(reference["first"]))
+                or (reference.get("last") and day > _date(reference["last"]))):
+            return False
+        if timeframe == "1min":
+            daily = verdict("1day", day)
+            report = (daily or {}).get("report") or {}
+            if daily and (daily.get("status") == "suspended" or report.get("non_trading")
+                          or report.get("suspended") or report.get("no_trades")):
+                return False
+        state = states[timeframe]
+        if state.get("available") is False or day in set(state.get("pending") or []):
+            return True
+        row = records[timeframe].get(day)
+        if row:
+            return bool(
+                row.get("dirty_reason") or not row.get("scanned", True)
+                or int(row.get("rules_version", validation_rules_version(timeframe)))
+                < validation_rules_version(timeframe)
+                or minute_grid_report_stale(timeframe, row)
+                or row.get("status") not in {"passed", "failed", "suspended"}
+            )
+        if day in set(state.get("failed") or []):
+            return False
+        return verdict(timeframe, day) is None
+
     output = []
     for day in dates:
         daily, minute = verdict("1day", day), verdict("1min", day)
@@ -172,6 +203,12 @@ def build_data_resolution(market, symbol: str, manifest: dict, days) -> dict:
             for day in sorted(records["1day"]) if verdict("1day", day) is not None}),
         "first_evaluable_date": evaluated[0] if evaluated else None,
         "last_evaluable_date": evaluated[-1] if evaluated else None}
+    pending_validation = {
+        timeframe: [day for day in dates if needs_validation(timeframe, day)]
+        for timeframe in ("1day", "1min")
+    }
+    if any(pending_validation.values()):
+        result["pending_validation"] = pending_validation
     result["plan_hash"] = _digest(result)
     return result
 
@@ -189,6 +226,8 @@ def validate_data_resolution(manifest: dict, start=None, end=None) -> dict:
             or plan.get("versions") != _versions(manifest)
             or plan.get("plan_hash") != _digest({key: value for key, value in plan.items() if key != "plan_hash"})):
         raise ValueError("DATA_RESOLUTION_MISMATCH: 冻结的逐日策略或依赖版本不匹配")
+    if any((plan.get("pending_validation") or {}).values()):
+        raise ValueError("DATA_VALIDATION_PENDING: 请求区间存在待校验数据，请先运行本地校验")
     days = plan.get("days")
     if (not isinstance(days, list) or not days
             or any(not isinstance(day, dict) or day.get("mode") not in MODES for day in days)):

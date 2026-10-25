@@ -12,7 +12,7 @@ from stockregression.settings import Settings
 from stockregression.storage import Store, dumps
 
 
-def seed_market(tmp_path, *, gap_days=0):
+def seed_market(tmp_path, *, gap_days=0, minute_days=120):
     root = tmp_path / "data"
     settings = Settings(data_dir=str(root), package_dir=str(root / "package"), performance={"validation_workers": 1})
     store = Store(root, settings=settings)
@@ -35,7 +35,7 @@ def seed_market(tmp_path, *, gap_days=0):
         high, low = np.maximum(opening, close) + .001, np.minimum(opening, close) - .001
         volume = np.full(240, 1000.)
         turnover = (opening + high + low + close) / 4 * volume
-        if index >= len(days) - 120:
+        if index >= len(days) - minute_days:
             part = pd.DataFrame({
                 "timestamp": minute_slots(day), "open": opening, "high": high,
                 "low": low, "close": close, "volume": volume, "turnover": turnover,
@@ -60,6 +60,62 @@ def seed_market(tmp_path, *, gap_days=0):
     repository.commit_bars(symbol, "1min", pd.concat(minute, ignore_index=True), source="import")
     market.refresh_snapshot(symbol)
     return store, market, days
+
+
+def test_expanded_window_requires_validation_instead_of_counting_pending_days_as_daily(tmp_path, monkeypatch):
+    store, market, days = seed_market(tmp_path, minute_days=250)
+    monkeypatch.setattr(research, "latest_closed_date", lambda: days[-1])
+    recent_request = EtfResearchRequest(window_days=120)
+    recent = research.preflight(store, recent_request, market=market, persist=True)
+    research.run_local_validation(store, recent_request, recent, market=market)
+
+    request = EtfResearchRequest(window_days=250)
+    with monkeypatch.context() as patch:
+        patch.setattr(market.repository, "bars", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("preflight must not read price bodies")))
+        before = research.preflight(store, request, market=market, persist=True)
+    row = before["rows"][0]
+    assert row["status"] == "pending_validation"
+    assert row["replay_allowed"] is False
+    assert "data_resolution" not in row
+    assert any("130 个交易日" in gap["message"] for gap in row["gaps"])
+
+    checked = research.run_local_validation(store, request, before, market=market)
+    assert checked["status"] == "completed", checked
+    after = research.preflight(store, request, market=market, persist=True)
+    assert after["rows"][0]["status"] == "ready"
+    assert after["rows"][0]["data_resolution"]["counts"]["minute"] == 250
+    assert after["rows"][0]["data_resolution"]["counts"]["daily"] == 0
+
+
+def test_zero_grid_report_is_rechecked_even_when_its_rules_version_is_current(tmp_path, monkeypatch):
+    from stockregression.market_data.coverage_index import CoverageArchive
+    from stockregression.market_data.validation import validation_targets
+
+    store, market, days = seed_market(tmp_path)
+    monkeypatch.setattr(research, "latest_closed_date", lambda: days[-1])
+    request = EtfResearchRequest()
+    research.run_local_validation(
+        store, request, research.preflight(store, request, market=market), market=market,
+    )
+    symbol = "512880.SH"
+    day = str(days[-2].date())
+    archive = CoverageArchive(market.repository)
+    row = archive.rows(symbol, "1min", start=day, end=day)[0]
+    row["report"] = {**row["report"], "expected_rows": 0}
+    row["_data_version"] = market.repository.dataset(symbol, "1min")["current_version"]
+    row["_daily_version"] = market.repository.dataset(symbol, "1day")["current_version"]
+    archive.commit_rows([row], expected_data_version=row["_data_version"])
+
+    selection = validation_targets(market, symbol, "1min", start=days[-120], end=days[-1])
+    assert selection["report_stale"] == [pd.Timestamp(day)]
+    before = research.preflight(store, request, market=market)
+    assert before["rows"][0]["status"] == "pending_validation"
+    checked = research.run_local_validation(store, request, before, market=market)
+    assert checked["status"] == "completed", checked
+    assert checked["rows"][0]["reports"][1]["report"]["checked_days"] == 1
+    assert archive.rows(symbol, "1min", start=day, end=day)[0]["report"]["expected_rows"] == 240
+    assert research.preflight(store, request, market=market)["rows"][0]["data_resolution"]["counts"]["minute"] == 120
 
 
 def test_real_package_local_validation_statistics_and_frozen_auxiliary(tmp_path, monkeypatch):

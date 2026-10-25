@@ -1721,6 +1721,11 @@ class MarketDataService:
                     symbol, timeframe, selection["rules_stale"],
                     reason="校验规则升级", adjustment=adjustment,
                 )
+            if selection.get("report_stale"):
+                archive_index.mark_dirty(
+                    symbol, timeframe, selection["report_stale"],
+                    reason="分钟校验报告需重新计算", adjustment=adjustment,
+                )
         target_days = selection["targets"]
         if not target_days:
             return {

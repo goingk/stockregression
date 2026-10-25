@@ -657,11 +657,12 @@ class CoverageArchive:
         return f".stockregression/quality/archives/{normalize_timeframe(timeframe)}/{safe_symbol}/{safe_adjustment}"
 
     def _summarize_month(self, dataset, timeframe, month, entries, calendar_dates) -> dict[str, Any]:
-        from .repository import validation_rules_version
+        from .repository import minute_grid_report_stale, validation_rules_version
 
         rules_version = validation_rules_version(timeframe)
         scanned = [row for row in entries if row.get("scanned")]
         clean = [row for row in scanned if not row.get("dirty_reason")
+                 and not minute_grid_report_stale(timeframe, row)
                  and int(row.get("rules_version") or 0) >= rules_version]
         pending = {_day_text(row["trade_date"]): str(row.get("dirty_reason") or "待重新检查")
                    for row in entries if row not in clean

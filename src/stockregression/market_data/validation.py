@@ -12,7 +12,7 @@ from .coverage_index import (
 )
 from .models import MarketDataError
 from .quality import validate_and_fill
-from .repository import VALIDATION_RULES_VERSION, validation_rules_version, utc_now
+from .repository import VALIDATION_RULES_VERSION, minute_grid_report_stale, validation_rules_version, utc_now
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe, timeframe_spec
 
 
@@ -340,6 +340,13 @@ def _expected_days(
         )
         observed = pd.DatetimeIndex([pd.Timestamp(row["trade_date"]) for row in rows])
         values = calendar_days.append(observed).append(prefetched).normalize().unique().sort_values()
+        # A previous 120-day validation is not the complete date index for a
+        # newly requested 250-day window. Short auxiliary calendars need the
+        # local daily timestamp index to discover those earlier sessions.
+        if (prefetched_dates is None and callable(getattr(repository, "trading_days", None))
+                and (not len(values) or pd.Timestamp(lower) < values.min()
+                     or pd.Timestamp(upper) > values.max())):
+            values = values.append(repository.trading_days(symbol, lower, upper)).normalize().unique().sort_values()
         return (
             values[(values >= pd.Timestamp(lower)) & (values <= pd.Timestamp(upper))],
             bool(len(calendar_days)), calendar_days,
@@ -484,6 +491,7 @@ def validation_targets(
     reused = 0
     dependency_stale: list[pd.Timestamp] = []
     rules_stale: list[pd.Timestamp] = []
+    report_stale: list[pd.Timestamp] = []
     for day in calendar_days:
         day = pd.Timestamp(day).normalize()
         if requested_dates is not None and day not in requested_dates:
@@ -503,6 +511,7 @@ def validation_targets(
         rule_mismatch = bool(
             row and row_rules_version < current_rules_version
         )
+        grid_mismatch = bool(row and minute_grid_report_stale(timeframe, row))
         invalid_months = set((head or {}).get("_invalid_months") or [])
         stale = bool(
             mode == "full" or explicitly_requested or head is None
@@ -514,7 +523,7 @@ def validation_targets(
             or version_changed_without_scope or day in pending
             or row is None or not row.get("scanned")
             or row.get("dirty_reason")
-            or dependency_mismatch or rule_mismatch
+            or dependency_mismatch or rule_mismatch or grid_mismatch
         )
         if stale:
             targets.append(day)
@@ -522,6 +531,8 @@ def validation_targets(
                 dependency_stale.append(day)
             if rule_mismatch:
                 rules_stale.append(day)
+            if grid_mismatch:
+                report_stale.append(day)
         else:
             reused += 1
     return {
@@ -536,6 +547,7 @@ def validation_targets(
         "file_state": file_state,
         "dependency_stale": dependency_stale,
         "rules_stale": rules_stale,
+        "report_stale": report_stale,
     }
 
 
@@ -739,6 +751,12 @@ def validate_incremental(
             archive_index.mark_dirty(
                 symbol, timeframe, selection["rules_stale"],
                 reason="校验规则升级",
+                adjustment=str(dataset.get("adjustment", "none")),
+            )
+        if selection.get("report_stale"):
+            archive_index.mark_dirty(
+                symbol, timeframe, selection["report_stale"],
+                reason="分钟校验报告需重新计算",
                 adjustment=str(dataset.get("adjustment", "none")),
             )
     if not targets:

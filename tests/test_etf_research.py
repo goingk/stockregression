@@ -564,6 +564,11 @@ def test_pending_invalid_or_uncalibrated_data_is_not_admitted(catalog, monkeypat
     store, market = catalog
     _install_minute_failures(monkeypatch, market, {"159611.SZ": ["2024-12-05"]}, **options)
     row = research.preflight(store, EtfResearchRequest(), market=market)["rows"][0]
+    if options.get("pending"):
+        assert row["status"] == "pending_validation"
+        assert row["replay_allowed"] is False
+        assert "data_resolution" not in row
+        return
     assert row["status"] == "ready"
     failed_day = next(item for item in row["data_resolution"]["days"] if item["date"] == "2024-12-05")
     assert failed_day["mode"] == "daily"
@@ -667,3 +672,43 @@ def test_sparse_etfs_do_not_shrink_the_healthy_gss_common_sample():
     assert all(row["sampling"]["statistics_days"] == 242 for row in healthy)
     assert all(row["sampling"]["comparable"] is False for row in sparse)
     assert [row["sampling"]["statistics_days"] for row in sparse] == [219, 112, 7]
+
+
+def test_marginal_outlier_does_not_null_the_healthy_gss_cohort():
+    days = pd.bdate_range("2024-01-01", periods=250)
+    rows = []
+    windows = {}
+    for index in range(11):
+        symbol = f"51{index:04d}.SH"
+        windows[symbol] = days
+        excluded = [
+            day.date().isoformat() for day in days[24:32]
+        ] if index >= 9 else []
+        rows.append({
+            "symbol": symbol, "status": "ready", "warnings": [], "sampling": {
+                "expected_days": 250, "valid_days": 250 - len(excluded),
+                "excluded_days": excluded, "statistics_excluded_days": excluded.copy(),
+                "statistics_days": 250 - len(excluded), "comparable": True,
+            },
+        })
+    outlier_symbol = "513310.SH"
+    windows[outlier_symbol] = days
+    outlier_excluded = [day.date().isoformat() for day in days[:24]]
+    rows.append({
+        "symbol": outlier_symbol, "status": "ready", "warnings": [], "sampling": {
+            "expected_days": 250, "valid_days": 226,
+            "excluded_days": outlier_excluded,
+            "statistics_excluded_days": outlier_excluded.copy(),
+            "statistics_days": 226, "comparable": True,
+        },
+    })
+
+    research._align_sampling(rows, windows)
+
+    healthy = rows[:-1]
+    outlier = rows[-1]
+    assert all(row["sampling"]["comparable"] for row in healthy)
+    assert all(row["sampling"]["statistics_days"] == 242 for row in healthy)
+    assert outlier["sampling"]["comparable"] is False
+    assert outlier["sampling"]["statistics_days"] == 226
+    assert any("已从横向评分组排除" in warning for warning in outlier["warnings"])
