@@ -26,6 +26,10 @@ def load_native_bundle(
     manifest = service.store.snapshot(config.symbol, version)
     if not manifest or not manifest.get("market_data"):
         raise DataQualityError("该数据版本不是行情数据库快照")
+    if manifest.get("data_resolution") or getattr(config, "data_policy", None):
+        manifest = service.resolution_manifest(config, version, manifest=manifest)
+        return _load_resolved_bundle(service, config, manifest,
+            statistics_only=statistics_only, summary_only=summary_only)
     versions = manifest.get("market_versions", {})
     if "1day" not in versions:
         raise DataQualityError("该版本没有日线，无法进行回测")
@@ -112,6 +116,121 @@ def load_native_bundle(
     return _native_coarse_bundle(
         config, target, minute, daily, actions, calendar, manifest
     )
+
+
+def _load_resolved_bundle(service, config, manifest, *, statistics_only=False, summary_only=False):
+    """Execute only the immutable, independently certified per-day inputs."""
+    from ..data_resolution import POLICY, validate_data_resolution, resolution_sampling
+    from ..snapshot_quality import frozen_quality_state
+
+    plan = validate_data_resolution(manifest, config.start_date, config.end_date)
+    if getattr(config, "data_policy", None) not in (None, POLICY):
+        raise DataQualityError("DATA_RESOLUTION_MISMATCH: 请求策略与冻结版本不一致")
+    target = normalize_timeframe(config.frequency)
+    if target != "1min":
+        raise DataQualityError("逐日分钟／日线策略只适用于 1 分钟回放")
+    versions = manifest.get("market_versions", {})
+    daily_version = int(versions["1day"]["version"])
+    daily = service.repository.bars(config.symbol, "1day", version=daily_version)
+    if daily.empty:
+        raise DataQualityError("没有可信日线可供初始化持仓或核实交易状态")
+    daily = daily.rename(columns={"timestamp": "date"}).copy()
+    daily["date"] = pd.to_datetime(daily.date).dt.normalize()
+    daily = daily.sort_values("date").drop_duplicates("date", keep="last")
+    modes = {item["date"]: item["mode"] for item in plan["days"]}
+    accepted = {day for day, mode in modes.items() if mode != "skip"}
+    minute_days = {day for day, mode in modes.items() if mode == "minute"}
+    # Historical rows are useful for initial valuation and daily diagnostics,
+    # but a current live ledger must never bless this frozen replay.
+    prior = set(plan.get("prior_daily_days") or []) | set(plan.get("history_daily_days") or [])
+    history = {day.date().isoformat() for day in daily.date
+               if day < pd.Timestamp(plan["start"])
+               and (day.date().isoformat() in prior
+                    or frozen_quality_state(manifest, "1day", day, day))}
+    daily = daily[daily.date.dt.date.astype(str).isin(accepted | history)].copy()
+    required = ["open", "high", "low", "close", "volume", "preclose", "tradestatus"]
+    if any(field not in daily for field in required):
+        raise DataQualityError("RESOLUTION_PLAN_MISMATCH: 已校验日线缺少必要回放字段")
+    for field in required:
+        daily[field] = pd.to_numeric(daily[field], errors="coerce")
+    window = daily[daily.date.dt.date.astype(str).isin(accepted)]
+    missing = accepted - set(window.date.dt.date.astype(str))
+    invalid = price_issue_details(window)
+    if (missing or not invalid.empty or window[required].isna().any().any()
+            or (~window.tradestatus.isin([0, 1])).any()):
+        raise DataQualityError("RESOLUTION_PLAN_MISMATCH: 冻结策略指定的日线与实际文件不一致")
+    _reject_reported_price_anomalies(service.repository, config.symbol, "1day", daily_version,
+        start=plan["start"], end=plan["end"], context="日线", accepted_days=accepted)
+    daily["is_st"] = daily.get("is_st", pd.Series(False, index=daily.index)).fillna(False).astype(bool)
+    daily["tradestatus"] = daily.tradestatus.astype(int)
+    calendar = _calendar(service, config.symbol, daily, manifest.get("auxiliary_versions", {}).get("calendar"))
+    days = pd.DatetimeIndex([pd.Timestamp(item["date"]) for item in plan["days"]])
+    # Preserve every planned session, including missing boundary dates.
+    calendar = pd.concat([calendar, pd.DataFrame({"date": days})], ignore_index=True).drop_duplicates("date").sort_values("date")
+    actions_version = manifest.get("auxiliary_versions", {}).get("actions")
+    if actions_version is None or service.repository.auxiliary(config.symbol, "actions", version=actions_version) is None:
+        raise DataQualityError("冻结的公司行动资料不可用，不能确认持仓结算")
+    actions = _actions(service, config.symbol, actions_version)
+    from ..corporate_actions import action_issues
+    issues = action_issues(actions, daily, pd.Timestamp(plan["start"]), pd.Timestamp(plan["end"]),
+        settlement=not statistics_only, price_tick=float((manifest.get("metadata") or {}).get("price_tick", .001)))
+    if issues:
+        raise DataQualityError("公司行动资料无法用于该区间：" + "；".join(issues[:8]))
+    daily = apply_price_limits(daily, calendar, manifest.get("metadata", {}))
+    metadata = _metadata(manifest, daily, target)
+    metadata["data_resolution"] = plan
+    metadata["data_policy"] = POLICY
+    metadata["etf_sampling"] = manifest.get("etf_sampling") or resolution_sampling(plan)
+    metadata["valuation_as_of"] = plan.get("last_evaluable_date")
+    reports = [{"date": item["date"], "mode": item["mode"], "reason": item["reason"],
+                "reason_code": item["reason_code"]} for item in plan["days"]]
+    counts = plan["counts"]
+    warnings = []
+    if counts["daily"] or counts["skip"]:
+        warnings.append(f"分钟 {counts['minute']} 日，日线降级 {counts['daily']} 日，跳过 {counts['skip']} 日；日线不还原盘中路径")
+    quality = {"days": reports, "minute_days": counts["minute"], "daily_days": counts["daily"],
+        "skipped_days": counts["skip"], "skip_days": [item["date"] for item in reports if item["mode"] == "skip"],
+        "suspended_days": counts["suspended"], "no_trade_days": counts["no_trades"],
+        "total_days": len(days), "usable_days": counts["minute"] + counts["daily"],
+        "minute_ratio": counts["minute"] / max(1, counts["minute"] + counts["daily"]),
+        "data_resolution_hash": plan["plan_hash"], "warnings": warnings, "requested_frequency": target}
+    if summary_only:
+        return DataBundle(symbol=config.symbol, bars=pd.DataFrame(), daily=daily,
+            actions=actions, calendar=days, quality=quality, version=manifest["version"], metadata=metadata, warnings=warnings)
+    minute = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
+    if minute_days:
+        if "1min" not in versions:
+            raise DataQualityError("RESOLUTION_PLAN_MISMATCH: 冻结版本缺少计划指定的分钟线")
+        minute_version = int(versions["1min"]["version"])
+        minute = service.repository.bars(config.symbol, "1min", version=minute_version,
+            start=plan["start"], end=pd.Timestamp(plan["end"]) + pd.Timedelta(days=1))
+        minute = minute.copy()
+        minute["timestamp"] = pd.to_datetime(minute.timestamp)
+        minute = minute[minute.timestamp.dt.date.astype(str).isin(minute_days)].copy()
+        _reject_invalid_prices(minute, config.symbol, "1min", minute_version,
+            start=plan["start"], end=plan["end"], context="1min")
+        _reject_reported_price_anomalies(service.repository, config.symbol, "1min", minute_version,
+            start=plan["start"], end=plan["end"], context="1min", accepted_days=minute_days)
+    if statistics_only:
+        if minute_days:
+            sample_calendar = pd.DataFrame({"date": sorted(pd.to_datetime(list(minute_days)))})
+            data = _statistics_bundle(config, minute, daily, actions, sample_calendar, manifest)
+            metadata.update({key: value for key, value in data.metadata.items()
+                             if key in {"etf_volume_verified", "volume_unverified_days"}})
+            bars = data.bars
+        else:
+            bars = minute.copy()
+            bars["frequency"] = "1m"
+        return DataBundle(symbol=config.symbol, bars=bars, daily=daily,
+            actions=actions, calendar=days, quality=quality, version=manifest["version"], metadata=metadata, warnings=warnings)
+    data = prepare_bundle(config.symbol, minute, daily, actions, calendar,
+        plan["start"], plan["end"], config.frequency, manifest["version"], metadata, manifest.get("profiles", {}))
+    data.metadata.update(metadata)
+    data.daily = daily
+    data.quality.update({"data_resolution_hash": plan["plan_hash"], "skipped_days": counts["skip"],
+                         "skip_days": quality["skip_days"]})
+    # The engine needs the trusted prior close, not only in-window daily rows.
+    return data
 
 
 def _preflight_bundle(config, daily, actions, calendar, manifest, target, start, end):
@@ -281,7 +400,7 @@ def _reject_invalid_prices(frame, symbol, timeframe, version, *, start, end, con
 
 
 def _reject_reported_price_anomalies(
-    repository, symbol, timeframe, version, *, start, end, context,
+    repository, symbol, timeframe, version, *, start, end, context, accepted_days=None,
 ):
     """Keep rejected source prices attached to the exact immutable data version."""
     detail = repository.version_info(symbol, timeframe, version)
@@ -302,6 +421,8 @@ def _reject_reported_price_anomalies(
         if lower is not None and stamp < lower:
             continue
         if upper is not None and stamp >= upper:
+            continue
+        if accepted_days is not None and stamp.date().isoformat() not in accepted_days:
             continue
         matching.append({
             **row, "symbol": symbol, "timeframe": timeframe,

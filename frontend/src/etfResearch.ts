@@ -1,8 +1,18 @@
 import type { BacktestConfig, FeeConfig } from './types.ts'
 
 export type EtfScope = 'watchlist' | 'local' | 'selected'
-export type EtfPreflightStatus = 'ready' | 'limited' | 'pending_validation' | 'insufficient_history' | 'data_not_ready'
+export type EtfPreflightStatus = 'ready' | 'limited' | 'pending_validation' | 'insufficient_history' | 'data_not_ready' | string
 export type EtfDataStatus = EtfPreflightStatus | 'pending' | 'unavailable' | 'completed' | 'failed'
+
+export type EtfResolutionMode = 'minute' | 'daily' | 'skip' | 'suspended' | 'no_trades'
+export interface EtfDataResolution {
+  policy: string
+  plan_hash: string
+  days: Array<{ date: string; mode: EtfResolutionMode; reason_code?: string | null; reason?: string | null }>
+  counts: Record<EtfResolutionMode, number>
+  first_evaluable_date: string | null
+  last_evaluable_date: string | null
+}
 
 export interface EtfSampling {
   expected_days: number
@@ -12,6 +22,8 @@ export interface EtfSampling {
   statistics_excluded_days: string[]
   statistics_days: number
   comparable: boolean
+  minute_complete_days?: number
+  gss_days?: number
 }
 
 export interface EtfExecution {
@@ -57,11 +69,14 @@ export interface EtfPreflightRow {
   gaps: EtfGap[]
   warnings: string[]
   sampling?: EtfSampling
+  data_resolution?: EtfDataResolution
+  replay_allowed?: boolean
 }
 
 export interface EtfPreflightCounts {
   total: number
   ready: number
+  replay_allowed?: number
   limited?: number
   pending_validation: number
   insufficient_history: number
@@ -89,6 +104,8 @@ export interface EtfPreflight {
   counts: EtfPreflightCounts
   rows: EtfPreflightRow[]
   universe: EtfUniverse
+  data_resolution?: EtfDataResolution
+  replay_allowed?: boolean
 }
 
 export interface EtfMetricDetail {
@@ -127,6 +144,10 @@ export interface EtfGridBasis {
   lower_price: number | null
   upper_price: number | null
   current_raw_price: number | null
+  current_price_date?: string | null
+  current_price_source?: 'minute' | 'daily' | null
+  current_price_basis?: string | null
+  current_raw_price_unadjusted?: number | null
   atr30_pct: number | null
   svr: number | null
   realized_skewness: number | null
@@ -163,12 +184,14 @@ export interface EtfCandidate {
 }
 
 export interface EtfValidation {
-  status: 'not_selected' | 'completed' | 'no_qualified' | 'unavailable' | 'partial' | 'cancelled'
+  status: 'not_selected' | 'completed' | 'no_qualified' | 'no_candidates' | 'unavailable' | 'partial' | 'cancelled'
   candidates: EtfCandidate[]
   recommendation: EtfCandidate | null
   forward_config: BacktestConfig | null
   reason?: string
   stop_reason?: string
+  reason_code?: string | null
+  constraints?: Record<string, unknown> | null
 }
 
 export interface EtfRow {
@@ -176,6 +199,8 @@ export interface EtfRow {
   symbol_name: string
   status: string
   data_status: string
+  replay_allowed?: boolean
+  data_resolution?: EtfDataResolution
   sampling?: EtfSampling
   version: string
   window_start: string
@@ -238,7 +263,7 @@ export interface EtfResearchResultCounts {
 export interface EtfResearchResult {
   id: string
   kind: 'etf_research'
-  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2' | 'etf_min_grid_v3' | 'etf_min_grid_v4'
+  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2' | 'etf_min_grid_v3' | 'etf_min_grid_v4' | 'etf_min_grid_v5'
   result_schema_version: 1
   status: 'completed' | 'partial' | 'cancelled'
   as_of: string
@@ -272,7 +297,7 @@ export interface EtfValidationResultCounts {
 export interface EtfValidationResult {
   id: string
   kind: 'etf_validation'
-  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2' | 'etf_min_grid_v3' | 'etf_min_grid_v4'
+  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2' | 'etf_min_grid_v3' | 'etf_min_grid_v4' | 'etf_min_grid_v5'
   result_schema_version: 1
   status: 'completed' | 'partial' | 'cancelled' | 'failed'
   as_of: string
@@ -312,22 +337,22 @@ export interface EtfMetricDefinition {
 }
 
 export const ETF_METRIC_DEFINITIONS: readonly EtfMetricDefinition[] = [
-  { key: 'rv_annualized', label: '1 分钟年化已实现波动率', unit: 'percent', meaning: '根据 1 分钟日内收益估算价格波动，并按 252 个交易日换算为年化水平，午休与隔夜不计。', usage: '衡量短周期价格波动，越高通常意味着更多网格触发机会，也伴随更大的波动风险。' },
+  { key: 'rv_annualized', label: '年化价格波动率（RV）', unit: 'percent', meaning: '根据完整分钟日内收益估算价格波动，并按 252 个交易日换算为年化水平，午休与隔夜不计。它不是年化收益率。', usage: '描述价格波动幅度；越高通常意味着更多网格触发机会，也伴随更大的波动风险。' },
   { key: 'rv_5m_annualized', label: '5 分钟年化已实现波动率', unit: 'percent', meaning: '根据 5 分钟日内收益估算价格波动，并按 252 个交易日换算为年化水平，午休与隔夜不计。', usage: '作为 1 分钟波动率的采样对照，数值越高表示观测到的日内波动越大。' },
-  { key: 'path_redundancy', label: '历史全窗口路径冗余（1 分钟）', unit: 'percent', meaning: '旧版 v1/v2 在全 120/250 日窗口上计算的路径冗余度。', usage: '仅作历史结果展示；不同于 v3 的逐日及滚动窗口均值，不可当作新日均指标。' },
-  { key: 'path_redundancy_daily_mean', label: '日均路径冗余（5m 采样）', unit: 'percent', meaning: '逐日计算首个采样 bar 开盘至当日收盘的路径冗余，再对有效日等权平均。', usage: '计入 v3 GSS 10%。先算各日 PR 再等权平均，不是对日 PR 平滑；高 PR 不代表盈利。' },
-  { key: 'path_redundancy_5d_mean', label: '5 日均路径冗余（5m 采样）', unit: 'percent', meaning: '每日推进一个窗口，计算连续 5 个交易日 PR 后对有效窗口等权平均；跨缺口窗口整窗剔除，隔夜保留真实位移。', usage: 'v3 GSS 路径分项的一半权重。先算各窗口 PR 再平均，不是日 PR 平滑；高 PR 不代表盈利。' },
-  { key: 'path_redundancy_20d_mean', label: '20 日均路径冗余（5m 采样）', unit: 'percent', meaning: '每日推进一个窗口，计算连续 20 个交易日 PR 后对有效窗口等权平均；跨缺口窗口整窗剔除，隔夜保留真实位移。', usage: '描述较长窗口，不计入 GSS；高 PR 不代表盈利。' },
-  { key: 'path_redundancy_daily_mean_1m', label: '日均路径冗余（1 分钟对照）', unit: 'percent', meaning: '按逐日窗口定义计算的 1 分钟采样对照值。', usage: '用于观察采样敏感性，不计入 GSS；日、5 日、20 日各尺度应分别比较；高 PR 不代表盈利。' },
-  { key: 'path_redundancy_5d_mean_1m', label: '5 日均路径冗余（1 分钟对照）', unit: 'percent', meaning: '按滚动 5 日窗口定义计算的 1 分钟采样对照值。', usage: '用于观察采样敏感性，不计入 GSS；日、5 日、20 日各尺度应分别比较；高 PR 不代表盈利。' },
-  { key: 'path_redundancy_20d_mean_1m', label: '20 日均路径冗余（1 分钟对照）', unit: 'percent', meaning: '按滚动 20 日窗口定义计算的 1 分钟采样对照值。', usage: '用于观察采样敏感性，不计入 GSS；日、5 日、20 日各尺度应分别比较；高 PR 不代表盈利。' },
-  { key: 'iovr', label: '日内 / 隔夜方差比', unit: 'ratio', meaning: '日内 1 分钟实现方差均值除以官方开盘相对前收盘隔夜平方收益均值。', usage: '比较波动发生在日内还是隔夜，越高表示相对更多方差来自日内。' },
+  { key: 'path_redundancy', label: '历史全窗口价格往返程度（PR，1m）', unit: 'percent', meaning: '旧版 v1/v2 在全 120/250 日窗口上计算的价格往返程度。', usage: '仅作历史结果展示；不同于 v3 的逐日及滚动窗口均值，不可当作新日均指标。' },
+  { key: 'path_redundancy_daily_mean', label: '日均价格往返程度（PR，5m）', unit: 'percent', meaning: '逐日计算首个采样 bar 开盘至当日收盘的路径冗余，再对有效日等权平均。', usage: '计入 v3 GSS 10%。先算各日 PR 再等权平均，不是对日 PR 平滑；高 PR 不代表盈利。' },
+  { key: 'path_redundancy_5d_mean', label: '5 日价格往返程度（PR，5m）', unit: 'percent', meaning: '每日推进一个窗口，计算连续 5 个交易日 PR 后对有效窗口等权平均；跨缺口窗口整窗剔除，隔夜保留真实位移。', usage: 'v3 GSS 路径分项的一半权重。先算各窗口 PR 再平均，不是日 PR 平滑；高 PR 不代表盈利。' },
+  { key: 'path_redundancy_20d_mean', label: '20 日价格往返程度（PR，5m）', unit: 'percent', meaning: '每日推进一个窗口，计算连续 20 个交易日 PR 后对有效窗口等权平均；跨缺口窗口整窗剔除，隔夜保留真实位移。', usage: '描述较长窗口，不计入 GSS；高 PR 不代表盈利。' },
+  { key: 'path_redundancy_daily_mean_1m', label: '日均价格往返程度（PR，1m 对照）', unit: 'percent', meaning: '按逐日窗口定义计算的 1 分钟采样对照值。', usage: '用于观察采样敏感性，不计入 GSS；日、5 日、20 日各尺度应分别比较；高 PR 不代表盈利。' },
+  { key: 'path_redundancy_5d_mean_1m', label: '5 日价格往返程度（PR，1m 对照）', unit: 'percent', meaning: '按滚动 5 日窗口定义计算的 1 分钟采样对照值。', usage: '用于观察采样敏感性，不计入 GSS；日、5 日、20 日各尺度应分别比较；高 PR 不代表盈利。' },
+  { key: 'path_redundancy_20d_mean_1m', label: '20 日价格往返程度（PR，1m 对照）', unit: 'percent', meaning: '按滚动 20 日窗口定义计算的 1 分钟采样对照值。', usage: '用于观察采样敏感性，不计入 GSS；日、5 日、20 日各尺度应分别比较；高 PR 不代表盈利。' },
+  { key: 'iovr', label: '日内／隔夜方差比（IOVR）', unit: 'ratio', meaning: '日内完整分钟实现方差均值除以官方开盘相对前收盘隔夜平方收益均值。', usage: '比较波动发生在日内还是隔夜；12 表示日内方差约为隔夜的 12 倍。' },
   { key: 'variance_ratio_60m', label: '5 分钟采样 · 60 分钟方差比', unit: 'ratio', meaning: '以 5 分钟收益为基频，比较聚合至 60 分钟的方差与基频方差的线性缩放值。', usage: '描述该时间尺度的收益延续性，约为 1 接近随机游走，高于 1 偏持续、低于 1 偏反转。' },
-  { key: 'variance_ratio_240m', label: '5 分钟采样 · 240 分钟方差比', unit: 'ratio', meaning: '以 5 分钟收益为基频，比较聚合至 240 分钟的方差与基频方差的线性缩放值。', usage: '描述较长日内尺度的收益延续性，约为 1 接近随机游走，高于 1 偏持续、低于 1 偏反转。' },
+  { key: 'variance_ratio_240m', label: '趋势／反转特征（VR 240m）', unit: 'ratio', meaning: '以 5 分钟收益为基频，比较聚合至 240 分钟的方差与基频方差的线性缩放值。', usage: '约为 1 接近随机游走；大于 1 偏趋势延续，小于 1 偏反转。' },
   { key: 'variance_ratio_1200m', label: '5 分钟采样 · 1200 分钟方差比', unit: 'ratio', meaning: '以 5 分钟收益为基频，比较聚合至 1200 分钟的方差与基频方差的线性缩放值。', usage: '描述跨日较长尺度的收益延续性，约为 1 接近随机游走，高于 1 偏持续、低于 1 偏反转。' },
   { key: 'ou_half_life_days', label: '30 分钟采样 · OU 半衰期', unit: 'days', meaning: '用 30 分钟价格拟合均值回归模型，估计价格偏离中枢的幅度缩小一半所需的交易日数。', usage: '用于描述拟合模型中的回归速度，半衰期越短表示回归越快，模型无效时不提供数值。' },
   { key: 'zero_crossing_rate', label: '5 分钟采样 · 滚动中枢过零率', unit: 'number', meaning: '5 分钟价格从过去约 5 日均线的一侧穿到另一侧的次数，占有效相邻价格对的比例。', usage: '越高表示围绕中枢往返更频繁，可辅助判断网格交易机会；显示为 0–1 比率。' },
-  { key: 'jump_ratio', label: '5 分钟采样 · 跳跃方差占比', unit: 'percent', meaning: '按日计算 5 分钟实现方差中超出双幂变差估计部分的占比，双幂变差不跨午休、隔夜或缺失段。', usage: '衡量方差中跳跃成分占比，越高表示极端跳动贡献越大。' },
+  { key: 'jump_ratio', label: '突发跳动方差占比（跳跃）', unit: 'percent', meaning: '按日计算完整 5 分钟数据实现方差中超出双幂变差估计部分的占比，不跨午休、隔夜或缺失段。', usage: '衡量突发价格跳动对波动的贡献；越高表示极端跳动贡献越大。' },
   { key: 'max_drawdown_duration_days', label: '最长水下持续期', unit: 'days', meaning: '取独立最近 250 日日线窗口内，从峰值到恢复此前高点的最长交易日数，期末未恢复时计入未完成区间。', usage: '衡量回撤后恢复所需时间，数值越大表示历史水下持续更久。' },
   { key: 'tick_to_price_ratio', label: '最小报价 / 均价', unit: 'percent', meaning: '最小价格单位除以最近 20 个有分钟数据交易日的未复权分钟收盘均价。', usage: '衡量最小报价单位相对价格的粗细，越高表示报价刻度相对更粗。' },
   { key: 'mean_raw_price', label: '平均不复权价格', unit: 'price', meaning: '最近 20 个有分钟数据交易日的未复权分钟收盘均价。', usage: '用于描述近期原始成交价格水平并参与适用性筛选，低于 0.5 元会被过滤。' },
@@ -616,8 +641,56 @@ export function etfSymbolValidationPath(resultId: string, symbol: string): strin
 
 export function validationStatusLabel(status: string): string {
   return ({
-    not_selected: '未进入核验', completed: '核验完成', no_qualified: '无合格候选', unavailable: '核验不可用', partial: '部分完成', cancelled: '核验已取消',
+    not_selected: '尚未试算', completed: '找到历史达标参数', no_qualified: '已试算但未达标', no_candidates: '没有生成有效网格', unavailable: '暂时无法试算', partial: '部分完成', cancelled: '试算已取消',
   } as Record<string, string>)[status] ?? status
+}
+
+export function validationSummary(validation?: Pick<EtfValidation, 'status' | 'reason' | 'reason_code' | 'constraints' | 'recommendation'> | null): string {
+  if (!validation) return '尚未试算'
+  if (validation.status === 'completed' && validation.recommendation) {
+    const metrics = validation.recommendation.metrics
+    const pct = (value: number | null) => finite(value) ? `${(value * 100).toFixed(2)}%` : '—'
+    return `历史本金收益 ${pct(metrics.peak_principal_return)} · 最大回撤 ${pct(metrics.max_principal_drawdown)} · 成交 ${metrics.trade_count ?? '—'} 笔`
+  }
+  if (validation.status === 'no_candidates') return candidateReasonText(validation.reason_code, validation.constraints) || validation.reason || '没有生成有效网格'
+  if (validation.status === 'no_qualified') return validation.reason || '已试算候选，但没有达到成交、收益、超额收益和回撤条件。'
+  if (validation.status === 'unavailable') return validation.reason || '相关样本不足，暂时无法完成可靠试算。'
+  if (validation.status === 'not_selected') return '尚未自动试算；查看详情了解筛选条件和下一步。'
+  return validation.reason || validationStatusLabel(validation.status)
+}
+
+export function candidateReasonText(reasonCode?: string | null, constraints?: Record<string, unknown> | null): string {
+  const current = constraints?.current_price
+  const lower = constraints?.lower_price
+  if (reasonCode === 'current_at_or_below_lower' && typeof current === 'number' && typeof lower === 'number') {
+    const date = typeof constraints?.current_price_date === 'string' ? constraints.current_price_date : null
+    const label = date ? `${date} 最近可信收盘价` : '现价'
+    return `${label} ${current.toFixed(4)} 元低于建议区间下界约 ${lower.toFixed(4)} 元，因此未生成网格。`
+  }
+  return ({
+    current_at_or_below_lower: '现价不高于建议区间下界，因此未生成网格。',
+    current_at_or_above_upper: '现价不低于建议区间上界，因此未生成网格。',
+    reference_outside_band: '参考价超出建议区间，因此未生成网格。',
+    step_inputs_invalid: '网格步长所需的样本或波幅数据无效。',
+    minimum_step_exceeds_maximum: '所需最小网格步长超过允许上限。',
+    tick_grid_invalid: '按最小报价单位对齐后无法形成有效网格。',
+    insufficient_samples: '相关分钟样本不足，无法可靠生成网格。',
+    grid_basis_missing: '现有样本尚未形成可靠的价格区间，暂未生成网格。',
+  } as Record<string, string>)[reasonCode ?? ''] ?? ''
+}
+
+export function dataResolutionSummary(resolution?: EtfDataResolution | null): string {
+  if (!resolution) return '逐日数据使用情况未提供（历史结果）'
+  const counts = resolution.counts
+  return `分钟 ${counts.minute ?? 0} 日 · 日线降级 ${counts.daily ?? 0} 日 · 跳过 ${counts.skip ?? 0} 日`
+}
+
+export function minuteAndGssSampleText(sampling?: EtfSampling): string {
+  if (!sampling) return '完整分钟日 — · GSS 样本 —'
+  const own = sampling.minute_complete_days ?? sampling.valid_days
+  if (sampling.comparable === false) return `完整分钟日 ${own} 日 · 未参与横向评分`
+  const gss = sampling.gss_days ?? sampling.statistics_days
+  return `完整分钟日 ${own} 日 · GSS 样本 ${gss} 日`
 }
 
 export function resultStatusTone(status: string): 'neutral' | 'blue' | 'green' | 'red' | 'amber' {
@@ -639,7 +712,7 @@ export function stopReasonLabel(reason: string): string {
   } as Record<string, string>)[reason] ?? reason
 }
 
-const NON_STATUS_COUNT_KEYS = new Set(['total', 'scored', 'eligible', 'validated', 'recommended'])
+const NON_STATUS_COUNT_KEYS = new Set(['total', 'scored', 'eligible', 'validated', 'recommended', 'no_candidates'])
 const DATA_STATUS_ORDER = [
   'ready', 'limited', 'pending_validation', 'insufficient_history', 'data_not_ready',
   'pending', 'unavailable', 'completed', 'failed',
@@ -659,8 +732,8 @@ export function etfDataStatusCounts(counts: Record<string, number | undefined>) 
     }))
 }
 
-export function etfResearchStartCount(counts: Pick<EtfPreflightCounts, 'ready' | 'limited'>): number {
-  return (counts.ready ?? 0) + (counts.limited ?? 0)
+export function etfResearchStartCount(counts: Pick<EtfPreflightCounts, 'ready' | 'limited'> & { replay_allowed?: number }): number {
+  return counts.replay_allowed ?? ((counts.ready ?? 0) + (counts.limited ?? 0))
 }
 
 export function samplingCoverageText(sampling?: EtfSampling): string {

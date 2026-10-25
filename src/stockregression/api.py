@@ -1974,20 +1974,40 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         row = next((item for item in original.get("rows", []) if item.get("symbol") == symbol), None)
         if row is None:
             raise HTTPException(404, "该 ETF 不在原始候选池中")
-        if row.get("data_status") == "limited" or (row.get("sampling") or {}).get("excluded_days"):
-            raise HTTPException(409, {"code": "DATA_NOT_READY", "message": "此结果仅使用完整日统计；参数回放需先补齐分钟行情，再创建新的研究"})
+        if (row.get("data_status") == "limited" or (row.get("sampling") or {}).get("excluded_days")) and not row.get("data_resolution"):
+            raise HTTPException(409, {"code": "DATA_NOT_READY", "message": "旧版 limited 结果不能升级为逐日降级回放；请按新规则重新研究"})
+        if original.get("method_version") == "etf_min_grid_v5" and not row.get("replay_allowed"):
+            raise HTTPException(409, {"code": "REPLAY_UNAVAILABLE", "message": "该 ETF 没有可复现的可信回放日；请按新规则重新研究"})
+        if original.get("method_version") == "etf_min_grid_v5" and not row.get("data_resolution"):
+            raise HTTPException(409, {"code": "DATA_RESOLUTION_MISSING", "message": "原 v5 结果缺少冻结逐日计划；请按新规则重新研究"})
         if not row.get("window_start") or not row.get("window_end"):
             raise HTTPException(409, {"code": "DATA_NOT_READY", "message": "原结果没有完整历史窗口；补齐数据后请创建新的研究"})
         frozen = original.get("universe", {}).get("versions", {}).get(symbol)
-        if not frozen or store.snapshot(symbol, frozen["version"], persist=False) is None:
+        if not frozen:
             raise HTTPException(409, {"code": "DATA_VERSION_NOT_FOUND", "message": "原始行情版本已清理或代际已改变，不能改用当前数据"})
+        frozen_manifest = store.snapshot(symbol, frozen["version"], persist=False)
+        if frozen_manifest is None:
+            raise HTTPException(409, {"code": "DATA_VERSION_NOT_FOUND", "message": "原始行情版本已清理或代际已改变，不能改用当前数据"})
+        if original.get("method_version") == "etf_min_grid_v5":
+            from .data_resolution import validate_data_resolution
+            try:
+                frozen_plan = validate_data_resolution(frozen_manifest, row["window_start"], row["window_end"])
+            except ValueError as exc:
+                raise HTTPException(409, {"code": "DATA_RESOLUTION_MISSING", "message": str(exc)}) from exc
+            if frozen_plan.get("plan_hash") != row.get("data_resolution", {}).get("plan_hash"):
+                raise HTTPException(409, {"code": "DATA_RESOLUTION_MISMATCH", "message": "原结果与冻结逐日计划不一致"})
         row = {key: value for key, value in row.items() if key in {
             "symbol", "symbol_name", "window_start", "window_end", "daily_start", "version", "gaps", "warnings", "sampling",
+            "data_status", "data_resolution", "replay_allowed",
         }}
-        row.update(status="ready", version=frozen["version"])
+        if original.get("method_version") != "etf_min_grid_v5":
+            row.update(status="ready", data_status="ready", version=frozen["version"])
+        else:
+            row.update(status=row.get("status") or "ready", version=frozen["version"])
         row.setdefault("gaps", [])
         row.setdefault("warnings", [])
         plan = {
+            "method_version": original.get("method_version"),
             "as_of": original["as_of"], "requested_as_of": original["as_of"],
             "scope": "selected", "symbols": [symbol], "window_days": request.window_days,
             "rows": [row], "counts": {"total": 1, "ready": 1},

@@ -9,13 +9,12 @@ from collections import Counter
 import hashlib
 import json
 import math
-import re
 import time
 from typing import Callable
 
 import pandas as pd
 
-from .etf_models import EtfResearchRequest, METHOD_VERSION, RESULT_SCHEMA_VERSION, MIN_COMPLETE_DAY_RATIO, MIN_OBSERVED_MINUTE_RATIO
+from .etf_models import EtfResearchRequest, METHOD_VERSION, RESULT_SCHEMA_VERSION, MIN_COMPLETE_DAY_RATIO
 from .market_data import MarketDataService
 from .market_data.models import MarketDataError
 from .models import BacktestConfig, DataBundle
@@ -23,6 +22,10 @@ from .providers import latest_closed_date
 from .performance import current_process_rss_bytes, current_workspace_bytes, rebalance_cpu_budget
 from .storage import Store, json_safe
 from .snapshot_quality import frozen_quality_state
+from .data_resolution import (
+    POLICY as ETF_DATA_POLICY, build_data_resolution, resolution_intervals,
+    resolution_sampling, resolution_snapshot_version, validate_data_resolution,
+)
 
 
 def _date(value) -> pd.Timestamp:
@@ -111,94 +114,45 @@ def _validation_gaps(market, symbol, timeframe, manifest, start, end, *, state=N
     return gaps
 
 
-def _limited_minute_days(market, symbol, window, state) -> list[str] | None:
-    """Only known missing bars may be omitted; pending or invalid data cannot."""
-    failed = sorted(set(state.get("failed") or []))
-    days = {day.date().isoformat() for day in window}
-    if (
-        state.get("available") is False
-        or state.get("pending") or state.get("pending_count")
-        or not set(failed).issubset(days)
-        or int(state.get("failed_count", len(failed))) != len(failed)
-        or (failed and int(state.get("validated_days") or 0) < len(days) - len(failed))
-        or (len(days) - len(failed)) / len(days) + 1e-12 < MIN_COMPLETE_DAY_RATIO
-    ):
-        return None
-    records = {
-        row["trade_date"]: row for row in market.repository.day_validations(
-            symbol, "1min", start=window[0], end=window[-1],
-        )
-    }
-    for day in failed:
-        record = records.get(day) or {}
-        report = record.get("report") or {}
-        reason = str(report.get("reason") or "")
-        messages = [reason, *(report.get("pending_validation") or [])]
-        if (
-            record.get("status") != "failed" or report.get("price_anomalies")
-            or report.get("blocked_price_rows") or report.get("blocked_timestamps")
-            or not all(
-                re.fullmatch(r"存在 \d+ 个未补齐的分钟缺口", str(message))
-                or str(message) == "交易日没有行情记录"
-                for message in messages
-            )
-        ):
-            return None
-    excluded = set(failed)
-    missing_minutes = 0
-    for day, record in records.items():
-        if day not in days:
-            continue
-        report = record.get("report") or {}
-        if record.get("status") == "suspended" or report.get("no_trades") or report.get("non_trading"):
-            continue
-        missing = max(0, 240 - int(record.get("row_count", report.get("observed_rows") or 0)) - int(report.get("auction_placeholders") or 0))
-        missing_minutes += missing
-        # A passed ledger may include short forward fills. Such a day is not
-        # a fully observed statistical sample, even though backtesting accepts it.
-        if missing or report.get("synthetic_rows"):
-            excluded.add(day)
-    if (
-        (len(days) - len(excluded)) / len(days) + 1e-12 < MIN_COMPLETE_DAY_RATIO
-        or 1 - missing_minutes / (240 * len(days)) + 1e-12 < MIN_OBSERVED_MINUTE_RATIO
-    ):
-        return None
-    return sorted(excluded)
-
-
-def _sampling(window, excluded) -> dict:
-    valid = len(window) - len(excluded)
-    return {
-        "expected_days": len(window), "valid_days": valid,
-        "coverage_ratio": valid / len(window), "excluded_days": list(excluded),
-        "statistics_excluded_days": list(excluded), "statistics_days": valid,
-        "comparable": True,
-    }
-
-
 def _align_sampling(rows, windows) -> None:
     usable = [row for row in rows if row["status"] in {"ready", "limited"}]
     if not usable:
         return
-    samples = [
-        {day.date().isoformat() for day in windows[row["symbol"]]} - set(row["sampling"]["excluded_days"])
-        for row in usable
-    ]
-    common = set.intersection(*samples)
-    aligned = all(len(common) / row["sampling"]["expected_days"] + 1e-12 >= MIN_COMPLETE_DAY_RATIO for row in usable)
+    scoring_group = []
     for row in usable:
+        sampling = row["sampling"]
+        own = {day.date().isoformat() for day in windows[row["symbol"]]} - set(sampling["excluded_days"])
+        if len(own) / max(1, sampling["expected_days"]) + 1e-12 >= MIN_COMPLETE_DAY_RATIO:
+            scoring_group.append((row, own))
+        else:
+            sampling["comparable"] = False
+            row["warnings"].append(
+                f"自有完整分钟样本 {len(own)}/{sampling['expected_days']} 日不足90%；保留统计和试算，不纳入GSS共同样本组",
+            )
+    if not scoring_group:
+        return
+    common = set.intersection(*(sample for _, sample in scoring_group))
+    aligned = all(
+        len(common) / max(1, row["sampling"]["expected_days"]) + 1e-12 >= MIN_COMPLETE_DAY_RATIO
+        for row, _ in scoring_group
+    )
+    for row, _ in scoring_group:
         sampling = row["sampling"]
         if aligned:
             expected = {day.date().isoformat() for day in windows[row["symbol"]]}
             sampling.update(statistics_excluded_days=sorted(expected - common), statistics_days=len(common))
             if sampling["statistics_excluded_days"]:
-                row["warnings"].append(f"横截面统一使用 {len(common)}/{sampling['expected_days']} 个完整分钟交易日；缺口日期整日排除，不拼接缺失路径")
-        elif row["status"] == "limited":
+                row["warnings"].append(
+                    f"GSS共同样本使用 {len(common)}/{sampling['expected_days']} 个完整分钟交易日；跨缺口窗口整段排除",
+                )
+        else:
             sampling["comparable"] = False
-            row["warnings"].append("范围内公共完整日不足90%，此标的只显示有效日统计，不参与GSS；完整标的继续按完整窗口评分")
+            row["warnings"].append(
+                "高覆盖标的之间的公共完整分钟样本不足90%；保留本标的统计和试算，不参与GSS横向评分",
+            )
 
 
-def _freeze_quality(market, manifest, start, end, daily_start, *, sampling=None, window=None) -> None:
+def _freeze_quality(market, manifest, start, end, daily_start, *, sampling=None, window=None, data_resolution=None) -> None:
     """Bind successful ledger intervals to exact immutable data dependencies."""
     from .market_data.repository import VALIDATION_RULES_VERSION
 
@@ -206,6 +160,20 @@ def _freeze_quality(market, manifest, start, end, daily_start, *, sampling=None,
         timeframe: [{"start": start.date().isoformat(), "end": end.date().isoformat(), "status": "complete"}]
         for timeframe in ("1day", "1min")
     }
+    if data_resolution is not None:
+        manifest["data_resolution"] = data_resolution
+        intervals = {
+            timeframe: resolution_intervals(data_resolution, timeframe)
+            for timeframe in ("1day", "1min")
+        }
+        intervals["1day"] = [
+            *(
+                {"start": day, "end": day, "status": "complete"}
+                for day in data_resolution.get("history_daily_days", data_resolution.get("prior_daily_days", []))
+                if day not in {entry["start"] for entry in intervals["1day"]}
+            ),
+            *intervals["1day"],
+        ]
     if sampling is not None:
         manifest["etf_sampling"] = sampling.copy()
         excluded = set(sampling["excluded_days"])
@@ -223,7 +191,7 @@ def _freeze_quality(market, manifest, start, end, daily_start, *, sampling=None,
                     intervals["1min"][-1]["end"] = stamp
                 previous = day
     daily_start = _date(daily_start)
-    if daily_start < start and not _validation_gaps(market, manifest["symbol"], "1day", manifest, daily_start, end):
+    if data_resolution is None and daily_start < start and not _validation_gaps(market, manifest["symbol"], "1day", manifest, daily_start, end):
         intervals["1day"][0]["start"] = daily_start.date().isoformat()
     manifest["quality_evidence"] = {
         "schema_version": 1, "rules_version": VALIDATION_RULES_VERSION,
@@ -231,10 +199,7 @@ def _freeze_quality(market, manifest, start, end, daily_start, *, sampling=None,
         "auxiliary_versions": dict(manifest.get("auxiliary_versions", {})),
         "intervals": intervals,
     }
-    content = {key: value for key, value in manifest.items() if key not in {"version", "created_at", "files", "profiles"}}
-    manifest["version"] = "mkt-" + hashlib.sha256(
-        json.dumps(json_safe(content), sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(),
-    ).hexdigest()[:24]
+    manifest["version"] = resolution_snapshot_version(manifest)
 
 
 def preflight(
@@ -257,9 +222,11 @@ def preflight(
             manifests[symbol] = snapshot
     closed = _date(latest_closed_date())
     latest = [
-        min(closed, _date(manifest["market_versions"]["1min"]["last"]))
+        min(closed, _date((manifest.get("market_versions", {}).get("1day")
+                           or manifest.get("market_versions", {}).get("1min", {}))["last"]))
         for manifest in manifests.values()
-        if manifest.get("market_versions", {}).get("1min", {}).get("last")
+        if (manifest.get("market_versions", {}).get("1day")
+            or manifest.get("market_versions", {}).get("1min", {})).get("last")
     ]
     as_of = _date(request.as_of) if request.as_of else max(latest, default=closed)
     versions = {}
@@ -290,9 +257,8 @@ def preflight(
             "auxiliary_versions": manifest.get("auxiliary_versions", {}),
         }
         references = manifest.get("market_versions", {})
-        for timeframe in ("1day", "1min"):
-            if timeframe not in references:
-                row["gaps"].append(_gap("bars", f"缺少本地 {timeframe} 行情", timeframe))
+        if "1day" not in references:
+            row["gaps"].append(_gap("bars", "缺少本地 1day 行情；无法建立日线统计与估值基准", "1day"))
         if row["gaps"]:
             continue
         try:
@@ -321,14 +287,16 @@ def preflight(
         # An independent daily window is used for MDDD, without requiring 250
         # days of minute prices when the selected minute window is 120 days.
         row["daily_start"] = days[max(0, len(days) - max(251, request.window_days + 1))].date().isoformat()
-        for timeframe in ("1day", "1min"):
+        for timeframe in ("1day",):
             reference = references[timeframe]
             first, last = reference.get("first"), reference.get("last")
-            if not first or _date(first) > start or (timeframe == "1day" and _date(first) >= start):
+            if not first or _date(first) >= start:
                 row["status"] = "insufficient_history"
                 row["gaps"].append(_gap("history", f"{timeframe} 未覆盖完整窗口及必要前置行情", timeframe))
             if not last or _date(last) < end:
-                row["gaps"].append(_gap("range", f"{timeframe} 截止未达到 {end.date()}", timeframe))
+                # Preserve the requested window. An internal or trailing
+                # daily hole is resolved per session and appears in the plan.
+                pass
         actions_version = manifest.get("auxiliary_versions", {}).get("actions")
         actions = market.repository.auxiliary(symbol, "actions", version=actions_version) if actions_version is not None else None
         from .corporate_actions import action_issues, resolve_actions
@@ -352,36 +320,42 @@ def preflight(
             row["gaps"].append(_gap("actions", reason))
         if row["gaps"]:
             continue
-        states = {timeframe: _validation_state(market, symbol, timeframe, manifest, start, end) for timeframe in ("1day", "1min")}
-        daily_gaps = _validation_gaps(market, symbol, "1day", manifest, start, end, state=states["1day"])
-        row["gaps"].extend(daily_gaps)
-        minute_gaps = _validation_gaps(market, symbol, "1min", manifest, start, end, state=states["1min"])
-        row["gaps"].extend(minute_gaps)
-        can_sample = not daily_gaps and (not minute_gaps or states["1min"].get("failed"))
-        excluded = _limited_minute_days(market, symbol, window, states["1min"]) if can_sample else None
-        if excluded:
-            row["status"] = "limited"
-            row["gaps"] = [gap for gap in row["gaps"] if gap["kind"] != "pending_validation"]
-            row["sampling"] = _sampling(window, excluded)
-            row["warnings"].append(f"排除 {len(excluded)} 个分钟缺口日后可统计；参数回放需先补齐分钟行情")
-            if not any(gap["kind"] == "quality_failed" for gap in row["gaps"]):
-                row["gaps"].append(_gap("observed_minutes", "部分已校验日期含少量补线，统计按整日排除：" + "、".join(excluded[:12]), "1min"))
-            continue
-        if any(gap["kind"] == "quality_failed" for gap in row["gaps"]):
+        try:
+            data_resolution = build_data_resolution(market, symbol, manifest, window)
+        except (ValueError, MarketDataError) as exc:
             row["status"] = "data_not_ready"
-        elif row["gaps"]:
-            row["status"] = "pending_validation"
-        elif excluded == []:
+            row["gaps"].append(_gap("data_resolution", str(exc)))
+            continue
+        row["data_resolution"] = data_resolution
+        row["sampling"] = resolution_sampling(data_resolution)
+        row["replay_allowed"] = bool(
+            data_resolution["counts"].get("minute", 0) + data_resolution["counts"].get("daily", 0) > 0
+            and data_resolution.get("first_evaluable_date")
+        )
+        # A row with a usable day is researchable even when other dates are
+        # degraded or skipped. Those dates remain visible in the frozen plan.
+        if row["replay_allowed"]:
             row["status"] = "ready"
-            row["sampling"] = _sampling(window, [])
+            degraded = data_resolution["counts"].get("daily", 0)
+            skipped = data_resolution["counts"].get("skip", 0)
+            if degraded or skipped:
+                row["warnings"].append(
+                    f"逐日数据：分钟 {data_resolution['counts'].get('minute', 0)} 日，日线降级 {degraded} 日，跳过 {skipped} 日",
+                )
         else:
-            row["gaps"].append(_gap("coverage", "真实完整日不足90%或真实分钟不足95%，请补齐数据后重试", "1min"))
+            all_unverified = all(not item.get("evidence", {}).get("1day") for item in data_resolution["days"])
+            row["status"] = "pending_validation" if all_unverified else "data_not_ready"
+            row["gaps"].append(_gap(
+                "pending_validation" if all_unverified else "no_evaluable_days",
+                "本地日线尚无冻结质量凭证，请先校验本地行情" if all_unverified
+                else "窗口内没有可用于研究或回放的分钟/日线交易日",
+            ))
     _align_sampling(rows, windows)
     for row in rows:
         if row["status"] not in {"ready", "limited"}:
             continue
         manifest = manifests[row["symbol"]]
-        _freeze_quality(market, manifest, _date(row["window_start"]), _date(row["window_end"]), row["daily_start"], sampling=row["sampling"], window=windows[row["symbol"]])
+        _freeze_quality(market, manifest, _date(row["window_start"]), _date(row["window_end"]), row["daily_start"], sampling=row["sampling"], window=windows[row["symbol"]], data_resolution=row["data_resolution"])
         row["version"] = manifest["version"]
         versions[row["symbol"]]["version"] = manifest["version"]
     universe = {
@@ -395,6 +369,7 @@ def preflight(
         _check_identity(market, universe)
     counts = Counter(row["status"] for row in rows)
     return json_safe({
+        "method_version": METHOD_VERSION,
         "as_of": as_of.date().isoformat(),
         "requested_as_of": request.as_of.isoformat() if request.as_of else None,
         "window_days": request.window_days, "scope": request.scope,
@@ -405,7 +380,7 @@ def preflight(
 
 def _result(request, plan, kind="etf_research") -> dict:
     return {
-        "kind": kind, "method_version": METHOD_VERSION,
+        "kind": kind, "method_version": plan.get("method_version", METHOD_VERSION),
         "result_schema_version": RESULT_SCHEMA_VERSION,
         "status": "completed", "as_of": plan["as_of"],
         "request": request.model_dump(mode="json"), "universe": plan["universe"],
@@ -435,64 +410,76 @@ def _bundle(store, market, request, row, universe, *, statistics_only=False) -> 
     manifest = store.snapshot(row["symbol"], row["version"], persist=False)
     if manifest is None:
         raise MarketDataError("DATA_VERSION_NOT_FOUND: 冻结的行情版本已不可用")
-    sampling = row.get("sampling")
-    if sampling and manifest.get("etf_sampling") != sampling:
-        raise MarketDataError("冻结的统计样本与研究窗口不一致，请重新预检")
-    if sampling and sampling.get("excluded_days") and not statistics_only:
-        raise MarketDataError("此快照仅供完整日统计；参数回放需补齐分钟行情")
-    config = request.execution.backtest(row["symbol"], row["window_start"], row["window_end"])
-    if sampling and sampling.get("excluded_days"):
-        # The full-window certificate intentionally does not cover failed days.
-        # Check the frozen complete-day intervals, never today's mutable ledger.
-        actions = market.repository.auxiliary(
-            row["symbol"], "actions", version=manifest.get("auxiliary_versions", {}).get("actions"),
+    data_resolution = manifest.get("data_resolution")
+    v5 = data_resolution is not None
+    if v5:
+        data_resolution = validate_data_resolution(manifest, row["window_start"], row["window_end"])
+        if row.get("data_resolution", {}).get("plan_hash") != data_resolution["plan_hash"]:
+            raise MarketDataError("DATA_RESOLUTION_MISMATCH: 行结果与冻结逐日计划不一致")
+        sampling = row.get("sampling") or resolution_sampling(data_resolution)
+        if manifest.get("etf_sampling") != sampling:
+            raise MarketDataError("冻结的统计样本与研究窗口不一致，请重新预检")
+        config = request.execution.backtest(
+            row["symbol"], row["window_start"], row["window_end"], data_policy=ETF_DATA_POLICY,
         )
-        if actions is None:
-            raise MarketDataError("冻结的公司行动资料已不可用，请重新预检")
-        calendar = _calendar(market, row["symbol"], manifest)
-        window = calendar[(calendar >= _date(row["window_start"])) & (calendar <= _date(row["window_end"]))]
-        excluded = set(sampling["excluded_days"])
-        good = [day for day in window if day.date().isoformat() not in excluded]
-        if (
-            len(window) != request.window_days
-            or len(good) != sampling.get("valid_days")
-            or len(good) / len(window) + 1e-12 < MIN_COMPLETE_DAY_RATIO
-            or not frozen_quality_state(manifest, "1day", window[0], window[-1])
-            or any(not frozen_quality_state(manifest, "1min", day, day) for day in good)
-        ):
-            raise MarketDataError("冻结的完整分钟交易日质量凭证不可用，请重新预检")
     else:
+        # Old ready snapshots remain reproducible through their strict v1-v4
+        # path. A limited snapshot can never silently gain v5 semantics.
+        if row.get("data_status") == "limited" or (row.get("sampling") or {}).get("excluded_days"):
+            raise MarketDataError("旧版 limited 结果不能自动升级为 v5 回放；请按新规则重新研究")
+        sampling = row.get("sampling")
+        config = request.execution.backtest(row["symbol"], row["window_start"], row["window_end"])
         readiness = market.readiness(config, row["version"], settlement=not statistics_only)
         if not readiness["ready"] or readiness.get("degraded_days"):
-            raise MarketDataError("请求窗口不满足严格分钟计算条件：" + "；".join(gap.get("message", "") for gap in readiness.get("gaps", [])))
+            raise MarketDataError("旧版快照不满足严格分钟计算条件：" + "；".join(gap.get("message", "") for gap in readiness.get("gaps", [])))
     if statistics_only:
         from .market_data.consumer import load_native_bundle
         data = load_native_bundle(market, config, row["version"], statistics_only=True)
     else:
         data = market.load_backtest_bundle(config, row["version"])
-    if sampling:
+    if v5:
         data.metadata["etf_sampling"] = sampling.copy()
-    # Retain the independent daily risk lookback. The replay engine itself
-    # still obeys the selected minute window's start and end dates.
-    daily_version = int(manifest["market_versions"]["1day"]["version"])
-    daily = market.repository.bars(
-        row["symbol"], "1day", version=daily_version,
-        start=row.get("daily_start"), end=row["window_end"],
-    )
-    data.daily = daily.rename(columns={"timestamp": "date"})
-    if "date" in data.daily:
-        data.daily["date"] = pd.to_datetime(data.daily.date).dt.normalize()
-    daily_state = frozen_quality_state(
-        manifest, "1day", row.get("daily_start", row["window_start"]), row["window_end"],
-    ) or market.repository.validation_state(
-        row["symbol"], "1day", version=daily_version,
-        calendar_version=manifest.get("auxiliary_versions", {}).get("calendar"),
-        start=row.get("daily_start", row["window_start"]), end=row["window_end"],
-    )
-    data.metadata["mddd_history_verified"] = bool(
-        daily_state.get("verified_from") and daily_state.get("verified_through")
-        and not daily_state.get("pending") and not daily_state.get("failed")
-    )
+        data.metadata["data_resolution"] = data_resolution
+        # The v5 consumer returns only plan-accepted sessions and frozen
+        # history_daily_days. Verify the full 250-session MDDD window against
+        # that frozen list and the returned frame; never consult today's ledger.
+        history = data.daily.copy()
+        if not history.empty:
+            history["date"] = pd.to_datetime(history.date, errors="coerce").dt.normalize()
+            valid_dates = set(history.loc[
+                pd.to_numeric(history.close, errors="coerce").gt(0)
+                & pd.to_numeric(history.volume, errors="coerce").gt(0)
+                & pd.to_numeric(history.tradestatus, errors="coerce").eq(1), "date",
+            ].dt.strftime("%Y-%m-%d"))
+            calendar = _calendar(market, row["symbol"], manifest)
+            expected = {day.date().isoformat() for day in calendar[calendar <= _date(row["window_end"])][-250:]}
+            accepted_dates = {
+                item["date"] for item in data_resolution["days"]
+                if item["mode"] in {"minute", "daily"}
+            }
+            frozen_daily_dates = set(data_resolution.get("history_daily_days") or []) | accepted_dates
+            data.metadata["mddd_history_verified"] = bool(
+                len(expected) == 250 and expected.issubset(frozen_daily_dates)
+                and expected.issubset(valid_dates)
+            )
+        else:
+            data.metadata["mddd_history_verified"] = False
+    else:
+        # Legacy snapshots have no resolution plan. Keep their strict historic
+        # behavior while deriving MDDD trust only from frozen certificates.
+        daily_version = int(manifest["market_versions"]["1day"]["version"])
+        daily = market.repository.bars(
+            row["symbol"], "1day", version=daily_version,
+            start=row.get("daily_start"), end=row["window_end"],
+        )
+        if not daily.empty:
+            daily = daily.rename(columns={"timestamp": "date"})
+            daily["date"] = pd.to_datetime(daily.date).dt.normalize()
+            daily = daily.loc[daily.date.map(
+                lambda day: bool(frozen_quality_state(manifest, "1day", day, day)),
+            )].copy()
+            data.daily = daily
+        data.metadata["mddd_history_verified"] = len(data.daily) >= 250
     _check_identity(market, universe)
     return data
 
@@ -520,19 +507,53 @@ def validate_candidates(
     *, stopped: Callable[[], str | None], progress: Callable[[float, str], None] | None = None,
 ) -> dict:
     from .engine import run_backtest
-    from .etf_statistics import generate_candidates
+    from .etf_statistics import generate_candidates, generate_candidates_with_diagnostics
     from .price_basis import price_factor_at
 
-    candidates = generate_candidates(row.get("grid_basis") or {})
+    basis = row.get("grid_basis") or {}
+    basis = dict(basis)
+    grid_basis = dict(basis.get("grid_basis") or basis)
+    current = _finite(grid_basis.get("current_raw_price"))
+    if current is not None and grid_basis.get("current_price_basis") != "as_of_adjusted":
+        # Grid bounds are calculated in the as-of adjusted price basis.
+        # Convert the final raw close into that same basis before comparing.
+        price_date = grid_basis.get("current_price_date") or row["window_end"]
+        current_factor = price_factor_at(row.get("actions_applied", []), _date(price_date))
+        if math.isfinite(current_factor) and current_factor > 0:
+            grid_basis["current_raw_price"] = current * current_factor
+    grid_basis["price_basis"] = "as_of_adjusted"
+    basis["grid_basis"] = grid_basis
+    candidates = generate_candidates(basis)
+    generated = (generate_candidates_with_diagnostics(basis) if not candidates
+                 else {"candidates": candidates, "reason_code": None, "constraints": {}})
     validation = {"status": "unavailable", "candidates": [], "recommendation": None, "forward_config": None}
     if not candidates:
-        validation["reason"] = "价格区间、步长范围或 Tick 约束没有形成有效候选"
+        validation.update(status="no_candidates", reason_code=generated["reason_code"],
+                          constraints=generated["constraints"])
+        source_date = grid_basis.get("current_price_date")
+        source_name = {"minute": "分钟线", "daily": "日线"}.get(
+            grid_basis.get("current_price_source"), "可信行情",
+        )
+        observed_at = f"截至 {source_date} 的最近有效收盘" if source_date else "现有可信收盘"
+        if generated["reason_code"] == "current_at_or_below_lower":
+            validation["reason"] = (
+                f"{observed_at}（{source_name}）{grid_basis['current_raw_price']:.4f} 元低于建议区间下界 "
+                f"{grid_basis['lower_price']:.7f} 元，因此未生成网格"
+            )
+        elif generated["reason_code"] == "current_at_or_above_upper":
+            validation["reason"] = (
+                f"{observed_at}（{source_name}）{grid_basis['current_raw_price']:.4f} 元高于建议区间上界 "
+                f"{grid_basis['upper_price']:.7f} 元，因此未生成网格"
+            )
+        else:
+            validation["reason"] = f"未生成有效网格：{generated['reason_code']}"
         return validation
     start = _date(row["window_start"])
     prior = data.daily[pd.to_datetime(data.daily.date).dt.normalize() < start].sort_values("date")
     prior = prior[(pd.to_numeric(prior.close, errors="coerce") > 0) & (pd.to_numeric(prior.get("tradestatus", 1), errors="coerce") == 1) & (pd.to_numeric(prior.volume, errors="coerce") > 0)]
     if prior.empty:
-        validation["reason"] = "缺少回放开始前的有效估值收盘"
+        validation["reason_code"] = "initial_valuation_missing"
+        validation["reason"] = "缺少回放开始前的有效估值收盘，无法初始化本金和持仓"
         return validation
     price_factor = price_factor_at(row.get("actions_applied", []), _date(prior.iloc[-1]["date"]))
     if not math.isfinite(price_factor) or price_factor <= 0:
@@ -550,6 +571,8 @@ def validate_candidates(
             **{key: parameters[key] / price_factor for key in ("reference_price", "lower_price", "upper_price")},
         }
         config = request.execution.backtest(row["symbol"], row["window_start"], row["window_end"], **patch)
+        if data.metadata.get("data_resolution"):
+            config.data_policy = ETF_DATA_POLICY
         candidate = {
             **parameters, "id": index + 1, "qualified": False, "reasons": [],
             "replay_config": config.model_dump(mode="json"),
@@ -604,11 +627,14 @@ def validate_candidates(
     validation.update(status="completed", recommendation=winner)
     forward_start = _date(row["window_end"]) + pd.Timedelta(days=1)
     forward_end = max(forward_start, _date(latest_closed_date()))
-    validation["forward_config"] = request.execution.backtest(
+    forward = request.execution.backtest(
         row["symbol"], forward_start.date(), forward_end.date(),
         selection_asof=row["window_end"], reference_price_mode="manual",
         **{key: winner[key] for key in ("buy_step", "sell_step", "reference_price", "lower_price", "upper_price")},
-    ).model_dump(mode="json")
+    )
+    if data.metadata.get("data_resolution"):
+        forward.data_policy = ETF_DATA_POLICY
+    validation["forward_config"] = forward.model_dump(mode="json")
     return validation
 
 
@@ -626,10 +652,13 @@ def run_etf_research(
         "market_state": None,
         "eligible": False, "filter_reasons": [], "gss_score": None,
         "rank": None, "score_cohort_size": 0, "score_contributions": {},
+        "replay_allowed": bool(item.get(
+            "replay_allowed",
+            item.get("status") == "ready" and not (item.get("sampling") or {}).get("excluded_days"),
+        )),
         "validation": {
-            "status": "unavailable" if item["status"] == "limited" else "not_selected",
-            "candidates": [], "recommendation": None, "forward_config": None,
-            **({"reason": "有效完整日统计可用；参数回放需先补齐窗口内分钟行情，再创建新的研究"} if item["status"] == "limited" else {}),
+            "status": "not_selected", "candidates": [],
+            "recommendation": None, "forward_config": None,
         },
     } for item in plan["rows"]]
     started = time.monotonic()
@@ -644,10 +673,13 @@ def run_etf_research(
             try:
                 data = _bundle(store, market, request, row, plan["universe"], statistics_only=True)
                 statistics = compute_etf_statistics(data, row["window_end"], request.window_days)
-                statistics["warnings"] = list(dict.fromkeys([*row["warnings"], *statistics.get("warnings", [])]))
+                statistics["warnings"] = list(dict.fromkeys([
+                    *row["warnings"], *getattr(data, "warnings", []), *statistics.get("warnings", []),
+                ]))
                 row.update(statistics)
                 if row["status"] != "completed":
                     row["data_status"] = row["status"]
+                    row["replay_allowed"] = False
                     if statistics.get("warnings"):
                         row["gaps"].append(_gap("statistics", statistics["warnings"][-1]))
                 del data
@@ -656,6 +688,7 @@ def run_etf_research(
                     _set_stop(result, "data_generation_changed")
                     break
                 row.update(status="data_not_ready", data_status="data_not_ready")
+                row["replay_allowed"] = False
                 row["gaps"] = [*row["gaps"], _gap("quality", str(exc))]
         if progress:
             progress(.02 + .48 * (index + 1) / max(1, len(result["rows"])), f"统计 ETF {index + 1}/{len(result['rows'])} · {row['symbol']}")
@@ -667,11 +700,18 @@ def run_etf_research(
             score_etfs(result["rows"])
             result["ranking_complete"] = True
     if result["ranking_complete"]:
-        eligible = sorted(
-            [row for row in result["rows"] if row.get("eligible") and row["status"] == "completed" and row["data_status"] == "ready"
-             and (row.get("gss_score") is not None or len(result["rows"]) == 1)],
-            key=lambda row: (-(row.get("gss_score") or 0), row["symbol"]),
-        )[:request.validation_top_k]
+        eligible_rows = [row for row in result["rows"]
+                         if row.get("eligible") and row.get("replay_allowed")]
+        ranked = sorted(
+            (row for row in eligible_rows if row.get("gss_score") is not None),
+            key=lambda row: (-(row["gss_score"]), row["symbol"]),
+        )
+        scored_symbols = {row["symbol"] for row in ranked}
+        unscored = sorted(
+            (row for row in eligible_rows if row["symbol"] not in scored_symbols),
+            key=lambda row: row["symbol"],
+        )
+        eligible = (ranked + unscored)[:request.validation_top_k]
         for index, row in enumerate(eligible):
             reason = stopped()
             if reason:
@@ -679,10 +719,15 @@ def run_etf_research(
                 break
             try:
                 data = _bundle(store, market, request, row, plan["universe"])
+                row["warnings"] = list(dict.fromkeys([
+                    *row.get("warnings", []), *getattr(data, "warnings", []),
+                ]))
                 row["validation"] = validate_candidates(
                     request, row, data, stopped=stopped,
                     progress=(lambda fraction, message: progress(.50 + .49 * (index + fraction) / max(1, len(eligible)), message)) if progress else None,
                 )
+                if row["validation"].get("reason_code") == "initial_valuation_missing":
+                    row["replay_allowed"] = False
                 del data
                 if row["validation"].get("stop_reason"):
                     _set_stop(result, row["validation"]["stop_reason"])
@@ -700,6 +745,7 @@ def run_etf_research(
         "eligible": sum(bool(row.get("eligible")) for row in result["rows"]),
         "validated": sum(row["validation"]["status"] in {"completed", "no_qualified"} for row in result["rows"]),
         "recommended": sum(row["validation"].get("recommendation") is not None for row in result["rows"]),
+        "no_candidates": sum(row["validation"]["status"] == "no_candidates" for row in result["rows"]),
         **{name: 0 for name in ("ready", "limited", "pending_validation", "insufficient_history", "data_not_ready")},
         **dict(Counter(row["data_status"] for row in result["rows"])),
     }
@@ -784,6 +830,6 @@ def run_local_validation(store, request, plan, *, market=None, progress=None, ca
 
 def request_fingerprint(request, plan) -> str:
     return hashlib.sha256(json.dumps(
-        {"method_version": METHOD_VERSION, "request": request.model_dump(mode="json"), "universe": plan["universe"]},
+        {"method_version": plan.get("method_version", METHOD_VERSION), "request": request.model_dump(mode="json"), "universe": plan["universe"]},
         sort_keys=True, ensure_ascii=False, default=str,
     ).encode()).hexdigest()

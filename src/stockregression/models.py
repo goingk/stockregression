@@ -82,6 +82,7 @@ class BacktestConfig(BaseModel):
     start_date: date
     end_date: date | None = None
     frequency: Frequency = "1m"
+    data_policy: Literal["minute_verified_daily_then_skip_v1"] | None = None
     initial_shares: int = Field(default=1000, ge=0, multiple_of=100)
     min_shares: int = Field(default=0, ge=0, multiple_of=100)
     max_shares: int | None = Field(default=2000, ge=0, multiple_of=100)
@@ -142,6 +143,8 @@ class BacktestConfig(BaseModel):
     @model_serializer(mode="wrap")
     def serialize_config(self, handler):
         values = handler(self)
+        if self.data_policy is None:
+            values.pop("data_policy", None)
         legacy = {"initial_cash", "initial_position", "min_position", "max_position", "buy_quantity", "sell_quantity", "dca_frequency"}
         modern = {"initial_shares", "min_shares", "max_shares", "buy_shares", "sell_shares", "dca", "reference_price_mode", "reserve_cash", "selection_asof"}
         for key in legacy if self.schema_version in (2, 3) else modern:
@@ -158,6 +161,8 @@ class BacktestConfig(BaseModel):
 
     @model_validator(mode="after")
     def valid_range(self):
+        if self.data_policy is not None and not self.symbol.startswith(("1", "5")):
+            raise ValueError("逐日数据策略仅适用于 ETF")
         if self.parameter_links.spacing and self.buy_step != self.sell_step:
             raise ValueError("统一买卖间距时 buy_step 与 sell_step 必须相等")
         if self.parameter_links.shares and self.buy_shares != self.sell_shares:

@@ -1897,6 +1897,8 @@ class MarketDataService:
         instrument = self.store.instrument(symbol) or {}
         asset_type = str(instrument.get("asset_type") or "")
         manifest = self.store.snapshot(symbol, version) if version else self.store.snapshot(symbol)
+        if (manifest or {}).get("data_resolution") or getattr(config, "data_policy", None):
+            return self._resolution_readiness(config, version, manifest, settlement=settlement)
         if version and not manifest:
             return {
                 "ready": False, "symbol": symbol, "frequency": config.frequency,
@@ -2114,6 +2116,75 @@ class MarketDataService:
                 "calendar_version": calendar_version,
                 "preparation": {"symbol": symbol, "frequency": target,
                 "start": str(config.start_date), "end": str(config.end_date) if config.end_date else None}}
+
+    def resolution_manifest(self, config: BacktestConfig, version: str | None = None, *, manifest=None) -> dict:
+        """Bind a new policy once; historical consumers only read that plan."""
+        from copy import deepcopy
+        from ..data_resolution import (
+            POLICY, build_data_resolution, validate_data_resolution,
+            resolution_intervals, resolution_snapshot_version, _digest,
+        )
+        selected = manifest or self.store.snapshot(config.symbol, version)
+        if selected is None:
+            raise MarketDataError("DATA_VERSION_NOT_FOUND: 冻结的行情版本已不可用")
+        requested = getattr(config, "data_policy", None)
+        if requested not in (None, POLICY):
+            raise MarketDataError("DATA_RESOLUTION_MISMATCH: 不支持的数据处理策略")
+        if selected.get("data_resolution"):
+            validate_data_resolution(selected, config.start_date, config.end_date)
+            return selected
+        if version is not None:
+            raise MarketDataError("DATA_RESOLUTION_MISSING: 历史版本没有冻结逐日策略，请新建研究")
+        if requested != POLICY:
+            raise MarketDataError("DATA_RESOLUTION_MISSING: 未指定逐日数据策略")
+        selected = deepcopy(selected)
+        references = selected.get("market_versions", {})
+        auxiliary = selected.get("auxiliary_versions", {})
+        if "1day" not in references or auxiliary.get("calendar") is None:
+            raise MarketDataError("缺少冻结日线或真实交易日历，无法制定逐日策略")
+        end = config.end_date or references["1day"].get("last")
+        days = self.repository.trading_days(config.symbol, config.start_date, end,
+            calendar_version=auxiliary["calendar"], daily_version=int(references["1day"]["version"]))
+        plan = build_data_resolution(self, config.symbol, selected, days)
+        plan["requested_start"] = str(config.start_date)
+        plan["requested_end"] = pd.Timestamp(end).date().isoformat()
+        plan["plan_hash"] = _digest({key: value for key, value in plan.items() if key != "plan_hash"})
+        selected["data_resolution"] = plan
+        intervals = {timeframe: resolution_intervals(plan, timeframe) for timeframe in ("1day", "1min")}
+        intervals["1day"] = [{"start": day, "end": day, "status": "complete"}
+                               for day in plan.get("prior_daily_days", [])] + intervals["1day"]
+        selected["quality_evidence"] = {"schema_version": 1, "rules_version": VALIDATION_RULES_VERSION,
+            "market_versions": {key: int(item["version"]) for key, item in references.items()},
+            "auxiliary_versions": dict(auxiliary), "intervals": intervals}
+        selected["version"] = resolution_snapshot_version(selected)
+        self.store.remember_market_snapshots([selected])
+        return selected
+
+    def _resolution_readiness(self, config, version, manifest, *, settlement=True) -> dict:
+        from .consumer import _load_resolved_bundle
+        base = {"ready": False, "symbol": config.symbol, "frequency": config.frequency,
+            "asset_type": "etf", "gaps": [], "warnings": [], "degraded_days": [], "skipped_days": [],
+            "checked_start": str(config.start_date), "checked_end": str(config.end_date) if config.end_date else None,
+            "snapshot_version": version, "preparation": {"symbol": config.symbol,
+            "frequency": config.frequency, "start": str(config.start_date), "end": str(config.end_date) if config.end_date else None}}
+        try:
+            selected = self.resolution_manifest(config, version, manifest=manifest)
+            data = _load_resolved_bundle(self, config, selected, statistics_only=not settlement, summary_only=True)
+            plan = selected["data_resolution"]
+            base.update(data_resolution=plan, snapshot_version=selected["version"],
+                package_id=selected.get("package_id"), calendar_version=selected.get("auxiliary_versions", {}).get("calendar"),
+                degraded_days=[day for day in plan["days"] if day["mode"] == "daily"],
+                skipped_days=[day for day in plan["days"] if day["mode"] == "skip"], warnings=data.warnings)
+            if not data.quality["usable_days"]:
+                base["gaps"].append({"kind": "no_usable_days", "message": "请求窗口内没有可信价格日；ETF 保留，但参数收益无法评价"})
+            prior = data.daily[(data.daily.date < pd.Timestamp(config.start_date)) & data.daily.close.gt(0)
+                               & data.daily.tradestatus.eq(1) & data.daily.volume.gt(0)]
+            if prior.empty:
+                base["gaps"].append({"kind": "reference_price", "message": "开始日期前没有可信收盘价，无法初始化持仓本金"})
+            base["ready"] = not base["gaps"]
+        except (ValueError, MarketDataError) as exc:
+            base["gaps"].append({"kind": "data_resolution", "message": str(exc)})
+        return base
 
     def _validation_covers(
         self, dataset: dict | None, start, end, *, version: int | None = None,

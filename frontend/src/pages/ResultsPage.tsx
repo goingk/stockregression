@@ -1,3 +1,4 @@
+import TableViewport from '../TableViewport'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { EChartsOption } from 'echarts'
 import { Download, RefreshCw } from 'lucide-react'
@@ -362,14 +363,14 @@ export default function ResultsPage({ selectedResultId, selectedCompareId, view,
         {!compareId ? <p className='field-hint'>在右上角选择另一条已保存回测结果。对照读取失败不会影响当前结果。</p> : compareId === selectedId ? <p className='inline-warning'>A/B 对照需要两条不同的结果。</p> : compareError ? <ErrorBox message={compareError} onRetry={() => setCompareRetryToken(token => token + 1)} /> : compareLoading && !compareResult ? <Loading label='独立读取对照结果…' /> : compareResult ? <>
           {compareLoading && <p className='inline-warning'>正在刷新对照结果，当前显示上次成功读取的内容。</p>}
           <p className={comparisonDifferences.length ? 'inline-warning' : 'field-hint'}>{comparisonDifferences.length ? '两侧以下口径不同：' + comparisonDifferences.join('、') + '。数值并列展示，不据此排名。' : '两侧标的、区间、费用口径与数据版本一致，可按同一口径逐项核对。'}</p>
-          <div className='table-wrap'><table><thead><tr><th>项目</th><th>A · 当前</th><th>B · 对照</th></tr></thead><tbody>{comparisonRows.map(row => <tr key={row.label}><td>{row.label}</td><td>{row.left}</td><td>{row.right}</td></tr>)}</tbody></table></div>
-          <div className='table-wrap results-compare-metrics'><table><thead><tr><th>网格指标</th><th>A</th><th>B</th><th>差值（A − B）</th></tr></thead><tbody>{Object.entries(metricLabels).map(([key, label]) => {
+          <TableViewport className='table-wrap' owner='local' stickyKeyColumn={1}><table><thead><tr><th>项目</th><th>A · 当前</th><th>B · 对照</th></tr></thead><tbody>{comparisonRows.map(row => <tr key={row.label}><td>{row.label}</td><td>{row.left}</td><td>{row.right}</td></tr>)}</tbody></table></TableViewport>
+          <TableViewport className='table-wrap results-compare-metrics' owner='local' stickyKeyColumn={1}><table><thead><tr><th>网格指标</th><th>A</th><th>B</th><th>差值（A − B）</th></tr></thead><tbody>{Object.entries(metricLabels).map(([key, label]) => {
             const left = result.strategies?.grid?.metrics?.[key]
             const right = compareResult.strategies?.grid?.metrics?.[key]
             const difference = left == null || right == null || !Number.isFinite(left) || !Number.isFinite(right) ? null : left - right
             const display = (value: number | null | undefined) => percentMetrics.includes(key) ? percent(value) : key === 'total_fees' ? money(value) : value == null || !Number.isFinite(value) ? '—' : String(value)
             return <tr key={key}><td>{label}</td><td>{display(left)}</td><td>{display(right)}</td><td className={difference == null ? '' : difference >= 0 ? 'gain' : 'loss'}>{percentMetrics.includes(key) ? percent(difference) : difference == null ? '—' : String(difference)}</td></tr>
-          })}</tbody></table></div>
+          })}</tbody></table></TableViewport>
           {comparisonDifferences.length > 0 && <p className='field-hint'>差值仅供核对，不表示更优：口径不一致时，收益率、回撤和费用不能直接排名。</p>}
         </> : <Empty title='对照结果不可用' detail='可移除对照后重新选择。' />}
       </Card>}
@@ -396,7 +397,7 @@ export default function ResultsPage({ selectedResultId, selectedCompareId, view,
         </div>
       </Disclosure>
       <Disclosure id='results-metrics' title='完整收益指标' summary={strategies.length + ' 类策略 · 收益、风险、费用与超额'}>
-        <div className='table-wrap'><table><thead><tr><th>指标</th>{strategies.map((strategy) => <th key={strategy.key}>{strategy.name}</th>)}</tr></thead><tbody>
+        <TableViewport className='table-wrap' owner='local' stickyKeyColumn={1}><table><thead><tr><th>指标</th>{strategies.map((strategy) => <th key={strategy.key}>{strategy.name}</th>)}</tr></thead><tbody>
           {Object.entries(metricLabels).map(([key, label]) => <tr key={key}><td>{label}</td>{strategies.map((strategy) => {
             const value = strategy.value.metrics?.[key]
             const shown = percentMetrics.includes(key) ? percent(value) : countMetrics.includes(key) ? value == null || !Number.isFinite(value) ? '—' : String(value) : key === 'total_fees' ? money(value) : value == null || !Number.isFinite(value) ? '—' : value.toFixed(2)
@@ -408,7 +409,7 @@ export default function ResultsPage({ selectedResultId, selectedCompareId, view,
             const excess = strategy.key === 'matched_funding_hold' || strategyReturn == null || baselineReturn == null || !Number.isFinite(strategyReturn) || !Number.isFinite(baselineReturn) ? null : strategyReturn - baselineReturn
             return <td key={strategy.key} className={excess == null ? '' : excess >= 0 ? 'gain' : 'loss'}>{excess == null ? '—' : (excess * 100).toFixed(2)}</td>
           })}</tr>
-        </tbody></table></div>
+        </tbody></table></TableViewport>
       </Disclosure>
       <Disclosure id='results-candles' title='K 线与成交标记' summary={(result.config?.frequency ?? '频率未知') + ' · ' + (reference?.name ?? '策略')}>
         <Card title={result.symbol + ' K 线与交易'} subtitle={'每根 K 线覆盖自身开盘到下一根 bar 开盘；窗口外或缺口内的成交不画标记。标记取自 ' + (reference?.name ?? '策略') + ' 成交记录。'} action={<div className='button-row'><span className='field-hint'>{barsRange}</span><Button variant='quiet' busy={earlierLoading} disabled={!earlierBefore || barsLoading} onClick={loadEarlier}>加载更早</Button></div>}>
@@ -417,22 +418,22 @@ export default function ResultsPage({ selectedResultId, selectedCompareId, view,
       </Disclosure>
       <Disclosure id='results-period-returns' title='年 / 月收益' summary={unit === 'year' ? '年度分解' : '月度分解'}>
         <Card subtitle={periodData.length ? '区间收益 = 期末峰值本金净值 − 期初峰值本金净值：本期期初取上一期期末净值，首期取运行基准；各期相加等于整段收益。' : '当前结果没有峰值本金净值，无法计算区间收益。'} action={<div className='segmented'><button className={unit === 'year' ? 'selected' : ''} onClick={() => onViewChange('year')}>年度</button><button className={unit === 'month' ? 'selected' : ''} onClick={() => onViewChange('month')}>月度</button></div>}>
-          {periodData.length ? <div className='table-wrap'><table><thead><tr><th>区间</th>{strategies.map((strategy) => <th key={strategy.key}>{strategy.name}</th>)}</tr></thead><tbody>{periodData.map((row) => <tr key={row.period}><td>{row.period}</td>{strategies.map((strategy) => {
+          {periodData.length ? <TableViewport className='table-wrap' owner='local' stickyKeyColumn={1}><table><thead><tr><th>区间</th>{strategies.map((strategy) => <th key={strategy.key}>{strategy.name}</th>)}</tr></thead><tbody>{periodData.map((row) => <tr key={row.period}><td>{row.period}</td>{strategies.map((strategy) => {
             const value = row.values[strategy.key]
             if (value === undefined) return <td key={strategy.key}>—</td>
             if (value === null) return <td key={strategy.key}>不可计算</td>
             return <td key={strategy.key} className={value >= 0 ? 'gain' : 'loss'}>{percent(value)}</td>
-          })}</tr>)}</tbody></table></div> : <Empty title='后端未提供区间收益' detail='此结果的净值点没有峰值本金口径数据，无法计算年 / 月收益。' />}
+          })}</tr>)}</tbody></table></TableViewport> : <Empty title='后端未提供区间收益' detail='此结果的净值点没有峰值本金口径数据，无法计算年 / 月收益。' />}
         </Card>
       </Disclosure>
       <Disclosure id='results-trades' title='成交记录' summary={(reference?.value.trades?.length ?? 0) + ' 笔 · ' + (reference?.name ?? '策略')}>
         <Card action={<SelectInput aria-label='查看策略成交' value={reference?.key ?? ''} onChange={(event) => setTradeStrategy(event.target.value)}>{strategies.map((strategy) => <option value={strategy.key} key={strategy.key}>{strategy.name}</option>)}</SelectInput>}>
-          <div className='table-wrap scroll-table'>{reference?.value.trades?.length ? <table><thead><tr><th>时间</th><th>方向</th><th>数量</th><th>价格</th><th>费用</th><th>现金</th><th>持股</th><th>原因</th></tr></thead><tbody>{reference.value.trades.slice().reverse().map((trade, index) => <tr key={index}><td>{String(trade.timestamp).replace('T', ' ').slice(0, 19)}</td><td><Badge tone={String(trade.side).toLowerCase().includes('buy') ? 'red' : 'green'}>{sideText(trade.side)}</Badge></td><td>{money(trade.quantity, 0)}</td><td>{money(trade.price, 3)}</td><td>{money(trade.fees)}</td><td>{money(trade.cash)}</td><td>{money(trade.shares, 0)}</td><td>{reasonText(trade.reason)}</td></tr>)}</tbody></table> : <Empty title='没有成交记录' />}</div>
+          <TableViewport className='table-wrap scroll-table' owner='local' stickyKeyColumn={1}>{reference?.value.trades?.length ? <table><thead><tr><th>时间</th><th>方向</th><th>数量</th><th>价格</th><th>费用</th><th>现金</th><th>持股</th><th>原因</th></tr></thead><tbody>{reference.value.trades.slice().reverse().map((trade, index) => <tr key={index}><td>{String(trade.timestamp).replace('T', ' ').slice(0, 19)}</td><td><Badge tone={String(trade.side).toLowerCase().includes('buy') ? 'red' : 'green'}>{sideText(trade.side)}</Badge></td><td>{money(trade.quantity, 0)}</td><td>{money(trade.price, 3)}</td><td>{money(trade.fees)}</td><td>{money(trade.cash)}</td><td>{money(trade.shares, 0)}</td><td>{reasonText(trade.reason)}</td></tr>)}</tbody></table> : <Empty title='没有成交记录' />}</TableViewport>
         </Card>
       </Disclosure>
       <Disclosure id='results-rejections' title='拒单记录' summary={(reference?.value.rejections?.length ?? 0) + ' 条 · ' + (reference?.name ?? '策略')}>
         <Card action={<SelectInput aria-label='查看策略拒单' value={reference?.key ?? ''} onChange={(event) => setTradeStrategy(event.target.value)}>{strategies.map((strategy) => <option value={strategy.key} key={strategy.key}>{strategy.name}</option>)}</SelectInput>}>
-          <div className='table-wrap scroll-table'>{reference?.value.rejections?.length ? <table><thead><tr><th>时间</th><th>方向</th><th>拒单原因</th><th>申请数量</th></tr></thead><tbody>{reference.value.rejections.map((row, index) => <tr key={index}><td>{String(row.timestamp ?? '').replace('T', ' ')}</td><td>{sideText(row.side)}</td><td>{reasonText(row.reason)}</td><td>{String(row.requested_quantity ?? '—')}</td></tr>)}</tbody></table> : <Empty title='无拒单记录' />}</div>
+          <TableViewport className='table-wrap scroll-table' owner='local' stickyKeyColumn={1}>{reference?.value.rejections?.length ? <table><thead><tr><th>时间</th><th>方向</th><th>拒单原因</th><th>申请数量</th></tr></thead><tbody>{reference.value.rejections.map((row, index) => <tr key={index}><td>{String(row.timestamp ?? '').replace('T', ' ')}</td><td>{sideText(row.side)}</td><td>{reasonText(row.reason)}</td><td>{String(row.requested_quantity ?? '—')}</td></tr>)}</tbody></table> : <Empty title='无拒单记录' />}</TableViewport>
         </Card>
       </Disclosure>
       <Disclosure id='results-data-quality' title='数据质量与运行提示' summary={(result.warnings?.length ?? 0) + ' 条提示 · 数据版本 ' + (result.data_version ?? '未知')}>

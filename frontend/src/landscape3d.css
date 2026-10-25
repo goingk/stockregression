@@ -5,7 +5,7 @@
 .landscape-fixed-tick { display:flex; align-items:center; gap:12px; min-width:240px; }
 .landscape-fixed-tick input[type="range"] { flex:1; min-width:120px; accent-color:#2563eb; }
 .research-landscape-table { display:flex; flex-direction:column; align-items:flex-start; gap:10px; }
-.research-landscape-table .table-scroll { width:100%; overflow:auto; }
+.research-landscape-table .table-viewport { width:100%; }
 .research-landscape-table table { width:100%; border-collapse:collapse; font-size:12px; }
 .research-landscape-table th,.research-landscape-table td { padding:8px 10px; border-bottom:1px solid #e7ebf1; text-align:right; white-space:nowrap; }
 .research-landscape-table th:first-child,.research-landscape-table td:first-child { text-align:left; }

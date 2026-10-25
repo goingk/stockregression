@@ -358,6 +358,7 @@ export function useConfigFormModel({ value, onChange, onFeeDefaultsEdit, onDefau
   const set = <K extends keyof BacktestConfig>(key: K, next: BacktestConfig[K]) => {
     onChange(previous => {
       const updated = { ...previous, [key]: next }
+      if (key === 'frequency' && next !== '1m') updated.data_policy = undefined
       const links = previous.parameter_links ?? { spacing: false, shares: false }
       if (key === 'buy_step' && links.spacing) updated.sell_step = next as number
       if (key === 'sell_step' && links.spacing) updated.buy_step = next as number
@@ -415,7 +416,8 @@ export function useConfigFormModel({ value, onChange, onFeeDefaultsEdit, onDefau
     symbolChangeRequested.current = true
     autoEnd.current = true
     onDateIntentChange?.(false)
-    onChange(previous => ({ ...previous, symbol, reference_price_mode: 'auto', reference_price: null }))
+    onChange(previous => ({ ...previous, symbol, reference_price_mode: 'auto', reference_price: null,
+      data_policy: /^[15]/.test(symbol) ? previous.data_policy : undefined }))
   }
   const changeStart = (next: string) => {
     onDateIntentChange?.(true)
@@ -447,6 +449,7 @@ export function ConfigSymbolDateFields({ model, purpose = 'backtest', footer }: 
       <NumField label="参考价格" value={value.reference_price} onChange={changeReference} suffix="元" min={.001} hint={reference ? `${reference.reference_date} 收盘 ${reference.reference_price} 元 · ${value.reference_price_mode === 'auto' ? '自动' : '手动'}` : '开始日期前最近交易日收盘价'} />
     </div>
     {referenceError && value.reference_price == null && value.reference_price_mode === 'auto' && <p className="inline-warning">{referenceError}</p>}
+    {value.data_policy && <p className="field-hint">沿用 ETF 研究的数据规则：分钟线优先，缺失日使用可靠日线，仍不可用时只跳过当天。</p>}
     {footer && <div className="research-basics-actions">{footer}</div>}
   </>
 }

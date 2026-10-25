@@ -1298,6 +1298,8 @@ export interface components {
              * @enum {string}
              */
             frequency: "1m" | "5m" | "15m" | "30m" | "60m" | "1d";
+            /** Data Policy */
+            data_policy?: "minute_verified_daily_then_skip_v1" | null;
             /**
              * Initial Shares
              * @default 1000

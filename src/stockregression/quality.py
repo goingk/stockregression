@@ -266,9 +266,13 @@ def apply_price_limits(daily: pd.DataFrame, calendar: pd.DataFrame, metadata: di
 
 
 def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actions: pd.DataFrame, calendar: pd.DataFrame, start, end, frequency: str, version: str, metadata: dict, profiles: dict) -> DataBundle:
+    from .data_resolution import MODES, POLICY, _digest
     start, end = pd.Timestamp(start).normalize(), pd.Timestamp(end).normalize()
-    if daily.empty:
+    resolution = metadata.get("data_resolution")
+    if daily.empty and resolution is None:
         raise DataQualityError("缺少不复权日线，请先下载或导入日线数据")
+    if daily.empty and "date" not in daily:
+        daily = pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume", "turnover", "tradestatus", "preclose"])
     daily = daily.copy().sort_values("date").drop_duplicates("date", keep="last")
     if metadata.get("listing_date"):
         start = max(start, pd.Timestamp(metadata["listing_date"]))
@@ -276,11 +280,22 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
         raise DataQualityError("所选区间跨越退市日期，缺少退市结算模型；请缩短回测区间")
     if calendar.empty:
         raise DataQualityError("缺少交易日历，不能将没有行情的工作日静默跳过")
-    daily = apply_price_limits(daily, calendar, metadata)
+    if not daily.empty:
+        daily = apply_price_limits(daily, calendar, metadata)
     days = pd.DatetimeIndex(pd.to_datetime(calendar.loc[calendar.date.between(start, end), "date"])).sort_values().unique()
+    resolution_days = {}
+    if resolution is not None:
+        if (resolution.get("policy") != POLICY or resolution.get("plan_hash") != _digest(
+                {key: value for key, value in resolution.items() if key != "plan_hash"})
+                or resolution.get("symbol") != symbol
+                or any(item.get("mode") not in MODES for item in resolution.get("days", []))):
+            raise DataQualityError("RESOLUTION_PLAN_MISMATCH: 未知逐日数据策略")
+        resolution_days = {pd.Timestamp(item["date"]).normalize(): item for item in resolution.get("days", [])}
+        if set(resolution_days) != set(days) or (days.size and (days.min() < start or days.max() > end)):
+            raise DataQualityError("RESOLUTION_PLAN_MISMATCH: 冻结计划交易日与日历不一致")
     daily = daily[daily.date.between(start, end)].copy()
     day_lookup = daily.set_index("date")
-    missing_days = [d.date().isoformat() for d in days if d not in day_lookup.index]
+    missing_days = [d.date().isoformat() for d in days if d not in day_lookup.index and resolution_days.get(d, {}).get("mode") != "skip"]
     if missing_days:
         raise DataQualityError("以下交易日没有日线且无法确认停牌：" + ", ".join(missing_days[:20]))
     if not len(days):
@@ -288,14 +303,24 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
     groups = {day: group.copy() for day, group in minute.groupby(minute.timestamp.dt.normalize())} if not minute.empty else {}
     output, reports, warnings = [], [], []
     for day in days:
+        planned = resolution_days.get(day)
+        if planned and planned.get("mode") == "skip":
+            reports.append({"date": str(day.date()), "mode": "skip", "reason_code": planned.get("reason_code"),
+                            "missing_minutes": 240, "missing_data_minutes": 240, "auction_placeholders": 0,
+                            "reason": planned.get("reason", "日线不可用，跳过当天")})
+            continue
         row = day_lookup.loc[day]
         status = int(row.tradestatus)
         if status not in (0, 1):
             raise DataQualityError(f"{day.date()} 的交易状态未知")
         if status == 0:
+            if planned and planned.get("mode") != "suspended":
+                raise DataQualityError(f"RESOLUTION_PLAN_MISMATCH: {day.date()} 冻结模式与停牌状态不一致")
             reports.append({"date": str(day.date()), "mode": "suspended", "missing_minutes": 0, "missing_data_minutes": 0, "auction_placeholders": 0, "reason": "确认停牌"})
             continue
         if float(row.volume) == 0:
+            if planned and planned.get("mode") != "no_trades":
+                raise DataQualityError(f"RESOLUTION_PLAN_MISMATCH: {day.date()} 冻结模式与无成交状态不一致")
             reports.append({"date": str(day.date()), "mode": "no_trades", "missing_minutes": 0, "missing_data_minutes": 0, "auction_placeholders": 0, "reason": "交易状态正常但全天无成交量"})
             continue
         prices = np.array([row.open, row.high, row.low, row.close], dtype=float)
@@ -305,12 +330,27 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
         slots = minute_slots(day)
         reason = ""
         volume_ratio_error = None
+        price_aggregation_error = None
         missing = len(slots)
         missing_data = missing
         auction_count = 0
         filled = None
         download_needed = frequency != "1d" and part.empty
-        if frequency != "1d" and not part.empty:
+        if planned and planned.get("mode") in ("suspended", "no_trades"):
+            actual = "suspended" if status == 0 else "no_trades" if float(row.volume) == 0 else None
+            if actual != planned["mode"]:
+                raise DataQualityError(f"RESOLUTION_PLAN_MISMATCH: {day.date()} 状态与冻结计划不一致")
+            reports.append({"date": str(day.date()), "mode": actual, "missing_minutes": 0,
+                            "missing_data_minutes": 0, "auction_placeholders": 0,
+                            "reason": planned.get("reason", actual)})
+            continue
+        if planned and planned.get("mode") == "daily":
+            if not np.isfinite(prices).all() or (prices <= 0).any() or float(row.volume) <= 0:
+                raise DataQualityError(f"RESOLUTION_PLAN_MISMATCH: {day.date()} 冻结日线已不可用")
+            filled = pd.DataFrame([{**row.to_dict(), "timestamp": day + pd.Timedelta(hours=15), "frequency": "1d",
+                                    "tradable": True, "is_synthetic": False, "is_skip": False}])
+            reason = planned.get("reason", "分钟线不可用，使用校验通过的日线")
+        elif frequency != "1d" and not part.empty:
             part = part.drop_duplicates("timestamp", keep="last").set_index("timestamp").reindex(slots)
             missing_mask = part.close.isna().to_numpy()
             missing = int(missing_mask.sum())
@@ -330,11 +370,22 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
                 reason = "分钟缺口超过连续3根或全日5根阈值"
             elif missing_mask[0] or missing_mask[120]:
                 reason = "交易时段首分钟缺失，无法因果补齐"
-            elif max(abs(float(observed.high.max()) - row.high), abs(float(observed.low.min()) - row.low), abs(float(observed.iloc[-1].close) - row.close)) > float(metadata.get("price_tick", 0.01)) * 1.1 and missing_data == 0:
+            elif not planned and max(abs(float(observed.high.max()) - row.high), abs(float(observed.low.min()) - row.low), abs(float(observed.iloc[-1].close) - row.close)) > float(metadata.get("price_tick", 0.01)) * 1.1 and missing_data == 0:
                 reason = "完整分钟价格聚合与日线不符"
             else:
+                if planned and missing_data == 0:
+                    difference = max(abs(float(observed.high.max()) - row.high),
+                                     abs(float(observed.low.min()) - row.low),
+                                     abs(float(observed.iloc[-1].close) - row.close))
+                    if difference > float(metadata.get("price_tick", 0.01)) * 1.1:
+                        # Both sources have independent frozen certificates.
+                        # A cross-source aggregate discrepancy is diagnostic;
+                        # it must not silently change an already frozen mode.
+                        price_aggregation_error = difference
                 if missing_data == 0 and np.isfinite(row.volume) and row.volume > 0:
                     volume_ratio_error = abs(float(observed.volume.sum()) / float(row.volume) - 1)
+                if planned and missing_data:
+                    raise DataQualityError(f"RESOLUTION_PLAN_MISMATCH: {day.date()} 冻结分钟日出现缺口")
                 previous = part.close.groupby(np.repeat([0, 1], 120)).ffill()
                 for price in ("open", "high", "low", "close"):
                     part.loc[missing_mask, price] = previous.loc[missing_mask]
@@ -347,12 +398,16 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
                 filled = part.reset_index(drop=True)
         elif frequency != "1d":
             reason = "没有分钟数据"
+        if planned and planned.get("mode") == "minute" and filled is None:
+            raise DataQualityError(f"RESOLUTION_PLAN_MISMATCH: {day.date()} 冻结分钟日不可用：{reason}")
+        if planned and planned.get("mode") not in ("minute", "daily", "suspended", "no_trades"):
+            raise DataQualityError(f"RESOLUTION_PLAN_MISMATCH: {day.date()} 有未知处理模式")
         if filled is None:
             filled = pd.DataFrame([{**row.to_dict(), "timestamp": day + pd.Timedelta(hours=15), "frequency": "1d", "tradable": True, "is_synthetic": False}])
             mode = "daily"
         else:
-            mode = "minute"
-            if frequency != "1m":
+            mode = "daily" if planned and planned.get("mode") == "daily" else "minute"
+            if mode == "minute" and frequency != "1m":
                 size = int(frequency[:-1])
                 resampled = []
                 for offset in (0, 120):
@@ -384,6 +439,7 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
                         "missing_data_minutes": missing_data if frequency != "1d" else 0,
                         "auction_placeholders": auction_count, "download_needed": download_needed,
                         "volume_ratio_error": volume_ratio_error,
+                        "price_aggregation_error": price_aggregation_error,
                         "volume_diagnostic": volume_diagnostic, "reason": report_reason})
     bars = pd.concat(output, ignore_index=True).sort_values("timestamp").reset_index(drop=True) if output else pd.DataFrame(columns=MINUTE_COLUMNS + ["frequency", "tradable", "is_synthetic"])
     minute_days = sum(report["mode"] == "minute" for report in reports)
@@ -400,6 +456,9 @@ def prepare_bundle(symbol: str, minute: pd.DataFrame, daily: pd.DataFrame, actio
     volume_mismatch_days = sum(report.get("volume_ratio_error") is not None and report["volume_ratio_error"] > 0.01 for report in reports)
     if volume_mismatch_days:
         warnings.append(f"{volume_mismatch_days} 个交易日分钟与日线成交量比存在偏差；分钟数据已保留，请核对来源单位或成交量口径。")
+    price_mismatch_days = sum(report.get("price_aggregation_error") is not None for report in reports)
+    if price_mismatch_days:
+        warnings.append(f"{price_mismatch_days} 个交易日的分钟价格汇总与日线存在差异；两种来源均有独立校验凭证，按冻结的真实分钟线回放，未用日线改写分钟价格。")
     if daily_days and frequency != "1d":
         warnings.append(f"{daily_days} 个交易日已整日降级为日线；不还原盘中路径")
     if metadata.get("is_demo"):

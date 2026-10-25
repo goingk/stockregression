@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   buildEtfResearchRequest, dataStatusLabel, dataStatusTone, etfDataStatusCounts, etfMarketStateMetricText, etfMetricRows, etfMetricText,
-  etfResearchStartCount, samplingCoverageText, samplingStatisticsText,
+  etfResearchStartCount, samplingCoverageText, samplingStatisticsText, dataResolutionSummary, minuteAndGssSampleText, validationSummary,
   etfSymbolValidationPath, executionError, executionFromBacktest, filterReasonLabel, filterReasonsText,
   gapText, isEtfResearchResult, isEtfValidationResult, itemsPageCount, parseSelectedEtfSymbols,
   marketStateStatusLabel, researchLinkResourceId, researchLinkStatusLabel, researchLinkSummaryText,
@@ -116,7 +116,7 @@ test('metric rows preserve declared sampling labels, values and missing reasons'
   assert.equal(etfMetricText('missing', null), '—')
   const v3Rows = etfMetricRows({ path_redundancy_daily_mean: .41, path_redundancy_5d_mean: .52, path_redundancy_20d_mean: .63, path_redundancy_daily_mean_1m: .44 }, {})
   assert.deepEqual(v3Rows.map(row => row.key), ['path_redundancy_daily_mean', 'path_redundancy_5d_mean', 'path_redundancy_20d_mean', 'path_redundancy_daily_mean_1m'])
-  assert.equal(v3Rows[0].label, '日均路径冗余（5m 采样）')
+  assert.equal(v3Rows[0].label, '日均价格往返程度（PR，5m）')
   assert.equal(v3Rows[0].value, '41.00%')
   const legacyRows = etfMetricRows({ path_redundancy: .7 }, {})
   assert.deepEqual(legacyRows.map(row => row.key), ['path_redundancy'])
@@ -150,7 +150,7 @@ test('saved rows translate filter reasons, data statuses, gaps and stop reasons'
 
 test('result counts separate ranking outcomes from dynamic data-status counts', () => {
   const counts = etfDataStatusCounts({
-    total: 10, scored: 7, eligible: 4, validated: 3, recommended: 2,
+    total: 10, scored: 7, eligible: 4, validated: 3, recommended: 2, no_candidates: 3,
     ready: 5, limited: 1, pending_validation: 2, insufficient_history: 1, data_not_ready: 1, unavailable: 1,
   })
   assert.deepEqual(counts.map(item => [item.status, item.label, item.count]), [
@@ -169,12 +169,32 @@ test('ETF research can start with limited-only availability and tolerates legacy
   assert.equal(etfResearchStartCount({ ready: 0 }), 0)
 })
 
+test('v5 reports daily resolution and separate own minute coverage from GSS common days', () => {
+  const resolution = {
+    policy: 'minute_verified_daily_then_skip_v1', plan_hash: 'frozen-plan',
+    days: [{ date: '2026-10-08', mode: 'daily', reason_code: 'minute_unavailable', reason: '分钟缺口' }],
+    counts: { minute: 242, daily: 7, skip: 1, suspended: 0, no_trades: 0 },
+    first_evaluable_date: '2025-10-25', last_evaluable_date: '2026-10-24',
+  }
+  assert.equal(dataResolutionSummary(resolution), '分钟 242 日 · 日线降级 7 日 · 跳过 1 日')
+  assert.equal(minuteAndGssSampleText({ valid_days: 250, statistics_days: 242, minute_complete_days: 250, gss_days: 242 }), '完整分钟日 250 日 · GSS 样本 242 日')
+  assert.equal(validationSummary({ status: 'no_candidates', reason_code: 'current_at_or_below_lower', constraints: { current_price: 1.02, lower_price: 1.1128013 } }), '现价 1.0200 元低于建议区间下界约 1.1128 元，因此未生成网格。')
+})
+
+test('legacy limited status remains distinct from v5 data-resolution replay eligibility', () => {
+  assert.equal(dataResolutionSummary(undefined), '逐日数据使用情况未提供（历史结果）')
+  assert.equal(validationSummary({ status: 'not_selected' }), '尚未自动试算；查看详情了解筛选条件和下一步。')
+  assert.equal(validationSummary({ status: 'no_qualified', reason: '候选未达到最低成交数。' }), '候选未达到最低成交数。')
+  assert.equal(etfResearchStartCount({ ready: 0, limited: 0, replay_allowed: 3 }), 3)
+})
+
 test('sampling labels show per-symbol complete coverage and actual common statistic days', () => {
   const sampling = { expected_days: 120, valid_days: 117, coverage_ratio: .975, excluded_days: ['2026-01-02'], statistics_excluded_days: ['2026-01-02', '2026-01-05'], statistics_days: 115, comparable: true }
   assert.equal(samplingCoverageText(sampling), '完整覆盖率 97.5%')
   assert.equal(samplingStatisticsText(sampling), '统计样本 115 日')
   assert.equal(samplingCoverageText(undefined), '覆盖率 —')
   assert.equal(samplingStatisticsText(undefined), '统计样本 —')
+  assert.equal(minuteAndGssSampleText({ ...sampling, comparable: false }), '完整分钟日 117 日 · 未参与横向评分')
 })
 
 test('ETF result kinds keep validation reports out of ranking rendering', () => {
@@ -206,5 +226,5 @@ test('research links prefer immutable results and keep summaries compact', () =>
   })
   assert.match(summary, /固定 已完成 · 先验 daily_state_v1 · 入选 3/)
   assert.match(summary, /自适应 运行中/)
-  assert.match(summary, /当前建议 无合格候选 · 候选 12/)
+  assert.match(summary, /当前建议 已试算但未达标 · 候选 12/)
 })

@@ -3848,6 +3848,18 @@
             "title": "Frequency",
             "default": "1m"
           },
+          "data_policy": {
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "minute_verified_daily_then_skip_v1"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Data Policy"
+          },
           "initial_shares": {
             "type": "integer",
             "multipleOf": 100.0,

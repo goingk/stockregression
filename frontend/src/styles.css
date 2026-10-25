@@ -1424,3 +1424,38 @@ td small.table-sub, .muted-cell { color:#64748b; }
   .research-free-variable-badge { margin-left: 0; }
   .research-section-stack-actions { width: 100%; justify-content: flex-start; }
 }
+
+
+/* Shared table viewport behavior. Local tables own both scroll axes; parent tables
+   stay in document flow so task reports have one vertical scroll container. */
+.table-viewport { min-width:0; width:100%; max-width:100%; }
+.table-viewport--local { max-height:var(--table-viewport-max-height, 360px); overflow:auto; overscroll-behavior:contain; scrollbar-gutter:stable; }
+.table-viewport--parent { max-height:none; overflow:visible; }
+.table-viewport table { width:100%; border-collapse:separate; border-spacing:0; }
+.table-viewport th, .scroll-table:not(.table-viewport) th { position:sticky; top:0; z-index:20; background:#f8f9fb; box-shadow:0 1px 0 #e5eaf1; }
+.table-viewport--parent table { table-layout:fixed; min-width:0; }
+.table-viewport--parent th, .table-viewport--parent td { white-space:normal; overflow-wrap:anywhere; word-break:normal; }
+.table-viewport--parent.scroll-table { max-height:none; }
+.table-viewport:focus-visible { outline:2px solid #4b83c3; outline-offset:2px; }
+.table-viewport tbody tr { --table-row-background:#fff; }
+.table-viewport tbody tr:hover { --table-row-background:#f5f8fc; }
+.table-viewport tbody tr.selected-row { --table-row-background:#eaf2ff; }
+.table-viewport tbody tr:hover td, .table-viewport tbody tr.selected-row td { background:var(--table-row-background); }
+.table-viewport[data-sticky-key-column="1"] tr > :nth-child(1),
+.table-viewport[data-sticky-key-column="2"] tr > :nth-child(2),
+.table-viewport[data-sticky-key-column="3"] tr > :nth-child(3),
+.table-viewport[data-sticky-key-column="4"] tr > :nth-child(4) { position:sticky; left:0; z-index:2; background:var(--table-row-background,#fff); box-shadow:1px 0 0 #e6ebf2; }
+.table-viewport[data-sticky-key-column="1"] thead tr > :nth-child(1),
+.table-viewport[data-sticky-key-column="2"] thead tr > :nth-child(2),
+.table-viewport[data-sticky-key-column="3"] thead tr > :nth-child(3),
+.table-viewport[data-sticky-key-column="4"] thead tr > :nth-child(4) { z-index:21; background:#f8f9fb; }
+.table-viewport[data-sticky-key-column="1"] tbody tr:hover > td:nth-child(1), .table-viewport[data-sticky-key-column="1"] tbody tr.selected-row > td:nth-child(1),
+.table-viewport[data-sticky-key-column="2"] tbody tr:hover > td:nth-child(2), .table-viewport[data-sticky-key-column="2"] tbody tr.selected-row > td:nth-child(2),
+.table-viewport[data-sticky-key-column="3"] tbody tr:hover > td:nth-child(3), .table-viewport[data-sticky-key-column="3"] tbody tr.selected-row > td:nth-child(3),
+.table-viewport[data-sticky-key-column="4"] tbody tr:hover > td:nth-child(4), .table-viewport[data-sticky-key-column="4"] tbody tr.selected-row > td:nth-child(4) { background:var(--table-row-background); }
+.report-drawer { overflow-y:auto; overscroll-behavior:contain; }
+@media(max-width:720px) {
+  .table-viewport--local { max-height:var(--table-viewport-max-height, 320px); }
+  .table-viewport--parent table { table-layout:fixed; }
+  .table-viewport--parent th, .table-viewport--parent td { padding:8px 6px; }
+}

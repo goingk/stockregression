@@ -58,6 +58,9 @@ GRID_BASIS_KEYS = (
     "lower_price",
     "upper_price",
     "current_raw_price",
+    "current_price_date",
+    "current_price_source",
+    "current_price_basis",
     "atr30_pct",
     "svr",
     "realized_skewness",
@@ -93,6 +96,7 @@ class _Context:
     days: pd.DatetimeIndex
     coverage_complete: bool
     raw_bars: pd.DataFrame
+    raw_daily: pd.DataFrame
     adjusted_bars: pd.DataFrame
     adjusted_daily: pd.DataFrame
     profile_bars: pd.DataFrame
@@ -103,6 +107,7 @@ class _Context:
     points_5m: pd.DataFrame
     points_30m: pd.DataFrame
     sampling: dict | None = None
+    data_resolution: dict | None = None
     minute_integrity: dict | None = None
     mddd_history_verified: bool = False
     mddd_unavailable_reason: str | None = None
@@ -1302,9 +1307,8 @@ def _prepare(data: DataBundle, as_of: pd.Timestamp, window_days: int) -> _Contex
                 sampling.get("expected_days") != window_days
                 or not own_excluded.issubset(excluded) or not excluded.issubset(expected)
                 or sampling.get("statistics_days") != count
-                or count / window_days + 1e-12 < MIN_COMPLETE_DAY_RATIO
             ):
-                raise _StatsError("data_not_ready", "有效完整日统计样本不满足90%覆盖要求")
+                raise _StatsError("data_not_ready", "冻结的分钟统计日与交易日历不一致")
             ignored = {
                 pd.Timestamp(item["date"]).normalize()
                 for item in (data.quality or {}).get("days", [])
@@ -1345,11 +1349,11 @@ def _prepare(data: DataBundle, as_of: pd.Timestamp, window_days: int) -> _Contex
     return _Context(
         as_of=as_of, requested_window_days=window_days,
         calendar_days=calendar_days, days=selected, coverage_complete=coverage_complete,
-        raw_bars=raw_bars, adjusted_bars=adjusted_bars, adjusted_daily=adjusted_daily,
+        raw_bars=raw_bars, raw_daily=raw_daily, adjusted_bars=adjusted_bars, adjusted_daily=adjusted_daily,
         profile_bars=profile_bars, factors=factors, warnings=warnings,
         minute_kind=minute_kind, points_1m=points_1m, points_5m=points_5m,
         points_30m=points_30m,
-        sampling=sampling, minute_integrity=integrity,
+        sampling=sampling, data_resolution=metadata.get("data_resolution"), minute_integrity=integrity,
         mddd_history_verified=mddd_verified,
         mddd_unavailable_reason=mddd_warning,
     )
@@ -1360,7 +1364,10 @@ def _empty_grid_basis(
 ) -> dict[str, Any]:
     return {
         "reference_price": None, "lower_price": None, "upper_price": None,
-        "current_raw_price": current_raw, "atr30_pct": None, "svr": None,
+        "current_raw_price": current_raw, "current_price_date": None,
+        "current_price_source": None, "current_price_basis": "as_of_adjusted",
+        "current_raw_price_unadjusted": None,
+        "atr30_pct": None, "svr": None,
         "realized_skewness": None, "realized_kurtosis": None, "price_tick": price_tick,
     }
 
@@ -1449,14 +1456,60 @@ def _set_metric(
     }
 
 
-def _current_raw_close(context: _Context) -> float | None:
+def _current_trusted_close(context: _Context) -> tuple[float | None, str | None, str | None, float | None]:
+    """Return the latest plan-approved close, adjusted to the decision basis."""
+    plan = context.data_resolution
+    modes = {item.get("date"): item.get("mode") for item in (plan or {}).get("days", [])}
+    if plan:
+        candidates = [
+            item["date"] for item in plan["days"]
+            if item.get("mode") in {"minute", "daily"}
+        ]
+        for day in reversed(candidates):
+            stamp = pd.Timestamp(day).normalize()
+            mode = modes[day]
+            if mode == "minute" and not context.raw_bars.empty:
+                part = context.raw_bars[
+                    context.raw_bars.timestamp.dt.normalize().eq(stamp)
+                    & ~context.raw_bars.frequency.eq("1d")
+                ]
+                if not part.empty:
+                    values = pd.to_numeric(part.close, errors="coerce")
+                    valid = np.isfinite(values) & values.gt(0)
+                    if valid.any():
+                        raw = _finite(values[valid].iloc[-1])
+                        source = "minute"
+                    else:
+                        raw = None
+                        source = None
+                else:
+                    raw, source = None, None
+            else:
+                raw, source = None, None
+            if raw is None and not context.raw_daily.empty:
+                row = context.raw_daily[context.raw_daily.date.eq(stamp)]
+                if not row.empty:
+                    raw = _positive(row.sort_values("date").iloc[-1].get("close"))
+                    if raw is not None:
+                        source = "daily"
+            if raw is not None:
+                factor = price_basis.price_factor_at(context.factors, stamp)
+                adjusted = raw * factor if _finite(factor) is not None and factor > 0 else None
+                if adjusted is not None and math.isfinite(adjusted) and adjusted > 0:
+                    return float(adjusted), stamp.date().isoformat(), source, float(raw)
+        return None, None, None, None
     if context.points_1m.empty:
-        return None
+        return None, None, None, None
     raw = pd.to_numeric(context.points_1m.raw_close, errors="coerce")
     usable = context.points_1m.valid.fillna(False).astype(bool) & np.isfinite(raw) & raw.gt(0)
     if not usable.any():
-        return None
-    return _finite(raw[usable].iloc[-1])
+        return None, None, None, None
+    index = usable[usable].index[-1]
+    stamp = pd.Timestamp(context.points_1m.loc[index, "day"]).normalize()
+    raw_value = _finite(raw.loc[index])
+    factor = price_basis.price_factor_at(context.factors, stamp)
+    adjusted = raw_value * factor if raw_value is not None and _finite(factor) is not None and factor > 0 else None
+    return (adjusted, stamp.date().isoformat(), "minute", raw_value)
 
 
 def _recent_raw_price(context: _Context) -> tuple[float | None, int, int]:
@@ -1490,7 +1543,7 @@ def compute_etf_statistics(
         metrics: dict[str, Any] = {key: None for key in METRIC_KEYS}
         details: dict[str, Any] = {key: {} for key in METRIC_KEYS}
         tick = _price_tick(data)
-        current_raw = _current_raw_close(context)
+        current_raw, current_price_date, current_price_source, current_raw_unadjusted = _current_trusted_close(context)
         if context.sampling and stamp.normalize().date().isoformat() in context.sampling.get("statistics_excluded_days", []):
             official = data.daily[pd.to_datetime(data.daily.date).dt.normalize().le(stamp.normalize())]
             if not official.empty:
@@ -1636,6 +1689,10 @@ def compute_etf_statistics(
 
         grid_basis = _empty_grid_basis(tick, current_raw)
         grid_basis.update({
+            "current_price_date": current_price_date,
+            "current_price_source": current_price_source,
+            "current_price_basis": "as_of_adjusted",
+            "current_raw_price_unadjusted": current_raw_unadjusted,
             "reference_price": _finite(reference),
             "lower_price": _finite(lower_price),
             "upper_price": _finite(upper_price),
@@ -1674,15 +1731,20 @@ def compute_etf_statistics(
             context.warnings.append(
                 f"请求{context.requested_window_days}个交易日，交易日历仅覆盖{len(context.days)}个",
             )
-        elif context.minute_kind != "1m" or context.adjusted_daily.empty or unexpected_missing:
+        elif context.adjusted_daily.empty or unexpected_missing:
             status = "data_not_ready"
             if context.adjusted_daily.empty:
-                context.warnings.append("窗口缺少日线开盘/前收盘历史，IOVR与MDDD不可评价")
+                context.warnings.append("窗口缺少可信日线历史；依赖日线的指标不可评价")
             if unexpected_missing:
                 preview = "、".join(sorted(unexpected_missing)[:5])
                 context.warnings.append(
                     f"{len(unexpected_missing)}个未排除日期未满足240槽有效OHLC/校准要求：{preview}",
                 )
+        elif context.minute_kind != "1m":
+            # A v5 sample may contain only verified daily bars. Keep the ETF
+            # and its daily metrics; minute-only metrics remain individually
+            # null with their own sample diagnostics.
+            status = "completed"
         filter_reasons: list[str] = []
         if status != "completed":
             filter_reasons.append(f"status_{status}")
@@ -2017,8 +2079,57 @@ def generate_candidates(basis: dict) -> list[dict]:
     return result
 
 
+def generate_candidates_with_diagnostics(basis: dict) -> dict[str, Any]:
+    """Generate candidates and retain the first concrete reason when none fit."""
+    if not isinstance(basis, Mapping):
+        return {"candidates": [], "reason_code": "grid_basis_missing", "constraints": {}}
+    source = basis.get("grid_basis") if isinstance(basis.get("grid_basis"), Mapping) else basis
+    reference = _positive(source.get("reference_price"))
+    lower = _positive(source.get("lower_price"))
+    upper = _positive(source.get("upper_price"))
+    current = _positive(source.get("current_raw_price"))
+    tick = _positive(source.get("price_tick")) or 0.001
+    atr = _finite(source.get("atr30_pct"))
+    mean = _positive(source.get("mean_raw_price")) or current
+    reason_code = None
+    if None in (reference, lower, upper, current):
+        reason_code = "grid_basis_missing"
+    elif current <= lower:
+        reason_code = "current_at_or_below_lower"
+    elif current >= upper:
+        reason_code = "current_at_or_above_upper"
+    elif reference <= lower or reference >= upper:
+        reason_code = "reference_outside_band"
+    elif atr is None or atr < 0 or mean is None:
+        reason_code = "step_inputs_invalid"
+    elif max(1.2 * atr, 5.0 * tick / mean) > 0.05 + 1e-12:
+        reason_code = "minimum_step_exceeds_maximum"
+    candidates = generate_candidates(basis)
+    if candidates:
+        return {"candidates": candidates, "reason_code": None, "constraints": {}}
+    if reason_code is None:
+        reason_code = "tick_grid_invalid"
+    return {
+        "candidates": [], "reason_code": reason_code,
+        "constraints": {
+            "reference_price": reference, "lower_price": lower,
+            "upper_price": upper, "current_price": current,
+            "current_price_date": source.get("current_price_date"),
+            "current_price_source": source.get("current_price_source"),
+            "current_price_basis": source.get("current_price_basis", "as_of_adjusted"),
+            "current_raw_price_unadjusted": _finite(source.get("current_raw_price_unadjusted")),
+            "price_tick": tick, "atr30_pct": atr,
+            "minimum_step": max(1.2 * atr, 5.0 * tick / mean) if atr is not None and mean else None,
+            "maximum_step": 0.05,
+            "inequalities": ["lower < current_price < upper", "lower < reference_price < upper"],
+            "price_basis": source.get("price_basis", "as_of_adjusted"),
+        },
+    }
+
+
 __all__ = [
     "compute_etf_statistics",
     "score_etfs",
     "generate_candidates",
+    "generate_candidates_with_diagnostics",
 ]

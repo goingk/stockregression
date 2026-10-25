@@ -16,8 +16,8 @@ import {
 } from '../components'
 import type { BacktestConfig, FeeConfig, ResultSummary } from '../types'
 import {
-  ETF_MARKET_STATE_METRICS, ETF_METRIC_DEFINITIONS, buildEtfResearchRequest, dataStatusLabel, dataStatusTone, etfDataStatusCounts, etfMarketStateMetricText, etfMetricRows, etfMetricText,
-  etfResearchStartCount, samplingCoverageText, samplingStatisticsText,
+  ETF_MARKET_STATE_METRICS, ETF_METRIC_DEFINITIONS, buildEtfResearchRequest, dataStatusLabel, dataStatusTone, etfDataStatusCounts, etfMarketStateMetricText, etfMetricRows,
+  etfResearchStartCount, samplingCoverageText, samplingStatisticsText, dataResolutionSummary, minuteAndGssSampleText, validationSummary,
   etfRequestKey, etfSymbolValidationPath, executionFromBacktest, filterReasonsText, gapText, itemsPageCount,
   marketStateStatusLabel, marketStateStatusTone, parseSelectedEtfSymbols, researchLinkActive, researchLinkResourceId,
   researchLinkStatusLabel, researchLinkStatusTone, researchLinkSummaryText, resultStatusLabel, resultStatusTone, safeItemsOffset, scoreDisplay, settingsError,
@@ -28,6 +28,8 @@ import type {
   EtfResearchRequest, EtfResearchSettings, EtfResult, EtfRow, EtfValidationRow,
 } from '../etfResearch.ts'
 import { isEtfResearchResult, isEtfValidationResult } from '../etfResearch.ts'
+import TableViewport from '../TableViewport'
+import './EtfResearchPage.css'
 
 type Props = {
   requestedResult?: string | null
@@ -70,7 +72,7 @@ function jsonText(value: unknown) {
 }
 
 function ValidationBadge({ status }: { status: string }) {
-  const tone = status === 'completed' ? 'green' : status === 'no_qualified' ? 'amber' : status === 'partial' ? 'amber' : status === 'cancelled' ? 'neutral' : status === 'unavailable' ? 'red' : 'neutral'
+  const tone = status === 'completed' ? 'green' : ['no_qualified', 'no_candidates', 'partial', 'unavailable'].includes(status) ? 'amber' : status === 'cancelled' ? 'neutral' : 'neutral'
   return <Badge tone={tone}>{validationStatusLabel(status)}</Badge>
 }
 
@@ -144,6 +146,8 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
   const historyLatest = useRef(new LatestRequest<string>())
   const itemLatest = useRef(new LatestRequest<string>())
   const detailLatest = useRef(new LatestRequest<string>())
+  const detailSection = useRef<HTMLElement | null>(null)
+  const detailRequested = useRef(false)
   const researchLinksLatest = useRef(new LatestRequest<string>())
   const taskSnapshotReady = useRef(false)
   const seenTerminalEtfJobs = useRef('')
@@ -166,6 +170,8 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
   }
 
   const requestKey = useMemo(() => execution ? etfRequestKey(settings, execution) : '', [settings, execution])
+  const latestRequestKey = useRef(requestKey)
+  latestRequestKey.current = requestKey
   const currentPreflight = preflight?.key === requestKey ? preflight.value : null
   const requestError = settingsError(settings, execution)
   const selectedSymbols = parseSelectedEtfSymbols(settings.symbolsText)
@@ -295,6 +301,7 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
 
   const openSymbol = async (symbol: string) => {
     if (!selectedResultId) return
+    detailRequested.current = true
     const existing = items.find(item => item.symbol === symbol)
     setSelectedSymbol(symbol)
     setDetail(existing ?? null)
@@ -311,6 +318,13 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
       if (detailLatest.current.isCurrent(ticket)) setDetailLoading(false)
     }
   }
+
+  useEffect(() => {
+    if (!detailRequested.current || detailLoading || detail?.symbol !== selectedSymbol || !detailSection.current) return
+    detailRequested.current = false
+    detailSection.current.scrollIntoView({ block: 'start', behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })
+    detailSection.current.focus({ preventScroll: true })
+  }, [detail?.symbol, detailLoading, selectedSymbol])
 
   useEffect(() => {
     if (!selectedResultId || !detail?.symbol) {
@@ -409,12 +423,28 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
   const startResearch = async () => {
     if (!execution) return
     if (requestError) { setError(requestError); return }
-    if (!currentPreflight) { setError('研究范围已修改，请先重新预检。'); return }
-    if (etfResearchStartCount(currentPreflight.counts) < 1) { setError('预检范围没有可研究的就绪或统计可用 ETF。'); return }
-    setResearchBusy(true); setError('')
+    const requestSnapshot = latestRequestKey.current
+    setResearchBusy(true); setError(''); setNotice('正在检查本地数据和研究范围…')
     try {
+      const checked = await preflightFor(settings, execution)
+      if (latestRequestKey.current !== requestSnapshot) {
+        setNotice('设置在预检期间发生变化，未提交旧请求；请再次点击开始研究。')
+        return
+      }
+      const reportsReplayEligibility = checked.rows.some(row => typeof row.replay_allowed === 'boolean')
+      const available = reportsReplayEligibility
+        ? checked.rows.filter(row => row.replay_allowed).length
+        : etfResearchStartCount(checked.counts)
+      if (available < 1) {
+        const reasons = checked.rows
+          .filter(row => reportsReplayEligibility ? !row.replay_allowed : !['ready', 'limited'].includes(row.status))
+          .map(row => `${row.symbol}：${[...row.gaps.map(gapText), ...row.warnings].filter(Boolean).join('；') || dataStatusLabel(row.status)}`)
+          .slice(0, 3)
+        setNotice(`本地没有可用于研究的 ETF。${reasons.length ? '原因：' + reasons.join('。') + '。' : ''}可点击“校验本地行情”后重试。`)
+        return
+      }
       await submitResearch(buildEtfResearchRequest(settings, execution), 'ETF研究')
-    } catch (cause) { setError(err(cause)) } finally { setResearchBusy(false) }
+    } catch (cause) { setError(err(cause)); setNotice('') } finally { setResearchBusy(false) }
   }
 
   const startDataValidation = async () => {
@@ -505,11 +535,9 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
   const pageCount = itemsPageCount(visibleItemsTotal, pageSize)
   const currentPage = Math.floor(safeItemsOffset(itemsOffset, visibleItemsTotal, pageSize) / pageSize) + 1
   const metricRows = detail ? etfMetricRows(detail.metrics ?? {}, detail.metric_details ?? {}) : []
-  const isV3 = researchResult?.method_version === 'etf_min_grid_v3' || researchResult?.method_version === 'etf_min_grid_v4'
-  const isV4Method = researchResult?.method_version === 'etf_min_grid_v4'
-  const redundancyDaily = (row: typeof items[number]) => row.metrics.path_redundancy_daily_mean
-  const redundancy5d = (row: typeof items[number]) => row.metrics.path_redundancy_5d_mean
-  const redundancy20d = (row: typeof items[number]) => row.metrics.path_redundancy_20d_mean
+  const isV3 = researchResult?.method_version === 'etf_min_grid_v3' || researchResult?.method_version === 'etf_min_grid_v4' || researchResult?.method_version === 'etf_min_grid_v5'
+  const isV4Method = researchResult?.method_version === 'etf_min_grid_v4' || researchResult?.method_version === 'etf_min_grid_v5'
+  const isV5Method = researchResult?.method_version === 'etf_min_grid_v5'
   const detailValidation = detail?.validation
   const detailCandidates = detailValidation?.candidates ?? []
   const gridBasis = detail?.grid_basis
@@ -538,10 +566,11 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
     <PageHeader
       eyebrow='ETF GRID RESEARCH'
       title='ETF 网格研究'
-      description='先预检本地分钟数据，再生成横截面排名，并按排名自动核验前 N 只 ETF 的样本内参数。'
+      description='选择本地 ETF，分析网格特征并试算历史参数；达标结果可带入后续回测。'
       action={<div className='button-row'><Button variant='quiet' busy={historyLoading} onClick={() => { void tasks.refresh(); void loadHistory(0, false) }}><RefreshCw size={14} />刷新历史</Button><Button variant='secondary' disabled={!selectedResultId} onClick={() => void exportResult()}><Download size={14} />导出 JSON</Button></div>}
     />
-    <div className='etf-sample-banner'><Badge tone='blue'>样本内</Badge><span>排名与候选回放均为样本内；截止日后的区间可在回测页另行回测。</span></div>
+    <div className='etf-sample-banner'><Badge tone='blue'>样本内研究</Badge><span>分析和历史试算用于比较，不代表未来收益保证。</span></div>
+    <ol className='etf-research-steps' aria-label='ETF 研究步骤'><li><b>1</b><span>选择 ETF</span></li><li><b>2</b><span>分析网格特征</span></li><li><b>3</b><span>历史试算参数</span></li><li><b>4</b><span>带入后续回测</span></li></ol>
     <Disclosure id='etf-metric-guide' title='指标含义与用途' summary='查看统计指标、GSS 评分和网格参数的简要说明' className='etf-metric-guide'>
       <p className='etf-help-intro'>GSS 是 0–100 分的网格适用性相对评分，分数越高表示在本次候选池中更符合评分偏好的波动与往返特征。它用于初筛，不代表预期收益；不同候选池的分数不宜直接比较。v3 使用 5 分钟作为主采样，1 分钟仅作采样敏感性对照，按相同窗口尺度分别比较；高路径冗余不证明盈利。</p><p className='etf-help-intro'>路径冗余先分别计算每个日、5 日或 20 日窗口的 PR，再对有效窗口等权平均，不是先把日 PR 平滑。日窗口从当天首个采样 bar 开盘到收盘；滚动窗口每日推进，遇到缺口整窗剔除，跨日计算保留真实隔夜位移。0 路程窗口无效。</p>
       <div className='etf-help-metrics'>{ETF_METRIC_DEFINITIONS.map(metric => <div key={metric.key}><h3>{metric.label}</h3><p><b>含义：</b>{metric.meaning}</p><p><b>用途：</b>{metric.usage}</p></div>)}</div>
@@ -552,29 +581,31 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
     </Disclosure>
     {error && <ErrorBox message={error} onClose={() => setError('')} />}
     {notice && <div className='notice success'><span>{notice}</span><button className='text-link' onClick={() => setNotice('')}>收起</button></div>}
-    <div className='etf-research-layout'>
+    <div className='etf-research-layout etf-research-layout--stacked'>
       <aside className='etf-research-config'>
-        <Card title='研究范围' subtitle='预检只检查本地范围和数据状态；选择数据校验后，待任务完成再重新预检。'>
+        <Card title='开始一次 ETF 研究' subtitle='自动检查本地数据；不会下载行情。新规则会按交易日使用分钟、日线降级或跳过。'>
           <div className='form-grid two'>
             <Field label='ETF 范围'><SelectInput value={settings.scope} onChange={event => updateSetting('scope', event.target.value as EtfResearchSettings['scope'])}><option value='watchlist'>自选 ETF</option><option value='local'>全部本地 ETF</option><option value='selected'>指定 ETF</option></SelectInput></Field>
             <Field label='统计窗口（交易日）'><SelectInput value={String(settings.window_days)} onChange={event => updateSetting('window_days', Number(event.target.value) === 250 ? 250 : 120)}><option value='120'>120 日</option><option value='250'>250 日</option></SelectInput></Field>
+            <Field label='截止日' hint='留空时使用本地最近已收盘日。'><TextInput type='date' value={settings.as_of} onChange={event => updateSetting('as_of', event.target.value)} /></Field>
           </div>
           {settings.scope === 'selected' && <Field label='ETF 代码' hint='空格、逗号或分号分隔；6 位代码会按首位补齐交易所。'><TextInput value={settings.symbolsText} onChange={event => updateSetting('symbolsText', event.target.value)} placeholder='例如 510210.SH, 159611.SZ' /></Field>}
           {settings.scope === 'selected' && selectedSymbols.invalid.length > 0 && <p className='inline-warning'>无法识别：{selectedSymbols.invalid.join('、')}</p>}
+          <Disclosure id='etf-advanced-settings' title='高级设置' summary={`自动试算 ${settings.validation_top_k} 只 · 最少成交 ${settings.min_trades} 笔`}>
           <div className='form-grid two'>
-            <Field label='截止日' hint='留空时使用本地分钟数据最近的已收盘交易日。'><TextInput type='date' value={settings.as_of} onChange={event => updateSetting('as_of', event.target.value)} /></Field>
-            <NumField label='自动核验前 N 名' min={0} max={100} step='1' hint='按排名自动回测前 N 只 ETF；填 0 时只生成排名。' value={settings.validation_top_k} onChange={next => next != null && updateSetting('validation_top_k', next)} />
+            <NumField label='自动试算 ETF 数量' min={0} max={100} step='1' hint='优先按排名试算；未评分但可执行的 ETF 按代码补足名额。填 0 时只分析特征。' value={settings.validation_top_k} onChange={next => next != null && updateSetting('validation_top_k', next)} />
             <NumField label='最少成交笔数' min={0} max={1_000_000} step='1' value={settings.min_trades} onChange={next => next != null && updateSetting('min_trades', next)} />
             <NumField label='最大本金回撤' min={.01} max={100} step='1' percentValue suffix='%' value={settings.max_principal_drawdown} onChange={next => next != null && updateSetting('max_principal_drawdown', next)} />
             <NumField label='最长运行时间' min={1} max={86400} step='1' suffix='秒' value={settings.max_runtime_seconds} onChange={next => next != null && updateSetting('max_runtime_seconds', next)} />
           </div>
+          </Disclosure>
           {requestError && <p className='inline-warning'>{requestError}</p>}
-          <div className='etf-launch-actions'><Button variant='secondary' busy={preflightBusy} onClick={() => void runPreflight()}><SearchCheck size={15} />预检范围</Button><Button busy={researchBusy} disabled={!currentPreflight || etfResearchStartCount(currentPreflight.counts) < 1 || Boolean(requestError)} onClick={() => void startResearch()}><FlaskConical size={15} />生成排名与核验</Button></div>
-          <p className='field-hint'>真实分钟覆盖率至少 95%、完整交易日至少 90% 时可统计；缺口日整日排除，有缺口的标的暂不回放参数。</p>
-          {!currentPreflight && preflight && !preflightBusy && <p className='inline-warning'>研究范围或执行参数已修改，请重新预检。</p>}
+          <div className='etf-launch-actions'><Button busy={researchBusy || preflightBusy} disabled={Boolean(requestError)} onClick={() => void startResearch()}><FlaskConical size={15} />开始研究</Button><Button variant='secondary' busy={validationBusy} disabled={Boolean(requestError)} onClick={() => void startDataValidation()}><ShieldCheck size={15} />校验本地行情</Button></div>
+          {preflightError && <ErrorBox message={preflightError} onRetry={() => void runPreflight()} />}
         </Card>
 
-        <Card title='当前回测执行设置' subtitle='从当前回测草稿读取；此处调整只用于本页 ETF 研究，不写入本机默认设置。' action={<Button variant='quiet' disabled={!backtest} onClick={resetExecution}><RefreshCw size={14} />重新读取</Button>}>
+        <Disclosure id='etf-advanced-execution' title='高级设置：持仓与费用' summary={`初始持股 ${execution.initial_shares} 份 · 佣金 ${percent(execution.fees.commission_rate, 3)} · 滑点 ${execution.fees.slippage_bps} 基点`}>
+          <div className='button-row'><Button variant='quiet' disabled={!backtest} onClick={resetExecution}><RefreshCw size={14} />重新读取当前回测草稿</Button></div>
           <div className='form-grid two'>
             <NumField label='初始持股' min={0} step='100' suffix='份' value={execution.initial_shares} onChange={next => next != null && updateExecution('initial_shares', next)} />
             <NumField label='最低持股' min={0} step='100' suffix='份' value={execution.min_shares} onChange={next => next != null && updateExecution('min_shares', next)} />
@@ -590,20 +621,20 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
             </div>
           </Disclosure>
           <p className='field-hint'>数量须为 100 份整数倍。ETF 资金语义沿用当前股数回测：成交时补足所需现金，不在这里设置固定现金预算。</p>
-        </Card>
+        </Disclosure>
       </aside>
 
       <main className='etf-research-main'>
-        <Card title='范围预检' subtitle='只检查数据就绪状态、窗口与版本；不会下载行情或现场扫描正文。' action={<Badge tone={currentPreflight?.counts.data_not_ready || currentPreflight?.counts.pending_validation || currentPreflight?.counts.limited ? 'amber' : currentPreflight ? 'green' : 'neutral'}>{currentPreflight ? '预检完成' : preflightBusy ? '预检中' : '等待预检'}</Badge>}>
-          {preflightBusy && !currentPreflight ? <Loading label='正在检查 ETF 范围…' /> : preflightError && !currentPreflight ? <ErrorBox message={preflightError} onRetry={() => void runPreflight()} /> : !currentPreflight ? <Empty title='先预检研究范围' detail='预检后会显示数据就绪数量、缺口、窗口与锁定版本。' /> : <>
+        <Disclosure id='etf-preflight-details' title='最近一次本地数据检查' summary={currentPreflight ? `${currentPreflight.rows.length} 只 ETF · 截止 ${dateText(currentPreflight.as_of)}` : preflightBusy ? '正在检查…' : '开始研究时自动检查'}>
+          {preflightBusy && !currentPreflight ? <Loading label='正在检查 ETF 范围…' /> : preflightError && !currentPreflight ? <ErrorBox message={preflightError} onRetry={() => void runPreflight()} /> : !currentPreflight ? <p className='field-hint'>点击“开始研究”会自动检查本地数据，并在这里列出各 ETF 的逐日使用情况。</p> : <>
             {preflightError && <ErrorBox message={preflightError} onRetry={() => void runPreflight()} />}
             <div className='stat-grid five etf-preflight-stats'><Stat label='范围总数' value={currentPreflight.counts.total} /><Stat label='就绪' value={currentPreflight.counts.ready} tone='green' /><Stat label='统计可用（受限）' value={currentPreflight.counts.limited ?? 0} tone={currentPreflight.counts.limited ? 'amber' : 'neutral'} /><Stat label='待校验' value={currentPreflight.counts.pending_validation} tone={currentPreflight.counts.pending_validation ? 'amber' : 'neutral'} /><Stat label='其他未就绪' value={currentPreflight.counts.insufficient_history + currentPreflight.counts.data_not_ready} tone={currentPreflight.counts.insufficient_history + currentPreflight.counts.data_not_ready ? 'red' : 'neutral'} /></div>
             <div className='etf-preflight-meta'><span>范围：{scopeLabel(currentPreflight.scope)}</span><span>实际截止：{dateText(currentPreflight.as_of)}</span><span>请求截止：{currentPreflight.requested_as_of ?? '本地最近已收盘日'}</span><span>窗口：{currentPreflight.window_days} 日</span></div>
-            <div className='table-wrap scroll-table etf-preflight-table'><table><thead><tr><th>ETF</th><th>状态</th><th>覆盖率 / 统计样本</th><th>窗口</th><th>锁定版本</th><th>缺口</th><th>提示</th></tr></thead><tbody>{currentPreflight.rows.map(row => <tr key={row.symbol}><td><strong>{row.symbol_name || row.symbol}</strong><small>{row.symbol}</small></td><td><Badge tone={dataStatusTone(row.status)}>{dataStatusLabel(row.status)}</Badge>{row.status === 'limited' && <small>仅使用有效分钟完整交易日统计；暂不回放参数。</small>}</td><td><small>{samplingCoverageText(row.sampling)}<br />{samplingStatisticsText(row.sampling)}</small></td><td>{dateText(row.window_start)}<br />至 {dateText(row.window_end)}</td><td><small>{row.version || '—'}</small></td><td><small>{compactGapText(row.gaps)}</small></td><td><small>{row.warnings.join('；') || '—'}</small></td></tr>)}</tbody></table></div>
-            <div className='etf-preflight-actions'><Button variant='quiet' busy={validationBusy} disabled={currentPreflight.counts.pending_validation + currentPreflight.counts.insufficient_history + currentPreflight.counts.data_not_ready + (currentPreflight.counts.limited ?? 0) === 0} onClick={() => void startDataValidation()}><ShieldCheck size={15} />校验待处理数据</Button><span>{validationJobId ? '数据校验任务运行中，完成后自动重新预检。' : '本地校验只检查现有数据质量，不会下载或补齐行情；缺口仍需补齐分钟数据。'}</span></div>
+            <TableViewport className='etf-preflight-table' owner='local' stickyKeyColumn={1} label='ETF 研究数据预检' maxHeight='280px'><table><thead><tr><th>ETF</th><th>数据状态</th><th>可试算</th><th>数据使用情况</th><th>窗口 / 版本</th><th>说明</th></tr></thead><tbody>{currentPreflight.rows.map(row => <tr key={row.symbol}><td><strong>{row.symbol_name || row.symbol}</strong><small>{row.symbol}</small></td><td><Badge tone={dataStatusTone(row.status)}>{dataStatusLabel(row.status)}</Badge></td><td>{row.replay_allowed ? '是' : '否'}{row.status === 'limited' && <small>历史版本限制</small>}</td><td><small>{row.data_resolution ? dataResolutionSummary(row.data_resolution) : minuteAndGssSampleText(row.sampling)}</small></td><td><small>{dateText(row.window_start)} 至 {dateText(row.window_end)}<br />{row.version || '—'}</small></td><td><small>{[compactGapText(row.gaps), ...row.warnings].filter(Boolean).join('；') || '—'}</small></td></tr>)}</tbody></table></TableViewport>
+            <div className='etf-preflight-actions'><Button variant='quiet' busy={validationBusy} disabled={currentPreflight.counts.pending_validation + currentPreflight.counts.insufficient_history + currentPreflight.counts.data_not_ready + (currentPreflight.counts.limited ?? 0) === 0} onClick={() => void startDataValidation()}><ShieldCheck size={15} />校验待处理数据</Button><span>{validationJobId ? '数据校验任务运行中，完成后自动重新预检。' : '本地校验只检查现有数据；分钟不可用时优先用可靠日线，当天仍不可用则跳过。'}</span></div>
             <Disclosure id='etf-preflight-universe' title='锁定数据包与版本' summary={`${currentPreflight.universe.package_id || '未命名数据包'} · ${currentPreflight.universe.generation || '—'}`}><pre className='json-preview'>{jsonText(currentPreflight.universe)}</pre></Disclosure>
           </>}
-        </Card>
+        </Disclosure>
 
         {validationReport ? <Card title='ETF 本地校验报告' className='etf-history-card etf-validation-report-card' action={historyControls}>
           {historyMore && <div className='button-row etf-history-more'><Button variant='quiet' busy={historyLoading} onClick={() => void loadHistory(historyOffset, true)}>加载更早研究历史</Button></div>}
@@ -615,7 +646,7 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
           <div className='etf-preflight-meta etf-validation-report-meta'><span>数据包：{validationReport.universe.package_id || '—'}</span><span>代际：{validationReport.universe.generation || '—'}</span><span>实际截止：{dateText(validationReport.as_of)}</span><span>请求截止：{validationReport.request.as_of ?? '自动选择'}</span></div>
           <div className='etf-result-actions'><Button variant='quiet' busy={historyLoading || resultLoading || itemsLoading} onClick={() => { void tasks.refresh(); setRefreshToken(token => token + 1) }}><RefreshCw size={14} />刷新报告</Button><Button variant='quiet' onClick={() => void exportResult()}><Download size={14} />导出 JSON</Button><span>校验报告与 ETF 排名分开保存；可从右上角切换到已有研究历史。</span></div>
           <Disclosure id={`etf-validation-universe-${validationReport.id}`} title='锁定数据包与版本' summary={`${validationReport.universe.package_id || '未命名数据包'} · ${validationReport.universe.generation || '—'}`}><pre className='json-preview'>{jsonText(validationReport.universe)}</pre></Disclosure>
-          <div className='table-wrap scroll-table etf-validation-report-table'><table><thead><tr><th>ETF</th><th>状态</th><th>原因与缺口</th><th>窗口 / 版本</th><th>校验明细</th></tr></thead><tbody>{validationItems.map(row => <tr key={row.symbol}><td><strong>{row.symbol_name || row.symbol}</strong><small>{row.symbol}</small></td><td><Badge tone={dataStatusTone(row.status)}>{resultStatusLabel(row.status)}</Badge></td><td><small>{row.reason || row.warnings?.join('；') || '—'}</small>{(row.gaps ?? []).length > 0 && <ul className='etf-report-gaps'>{(row.gaps ?? []).map((gap, index) => <li key={`${gap.kind}-${index}`}>{gapText(gap)}</li>)}</ul>}</td><td><small>{dateText(row.window_start)} 至 {dateText(row.window_end)}<br />版本 {row.version || '—'}</small></td><td>{(row.reports ?? []).length > 0 ? <Disclosure id={`etf-validation-reports-${validationReport.id}-${row.symbol}`} title='reports JSON' summary={`${(row.reports ?? []).length} 项`}><pre className='json-preview'>{jsonText(row.reports)}</pre></Disclosure> : <small>—</small>}</td></tr>)}</tbody></table></div>
+          <TableViewport className='etf-validation-report-table' stickyKeyColumn={1} maxHeight='335px' label='ETF 本地校验明细'><table><thead><tr><th>ETF</th><th>状态</th><th>原因与缺口</th><th>窗口 / 版本</th><th>校验明细</th></tr></thead><tbody>{validationItems.map(row => <tr key={row.symbol}><td><strong>{row.symbol_name || row.symbol}</strong><small>{row.symbol}</small></td><td><Badge tone={dataStatusTone(row.status)}>{resultStatusLabel(row.status)}</Badge></td><td><small>{row.reason || row.warnings?.join('；') || '—'}</small>{(row.gaps ?? []).length > 0 && <ul className='etf-report-gaps'>{(row.gaps ?? []).map((gap, index) => <li key={`${gap.kind}-${index}`}>{gapText(gap)}</li>)}</ul>}</td><td><small>{dateText(row.window_start)} 至 {dateText(row.window_end)}<br />版本 {row.version || '—'}</small></td><td>{(row.reports ?? []).length > 0 ? <Disclosure id={`etf-validation-reports-${validationReport.id}-${row.symbol}`} title='reports JSON' summary={`${(row.reports ?? []).length} 项`}><pre className='json-preview'>{jsonText(row.reports)}</pre></Disclosure> : <small>—</small>}</td></tr>)}</tbody></table></TableViewport>
           {itemsLoading && <Loading label='读取校验明细…' />}
           {!itemsLoading && !validationItems.length && <Empty title='没有校验明细' detail='该报告没有可显示的分页标的。' />}
           <div className='pagination-row etf-ranking-pagination'><span>第 {currentPage} / {pageCount} 页 · 共 {validationItemsTotal} 行</span><div><Button variant='quiet' disabled={itemsOffset <= 0 || itemsLoading} onClick={() => setItemsOffset(current => safeItemsOffset(current - pageSize, validationItemsTotal, pageSize))}>上一页</Button><Button variant='quiet' disabled={itemsOffset + pageSize >= validationItemsTotal || itemsLoading} onClick={() => setItemsOffset(current => safeItemsOffset(current + pageSize, validationItemsTotal, pageSize))}>下一页</Button></div></div>
@@ -623,20 +654,30 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
         <Card title='ETF 研究结果' className='etf-history-card' action={historyControls}>
           {historyMore && <div className='button-row etf-history-more'><Button variant='quiet' busy={historyLoading} onClick={() => void loadHistory(historyOffset, true)}>加载更早 ETF 研究</Button></div>}
           {resultLoading && !result ? <Loading label='读取 ETF 结果…' /> : !selectedResultId ? <Empty title='尚无 ETF 研究结果' detail='完成范围预检后启动排名与核验，或从任务中心打开已有任务。' /> : !researchResult ? <Empty title='未找到 ETF 研究结果' detail='该结果不是 ETF 研究排名；可从右上角切换到已有研究历史。' /> : <>
-            <div className='etf-result-heading'><div><Badge tone={resultStatusTone(researchResult.status)}>{resultStatusLabel(researchResult.status)}</Badge><Badge tone='blue'>样本内</Badge><Badge tone={researchResult.ranking_complete ? 'green' : 'amber'}>{researchResult.ranking_complete ? '排名完整' : '排名范围有限'}</Badge></div><span>截止 {dateText(researchResult.as_of)} · {researchResult.rows_count} 只 · 方法 {researchResult.method_version}</span></div>
+            <div className='etf-result-heading'><div><Badge tone={resultStatusTone(researchResult.status)}>{resultStatusLabel(researchResult.status)}</Badge><Badge tone='blue'>样本内</Badge><Badge tone={researchResult.ranking_complete ? 'green' : 'amber'}>{researchResult.ranking_complete ? '排名完整' : '排名范围有限'}</Badge></div><span>截止 {dateText(researchResult.as_of)} · {researchResult.rows_count} 只 ETF</span></div>
             {researchResult.stop_reason && <p className='inline-warning'>停止原因：{stopReasonLabel(researchResult.stop_reason)}</p>}
             {researchResult.warnings.length > 0 && <div className='warning-list'>{researchResult.warnings.map((warning, index) => <div key={index}><span className='warning-dot' />{warning}</div>)}</div>}
-            <div className='stat-grid five etf-result-stats'><Stat label='范围总数' value={researchResult.counts.total} /><Stat label='可评分' value={researchResult.counts.scored} /><Stat label='符合硬过滤' value={researchResult.counts.eligible} tone='green' /><Stat label='完成自动核验' value={researchResult.counts.validated} /><Stat label='有推荐参数' value={researchResult.counts.recommended} /></div>
-            {resultDataStatusCounts.length > 0 && <div className='stat-grid four etf-data-status-stats'>{resultDataStatusCounts.map(item => <Stat key={item.status} label={item.label} value={item.count} tone={item.tone} />)}</div>}
-            <div className='etf-result-actions'><Button variant='quiet' busy={historyLoading || resultLoading} onClick={() => { void tasks.refresh(); setRefreshToken(token => token + 1) }}><RefreshCw size={14} />刷新结果</Button><Button variant='quiet' onClick={() => void exportResult()}><Download size={14} />导出 JSON</Button><span>{scopeLabel(researchResult.request.scope)} · {researchResult.request.window_days} 日窗口 · 自动核验前 {researchResult.request.validation_top_k} 名 · 最少成交 {researchResult.request.min_trades}</span></div>
+            <div className='stat-grid five etf-result-stats'><Stat label='范围总数' value={researchResult.counts.total} /><Stat label='可评分' value={researchResult.counts.scored} /><Stat label='满足网格筛选' value={researchResult.counts.eligible} tone='green' /><Stat label='已完成历史试算' value={researchResult.counts.validated} /><Stat label='找到达标参数' value={researchResult.counts.recommended} /></div>
+            {resultDataStatusCounts.length > 0 && <Disclosure id='etf-result-data-status' title='数据检查概况' summary={resultDataStatusCounts.map(item => `${item.label} ${item.count} 只`).join(' · ')}><div className='stat-grid four etf-data-status-stats'>{resultDataStatusCounts.map(item => <Stat key={item.status} label={item.label} value={item.count} tone={item.tone} />)}</div></Disclosure>}
+            <div className='etf-result-actions'><Button variant='quiet' busy={historyLoading || resultLoading} onClick={() => { void tasks.refresh(); setRefreshToken(token => token + 1) }}><RefreshCw size={14} />刷新结果</Button><Button variant='quiet' onClick={() => void exportResult()}><Download size={14} />导出 JSON</Button><span>{scopeLabel(researchResult.request.scope)} · {researchResult.request.window_days} 日窗口 · 自动试算 {researchResult.request.validation_top_k} 只 · 最少成交 {researchResult.request.min_trades}</span></div>
+            <Disclosure id={`etf-result-raw-${researchResult.id}`} title='研究版本与原始 JSON' summary={`${researchResult.method_version} · 结果格式 ${researchResult.result_schema_version}`}><pre className='json-preview'>{jsonText(researchResult)}</pre></Disclosure>
 
-            <div className='table-wrap scroll-table etf-ranking-table'><table><thead><tr><th>排名</th><th>ETF</th><th>GSS</th><th>可入选</th><th>状态 / 覆盖</th><th>RV</th>{isV3 ? <><th>日均路径冗余（5m）</th><th>5 日均路径冗余（5m）</th><th>20 日均路径冗余（5m）</th></> : <th>历史全窗口 PR（1m）</th>}<th>IOVR</th><th>VR 240m</th><th>跳跃</th><th>核验</th><th>操作</th></tr></thead><tbody>{items.map(row => <tr key={row.symbol} className={selectedSymbol === row.symbol ? 'selected-row' : ''}><td>{row.rank ?? '—'}</td><td><strong>{row.symbol_name || row.symbol}</strong><small>{row.symbol} · 横截面 n={row.score_cohort_size}</small></td><td><strong className='etf-score'>{scoreDisplay(row)}</strong></td><td><Badge tone={row.eligible ? 'green' : 'red'}>{row.eligible ? '符合硬过滤' : '已过滤'}</Badge></td><td><Badge tone={dataStatusTone(row.data_status || row.status)}>{dataStatusLabel(row.data_status || row.status)}</Badge>{row.sampling && <small>{samplingCoverageText(row.sampling)} · {samplingStatisticsText(row.sampling)}</small>}{row.data_status === 'limited' && <small>数据受限，参数核验不可用</small>}</td><td>{etfMetricText('rv_annualized', row.metrics.rv_annualized)}</td>{isV3 ? <><td>{etfMetricText('path_redundancy_daily_mean', redundancyDaily(row))}<small>1m 对照 {etfMetricText('path_redundancy_daily_mean_1m', row.metrics.path_redundancy_daily_mean_1m)}</small></td><td>{etfMetricText('path_redundancy_5d_mean', redundancy5d(row))}<small>1m 对照 {etfMetricText('path_redundancy_5d_mean_1m', row.metrics.path_redundancy_5d_mean_1m)}</small></td><td>{etfMetricText('path_redundancy_20d_mean', redundancy20d(row))}<small>1m 对照 {etfMetricText('path_redundancy_20d_mean_1m', row.metrics.path_redundancy_20d_mean_1m)}</small></td></> : <td>{etfMetricText('path_redundancy', row.metrics.path_redundancy)}</td>}<td>{etfMetricText('iovr', row.metrics.iovr)}</td><td>{etfMetricText('variance_ratio_240m', row.metrics.variance_ratio_240m)}</td><td>{etfMetricText('jump_ratio', row.metrics.jump_ratio)}</td><td><ValidationBadge status={row.validation.status} /></td><td><Button variant='quiet' busy={detailLoading && selectedSymbol === row.symbol} onClick={() => void openSymbol(row.symbol)}>诊断</Button></td></tr>)}</tbody></table></div>
+            <TableViewport className='etf-summary-table' owner='local' stickyKeyColumn={1} label='ETF 研究结论' maxHeight='520px'><table><thead><tr><th>ETF / 排名</th><th><details className='etf-metric-explainer' title='GSS 用于本次 ETF 候选池内比较，不是收益预测。'><summary>网格特征相对分（GSS）</summary><div><p>用于衡量 ETF 在本次候选池中的相对网格特征，不是收益预测。</p></div></details></th><th>当前结论</th><th>历史参数试算</th><th>数据使用情况</th><th>操作</th></tr></thead><tbody>{items.map(row => <tr key={row.symbol} className={selectedSymbol === row.symbol ? 'selected-row' : ''}><td><strong>{row.rank != null ? `#${row.rank} ` : ''}{row.symbol_name || row.symbol}</strong><small>{row.symbol} · 横截面样本 ${row.score_cohort_size}</small></td><td><strong className='etf-score'>{scoreDisplay(row)}</strong></td><td><Badge tone={row.eligible ? 'green' : 'amber'}>{row.status !== 'completed' ? '暂不能判断特征' : row.eligible ? '符合特征筛选' : '未满足特征筛选'}</Badge>{!row.eligible && <small>{filterReasonsText(row.filter_reasons)}</small>}</td><td><Badge tone={row.validation.status === 'completed' ? 'green' : row.validation.status === 'no_candidates' || row.validation.status === 'unavailable' ? 'amber' : 'neutral'}>{validationStatusLabel(row.validation.status)}</Badge><small>{validationSummary(row.validation)}</small></td><td><small>{row.data_resolution ? dataResolutionSummary(row.data_resolution) : row.data_status === 'limited' ? '历史版本：分钟数据受限，参数试算不可用' : dataStatusLabel(row.data_status || row.status)}</small><small>{minuteAndGssSampleText(row.sampling)}</small></td><td><Button variant='quiet' busy={detailLoading && selectedSymbol === row.symbol} onClick={() => void openSymbol(row.symbol)}>{selectedSymbol === row.symbol ? '返回详情' : row.validation.status === 'completed' ? '查看参数' : row.validation.status === 'no_candidates' ? '查看原因' : row.validation.status === 'no_qualified' ? '查看记录' : row.data_status === 'data_not_ready' ? '数据诊断' : '查看详情'}</Button></td></tr>)}</tbody></table></TableViewport>
             {itemsLoading && <Loading label='读取排名行…' />}
             {!itemsLoading && !items.length && <Empty title='没有排名行' detail='当前研究范围可能全部历史不足或数据未就绪。' />}
             <div className='pagination-row etf-ranking-pagination'><span>第 {currentPage} / {pageCount} 页 · 共 {itemsTotal} 行</span><div><Button variant='quiet' disabled={itemsOffset <= 0 || itemsLoading} onClick={() => setItemsOffset(current => safeItemsOffset(current - pageSize, itemsTotal, pageSize))}>上一页</Button><Button variant='quiet' disabled={itemsOffset + pageSize >= itemsTotal || itemsLoading} onClick={() => setItemsOffset(current => safeItemsOffset(current + pageSize, itemsTotal, pageSize))}>下一页</Button></div></div>
-            {detail && <section className='etf-detail-section'>
-              <div className='etf-detail-heading'><div><h2>{detail.symbol_name || detail.symbol}</h2><span>{detail.symbol} · {dateText(detail.window_start)} 至 {dateText(detail.window_end)} · 数据版本 {detail.version || '—'}</span></div><div><Badge tone={dataStatusTone(detail.data_status)}>{dataStatusLabel(detail.data_status)}</Badge><Badge tone={detail.eligible ? 'green' : 'red'}>{detail.eligible ? '符合硬过滤' : '未通过硬过滤'}</Badge><Badge tone='blue'>样本内</Badge>{detailMarketState && <Badge tone={marketStateStatusTone(detailMarketState.status)}>日线状态 · {marketStateStatusLabel(detailMarketState.status)}</Badge>}</div></div>
+            {detail && <section className='etf-detail-section' ref={detailSection} tabIndex={-1}>
+              <div className='etf-detail-heading'><div><h2>{detail.symbol_name || detail.symbol}</h2><span>{detail.symbol} · {dateText(detail.window_start)} 至 {dateText(detail.window_end)}</span></div><div><Badge tone={dataStatusTone(detail.data_status)}>{dataStatusLabel(detail.data_status)}</Badge><Badge tone={detail.eligible ? 'green' : 'red'}>{detail.eligible ? '满足网格筛选' : '未满足网格筛选'}</Badge><Badge tone='blue'>样本内</Badge>{detailMarketState && <Badge tone={marketStateStatusTone(detailMarketState.status)}>日线状态 · {marketStateStatusLabel(detailMarketState.status)}</Badge>}</div></div>
+              <div className='etf-user-conclusion'><div><small>当前结论</small><strong>{detail.status !== 'completed' ? '暂不能判断网格特征' : detail.eligible ? '符合网格特征筛选' : '未满足网格特征筛选'}</strong><span>{detailFilterReasons.length ? filterReasonsText(detailFilterReasons) : '特征筛选通过；这不代表未来收益预测。'}</span></div><div><small>历史参数试算</small><ValidationBadge status={detailValidation?.status ?? 'not_selected'} /><span>{validationSummary(detailValidation)}</span></div><div><small>网格参考区间</small><strong>{money(gridBasis?.lower_price, 4)} – {money(gridBasis?.upper_price, 4)} 元</strong><span>比较价格 {money(gridBasis?.current_raw_price, 4)} 元 · 参考价 {money(gridBasis?.reference_price, 4)} 元</span>{gridBasis?.current_price_date && <span>价格来自 {dateText(gridBasis.current_price_date)} {gridBasis.current_price_source === 'daily' ? '日线' : '分钟线'}收盘，已统一到本次研究的价格口径。</span>}</div></div>
+              <section className='etf-parameter-summary' aria-label='参数试算结论'><div><h3>参数试算</h3><ValidationBadge status={detailValidation?.status ?? 'not_selected'} /></div><p>{validationSummary(detailValidation)}</p>{detailValidation?.recommendation && <p>推荐候选 #{String(detailValidation.recommendation.id)} · 基准步长 {percent(detailValidation.recommendation.base_step)} · 历史峰值本金收益 {percent(detailValidation.recommendation.metrics.peak_principal_return)} · 最大回撤 {percent(detailValidation.recommendation.metrics.max_principal_drawdown)}</p>}</section>
+              <Disclosure id={`etf-data-resolution-${detail.symbol}`} title='数据使用情况' summary={dataResolutionSummary(detail.data_resolution)}>
+                <p>{minuteAndGssSampleText(detail.sampling)} · 可进入参数试算：{detail.replay_allowed ? '是' : '否'}</p>
+                {detail.data_resolution && <><p>策略 {detail.data_resolution.policy} · 计划校验码 {detail.data_resolution.plan_hash}</p><p>可评价区间 {dateText(detail.data_resolution.first_evaluable_date)} 至 {dateText(detail.data_resolution.last_evaluable_date)}</p><ul className='etf-resolution-days'>{detail.data_resolution.days.filter(day => day.mode !== 'minute').map(day => <li key={day.date}><b>{day.date}</b> · {({ daily: '日线降级', skip: '跳过', suspended: '停牌', no_trades: '全天无成交' } as Record<string, string>)[day.mode]} · {day.reason || day.reason_code || '—'}</li>)}</ul></>}
+                {!detail.data_resolution && <p>历史结果未记录逐日分钟／日线使用清单。{detail.data_status === 'limited' && '此历史版本的受限状态仍不允许参数试算。'}</p>}
+                {(detailGaps.length > 0 || detailWarnings.length > 0) && <p>其他数据说明：{[...detailGaps.map(gapText), ...detailWarnings].join('；')}</p>}
+              </Disclosure>
               {(detailFilterReasons.length > 0 || detailGaps.length > 0 || detailWarnings.length > 0) && <div className='etf-filter-reasons'>{detailFilterReasons.length > 0 && <p><strong>过滤原因：</strong>{filterReasonsText(detailFilterReasons)}</p>}{detailGaps.length > 0 && <div className='etf-gap-list'><strong>数据缺口：</strong><ul>{detailGaps.map((gap, index) => <li key={`${gap.timeframe ?? ''}-${gap.kind}-${index}`}>{gapText(gap)}</li>)}</ul></div>}{detailWarnings.length > 0 && <p><strong>数据提示：</strong>{detailWarnings.join('；')}</p>}</div>}
+              <Disclosure id={`etf-professional-metrics-${detail.symbol}`} title='专业指标与计算细节' summary='展开查看 RV、IOVR、PR、VR 等统计指标'>
               {detailMarketState ? <section className='etf-market-state-card' aria-label='日线市场状态先验'>
                 <div className='etf-market-state-head'><div><h3>日线市场状态先验</h3><p><Badge tone={marketStateStatusTone(detailMarketState.status)}>{marketStateStatusLabel(detailMarketState.status)}</Badge><span>{detailMarketState.method_version || 'daily_state_v1'} · 截止 {dateText(detailMarketState.as_of)}</span></p></div><span>{marketStateSampleCount != null ? `样本 ${marketStateSampleCount} 个日线交易日` : '样本数未提供'}</span></div>
                 {marketStateMessage && <p className='inline-warning'>{marketStateMessage}</p>}
@@ -653,23 +694,24 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
                 <p>{samplingCoverageText(detail.sampling)} · {samplingStatisticsText(detail.sampling)} · {detail.sampling.comparable ? '同池统计日期已对齐' : '仅诊断，不参与 GSS'}</p>
                 <p>统计排除日期：{detail.sampling.statistics_excluded_days.join('、') || '无'}。缺口处断开计算，未用日线或合成分钟替代。</p>
               </Disclosure>}
-              <div className='etf-metric-grid'>{metricRows.map(metric => <div key={metric.key}><small>{metric.label}</small><strong>{metric.value}</strong>{metric.meaning && <p className='etf-metric-copy'><b>含义：</b>{metric.meaning}</p>}{metric.usage && <p className='etf-metric-copy'><b>用途：</b>{metric.usage}</p>}{metric.detail?.reason && <span>{metric.detail.reason}</span>}{metric.detail?.sample_count != null && <span>{metric.key.startsWith('path_redundancy_') && metric.key !== 'path_redundancy' ? `有效窗口 ${metric.detail.sample_count} 个` : `样本 ${metric.detail.sample_count}`}</span>}</div>)}</div>
+              <div className='etf-metric-grid'>{metricRows.map(metric => <div key={metric.key}><details className='etf-metric-explainer' title={`${metric.meaning} ${metric.usage}`}><summary>{metric.label}</summary><div><p><b>含义：</b>{metric.meaning || '该字段由历史结果提供，当前版本没有附带解释。'}</p><p><b>用途：</b>{metric.usage || '查看样本和数据说明后再作判断。'}</p></div></details><strong>{metric.value}</strong>{metric.detail?.reason && <span>{metric.detail.reason}</span>}{metric.detail?.sample_count != null && <span>{metric.key.startsWith('path_redundancy_') && metric.key !== 'path_redundancy' ? `有效窗口 ${metric.detail.sample_count} 个` : `样本 ${metric.detail.sample_count}`}</span>}</div>)}</div>
               <div className='etf-grid-basis-grid'><span><small>ATR30</small><strong>{percent(gridBasis?.atr30_pct)}</strong></span><span><small>SVR</small><strong>{money(gridBasis?.svr, 3)}</strong></span><span><small>已实现偏度</small><strong>{money(gridBasis?.realized_skewness, 3)}</strong></span><span><small>已实现峰度</small><strong>{money(gridBasis?.realized_kurtosis, 3)}</strong></span><span><small>最小报价</small><strong>{money(gridBasis?.price_tick, 3)} 元</strong></span></div><Disclosure id='etf-grid-basis-help' title='网格参数说明' summary='ATR30、SVR、偏度、峰度与报价单位'><MetricHelpList items={gridBasisHelp} /></Disclosure>
               {Object.keys(detail.score_contributions ?? {}).length > 0 && <Disclosure id='etf-score-contributions' title='GSS 分项贡献' summary={`${Object.keys(detail.score_contributions).length} 项`}><p className='etf-help-intro'>各项为加权后的得分贡献（分），相加得到 GSS。{isV3 ? 'v3/v4 权重：RV 25%、日均 PR 10%、5 日 PR 10%、反向 VR240 20%、IOVR 15%、过零率 10%、反向跳跃占比 10%；20 日 PR 与 1 分钟对照不计分。' : '历史 v1/v2 权重：RV 25%、全窗口路径冗余 20%、反向 VR240 20%、IOVR 15%、过零率 10%、反向跳跃占比 10%。'}反向表示原值越低，得分越高。</p><div className='etf-contribution-grid'>{Object.entries(detail.score_contributions).map(([key, value]) => <span key={key}><small>{ETF_METRIC_DEFINITIONS.find(metric => metric.key === key)?.label ?? key.replaceAll('_', ' ')}</small><strong>{value.toFixed(4)} 分</strong></span>)}</div></Disclosure>}
-              <div className='etf-validation-section'><div className='etf-validation-title'><div><h3>参数核验与候选</h3><p>候选指标为样本内自动回放；GSS 与硬过滤资格独立展示。</p></div><ValidationBadge status={detailValidation?.status ?? 'not_selected'} /></div>
-                {detailValidation?.reason && <p className='inline-warning'>核验原因：{detailValidation.reason}</p>}
+              </Disclosure>
+              <div className='etf-validation-section'><div className='etf-validation-title'><div><h3>参数试算详情</h3><p>数据完整性、网格特征筛选和历史参数试算分别判断。</p></div><ValidationBadge status={detailValidation?.status ?? 'not_selected'} /></div>
+                {detailValidation?.reason && <p className='inline-warning'>试算结论：{validationSummary(detailValidation)}</p>}
                 {detailValidation?.stop_reason && <p className='inline-warning'>核验停止原因：{stopReasonLabel(detailValidation.stop_reason)}</p>}
                 <Disclosure id='etf-candidate-metrics-help' title='候选指标说明' summary='步长、收益、超额、回撤、成交和费用'><MetricHelpList items={candidateHelp} /></Disclosure>
-                {detailCandidates.length ? <div className='table-wrap scroll-table etf-candidate-table'><table><thead><tr><th>候选</th><th>基准 / 买入 / 卖出步长</th><th>参考 / 上下轨</th><th>网格上下格数</th><th>峰值本金收益</th><th>同资金持有</th><th>差值超额</th><th>最大回撤</th><th>成交 / 买卖</th><th>费用</th><th>资格</th><th>操作</th></tr></thead><tbody>{detailCandidates.map(candidate => <tr key={String(candidate.id)}><td><strong>#{String(candidate.id)}</strong>{detailValidation?.recommendation?.id === candidate.id && <Badge tone='blue'>推荐</Badge>}{candidate.asymmetric && <Badge tone='amber'>非对称</Badge>}</td><td>{percent(candidate.base_step)} / {percent(candidate.buy_step)} / {percent(candidate.sell_step)}</td><td>{money(candidate.reference_price, 3)} / {money(candidate.lower_price, 3)} / {money(candidate.upper_price, 3)}</td><td>{candidate.grids_down_count} / {candidate.grids_up_count}</td><td>{percent(candidate.metrics.peak_principal_return)}</td><td>{percent(candidate.metrics.matched_funding_hold_return)}</td><td>{percent(candidate.metrics.excess_return)}</td><td>{percent(candidate.metrics.max_principal_drawdown)}</td><td>{candidate.metrics.trade_count ?? '—'} / {candidate.metrics.buy_count ?? '—'} / {candidate.metrics.sell_count ?? '—'}</td><td>{money(candidate.metrics.total_fees)}</td><td><Badge tone={candidate.qualified ? 'green' : 'amber'}>{candidate.qualified ? '合格' : '未合格'}</Badge>{candidate.reasons.length > 0 && <small>{candidate.reasons.join('；')}</small>}</td><td><div className='button-row etf-candidate-actions'><Button variant='quiet' busy={rowBusy === 'replay:' + String(candidate.id)} onClick={() => void replayCandidate(detail, candidate)}>按此复现</Button></div></td></tr>)}</tbody></table></div> : <Empty title='没有参数候选' detail={validationStatusLabel(detailValidation?.status ?? 'not_selected')} />}
-                <div className='etf-detail-actions'><Button busy={rowBusy === detail.symbol} disabled={detail.data_status === 'limited'} onClick={() => void validateSingleSymbol(detail)}><SearchCheck size={15} />按原数据核验此 ETF</Button>{detail.data_status === 'limited' && <span>统计可用（受限）：请处理诊断原因后再进行参数核验。</span>}<Button variant='quiet' disabled={!detail.validation.forward_config} onClick={() => loadForwardConfig(detail)}>载入截止日后回测草稿</Button>{!detail.validation.forward_config && <span>尚无选参截止日后的回测配置。</span>}</div>
+                {detailCandidates.length ? <TableViewport className='etf-candidate-table' stickyKeyColumn={1} maxHeight='335px' label='历史试算候选'><table><thead><tr><th>候选</th><th>基准 / 买入 / 卖出步长</th><th>参考 / 上下轨</th><th>网格上下格数</th><th>峰值本金收益</th><th>同资金持有</th><th>差值超额</th><th>最大回撤</th><th>成交 / 买卖</th><th>费用</th><th>资格</th><th>操作</th></tr></thead><tbody>{detailCandidates.map(candidate => <tr key={String(candidate.id)}><td><strong>#{String(candidate.id)}</strong>{detailValidation?.recommendation?.id === candidate.id && <Badge tone='blue'>推荐</Badge>}{candidate.asymmetric && <Badge tone='amber'>非对称</Badge>}</td><td>{percent(candidate.base_step)} / {percent(candidate.buy_step)} / {percent(candidate.sell_step)}</td><td>{money(candidate.reference_price, 3)} / {money(candidate.lower_price, 3)} / {money(candidate.upper_price, 3)}</td><td>{candidate.grids_down_count} / {candidate.grids_up_count}</td><td>{percent(candidate.metrics.peak_principal_return)}</td><td>{percent(candidate.metrics.matched_funding_hold_return)}</td><td>{percent(candidate.metrics.excess_return)}</td><td>{percent(candidate.metrics.max_principal_drawdown)}</td><td>{candidate.metrics.trade_count ?? '—'} / {candidate.metrics.buy_count ?? '—'} / {candidate.metrics.sell_count ?? '—'}</td><td>{money(candidate.metrics.total_fees)}</td><td><Badge tone={candidate.qualified ? 'green' : 'amber'}>{candidate.qualified ? '合格' : '未合格'}</Badge>{candidate.reasons.length > 0 && <small>{candidate.reasons.join('；')}</small>}</td><td><div className='button-row etf-candidate-actions'><Button variant='quiet' busy={rowBusy === 'replay:' + String(candidate.id)} onClick={() => void replayCandidate(detail, candidate)}>按此复现</Button></div></td></tr>)}</tbody></table></TableViewport> : <Empty title='没有参数候选' detail={validationStatusLabel(detailValidation?.status ?? 'not_selected')} />}
+                <div className='etf-detail-actions'><Button busy={rowBusy === detail.symbol} disabled={!detail.eligible || (isV5Method ? !detail.replay_allowed : detail.data_status === 'limited')} onClick={() => void validateSingleSymbol(detail)}><SearchCheck size={15} />按原数据单独试算</Button>{!detail.eligible && <span>当前未满足网格筛选；可查看原因，或进入参数研究调整策略。</span>}{!isV5Method && detail.data_status === 'limited' && <span>历史版本受限状态：需重新运行 v5 研究后才能按逐日策略试算。</span>}{isV5Method && !detail.replay_allowed && <span>{detailValidation?.reason || detailGaps[0]?.message || '本次数据不满足参数试算的执行条件。'}</span>}<Button variant='quiet' disabled={!detail.validation.forward_config} onClick={() => loadForwardConfig(detail)}>载入截止日后回测草稿</Button>{!detail.validation.forward_config && <span>尚无选参截止日后的回测配置。</span>}</div>
                 <div className='etf-research-entry'><div><strong>进入参数研究</strong><p>按来源截止日前一年或截止日之后建立草稿。可在参数研究中调整日期和设置；提交前检查目标行情。</p></div><div className='button-row'><Button variant='secondary' onClick={() => enterResearchDraft(detail)}><FlaskConical size={15} />默认前一年草稿</Button><Button variant='quiet' onClick={() => enterResearchDraft(detail, 'after_cutoff')}><FlaskConical size={15} />研究截止日之后</Button></div></div>
               </div>
               <section className='etf-related-research' aria-label='关联参数研究'>
                 <div className='etf-related-research-head'><div><h3>关联参数研究</h3><p>展示由此 ETF 发起的任务与结果，运行中自动更新。</p></div><div className='button-row'><Button variant='quiet' busy={researchLinksLoading} onClick={() => setResearchLinksToken(value => value + 1)}><RefreshCw size={14} />刷新关联</Button><Link2 size={14} /></div></div>
-                {researchLinksError ? <div className='notice error'><span>关联任务读取失败：{researchLinksError}</span><Button variant='quiet' onClick={() => setResearchLinksToken(value => value + 1)}>重试</Button></div> : researchLinksLoading && !researchLinks.length ? <Loading label='读取关联研究…' /> : !researchLinks.length ? <Empty title='尚无关联参数研究' detail='从当前 ETF 行建立参数研究后，任务和结果会通过只读链接出现在这里。' /> : <div className='table-wrap scroll-table etf-related-research-table'><table><thead><tr><th>任务 / 结果</th><th>状态</th><th>更新时间</th><th>先验摘要</th><th>错误</th><th>操作</th></tr></thead><tbody>{researchLinks.map(link => <tr key={link.job_id}><td><strong>{link.job_id}</strong><small>{link.result_id ? '结果 ' + link.result_id : '任务尚未保存结果'}</small></td><td><Badge tone={researchLinkStatusTone(link.status)}>{researchLinkStatusLabel(link.status)}</Badge></td><td><small>{dateText(link.updated_at || link.created_at)}</small></td><td><small>{researchLinkSummaryText(link.summary)}</small></td><td><small>{link.error ? (typeof link.error === 'string' ? link.error : jsonText(link.error)) : '—'}</small></td><td><Button variant='quiet' onClick={() => onOpenResearchResource?.(researchLinkResourceId(link))}><ArrowUpRight size={14} />打开研究</Button></td></tr>)}</tbody></table></div>}
+                {researchLinksError ? <div className='notice error'><span>关联任务读取失败：{researchLinksError}</span><Button variant='quiet' onClick={() => setResearchLinksToken(value => value + 1)}>重试</Button></div> : researchLinksLoading && !researchLinks.length ? <Loading label='读取关联研究…' /> : !researchLinks.length ? <Empty title='尚无关联参数研究' detail='从当前 ETF 行建立参数研究后，任务和结果会通过只读链接出现在这里。' /> : <TableViewport className='etf-related-research-table' stickyKeyColumn={1} maxHeight='335px' label='关联参数研究'><table><thead><tr><th>任务 / 结果</th><th>状态</th><th>更新时间</th><th>先验摘要</th><th>错误</th><th>操作</th></tr></thead><tbody>{researchLinks.map(link => <tr key={link.job_id}><td><strong>{link.job_id}</strong><small>{link.result_id ? '结果 ' + link.result_id : '任务尚未保存结果'}</small></td><td><Badge tone={researchLinkStatusTone(link.status)}>{researchLinkStatusLabel(link.status)}</Badge></td><td><small>{dateText(link.updated_at || link.created_at)}</small></td><td><small>{researchLinkSummaryText(link.summary)}</small></td><td><small>{link.error ? (typeof link.error === 'string' ? link.error : jsonText(link.error)) : '—'}</small></td><td><Button variant='quiet' onClick={() => onOpenResearchResource?.(researchLinkResourceId(link))}><ArrowUpRight size={14} />打开研究</Button></td></tr>)}</tbody></table></TableViewport>}
                 {researchLinksTotal > researchLinkLimit && <div className='pagination-row etf-ranking-pagination'><span>第 {researchLinkPage} / {researchLinkPages} 页 · 共 {researchLinksTotal} 条</span><div><Button variant='quiet' disabled={researchLinksOffset <= 0 || researchLinksLoading} onClick={() => setResearchLinksOffset(value => safeItemsOffset(value - researchLinkLimit, researchLinksTotal, researchLinkLimit))}>上一页</Button><Button variant='quiet' disabled={researchLinksOffset + researchLinkLimit >= researchLinksTotal || researchLinksLoading} onClick={() => setResearchLinksOffset(value => safeItemsOffset(value + researchLinkLimit, researchLinksTotal, researchLinkLimit))}>下一页</Button></div></div>}
               </section>
-              <Disclosure id='etf-detail-diagnostics' title='诊断字段与版本' summary={'版本 ' + (detail.version || '—')}><pre className='json-preview'>{jsonText(detail.diagnostics)}</pre></Disclosure>
+              <Disclosure id='etf-detail-diagnostics' title='诊断字段与版本' summary='按需展开'><p>研究方法 {researchResult.method_version} · 数据版本 {detail.version || '—'}</p><pre className='json-preview'>{jsonText(detail.diagnostics)}</pre></Disclosure>
             </section>}
           </>}
         </Card>

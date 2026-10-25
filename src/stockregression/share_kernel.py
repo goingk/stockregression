@@ -241,6 +241,7 @@ def simulate(
     preclose_by_day: np.ndarray, action_record_day: np.ndarray,
     action_ex_day: np.ndarray, action_pay_day: np.ndarray, action_stock_day: np.ndarray,
     action_cash_per_share: np.ndarray, action_bonus_ratio: np.ndarray,
+    skip_mask: np.ndarray,
     grid_initial_equity: float, dca_initial_equity: float,
     buy_hold_initial_equity: float, min_shares: float, max_shares: float,
     grid_mode: int, buy_step: float, sell_step: float, grid_step: float,
@@ -671,6 +672,30 @@ def simulate(
         # Observed non-tradable bars are real opening events: an order waiting
         # for this open expires here, while the bar itself must not generate a
         # trade, a close signal, an equity mark, or a period-return observation.
+        if skip_mask[i]:
+            prior_signal_allowed = False
+            for slot in range(active_count):
+                account = active_accounts[slot]
+                if pending_side[account] != 0:
+                    if keep_details:
+                        rejection_bar[rejection_n] = i
+                        rejection_ts[rejection_n] = open_timestamps_ns[i]
+                        rejection_strategy[rejection_n] = account
+                        rejection_side[rejection_n] = pending_side[account]
+                        rejection_reason[rejection_n] = 13
+                        rejection_quantity[rejection_n] = pending_quantity[account]
+                        rejection_n += 1
+                    pending_side[account] = 0
+                    pending_quantity[account] = 0
+                    pending_reason[account] = 0
+            for action in range(action_count):
+                if action_record_day[action] == day_id:
+                    for slot in range(active_count):
+                        account = active_accounts[slot]
+                        entitlement_cash[account, action] = shares[account] * action_cash_per_share[action]
+                        entitlement_bonus[account, action] = shares[account] * action_bonus_ratio[action]
+            continue
+
         if not tradable_mask[i]:
             prior_signal_allowed = False
             for slot in range(active_count):

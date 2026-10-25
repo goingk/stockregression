@@ -11,6 +11,7 @@ import stockregression.etf_statistics as statistics
 from stockregression.etf_statistics import (
     compute_etf_statistics,
     generate_candidates,
+    generate_candidates_with_diagnostics,
     score_etfs,
 )
 from stockregression.models import DataBundle
@@ -151,7 +152,9 @@ def _assert_metric_contract(result: dict) -> None:
         assert isinstance(detail["sample_count"], int) and detail["sample_count"] >= 0
     assert {
         "reference_price", "lower_price", "upper_price", "current_raw_price",
-        "atr30_pct", "svr", "realized_skewness", "realized_kurtosis", "price_tick",
+        "current_price_date", "current_price_source", "current_price_basis",
+        "current_raw_price_unadjusted", "atr30_pct", "svr", "realized_skewness",
+        "realized_kurtosis", "price_tick",
     } == set(result["grid_basis"])
     assert result["market_state"]["method_version"] == "daily_state_v1"
     assert set(result["market_state"]["metrics"]) == {
@@ -339,7 +342,9 @@ def test_path_redundancy_equal_window_weight_short_20d_and_one_minute_contract()
 def test_sampling_below_90_percent_is_not_accepted_by_statistics():
     data = _synthetic_bundle()
     _use_complete_days(data, data.calendar[-14:-1])
-    assert compute_etf_statistics(data, data.calendar[-1], 120)["status"] == "data_not_ready"
+    result = compute_etf_statistics(data, data.calendar[-1], 120)
+    assert result["status"] == "completed"
+    assert result["metric_details"]["rv_annualized"]["sample_count"] == 107
 
 
 def test_market_state_diagnostic_unavailable_does_not_block_existing_statistics(monkeypatch):
@@ -1111,3 +1116,45 @@ def test_negative_skew_mirrors_asymmetry_and_invalid_ranges_produce_no_candidate
     assert generate_candidates(_candidate_basis(current_raw_price=1.50)) == []
     assert generate_candidates(_candidate_basis(lower_price=1.10, upper_price=1.20)) == []
     assert generate_candidates(_candidate_basis(atr30_pct=0.06)) == []
+
+
+def test_candidate_diagnostics_identify_current_at_or_below_lower_boundary():
+    result = generate_candidates_with_diagnostics(_candidate_basis(
+        current_raw_price=1.02, lower_price=1.1128013,
+        current_price_date="2026-10-23", current_price_source="daily",
+        current_price_basis="as_of_adjusted", current_raw_price_unadjusted=1.02,
+    ))
+    assert result["candidates"] == []
+    assert result["reason_code"] == "current_at_or_below_lower"
+    assert result["constraints"]["current_price"] == 1.02
+    assert result["constraints"]["lower_price"] == 1.1128013
+    assert result["constraints"]["current_price_date"] == "2026-10-23"
+    assert result["constraints"]["current_price_source"] == "daily"
+
+
+def test_v5_current_close_uses_latest_verified_daily_after_minute_tail_gap():
+    data = _synthetic_bundle()
+    selected = pd.DatetimeIndex(data.calendar[-120:])
+    fallback_days = selected[-8:]
+    data.bars = data.bars[~pd.to_datetime(data.bars.timestamp).dt.normalize().isin(fallback_days)].copy()
+    day_rows = [{"date": day.date().isoformat(), "mode": "minute" if day not in fallback_days else "daily"}
+                for day in selected]
+    data.metadata["data_resolution"] = {
+        "policy": "minute_verified_daily_then_skip_v1", "days": day_rows,
+    }
+    data.metadata["etf_sampling"] = {
+        "expected_days": 120, "valid_days": 112, "statistics_days": 112,
+        "excluded_days": [day.date().isoformat() for day in fallback_days],
+        "statistics_excluded_days": [day.date().isoformat() for day in fallback_days],
+        "comparable": True, "data_policy": "minute_verified_daily_then_skip_v1",
+    }
+    data.quality = {"days": [{"date": day.date().isoformat(), "mode": "daily"} for day in fallback_days]}
+    result = compute_etf_statistics(data, selected[-1], 120)
+    basis = result["grid_basis"]
+    assert basis["current_price_date"] == selected[-1].date().isoformat()
+    assert basis["current_price_source"] == "daily"
+    assert basis["current_raw_price"] == pytest.approx(float(
+        data.daily.loc[pd.to_datetime(data.daily.date).dt.normalize().eq(selected[-1]), "close"].iloc[-1]
+    ))
+    assert result["metric_details"]["rv_annualized"]["sample_count"] == 112
+    assert result["metric_details"]["mean_raw_price"]["sample_count"] <= 112 * 240

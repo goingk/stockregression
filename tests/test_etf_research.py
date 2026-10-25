@@ -28,8 +28,8 @@ def test_request_fingerprint_changes_with_method_version(monkeypatch):
     assert current != previous
 
 
-def test_current_etf_method_version_is_v4():
-    assert research.METHOD_VERSION == "etf_min_grid_v4"
+def test_current_etf_method_version_is_v5():
+    assert research.METHOD_VERSION == "etf_min_grid_v5"
 
 
 class CatalogOnlyRepository:
@@ -61,9 +61,9 @@ class CatalogOnlyRepository:
         assert daily_version == 7
         pending = symbol in self.pending
         return {
-            "verified_from": None if pending else str(start.date()),
-            "verified_through": None if pending else str(end.date()),
-            "failed": [], "pending": [str(start.date())] if pending else [],
+            "verified_from": None if pending else pd.Timestamp(start).date().isoformat(),
+            "verified_through": None if pending else pd.Timestamp(end).date().isoformat(),
+            "failed": [], "pending": [pd.Timestamp(start).date().isoformat()] if pending else [],
         }
 
     def bars(self, *args, **kwargs):
@@ -106,7 +106,9 @@ class CatalogStore:
         return deepcopy(value) if value and version in (None, value["version"]) else None
 
     def remember_market_snapshots(self, manifests):
-        self.persisted.extend(manifest["symbol"] for manifest in manifests)
+        for manifest in manifests:
+            self.persisted.append(manifest["symbol"])
+            self.values[manifest["symbol"]] = deepcopy(manifest)
 
 
 @pytest.fixture
@@ -127,7 +129,7 @@ def test_preflight_is_catalog_only_and_ready_index_does_not_bypass_ledger(catalo
     assert plan["symbols"] == ["159611.SZ", "512880.SH"]
     assert not store.persisted
     assert {item[1] for item in market.repository.checked_versions} == {"1day", "1min"}
-    assert len(market.repository.checked_versions) == 5  # ready row also checks independent daily risk history
+    assert len(market.repository.checked_versions) == 4
 
 
 def test_explicit_date_never_falls_back_to_an_older_minute_end(catalog):
@@ -137,8 +139,8 @@ def test_explicit_date_never_falls_back_to_an_older_minute_end(catalog):
     assert plan["as_of"] == "2024-12-31"
     row = plan["rows"][0]
     assert row["window_end"] == "2024-12-31"
-    assert row["status"] == "data_not_ready"
-    assert any(gap["kind"] == "range" for gap in row["gaps"])
+    assert row["status"] == "ready"
+    assert row["data_resolution"]["days"][-1]["mode"] == "daily"
     assert len(store.persisted) == 2
 
 
@@ -160,13 +162,14 @@ def test_short_incremental_calendar_does_not_hide_existing_daily_history(catalog
     assert market.repository.checked_date_indexes == [("159611.SZ", 7), ("512880.SH", 7)]
 
 
-def test_default_cutoff_uses_minute_availability_instead_of_latest_daily(catalog):
+def test_default_cutoff_uses_latest_daily_and_falls_back_after_minute_coverage(catalog):
     store, market = catalog
     for snapshot in store.values.values():
         snapshot["market_versions"]["1min"]["last"] = "2024-12-30"
     plan = research.preflight(store, EtfResearchRequest(), market=market)
-    assert plan["as_of"] == "2024-12-30"
-    assert all(row["window_end"] == "2024-12-30" for row in plan["rows"])
+    assert plan["as_of"] == "2024-12-31"
+    assert all(row["window_end"] == "2024-12-31" for row in plan["rows"])
+    assert all(row["data_resolution"]["days"][-1]["mode"] == "daily" for row in plan["rows"])
 
 
 def test_local_pool_contains_only_package_symbols(catalog):
@@ -502,19 +505,32 @@ def _install_minute_failures(monkeypatch, market, failures, *, reason="存在 60
             value.update(
                 failed=dates, failed_count=len(dates), validated_days=len(window) - len(dates),
                 pending=[dates[0]] if pending else [], pending_count=int(pending),
-                verified_through=str((pd.Timestamp(dates[0]) - pd.offsets.BDay(1)).date()),
             )
         return value
 
     monkeypatch.setattr(market.repository, "validation_state", state)
-    monkeypatch.setattr(market.repository, "day_validations", lambda symbol, *args, **kwargs: [
-        {"trade_date": day, "status": "failed", "row_count": 180,
-         "report": {"reason": reason, "pending_validation": [reason], "unfillable": 60, "blocked_price_rows": int(invalid)}}
-        for day in failures.get(symbol, [])
-    ], raising=False)
+
+    def day_validations(symbol, timeframe, *, start, end):
+        sessions = market.repository.days[
+            (market.repository.days >= pd.Timestamp(start)) & (market.repository.days <= pd.Timestamp(end))
+        ]
+        failed = set(failures.get(symbol, [])) if timeframe == "1min" else set()
+        result = []
+        for session in sessions:
+            day = session.date().isoformat()
+            broken = timeframe == "1min" and day in failed
+            result.append({
+                "trade_date": day, "status": "failed" if broken else "passed",
+                "row_count": 180 if broken else (240 if timeframe == "1min" else 1),
+                "report": ({"reason": reason, "pending_validation": [reason], "unfillable": 60,
+                            "blocked_price_rows": int(invalid)} if broken else {}),
+            })
+        return result
+
+    monkeypatch.setattr(market.repository, "day_validations", day_validations, raising=False)
 
 
-def test_limited_preflight_uses_common_days_and_never_certifies_the_gap(catalog, monkeypatch):
+def test_v5_falls_back_per_day_and_never_certifies_missing_minutes(catalog, monkeypatch):
     from stockregression.snapshot_quality import frozen_quality_state
 
     store, market = catalog
@@ -524,10 +540,11 @@ def test_limited_preflight_uses_common_days_and_never_certifies_the_gap(catalog,
     monkeypatch.setattr(store, "remember_market_snapshots", lambda values: manifests.extend(deepcopy(values)))
     plan = research.preflight(store, EtfResearchRequest(), market=market, persist=True)
     limited, complete = plan["rows"]
-    assert plan["counts"]["limited"] == 1 and plan["counts"]["ready"] == 1
-    assert limited["status"] == "limited" and complete["status"] == "ready"
-    assert limited["sampling"]["valid_days"] == 119
-    assert complete["sampling"]["valid_days"] == 120
+    assert plan["counts"]["ready"] == 2
+    assert limited["status"] == "ready" and complete["status"] == "ready"
+    assert limited["data_resolution"]["counts"]["daily"] == 1
+    assert limited["replay_allowed"] is True
+    assert complete["data_resolution"]["counts"]["daily"] == 0
     for row in plan["rows"]:
         assert row["sampling"]["statistics_excluded_days"] == [failed]
         assert row["sampling"]["statistics_days"] == 119
@@ -547,17 +564,19 @@ def test_pending_invalid_or_uncalibrated_data_is_not_admitted(catalog, monkeypat
     store, market = catalog
     _install_minute_failures(monkeypatch, market, {"159611.SZ": ["2024-12-05"]}, **options)
     row = research.preflight(store, EtfResearchRequest(), market=market)["rows"][0]
-    assert row["status"] == "data_not_ready"
-    assert "sampling" not in row
+    assert row["status"] == "ready"
+    failed_day = next(item for item in row["data_resolution"]["days"] if item["date"] == "2024-12-05")
+    assert failed_day["mode"] == "daily"
 
 
-@pytest.mark.parametrize("failed_days,expected_status", [(12, "limited"), (13, "data_not_ready")])
-def test_minute_complete_day_threshold_is_inclusive_at_90_percent(catalog, monkeypatch, failed_days, expected_status):
+@pytest.mark.parametrize("failed_days", [12, 13])
+def test_old_minute_coverage_thresholds_do_not_reject_daily_fallback(catalog, monkeypatch, failed_days):
     store, market = catalog
     dates = [day.date().isoformat() for day in market.repository.days[-20:-20 + failed_days]]
     _install_minute_failures(monkeypatch, market, {"159611.SZ": dates})
     row = research.preflight(store, EtfResearchRequest(), market=market)["rows"][0]
-    assert row["status"] == expected_status
+    assert row["status"] == "ready"
+    assert row["data_resolution"]["counts"]["daily"] == failed_days
 
 
 def test_incompatible_samples_keep_diagnostics_without_mixing_gss(catalog, monkeypatch):
@@ -565,7 +584,7 @@ def test_incompatible_samples_keep_diagnostics_without_mixing_gss(catalog, monke
     dates = [day.date().isoformat() for day in market.repository.days[-20:-4]]
     _install_minute_failures(monkeypatch, market, {"159611.SZ": dates[:8], "512880.SH": dates[8:]})
     rows = research.preflight(store, EtfResearchRequest(), market=market)["rows"]
-    assert all(row["status"] == "limited" for row in rows)
+    assert all(row["status"] == "ready" for row in rows)
     assert all(row["sampling"]["comparable"] is False for row in rows)
     assert all(row["sampling"]["statistics_days"] == 112 for row in rows)
 
@@ -587,13 +606,19 @@ def test_individual_replay_cannot_bypass_limited_statistics_policy(tmp_path):
 def test_short_filled_sessions_are_excluded_even_when_the_ledger_passed(catalog, monkeypatch):
     store, market = catalog
     dates = ["2024-12-05", "2024-12-06"]
-    monkeypatch.setattr(market.repository, "day_validations", lambda symbol, *args, **kwargs: [
-        {"trade_date": day, "status": "passed", "row_count": 238,
-         "report": {"synthetic_rows": 2, "auction_placeholders": 0}}
-        for day in (dates if symbol == "159611.SZ" else [])
-    ])
+    def records(symbol, timeframe, *, start, end):
+        sessions = market.repository.days[
+            (market.repository.days >= pd.Timestamp(start)) & (market.repository.days <= pd.Timestamp(end))
+        ]
+        if timeframe == "1day":
+            return [{"trade_date": session.date().isoformat(), "status": "passed", "row_count": 1}
+                    for session in sessions]
+        return [{"trade_date": day, "status": "passed", "row_count": 238,
+                 "report": {"synthetic_rows": 2, "auction_placeholders": 0}}
+                for day in (dates if symbol == "159611.SZ" and timeframe == "1min" else [])]
+    monkeypatch.setattr(market.repository, "day_validations", records)
     rows = research.preflight(store, EtfResearchRequest(), market=market)["rows"]
-    assert rows[0]["status"] == "limited"
+    assert rows[0]["status"] == "ready"
     assert rows[0]["sampling"]["excluded_days"] == dates
     assert rows[1]["sampling"]["statistics_excluded_days"] == dates
 
@@ -602,8 +627,43 @@ def test_whole_missing_sessions_must_also_pass_the_95_percent_minute_gate(catalo
     store, market = catalog
     dates = [day.date().isoformat() for day in market.repository.days[-20:-8]]
     _install_minute_failures(monkeypatch, market, {"159611.SZ": dates})
-    monkeypatch.setattr(market.repository, "day_validations", lambda symbol, *args, **kwargs: [
-        {"trade_date": day, "status": "failed", "row_count": 0,
-         "report": {"reason": "交易日没有行情记录"}} for day in (dates if symbol == "159611.SZ" else [])
-    ])
-    assert research.preflight(store, EtfResearchRequest(), market=market)["rows"][0]["status"] == "data_not_ready"
+    original = market.repository.day_validations
+    def records(symbol, timeframe, **kwargs):
+        rows = original(symbol, timeframe, **kwargs)
+        if symbol == "159611.SZ" and timeframe == "1min":
+            for row in rows:
+                if row["trade_date"] in dates:
+                    row.update(row_count=0, report={"reason": "交易日没有行情记录"})
+        return rows
+    monkeypatch.setattr(market.repository, "day_validations", records)
+    assert research.preflight(store, EtfResearchRequest(), market=market)["rows"][0]["status"] == "ready"
+
+
+def test_sparse_etfs_do_not_shrink_the_healthy_gss_common_sample():
+    days = pd.bdate_range("2024-01-01", periods=250)
+    rows = []
+    windows = {}
+    for index in range(8):
+        symbol = f"51{index:04d}.SH"
+        windows[symbol] = days
+        excluded = [day.date().isoformat() for day in days[:8]]
+        rows.append({"symbol": symbol, "status": "ready", "warnings": [], "sampling": {
+            "expected_days": 250, "valid_days": 242, "excluded_days": excluded,
+            "statistics_excluded_days": excluded.copy(), "statistics_days": 242,
+            "comparable": True,
+        }})
+    for symbol, minute_days in (("513310.SH", 219), ("515330.SH", 112), ("530000.SH", 7)):
+        windows[symbol] = days
+        excluded = [day.date().isoformat() for day in days[minute_days:]]
+        rows.append({"symbol": symbol, "status": "ready", "warnings": [], "sampling": {
+            "expected_days": 250, "valid_days": minute_days, "excluded_days": excluded,
+            "statistics_excluded_days": excluded.copy(), "statistics_days": minute_days,
+            "comparable": True,
+        }})
+    research._align_sampling(rows, windows)
+    healthy = rows[:8]
+    sparse = rows[8:]
+    assert all(row["sampling"]["comparable"] for row in healthy)
+    assert all(row["sampling"]["statistics_days"] == 242 for row in healthy)
+    assert all(row["sampling"]["comparable"] is False for row in sparse)
+    assert [row["sampling"]["statistics_days"] for row in sparse] == [219, 112, 7]

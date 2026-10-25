@@ -229,6 +229,8 @@ export interface BacktestConfig {
   reserve_cash?: number | null
   /** Parameter selection cutoff associated with a loaded research candidate. */
   selection_asof?: string | null
+  /** Frozen ETF replay policy; omitted configs keep the legacy backtest behavior. */
+  data_policy?: 'minute_verified_daily_then_skip_v1' | null
   grid_mode: 'trailing' | 'arithmetic' | 'geometric'
   buy_step: number
   sell_step: number

@@ -123,15 +123,17 @@ def test_real_partial_package_remains_statistics_only_and_reproducible(tmp_path,
     before = research.preflight(store, request, market=market, persist=True)
     assert research.run_local_validation(store, request, before, market=market)["status"] == "partial"
     plan = research.preflight(store, request, market=market, persist=True)
-    assert plan["rows"][0]["status"] == "limited", plan["rows"]
+    assert plan["rows"][0]["status"] == "ready", plan["rows"]
+    assert plan["rows"][0]["data_resolution"]["counts"]["daily"] == 1
     assert plan["rows"][0]["sampling"]["statistics_days"] == 119
     result = research.run_etf_research(store, request, plan, market=market)
     row = result["rows"][0]
     assert row["status"] == "completed", row
-    assert row["data_status"] == "limited"
-    assert row["validation"]["status"] == "unavailable"
-    assert row["validation"]["recommendation"] is None and not row["validation"]["candidates"]
+    assert row["data_status"] == "ready"
+    assert row["replay_allowed"] is True
+    assert row["validation"]["status"] in {"completed", "no_qualified", "no_candidates"}
     assert row["metric_details"]["rv_annualized"]["sample_count"] == 119
+    assert row["data_resolution"]["counts"]["daily"] == 1
     frozen = store.snapshot(row["symbol"], row["version"], persist=False)
     omitted = days[-2]
     assert not frozen_quality_state(frozen, "1min", omitted, omitted)
@@ -144,7 +146,7 @@ def test_real_partial_package_remains_statistics_only_and_reproducible(tmp_path,
     auxiliary = market.repository.auxiliary
     with monkeypatch.context() as patch:
         patch.setattr(market.repository, "auxiliary", lambda symbol, kind, **kwargs: None if kind == "actions" else auxiliary(symbol, kind, **kwargs))
-        with pytest.raises(MarketDataError, match="公司行动"):
+        with pytest.raises(ValueError, match="公司行动"):
             research._bundle(store, market, request, plan["rows"][0], plan["universe"], statistics_only=True)
     # New data and ledger revisions cannot change the old complete-day sample.
     changed = market.repository.bars(row["symbol"], "1min", start=days[-1], end=days[-1]).copy()
@@ -154,3 +156,61 @@ def test_real_partial_package_remains_statistics_only_and_reproducible(tmp_path,
     repeated = research.run_etf_research(store, request, plan, market=market)
     assert repeated["rows"][0]["status"] == "completed", repeated["rows"][0]
     assert repeated["rows"][0]["metrics"] == row["metrics"]
+
+
+def test_legacy_ready_bundle_uses_strict_config_without_v5_data_policy(tmp_path, monkeypatch):
+    from stockregression.models import DataBundle
+
+    store, market, days = seed_market(tmp_path)
+    request = EtfResearchRequest()
+    manifest = store.snapshot("512880.SH", persist=True)
+    assert manifest and "data_resolution" not in manifest
+    seen = []
+    monkeypatch.setattr(market, "readiness", lambda *args, **kwargs: {"ready": True, "degraded_days": []})
+    monkeypatch.setattr(market, "load_backtest_bundle", lambda config, version: seen.append((config, version)) or
+                        DataBundle("512880.SH", pd.DataFrame(), pd.DataFrame()))
+    universe = {
+        "package_id": manifest["package_id"], "generation": manifest["generation"],
+        "versions": {"512880.SH": {"version": manifest["version"]}},
+    }
+    row = {"symbol": "512880.SH", "version": manifest["version"], "window_start": str(days[-120].date()),
+           "window_end": str(days[-1].date()), "daily_start": str(days[-121].date()),
+           "data_status": "ready", "status": "ready"}
+    research._bundle(store, market, request, row, universe)
+    assert len(seen) == 1
+    assert seen[0][0].data_policy is None
+
+
+def test_missing_initial_valuation_keeps_statistics_and_disables_replay(tmp_path, monkeypatch):
+    from stockregression import etf_statistics
+    from stockregression.models import DataBundle
+
+    request = EtfResearchRequest(scope="selected", symbols=["512880.SH"], validation_top_k=1)
+    day = pd.Timestamp("2024-01-10")
+    candidate = {"buy_step": .01, "sell_step": .01, "base_step": .01, "reference_price": 10.,
+                 "lower_price": 9., "upper_price": 11., "grids_down_count": 10,
+                 "grids_up_count": 10, "asymmetric": False}
+    data = DataBundle("512880.SH", pd.DataFrame(), pd.DataFrame({
+        "date": [day], "close": [10.], "volume": [1000.], "tradestatus": [1],
+    }))
+    stats = {
+        "status": "completed", "metrics": {"rv_annualized": .2},
+        "metric_details": {}, "grid_basis": {}, "market_state": None,
+        "actions_applied": [], "eligible": True, "filter_reasons": [],
+        "warnings": [], "diagnostics": {},
+    }
+    monkeypatch.setattr(etf_statistics, "compute_etf_statistics", lambda *_: stats)
+    monkeypatch.setattr(etf_statistics, "generate_candidates", lambda *_: [candidate])
+    monkeypatch.setattr(research, "_bundle", lambda *args, **kwargs: data)
+    result = research.run_etf_research(Store(tmp_path), request, {
+        "method_version": "etf_min_grid_v4", "as_of": day.date().isoformat(),
+        "universe": {"symbols": ["512880.SH"]},
+        "rows": [{"symbol": "512880.SH", "status": "ready", "window_start": day.date().isoformat(),
+                  "window_end": day.date().isoformat(), "replay_allowed": True,
+                  "data_status": "ready", "warnings": [], "sampling": {"excluded_days": []}}],
+    }, market=object())
+    row = result["rows"][0]
+    assert row["status"] == "completed"
+    assert row["metrics"]["rv_annualized"] == .2
+    assert row["validation"]["reason_code"] == "initial_valuation_missing"
+    assert row["replay_allowed"] is False

@@ -122,7 +122,14 @@ def funding(config, data):
 def _inputs(config, data):
     from .engine import _prepare_actions
     fees = config.fees
-    key = (id(data), data.version, config.start_date, config.end_date, config.frequency, config.dca.frequency, fees.share_face_value, fees.legacy_sh_transfer_rate, fees.legacy_sh_min_transfer, fees.legacy_sz_transfer_rate)
+    resolution = data.metadata.get("data_resolution")
+    if resolution is not None:
+        from .data_resolution import POLICY, _digest
+        if (resolution.get("policy") != POLICY or resolution.get("symbol") != config.symbol
+                or resolution.get("plan_hash") != _digest({key: value for key, value in resolution.items() if key != "plan_hash"})):
+            raise ValueError("RESOLUTION_PLAN_MISMATCH: 冻结逐日计划校验失败")
+    resolution_hash = resolution.get("plan_hash") if resolution else None
+    key = (id(data), data.version, resolution_hash, config.start_date, config.end_date, config.frequency, config.data_policy, config.dca.frequency, fees.share_face_value, fees.legacy_sh_transfer_rate, fees.legacy_sh_min_transfer, fees.legacy_sz_transfer_rate)
     if key in _CACHE and _CACHE[key]["data"] is data:
         _CACHE.move_to_end(key)
         return _CACHE[key]
@@ -135,28 +142,66 @@ def _inputs(config, data):
         frame = frame[frame.timestamp.between(start, end + pd.Timedelta(days=1), inclusive="left")]
         if "is_synthetic" in frame:
             frame = frame[~frame.is_synthetic.fillna(False)]
+    resolution = data.metadata.get("data_resolution")
+    frozen = resolution is not None
+    if config.data_policy and (not frozen or config.data_policy != resolution.get("policy")):
+        raise ValueError("RESOLUTION_PLAN_MISMATCH: 配置要求的逐日策略与冻结快照不一致")
+    if frozen and (resolution.get("policy") != "minute_verified_daily_then_skip_v1" or not resolution.get("plan_hash")):
+        raise ValueError("RESOLUTION_PLAN_MISMATCH: 冻结逐日计划无效")
+    resolution_by_day = {pd.Timestamp(item["date"]).normalize(): item for item in resolution.get("days", [])} if frozen else {}
+    if frozen:
+        from .data_resolution import MODES, POLICY, _digest
+        if (resolution.get("policy") != POLICY or resolution.get("symbol") != config.symbol
+                or resolution.get("plan_hash") != _digest({key: value for key, value in resolution.items() if key != "plan_hash"})
+                or any(item.get("mode") not in MODES for item in resolution_by_day.values())):
+            raise ValueError("RESOLUTION_PLAN_MISMATCH: 冻结逐日计划校验失败")
     observed = set(pd.to_datetime(frame.timestamp).dt.normalize()) if not frame.empty else set()
     additions = []
     for row in daily.to_dict("records"):
         day = pd.Timestamp(row["date"])
+        plan = resolution_by_day.get(day)
+        if frozen and plan is None:
+            raise ValueError(f"RESOLUTION_PLAN_MISMATCH: {day.date()} 不在冻结逐日计划中")
+        if plan and plan.get("mode") == "skip":
+            continue
+        if plan and plan.get("mode") == "daily":
+            frame = frame[frame.timestamp.dt.normalize() != day]
+            observed.discard(day)
         suspended = row.get("tradestatus") == 0 or row.get("volume", 0) == 0
         if suspended and not frame.empty:
             frame = frame[frame.timestamp.dt.normalize() != day]
         if suspended or day not in observed:
-            if not suspended and config.frequency != "1d" and not any(x.get("date") == str(day.date()) and x.get("mode") == "daily" for x in data.quality.get("days", [])):
+            expected_mode = plan.get("mode") if plan else None
+            if not suspended and config.frequency != "1d" and expected_mode not in ("daily", "skip") and not any(x.get("date") == str(day.date()) and x.get("mode") == "daily" for x in data.quality.get("days", [])):
                 raise ValueError(f"{day.date()} 缺少可回测行情")
-            additions.append({**row, "timestamp": day + pd.Timedelta(hours=15), "frequency": "1d", "tradable": True, "volume": 0 if suspended else row["volume"]})
+            if expected_mode == "minute" and not suspended and day not in observed:
+                raise ValueError(f"RESOLUTION_PLAN_MISMATCH: {day.date()} 冻结分钟行情缺失")
+            if expected_mode == "daily" and not suspended:
+                additions.append({**row, "timestamp": day + pd.Timedelta(hours=15), "frequency": "1d", "tradable": True, "volume": row["volume"], "is_skip": False})
+            elif suspended:
+                additions.append({**row, "timestamp": day + pd.Timedelta(hours=15), "frequency": "1d", "tradable": False, "volume": 0, "is_skip": False})
+    if frozen:
+        for day, plan in resolution_by_day.items():
+            if plan.get("mode") != "skip":
+                continue
+            frame = frame[frame.timestamp.dt.normalize() != day]
+            additions.append({"timestamp": day + pd.Timedelta(hours=15), "frequency": "1d", "open": np.nan,
+                              "high": np.nan, "low": np.nan, "close": np.nan, "volume": 0.0,
+                              "tradable": False, "is_synthetic": False, "is_skip": True})
     if additions:
         frame = pd.concat([frame, pd.DataFrame(additions)], ignore_index=True)
     if frame.empty:
         raise ValueError("所选区间没有可回测行情")
     frame = frame.sort_values("timestamp").reset_index(drop=True)
     stamps = pd.DatetimeIndex(frame.timestamp)
-    days = stamps.normalize().unique().sort_values()
+    calendar_days = pd.DatetimeIndex(pd.to_datetime(data.calendar)).normalize()
+    calendar_days = calendar_days[(calendar_days >= start) & (calendar_days <= end)].unique().sort_values()
+    days = calendar_days if len(calendar_days) else stamps.normalize().unique().sort_values()
     codes = pd.factorize(stamps.normalize(), sort=True)[0].astype(np.int64)
     n = len(frame)
     first = np.r_[True, codes[1:] != codes[:-1]]
     tradable = frame.get("tradable", pd.Series(True, index=frame.index)).fillna(False).to_numpy(dtype=np.bool_)
+    skip = frame.get("is_skip", pd.Series(False, index=frame.index, dtype=bool)).eq(True).to_numpy(dtype=np.bool_)
     last = np.zeros(n, dtype=np.bool_)
     valid = np.flatnonzero(tradable)
     if len(valid):
@@ -206,9 +251,11 @@ def _inputs(config, data):
         np.full(n, str(config.frequency), dtype=object) if frequency_column is None
         else frequency_column.astype(str).to_numpy()
     )
+    # Extend the array tuple at its end: existing research/preview consumers
+    # use the stable price-band, opening-time and corporate-action positions.
     arrays = (opens, closes, pd.to_numeric(frame.volume, errors="coerce").fillna(0).to_numpy(dtype=np.float64), tradable, ups, downs, stamps.asi8, _open_timestamps_ns(stamps, frequencies), codes, first & new_period[codes], last, stamp[codes], transfer[codes], face[codes], minimum[codes], bilateral[codes], preclose,
-              np.asarray([-1 if a.record_date < config.start_date else day_ids.get(a.record_date, -2) for a in actions], dtype=np.int64), np.asarray([day_ids.get(a.ex_date, -2) for a in actions], dtype=np.int64), np.asarray([day_ids.get(a.pay_date, -2) for a in actions], dtype=np.int64), np.asarray([day_ids.get(a.stock_date, -2) for a in actions], dtype=np.int64), np.asarray([a.cash_per_share for a in actions], dtype=np.float64), np.asarray([a.bonus_ratio for a in actions], dtype=np.float64))
-    result = {"arrays": arrays, "days": days, "stamps": stamps, "tradable": tradable, "opens": arrays[7], "period_keys": keys, "terms": terms, "data": data, "end": str(end.date())}
+              np.asarray([-1 if a.record_date < config.start_date else day_ids.get(a.record_date, -2) for a in actions], dtype=np.int64), np.asarray([day_ids.get(a.ex_date, -2) for a in actions], dtype=np.int64), np.asarray([day_ids.get(a.pay_date, -2) for a in actions], dtype=np.int64), np.asarray([day_ids.get(a.stock_date, -2) for a in actions], dtype=np.int64), np.asarray([a.cash_per_share for a in actions], dtype=np.float64), np.asarray([a.bonus_ratio for a in actions], dtype=np.float64), skip)
+    result = {"arrays": arrays, "days": days, "stamps": stamps, "tradable": tradable, "skip": skip, "opens": arrays[7], "period_keys": keys, "terms": terms, "data": data, "end": str(end.date())}
     _CACHE[key] = result
     while len(_CACHE) > 2:
         _CACHE.popitem(last=False)
@@ -430,7 +477,7 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
                     "principal_drawdown": float(drawdown[account, i]) if drawdown_denominator > 0 else None,
                 })
         trades = [{"timestamp": openings[int(tb[j])], "side": "buy" if ts[j] == 1 else "sell", "quantity": int(tq[j]), "price": float(tp[j]), "fees": float(tf[j]), "cash": float(tc[j]), "shares": int(th[j]), "reason": engine._TRADE_REASONS[int(tr[j])], "external_topup": float(ttop[j]) if account == 0 else 0.0} for j in range(len(tb)) if ta[j] == account]
-        rejections = [{"timestamp": pd.Timestamp(rt[j]).isoformat(), "side": "buy" if rs[j] == 1 else "sell", "reason": "parameter_update" if int(rr[j]) == 12 else engine._REJECTION_REASONS[int(rr[j])], "requested_quantity": int(rq[j])} for j in range(len(rb)) if ra[j] == account]
+        rejections = [{"timestamp": pd.Timestamp(rt[j]).isoformat(), "side": "buy" if rs[j] == 1 else "sell", "reason": "parameter_update" if int(rr[j]) == 12 else "unavailable_day" if int(rr[j]) == 13 else engine._REJECTION_REASONS[int(rr[j])], "requested_quantity": int(rq[j])} for j in range(len(rb)) if ra[j] == account]
         if account == 1 and not summary_only and not preview:
             bought = {period_key(t["timestamp"], config.dca.frequency) for t in trades}
             for key in dict.fromkeys(prepared["period_keys"]):
