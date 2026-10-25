@@ -582,9 +582,9 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
             <NumField label='每次买入' min={100} step='100' suffix='份' value={execution.buy_shares} onChange={next => next != null && updateExecution('buy_shares', next)} />
             <NumField label='每次卖出' min={100} step='100' suffix='份' value={execution.sell_shares} onChange={next => next != null && updateExecution('sell_shares', next)} />
           </div>
-          <Disclosure id='etf-execution-fees' title='费用与滑点' summary={`佣金 ${percent(execution.fees.commission_rate)} · 滑点 ${execution.fees.slippage_bps} 基点`}>
+          <Disclosure id='etf-execution-fees' title='费用与滑点' summary={`佣金 ${percent(execution.fees.commission_rate, 3)} · 滑点 ${execution.fees.slippage_bps} 基点`}>
             <div className='form-grid two'>
-              <NumField label='佣金费率' min={0} max={5} step='.01' percentValue suffix='%' value={execution.fees.commission_rate} onChange={next => next != null && updateFee('commission_rate', next)} />
+              <NumField label='佣金费率' min={0} max={5} step='.001' percentValue suffix='%' hint='最小单位 0.001%' value={execution.fees.commission_rate} onChange={next => next != null && updateFee('commission_rate', next)} />
               <NumField label='最低佣金' min={0} step='.01' suffix='元' value={execution.fees.min_commission} onChange={next => next != null && updateFee('min_commission', next)} />
               <NumField label='滑点' min={0} max={1000} step='.1' suffix='基点' value={execution.fees.slippage_bps} onChange={next => next != null && updateFee('slippage_bps', next)} />
             </div>

@@ -174,17 +174,23 @@ export function loadConfig(value: BacktestConfig): { config: BacktestConfig; not
   } }
 }
 
-export function configError(value: BacktestConfig): string {
+/** Research owns its four search axes, so hidden account quantities must not block submission. */
+export function configError(value: BacktestConfig, options: { ignoreHiddenResearchQuantities?: boolean } = {}): string {
   if (!/^(?:[56]\d{5}\.SH|[013]\d{5}\.SZ)$/.test(value.symbol)) return '请选择有效的沪深股票或 ETF'
   if (!value.start_date || !value.end_date || value.start_date > value.end_date) return '请填写有效起止日期'
   const isStarBoard = value.symbol.startsWith('688') || value.symbol.startsWith('689')
   const lotSize = 100
-  for (const name of ['initial_shares', 'min_shares', 'buy_shares', 'sell_shares'] as const) {
+  const quantities = options.ignoreHiddenResearchQuantities
+    ? ['initial_shares'] as const
+    : ['initial_shares', 'min_shares', 'buy_shares', 'sell_shares'] as const
+  for (const name of quantities) {
     const minShares = name === 'buy_shares' ? isStarBoard ? 200 : lotSize : name === 'sell_shares' ? lotSize : 0
     if (!Number.isInteger(value[name]) || value[name] % lotSize !== 0 || value[name] < minShares) return `持股和交易数量应以 ${lotSize} 为单位${name === 'buy_shares' || name === 'sell_shares' ? `，该交易量至少 ${minShares}` : ''}`
   }
-  if (value.max_shares != null && (!Number.isInteger(value.max_shares) || value.max_shares % lotSize !== 0 || value.max_shares < 0)) return '最高持股须为 100 的整数倍，留空表示不限制'
-  if (value.min_shares > value.initial_shares || (value.max_shares != null && value.initial_shares > value.max_shares)) return '最低持股 ≤ 初始持股 ≤ 最高持股'
+  if (!options.ignoreHiddenResearchQuantities) {
+    if (value.max_shares != null && (!Number.isInteger(value.max_shares) || value.max_shares % lotSize !== 0 || value.max_shares < 0)) return '最高持股须为 100 的整数倍，留空表示不限制'
+    if (value.min_shares > value.initial_shares || (value.max_shares != null && value.initial_shares > value.max_shares)) return '最低持股 ≤ 初始持股 ≤ 最高持股'
+  }
   const minDcaShares = isStarBoard ? 200 : lotSize
   if (!Number.isInteger(value.dca.shares) || value.dca.shares < minDcaShares || value.dca.shares % lotSize !== 0) return `定投数量应为 ${lotSize} 的正整数倍，至少 ${minDcaShares}`
   if (!Number.isInteger(value.dca.initial_shares) || value.dca.initial_shares < 0 || value.dca.initial_shares % lotSize !== 0) return `定投初始持仓应为 ${lotSize} 的整数倍`
@@ -288,7 +294,18 @@ export function DateRangeField({ calendar, start, end, startLabel = '开始日�
   </div>
 }
 
-export function ConfigForm({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit, onDateReadinessChange, onDateIntentChange, datesExplicit = false, purpose = 'backtest', researchProtocol = 1 }: { purpose?: 'backtest' | 'research'; researchProtocol?: number; value: BacktestConfig; datesExplicit?: boolean; onChange: (next: BacktestConfig | ((previous: BacktestConfig) => BacktestConfig)) => void; onFeeDefaultsEdit?: (next: FeeDefaults) => void; onDefaultsEdit?: (group: StrategyDefaultsGroup, next: BacktestConfig) => void; onDateReadinessChange?: (ready: boolean) => void; onDateIntentChange?: (explicit: boolean) => void }) {
+type ConfigFormSharedProps = {
+  value: BacktestConfig
+  onChange: (next: BacktestConfig | ((previous: BacktestConfig) => BacktestConfig)) => void
+  onFeeDefaultsEdit?: (next: FeeDefaults) => void
+  onDefaultsEdit?: (group: StrategyDefaultsGroup, next: BacktestConfig) => void
+  onDateReadinessChange?: (ready: boolean) => void
+  onDateIntentChange?: (explicit: boolean) => void
+  datesExplicit?: boolean
+}
+
+/** Shared calendar, date, reference-price and fee controller for both entry forms. */
+export function useConfigFormModel({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit, onDateReadinessChange, onDateIntentChange, datesExplicit = false }: ConfigFormSharedProps) {
   const [reference, setReference] = useState<{ reference_date: string; reference_price: number } | null>(null)
   const [referenceError, setReferenceError] = useState('')
   const calendarState = useTradingCalendar(value.symbol, value.frequency)
@@ -385,53 +402,111 @@ export function ConfigForm({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit,
   const share = (key: 'initial_shares' | 'min_shares' | 'buy_shares' | 'sell_shares', label: string) => <NumField key={key} label={label} value={value[key]} onChange={next => next != null && set(key, next)} suffix={unit} min={key === 'buy_shares' ? isStarBoard ? 200 : 100 : key === 'sell_shares' ? 100 : 0} step="100" />
   const maxShares = <NumField label="最高持股" value={value.max_shares} onChange={next => set('max_shares', next)} suffix={unit} min={0} step="100" hint="留空表示不限制持股数量；买入时按需补足现金。" />
   const fundingNote = '现金不足时仅在成功买入时补足差额，收益率按峰值净投入计算'
-  return <div className="config-form share-config-form">
-    <div className="form-section" data-validation-group="symbol"><div className="section-title"><span>01</span><strong>{purpose === 'research' ? '研究对象与评估区间' : '标的与区间'}</strong></div><div className="form-grid two">
-      <Field label="股票 / ETF" className="full-width"><SymbolPicker value={value.symbol} onChange={symbol => {
-        if (calendar?.trading_dates?.length && value.start_date && value.end_date) {
-          const count = tradingDayCount(calendar.trading_dates, value.start_date, value.end_date)
-          if (count > 0) previousWindowCount.current = count
-        }
-        symbolChangeRequested.current = true
-        autoEnd.current = true
-        onDateIntentChange?.(false)
-        onChange(previous => ({ ...previous, symbol, reference_price_mode: 'auto', reference_price: null }))
-      }} /></Field>
-      <div className="field full-width"><span className="field-label">日期区间</span><DateRangeField calendar={calendar} start={value.start_date} end={value.end_date ?? ''} startLabel={purpose === 'research' ? '评估开始日期' : '开始日期'} endLabel={purpose === 'research' ? '评估结束日期' : '结束日期'} onStart={next => { onDateIntentChange?.(true); onChange(previous => ({ ...previous, start_date: next, reference_price_mode: 'auto', reference_price: null })) }} onEnd={next => { autoEnd.current = false; onDateIntentChange?.(true); set('end_date', next || null) }} /></div>
+  const setLink = (axis: keyof BacktestConfig['parameter_links'], next: boolean) => {
+    const updated = setParameterLink(value, axis, next)
+    onChange(updated)
+    onDefaultsEdit?.(axis === 'spacing' ? 'grid' : 'position', updated)
+  }
+  const changeSymbol = (symbol: string) => {
+    if (calendar?.trading_dates?.length && value.start_date && value.end_date) {
+      const count = tradingDayCount(calendar.trading_dates, value.start_date, value.end_date)
+      if (count > 0) previousWindowCount.current = count
+    }
+    symbolChangeRequested.current = true
+    autoEnd.current = true
+    onDateIntentChange?.(false)
+    onChange(previous => ({ ...previous, symbol, reference_price_mode: 'auto', reference_price: null }))
+  }
+  const changeStart = (next: string) => {
+    onDateIntentChange?.(true)
+    onChange(previous => ({ ...previous, start_date: next, reference_price_mode: 'auto', reference_price: null }))
+  }
+  const changeEnd = (next: string) => {
+    autoEnd.current = false
+    onDateIntentChange?.(true)
+    set('end_date', next || null)
+  }
+  const changeReference = (next: number | null) => onChange(previous => ({ ...previous, reference_price: next, reference_price_mode: next == null ? 'auto' : 'manual' }))
+  return {
+    value, onChange, reference, referenceError, calendarState, calendar,
+    set, setFees, setLink, changeSymbol, changeStart, changeEnd, changeReference,
+    unit, spacingLinked, sharesLinked, fees, isStarBoard, share, maxShares, fundingNote,
+  }
+}
+
+export type ConfigFormModel = ReturnType<typeof useConfigFormModel>
+
+export function ConfigSymbolDateFields({ model, purpose = 'backtest', footer }: { model: ConfigFormModel; purpose?: 'backtest' | 'research'; footer?: ReactNode }) {
+  const { value, calendar, calendarState, reference, referenceError, changeSymbol, changeStart, changeEnd, set, changeReference } = model
+  return <>
+    <div className="form-grid two">
+      <Field label="股票 / ETF" className="full-width"><SymbolPicker value={value.symbol} onChange={changeSymbol} /></Field>
+      <div className="field full-width"><span className="field-label">日期区间</span><DateRangeField calendar={calendar} start={value.start_date} end={value.end_date ?? ''} startLabel={purpose === 'research' ? '评估开始日期' : '开始日期'} endLabel={purpose === 'research' ? '评估结束日期' : '结束日期'} onStart={changeStart} onEnd={changeEnd} /></div>
       {calendarState.ready && !value.end_date && calendar?.last_date && calendar.last_date < value.start_date && <p className="inline-warning full-width">暂无截止日后数据：本地数据截止 {calendar.last_date}，所选起始日为 {value.start_date}。</p>}
       <Field label="数据频率"><SelectInput value={value.frequency} onChange={event => set('frequency', event.target.value as BacktestConfig['frequency'])}>{['1m', '5m', '15m', '30m', '60m', '1d'].map(item => <option key={item}>{item}</option>)}</SelectInput></Field>
-      <NumField label="参考价格" value={value.reference_price} onChange={next => onChange(previous => ({ ...previous, reference_price: next, reference_price_mode: next == null ? 'auto' : 'manual' }))} suffix="元" min={.001} hint={reference ? `${reference.reference_date} 收盘 ${reference.reference_price} 元 · ${value.reference_price_mode === 'auto' ? '自动' : '手动'}` : '开始日期前最近交易日收盘价'} />
-    </div>{referenceError && value.reference_price == null && value.reference_price_mode === 'auto' && <p className="inline-warning">{referenceError}</p>}</div>
-    <div className="form-section" data-validation-group="grid"><div className="section-title"><span>02</span><strong>网格规则</strong></div><div className="form-grid two">
-      {purpose === 'research' ? <Field label="研究网格"><div className="result-meta"><Badge tone="blue">等比网格</Badge><span>{spacingLinked ? '买卖间距共用一个参数' : '买卖间距分别搜索与展示'}</span></div></Field> : <Field label="网格模式"><SelectInput value={value.grid_mode} onChange={event => set('grid_mode', event.target.value as BacktestConfig['grid_mode'])}><option value="trailing">移动网格</option><option value="arithmetic">等差网格</option><option value="geometric">等比网格</option></SelectInput></Field>}
-      <NumField label={spacingLinked ? '统一买卖间距' : '买入间距'} value={value.buy_step ?? .03} onChange={next => next != null && set('buy_step', next)} percentValue suffix="%" min={.01} max={100} hint={spacingLinked ? '参考价上下网格共用此间距' : '参考价下方每隔该幅度设置买入网格'} />
-      {!spacingLinked && <NumField label="卖出间距" value={value.sell_step ?? .03} onChange={next => next != null && set('sell_step', next)} percentValue suffix="%" min={.01} max={100} hint={purpose === 'research' ? '参考价上方每隔该幅度设置卖出网格；正式刻度 0.01 个百分点' : '参考价上方每隔该幅度设置卖出网格'} />}
-      <div className="field full-width"><span className="field-label">间距参数联动</span><label className="link-toggle"><input type="checkbox" checked={spacingLinked} onChange={event => { const next = setParameterLink(value, 'spacing', event.target.checked); onChange(next); onDefaultsEdit?.('grid', next) }} /><span>统一买卖间距</span></label>{spacingLinked && <small>已采用当前买入值，双向共用</small>}</div>
-      <Disclosure id={`config-${purpose}-price-bounds`} title="价格边界" summary={`${value.lower_price ?? '不限'} ～ ${value.upper_price ?? '不限'}`} className="form-disclosure full-width"><div className="form-grid two">
-      <NumField label="价格下限" value={value.lower_price} onChange={next => set('lower_price', next)} suffix="元" min={.001} />
-      <NumField label="价格上限" value={value.upper_price} onChange={next => set('upper_price', next)} suffix="元" min={.001} />
-      </div></Disclosure>
-    </div></div>
-    <div className="form-section" data-validation-group="position"><div className="section-title"><span>03</span><div><strong>{purpose === 'research' ? '固定账户' : '仓位与交易量'}</strong><small>{fundingNote}</small></div></div><div className="form-grid two">
-      {share('initial_shares', '初始持股')}
-      {purpose === 'backtest' && <>{share('min_shares', '最低持股')}{maxShares}{share('buy_shares', sharesLinked ? '每次买卖' : '每次买入')}{!sharesLinked && share('sell_shares', '每次卖出')}</>}
-      <div className="field full-width"><span className="field-label">交易量参数联动</span><label className="link-toggle"><input type="checkbox" checked={sharesLinked} onChange={event => { const next = setParameterLink(value, 'shares', event.target.checked); onChange(next); onDefaultsEdit?.('position', next) }} /><span>统一买卖份额</span></label>{sharesLinked && <small>已采用当前买入值，双向共用</small>}</div>
-    </div>{purpose === 'research' && researchProtocol !== 5 && <Disclosure id="config-research-baseline-position" title="对照策略仓位与交易量" summary={`${value.min_shares}～${value.max_shares ?? '不限'} ${unit}`} className="form-disclosure"><div className="form-grid two">{share('min_shares', '最低持股')}{maxShares}{share('buy_shares', sharesLinked ? '每次买卖' : '每次买入')}{!sharesLinked && share('sell_shares', '每次卖出')}</div></Disclosure>}</div>
-    <div data-validation-group="dca"><Disclosure id={`config-${purpose}-dca`} title="定投设置" summary={`${{daily: '每天', weekly: '每周', monthly: '每月'}[value.dca.frequency]} ${value.dca.shares} ${unit}`} className="form-disclosure"><div className="form-grid two">
-      <Field label="定投频率"><SelectInput value={value.dca.frequency} onChange={event => set('dca', { ...value.dca, frequency: event.target.value as BacktestConfig['dca']['frequency'] })}><option value="daily">每天</option><option value="weekly">每周</option><option value="monthly">每月</option></SelectInput></Field>
-      <NumField label="每期定投" value={value.dca.shares} onChange={next => next != null && set('dca', { ...value.dca, shares: next })} suffix={unit} min={isStarBoard ? 200 : 100} step="100" />
-      <NumField label="定投初始持仓" value={value.dca.initial_shares} onChange={next => next != null && set('dca', { ...value.dca, initial_shares: next })} suffix={unit} min={0} step="100" hint="回测开始前已持有，不收取开仓手续费" />
-    </div></Disclosure></div>
-    <div data-validation-group="fees"><Disclosure id={`config-${purpose}-fees`} title="费用与滑点" summary={`${percent(fees.commission_rate)} · 最低 ${money(fees.min_commission)} 元`} className="form-disclosure"><div className="form-grid two">
-      <NumField label="佣金费率" value={fees.commission_rate} onChange={next => next != null && setFees({ commission_rate: next })} percentValue suffix="%" min={0} max={5} hint="0.05 表示 0.05%" />
+      <NumField label="参考价格" value={value.reference_price} onChange={changeReference} suffix="元" min={.001} hint={reference ? `${reference.reference_date} 收盘 ${reference.reference_price} 元 · ${value.reference_price_mode === 'auto' ? '自动' : '手动'}` : '开始日期前最近交易日收盘价'} />
+    </div>
+    {referenceError && value.reference_price == null && value.reference_price_mode === 'auto' && <p className="inline-warning">{referenceError}</p>}
+    {footer && <div className="research-basics-actions">{footer}</div>}
+  </>
+}
+
+export function ConfigPriceBoundsFields({ model }: { model: ConfigFormModel }) {
+  const { value, set } = model
+  return <div className="form-grid two">
+    <NumField label="价格下限" value={value.lower_price} onChange={next => set('lower_price', next)} suffix="元" min={.001} />
+    <NumField label="价格上限" value={value.upper_price} onChange={next => set('upper_price', next)} suffix="元" min={.001} />
+  </div>
+}
+
+export function ConfigFeesFields({ model, extraBeforeSlippage }: { model: ConfigFormModel; extraBeforeSlippage?: ReactNode }) {
+  const { fees, setFees, unit } = model
+  return <>
+    <div className="form-grid two">
+      <NumField label="佣金费率" value={fees.commission_rate} onChange={next => next != null && setFees({ commission_rate: next })} percentValue suffix="%" min={0} max={5} step=".001" hint="0.05 表示 0.05%；最小单位 0.001%" />
       <NumField label="最低佣金" value={fees.min_commission} onChange={next => next != null && setFees({ min_commission: next })} suffix="元" min={0} />
+      {extraBeforeSlippage}
       <NumField label="滑点" value={fees.slippage_bps} onChange={next => next != null && setFees({ slippage_bps: next })} suffix="基点" min={0} max={1000} />
-    </div>{unit === '股' && <details className="advanced-disclosure"><summary>股票早期过户费设置</summary><div className="form-grid two">
+    </div>
+    {unit === '股' && <details className="advanced-disclosure"><summary>股票早期过户费设置</summary><div className="form-grid two">
       <NumField label="股票面值" value={fees.share_face_value} onChange={next => next != null && setFees({ share_face_value: next })} suffix="元" min={.0001} />
       <NumField label="沪市历史过户费率" value={fees.legacy_sh_transfer_rate} onChange={next => next != null && setFees({ legacy_sh_transfer_rate: next })} percentValue suffix="%" min={0} />
       <NumField label="沪市历史最低过户费" value={fees.legacy_sh_min_transfer} onChange={next => next != null && setFees({ legacy_sh_min_transfer: next })} suffix="元" min={0} />
       <NumField label="深市历史过户费率" value={fees.legacy_sz_transfer_rate} onChange={next => next != null && setFees({ legacy_sz_transfer_rate: next })} percentValue suffix="%" min={0} />
-    </div></details>}</Disclosure></div>
+    </div></details>}
+  </>
+}
+
+export function ConfigDcaFields({ model }: { model: ConfigFormModel }) {
+  const { value, set, unit, isStarBoard } = model
+  return <div className="form-grid two">
+    <Field label="定投频率"><SelectInput value={value.dca.frequency} onChange={event => set('dca', { ...value.dca, frequency: event.target.value as BacktestConfig['dca']['frequency'] })}><option value="daily">每天</option><option value="weekly">每周</option><option value="monthly">每月</option></SelectInput></Field>
+    <NumField label="每期定投" value={value.dca.shares} onChange={next => next != null && set('dca', { ...value.dca, shares: next })} suffix={unit} min={isStarBoard ? 200 : 100} step="100" />
+    <NumField label="定投初始持仓" value={value.dca.initial_shares} onChange={next => next != null && set('dca', { ...value.dca, initial_shares: next })} suffix={unit} min={0} step="100" hint="回测开始前已持有，不收取开仓手续费" />
+  </div>
+}
+
+export function ConfigForm({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit, onDateReadinessChange, onDateIntentChange, datesExplicit = false, purpose = 'backtest', researchProtocol = 1 }: ConfigFormSharedProps & { purpose?: 'backtest' | 'research'; researchProtocol?: number }) {
+  const model = useConfigFormModel({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit, onDateReadinessChange, onDateIntentChange, datesExplicit })
+  const { set, setLink, value: current, unit, spacingLinked, sharesLinked, fees, share, maxShares, fundingNote } = model
+  return <div className="config-form share-config-form">
+    <div className="form-section" data-validation-group="symbol"><div className="section-title"><span>01</span><strong>{purpose === 'research' ? '研究对象与评估区间' : '标的与区间'}</strong></div>
+      <ConfigSymbolDateFields model={model} purpose={purpose} />
+    </div>
+    <div className="form-section" data-validation-group="grid"><div className="section-title"><span>02</span><strong>网格规则</strong></div><div className="form-grid two">
+      {purpose === 'research' ? <Field label="研究网格"><div className="result-meta"><Badge tone="blue">等比网格</Badge><span>{spacingLinked ? '买卖间距共用一个参数' : '买卖间距分别搜索与展示'}</span></div></Field> : <Field label="网格模式"><SelectInput value={value.grid_mode} onChange={event => set('grid_mode', event.target.value as BacktestConfig['grid_mode'])}><option value="trailing">移动网格</option><option value="arithmetic">等差网格</option><option value="geometric">等比网格</option></SelectInput></Field>}
+      <NumField label={spacingLinked ? '统一买卖间距' : '买入间距'} value={value.buy_step ?? .03} onChange={next => next != null && set('buy_step', next)} percentValue suffix="%" min={.01} max={100} hint={spacingLinked ? '参考价上下网格共用此间距' : '参考价下方每隔该幅度设置买入网格'} />
+      {!spacingLinked && <NumField label="卖出间距" value={value.sell_step ?? .03} onChange={next => next != null && set('sell_step', next)} percentValue suffix="%" min={.01} max={100} hint={purpose === 'research' ? '参考价上方每隔该幅度设置卖出网格；正式刻度 0.01 个百分点' : '参考价上方每隔该幅度设置卖出网格'} />}
+      <div className="field full-width"><span className="field-label">间距参数联动</span><label className="link-toggle"><input type="checkbox" checked={spacingLinked} onChange={event => setLink('spacing', event.target.checked)} /><span>统一买卖间距</span></label>{spacingLinked && <small>已采用当前买入值，双向共用</small>}</div>
+      <Disclosure id={`config-${purpose}-price-bounds`} title="价格边界" summary={`${current.lower_price ?? '不限'} ～ ${current.upper_price ?? '不限'}`} className="form-disclosure full-width"><ConfigPriceBoundsFields model={model} /></Disclosure>
+    </div></div>
+    <div className="form-section" data-validation-group="position"><div className="section-title"><span>03</span><div><strong>{purpose === 'research' ? '固定账户' : '仓位与交易量'}</strong><small>{fundingNote}</small></div></div><div className="form-grid two">
+      {share('initial_shares', '初始持股')}
+      {purpose === 'backtest' && <>{share('min_shares', '最低持股')}{maxShares}{share('buy_shares', sharesLinked ? '每次买卖' : '每次买入')}{!sharesLinked && share('sell_shares', '每次卖出')}</>}
+      <div className="field full-width"><span className="field-label">交易量参数联动</span><label className="link-toggle"><input type="checkbox" checked={sharesLinked} onChange={event => setLink('shares', event.target.checked)} /><span>统一买卖份额</span></label>{sharesLinked && <small>已采用当前买入值，双向共用</small>}</div>
+    </div>{purpose === 'research' && researchProtocol !== 5 && <Disclosure id="config-research-baseline-position" title="对照策略仓位与交易量" summary={`${current.min_shares}～${current.max_shares ?? '不限'} ${unit}`} className="form-disclosure"><div className="form-grid two">{share('min_shares', '最低持股')}{maxShares}{share('buy_shares', sharesLinked ? '每次买卖' : '每次买入')}{!sharesLinked && share('sell_shares', '每次卖出')}</div></Disclosure>}</div>
+    <div data-validation-group="dca"><Disclosure id={`config-${purpose}-dca`} title="定投设置" summary={`${{daily: '每天', weekly: '每周', monthly: '每月'}[current.dca.frequency]} ${current.dca.shares} ${unit}`} className="form-disclosure"><ConfigDcaFields model={model} /></Disclosure></div>
+    <div data-validation-group="fees"><Disclosure id={`config-${purpose}-fees`} title="费用与滑点" summary={`${percent(fees.commission_rate, 3)} · 最低 ${money(fees.min_commission)} 元`} className="form-disclosure"><ConfigFeesFields model={model} /></Disclosure></div>
   </div>
 }
 

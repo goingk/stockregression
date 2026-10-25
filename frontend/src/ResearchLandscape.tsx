@@ -22,6 +22,8 @@ import {
 } from './landscapeData'
 
 const Landscape3D = lazy(() => import('./Landscape3D'))
+const landscapeColorRamp = ['#16a34a', '#94a3b8', '#dc2626']
+const landscapeMissingColor = '#d1d5db'
 
 type Dict = Record<string, unknown>
 
@@ -192,7 +194,7 @@ export default function ResearchLandscape({ resultId, decisionOptions, decision:
       if (!point) return ''
       return `${point.is_focus ? '<b>相对最佳单点</b><br/>' : ''}${Object.entries(point.params).filter(([, value]) => value != null).map(([key, value]) => `${landscapeParameterLabel(key, renderData?.parameter_space)}: ${formatLandscapeParameter(key, value)}`).join('<br/>')}<br/>差值超额: ${ratio(point.excess_return)}<br/>峰值本金收益: ${ratio(point.grid_return)}<br/>最大本金回撤: ${ratio(point.drawdown)}<br/>成交笔数: ${point.trade_count == null ? '—' : number(Number(point.trade_count), 0)}`
     } },
-    visualMap: { dimension: 3, min: -colorAbs, max: colorAbs, inRange: { color: ['#e11d48', '#f8fafc', '#0d9488'] }, outOfRange: { color: '#a8b0bc' }, text: ['高', '低'], formatter: (value: number) => ratio(value), calculable: true, orient: 'horizontal', left: 'center', bottom: 10 },
+    visualMap: { dimension: 3, min: -colorAbs, max: colorAbs, inRange: { color: landscapeColorRamp }, outOfRange: { color: landscapeMissingColor }, text: ['高', '低'], formatter: (value: number) => ratio(value), calculable: true, orient: 'horizontal', left: 'center', bottom: 10 },
     xAxis3D: { type: 'value', splitNumber: 3, nameGap: 15, nameTextStyle: { fontSize: 12 }, name: landscapeParameterLabel(axesFor3d[0] ?? '', renderData?.parameter_space), axisLabel: { formatter: (value: number) => formatLandscapeAxis(axesFor3d[0] ?? '', value) }, ...boundsForAxis(axesFor3d[0]) },
     yAxis3D: { type: 'value', splitNumber: 3, nameGap: 15, nameTextStyle: { fontSize: 12 }, name: landscapeParameterLabel(axesFor3d[1] ?? '', renderData?.parameter_space), axisLabel: { formatter: (value: number) => formatLandscapeAxis(axesFor3d[1] ?? '', value) }, ...boundsForAxis(axesFor3d[1]) },
     zAxis3D: { type: 'value', splitNumber: 3, nameGap: 15, nameTextStyle: { fontSize: 12 }, name: landscapeParameterLabel(axesFor3d[2] ?? '', renderData?.parameter_space), axisLabel: { formatter: (value: number) => formatLandscapeAxis(axesFor3d[2] ?? '', value) }, ...boundsForAxis(axesFor3d[2]) },
@@ -236,7 +238,7 @@ export default function ResearchLandscape({ resultId, decisionOptions, decision:
         type: 'continuous', dimension: 2, seriesIndex: 0, min: minValue, max: maxValue,
         calculable: true, orient: 'horizontal', left: 'center', bottom: 8, itemWidth: 12, itemHeight: 190,
         text: ['较高', '较低'], textGap: 8,
-        inRange: { color: ['#e11d48', '#f8fafc', '#0d9488'] }, outOfRange: { color: '#a8b0bc' },
+        inRange: { color: landscapeColorRamp }, outOfRange: { color: landscapeMissingColor },
         formatter: (value: unknown) => `${(Number(value) * 100).toFixed(1)}%`,
       },
       dataZoom: [
@@ -329,7 +331,7 @@ export default function ResearchLandscape({ resultId, decisionOptions, decision:
 
     <div className='research-chart-guide'>
       <span><b>{view === '2d' ? '每个格子' : '每个点'}</b>是一组参数</span>
-      <span><b>绿色 / 红色</b>表示相对全局零点偏高 / 偏低；白色为零，灰色为缺失</span>
+      <span><b>红色 / 绿色</b>表示相对全局零点偏高 / 偏低；灰色为零，浅灰色为缺失</span>
       <span>指标：{metric === 'excess' ? '差值超额' : '峰值本金收益'}；{data.sampled ? `显示 ${data.returned_count ?? data.points.length} / ${data.total}（服务端空间分桶抽样）` : `共 ${data.total} 个候选`}</span>
     </div>
 

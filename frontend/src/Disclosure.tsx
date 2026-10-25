@@ -16,14 +16,14 @@ export function usePersistentFlag(key: string, defaultValue = false) {
   return [value, update] as const
 }
 
-export default function Disclosure({ id, title, summary, children, defaultOpen = false, className = '' }: {
-  id: string; title: string; summary?: ReactNode; children: ReactNode; defaultOpen?: boolean; className?: string
+export default function Disclosure({ id, title, summary, children, defaultOpen = false, className = '', leading }: {
+  id: string; title: string; summary?: ReactNode; children: ReactNode; defaultOpen?: boolean; className?: string; leading?: ReactNode
 }) {
   const [open, setOpen] = usePersistentFlag(id, defaultOpen)
   return <details className={`disclosure ${className}`} open={open} data-disclosure={id} onToggle={event => {
     if (event.currentTarget.open !== open) setOpen(event.currentTarget.open)
   }}>
-    <summary><ChevronRight size={15} /><span>{title}</span>{summary != null && <small>{summary}</small>}</summary>
+    <summary>{leading}<ChevronRight size={15} /><span>{title}</span>{summary != null && <small>{summary}</small>}</summary>
     <div className="disclosure-body">{children}</div>
   </details>
 }

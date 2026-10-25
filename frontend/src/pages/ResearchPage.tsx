@@ -8,13 +8,18 @@ import { resultsPageQuery } from '../resultsReview'
 import ResearchLandscape from '../ResearchLandscape'
 import DataDiagnosticsPanel from '../DataDiagnosticsPanel'
 import Disclosure from '../Disclosure'
+import ResearchSectionStack, { type ResearchSection } from '../ResearchSectionStack'
 import { useTasks } from '../TaskCenter'
 import { useResearchDraft } from '../ResearchDraftContext'
 import {
   archivedResearchSource, isMissingResearchSourceError, requestedDataVersionFromPreview, researchPriorPolicyLabel,
   researchSourceErrorFromPreview, researchSourceRequestFields,
 } from '../researchDraft.ts'
-import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, Field, Loading, NumField, PageHeader, SelectInput, TextInput, configError, configPayload, loadConfig, percent, useErrorMessage } from '../components'
+import {
+  Badge, Button, Card, ConfigDcaFields, ConfigFeesFields, ConfigPriceBoundsFields, ConfigSymbolDateFields,
+  Empty, ErrorBox, Field, Loading, NumField, PageHeader, SelectInput, TextInput, configError, configPayload,
+  loadConfig, money, percent, useConfigFormModel, useErrorMessage,
+} from '../components'
 import { flushConfiguration, useWorkbenchDefaults } from '../useWorkbenchDefaults'
 import { researchEstimateKey, useResearchEstimate } from '../researchEstimate'
 import { canSubmitResearchEstimate } from '../researchEstimateFreshness'
@@ -270,7 +275,7 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
   const configuration = useWorkbenchDefaults()
   const uiSettings = (configuration.document.ui ?? {}) as Dict
   const [dateReady, setDateReady] = useState(false)
-  const { protocol_version: protocolVersion, selection_target: selectionTarget, rebalance_days: rebalanceDays, seed, top_candidates: topCandidates, max_principal_drawdown: maxPrincipalDrawdown, min_trades: minTrades, min_history_days: minHistoryDays, min_minute_ratio: minMinuteRatio, strategy_version: strategyVersion, ranking_mode: rankingMode, hypercube_edge: hypercubeEdge, granularity, search_method: searchMethod, training_budget: trainingBudget, validation_budget: validationBudget, reporting_budget: reportingBudget, total_evaluation_budget: totalEvaluationBudget, max_runtime_seconds: maxRuntimeSeconds, recommendation_count: recommendationCount, slippage_mode: slippageMode, fixed_half_widths: fixedHalfWidths, sigma, alpha, beta: scoreBeta, tau, eta_limit: etaLimit, eta_hard_cap: etaHardCap, gamma_max: gammaMax, eta_floor: etaFloor, gamma_min: gammaMin, floor_k_ref: floorKRef, training_min_days: trainingMinDays, training_max_days: trainingMaxDays, training_window_mode: trainingWindowMode, peak_tolerance: peakTolerance, start_min: startMin, start_max: startMax, starts_per_candidate: startsPerCandidate, initial_strides: initialStrides, stride_multiplier: strideMultiplier, max_stride_fraction: maxStrideFraction, validation_reserve_fraction: validationReserveFraction, exhaustive_memory_limit_mb: exhaustiveMemoryLimitMb, estimated_bytes_per_point: estimatedBytesPerPoint, stress_cost_multiplier: stressCostMultiplier, stress_region_count: stressRegionCount } = settings
+  const { selection_target: selectionTarget, rebalance_days: rebalanceDays, seed, top_candidates: topCandidates, max_principal_drawdown: maxPrincipalDrawdown, min_trades: minTrades, min_history_days: minHistoryDays, min_minute_ratio: minMinuteRatio, strategy_version: strategyVersion, ranking_mode: rankingMode, hypercube_edge: hypercubeEdge, granularity, search_method: searchMethod, training_budget: trainingBudget, validation_budget: validationBudget, reporting_budget: reportingBudget, total_evaluation_budget: totalEvaluationBudget, max_runtime_seconds: maxRuntimeSeconds, recommendation_count: recommendationCount, slippage_mode: slippageMode, fixed_half_widths: fixedHalfWidths, sigma, alpha, beta: scoreBeta, tau, eta_limit: etaLimit, eta_hard_cap: etaHardCap, gamma_max: gammaMax, eta_floor: etaFloor, gamma_min: gammaMin, floor_k_ref: floorKRef, training_min_days: trainingMinDays, training_max_days: trainingMaxDays, training_window_mode: trainingWindowMode, peak_tolerance: peakTolerance, start_min: startMin, start_max: startMax, starts_per_candidate: startsPerCandidate, initial_strides: initialStrides, stride_multiplier: strideMultiplier, max_stride_fraction: maxStrideFraction, validation_reserve_fraction: validationReserveFraction, exhaustive_memory_limit_mb: exhaustiveMemoryLimitMb, estimated_bytes_per_point: estimatedBytesPerPoint, stress_cost_multiplier: stressCostMultiplier, stress_region_count: stressRegionCount } = settings
   const tasks = useTasks()
   const researchDraft = useResearchDraft()
   const sourceEtf = researchDraft.state.source_etf
@@ -496,9 +501,18 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
     setPreflight({ status: 'idle', preview: null, message: '' })
     setPreflightToken(token => token + 1)
   }
+  const configModel = useConfigFormModel({
+    value: base,
+    onChange: changeBase,
+    onDateReadinessChange: setDateReady,
+    onDateIntentChange,
+    datesExplicit,
+    onFeeDefaultsEdit,
+    onDefaultsEdit,
+  })
   const researchValidationError = () => {
     const researchBase = researchConfigForSubmission(base)
-    const baseError = configError(researchBase)
+    const baseError = configError(researchBase, { ignoreHiddenResearchQuantities: true })
     if (baseError) return baseError
     if (researchBase.initial_shares <= 0) return '稳健 J 研究要求初始持股大于零。'
     if (!validResearchDefaults(settings)) return '请填写有效研究设置；搜索上限应不小于下限；研究细粒度须为参数最小单位（间距 0.01 个百分点、股数 100 股 / 份）的正整数倍；超正方体边长须为正奇数。'
@@ -746,7 +760,17 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
   const completionDecisionLabel = landscapeDecisions.find(item => item.value === completionDecisionValue)?.label ?? '评估开始日前选参'
   const previewTraining = record(preflight.preview?.training_window)
   const preflightReady = canSubmitResearchEstimate(estimate, estimateKey, preflight, dateReady, validation)
-  const rangesSummary = robustFields.filter(name => !(links.spacing && name === 'sell_step') && !(links.shares && name === 'sell_shares')).map(name => labels[name] + ' ' + rangeValue(name, ranges[name].low) + '–' + rangeValue(name, ranges[name].high)).join(' · ')
+  const activeRobustFields = robustFields.filter(name => !(links.spacing && name === 'sell_step') && !(links.shares && name === 'sell_shares'))
+  const freeVariableCount = activeRobustFields.length
+  const rangesSummary = `${freeVariableCount} 个自由变量 · ${activeRobustFields.map(name => labels[name] + ' ' + rangeValue(name, ranges[name].low) + '–' + rangeValue(name, ranges[name].high)).join(' · ')}`
+  const basicsSummary = `${base.symbol || '未选标的'} · ${base.start_date || '未设开始'} 至 ${base.end_date || '未设结束'} · ${base.frequency}`
+  const priceBoundsSummary = `${base.lower_price == null ? '不限' : money(base.lower_price, 3)} ～ ${base.upper_price == null ? '不限' : money(base.upper_price, 3)} 元`
+  const feesSummary = `佣金 ${percent(configModel.fees.commission_rate, 3)} · 最低 ${money(configModel.fees.min_commission)} 元 · 滑点 ${configModel.fees.slippage_bps} 基点`
+  const dcaFrequency = { daily: '每天', weekly: '每周', monthly: '每月' }[base.dca.frequency]
+  const dcaSummary = `${dcaFrequency} ${base.dca.shares} ${configModel.unit} · 初始 ${base.dca.initial_shares} ${configModel.unit}`
+  const planSummary = `${schemeLabel(selectionTarget, rebalanceDays)} · ${rebalanceDays} 日换参 · 种子 ${seed} · 训练/核验 ${trainingBudget}/${validationBudget} · 展示 ${topCandidates} 组`
+  const preflightTone = preflightReady ? 'green' : preflight.status === 'loading' ? 'blue' : preflight.status === 'idle' ? 'neutral' : 'amber'
+  const preflightStatusLabel = preflightReady ? '可以启动' : preflight.status === 'loading' ? '预检中' : preflight.status === 'idle' ? '等待预检' : '存在阻断项'
   const savedRanges = actualRanges && Object.keys(actualRanges).length ? <div className='table-wrap'><table><thead><tr><th>参数</th><th>下限</th><th>上限</th></tr></thead><tbody>{Object.entries(actualRanges).map(([key, raw]) => { const range = record(raw); return <tr key={key}><td>{labels[key] ?? key}</td><td>{range ? rangeValue(key, range.low) : '—'}</td><td>{range ? rangeValue(key, range.high) : '—'}</td></tr> })}</tbody></table></div> : <Empty title='任务中未保存搜索范围' />
   const revision = completion?.selected_revision ?? null
   const revisionScope = completion?.revision_scope ?? null
@@ -755,8 +779,180 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
     : '—'
   const completionStatusLabel = completion?.status === 'complete' ? '候选评分已完整' : completion?.status === 'available' ? '存在未完成候选，可补算' : '暂无可补算内容'
 
+  const researchSections: ResearchSection[] = [
+    {
+      id: 'research-basics',
+      title: '标的与评估区间',
+      summary: basicsSummary,
+      defaultOpen: true,
+      content: <ConfigSymbolDateFields model={configModel} purpose='research' footer={<Button variant='quiet' disabled={!base.symbol} onClick={() => {
+        get<{ first_date?: string }>('/data/coverage/' + base.symbol).then(value => {
+          if (value.first_date) onBaseChange(previous => ({ ...previous, start_date: new Date(Date.parse(value.first_date! + 'T00:00:00Z') + 86400000).toISOString().slice(0, 10), reference_price_mode: 'auto', reference_price: null }))
+        }).catch(cause => reportError(err(cause)))
+      }}>使用全部本地历史</Button>} />,
+    },
+    {
+      id: 'research-price-bounds',
+      title: '网格价格边界',
+      summary: priceBoundsSummary,
+      content: <><ConfigPriceBoundsFields model={configModel} /><p className='field-hint'>留空表示不限制边界；上下限都填写时必须满足下限小于上限。</p></>,
+    },
+    {
+      id: 'research-fees',
+      title: '费用与滑点',
+      summary: feesSummary,
+      content: <ConfigFeesFields model={configModel} extraBeforeSlippage={<Field label='研究滑点处理'><SelectInput value={slippageMode} onChange={event => updateSettings({ slippage_mode: event.target.value as ResearchDefaults['slippage_mode'] })}><option value='configured'>按当前配置</option><option value='zero'>不考虑滑点</option></SelectInput></Field>} />,
+    },
+    {
+      id: 'research-dca',
+      title: '定投设置',
+      summary: dcaSummary,
+      content: <ConfigDcaFields model={configModel} />,
+    },
+    {
+      id: 'research-plan',
+      title: '搜索方案与预算',
+      summary: planSummary,
+      content: <>
+        <div className='field-label'>参数方案</div>
+        <div className='research-scheme-tabs' role='group' aria-label='参数方案'>
+          {([['fixed', '固定参数'], ['adaptive', '每季自适应'], ['both', '两者对照']] as const).map(([value, label]) => <button type='button' className={selectionTarget === value ? 'selected' : ''} key={value} aria-pressed={selectionTarget === value} onClick={() => updateSettings({ selection_target: value })}>{label}</button>)}
+        </div>
+        <p className='field-hint'>{selectionTarget === 'fixed' ? '评估开始前锁定一组参数，整个评估期不变。' : selectionTarget === 'adaptive' ? '每隔 ' + rebalanceDays + ' 个交易日重选，账户连续运行。' : '同时比较一次锁定与每隔 ' + rebalanceDays + ' 个交易日重选。'}</p>
+        <div className='form-grid two'>
+          <NumField label='自适应换参周期（交易日）' min={1} max={504} step='1' value={rebalanceDays} onChange={next => next != null && updateSettings({ rebalance_days: next })} />
+          <NumField label='随机种子' step='1' value={seed} onChange={next => next != null && updateSettings({ seed: next })} />
+          <NumField label='结果候选展示上限' min={1} max={100} step='1' value={topCandidates} onChange={next => next != null && updateSettings({ top_candidates: next })} hint='只限制页面展示数量，不截断研究评价。' />
+          <NumField label='超正方体边长（研究刻度）' min={1} max={99} step='2' value={hypercubeEdge} onChange={next => next != null && updateSettings({ hypercube_edge: next })} hint='奇数边长使中心落在整数刻度；边长 3 表示每个维度取中心及两侧各一格。' />
+          <Field label='搜索方法'><SelectInput value={searchMethod} onChange={event => updateSettings({ search_method: event.target.value as ResearchDefaults['search_method'] })}><option value='auto'>自动（小空间穷举）</option><option value='hierarchical'>分层搜索</option><option value='exhaustive'>完整枚举</option></SelectInput></Field>
+          <NumField label='训练回测预算（唯一参数点）' min={1} max={1000000} step='1' value={trainingBudget} onChange={next => next != null && updateSettings({ training_budget: next })} />
+          <NumField label='邻域与峰值核验预算（唯一参数点）' min={1} max={2000000} step='1' value={validationBudget} onChange={next => next != null && updateSettings({ validation_budget: next })} />
+          <NumField label='展示补算预算（唯一参数点）' min={0} max={2000000} step='1' value={reportingBudget} onChange={next => next != null && updateSettings({ reporting_budget: next })} hint='用于对已归档候选做展示补算；不参与择参评分。' />
+          <NumField label='推荐参数个数' min={1} max={100} step='1' value={recommendationCount} onChange={next => next != null && updateSettings({ recommendation_count: next })} />
+        </div>
+        <p className='field-hint'>本版本使用等比网格 v5 · 稳健 J 排名。间距与份额按实际自由参数搜索；最低持仓固定为零、最高持仓自然放开。</p>
+      </>,
+    },
+    {
+      id: 'research-search-ranges',
+      title: '可调搜索范围与变量',
+      summary: rangesSummary,
+      defaultOpen: true,
+      content: <>
+        <div className='research-free-variable-summary'>
+          <div><small>研究自由变量</small><strong>{freeVariableCount} / 4</strong></div>
+          <span>统一开关改变研究时参与搜索的变量数；初始持股是固定账户基数，不新增搜索轴。</span>
+        </div>
+        <div className='form-grid two research-range-base'>
+          <NumField label='初始持股' value={base.initial_shares} onChange={next => next != null && configModel.set('initial_shares', next)} suffix={configModel.unit} min={0} step='100' hint='固定账户基数；买卖比例由每次交易股数除以初始持股派生，不参与搜索。' />
+        </div>
+        <div className='research-link-toggles'>
+          <label className='link-toggle'><input type='checkbox' checked={links.spacing} onChange={event => configModel.setLink('spacing', event.target.checked)} /><span>统一买卖间距</span></label>
+          <label className='link-toggle'><input type='checkbox' checked={links.shares} onChange={event => configModel.setLink('shares', event.target.checked)} /><span>统一买卖份额</span></label>
+          <span className='research-free-variable-badge'>{freeVariableCount} 个自由变量</span>
+        </div>
+        <p className='field-hint'>四个轴各自只有一个步长来源。研究细粒度就是该轴整数刻度宽度，间距以 0.01 个百分点为最小单位，股数以 100 股 / 份为最小单位。</p>
+        <div className='research-range-grid'>{activeRobustFields.map(name => {
+          const unit = researchQuantityUnit(name)
+          const minimum = pctRange.has(name) ? .01 : name === 'buy_shares' ? (configModel.isStarBoard ? 200 : 100) : name === 'sell_shares' ? 100 : 0
+          return <div className='research-range-card' key={name}>
+            <div className='research-range-heading'>
+              <div className='research-range-title'><strong>{name === 'buy_step' && links.spacing ? '统一买卖间距' : name === 'buy_shares' && links.shares ? '统一买卖份额' : labels[name]}</strong></div>
+              <small>单位 {pctRange.has(name) ? '0.01 个百分点' : `${unit} 股 / 份`}</small>
+            </div>
+            <div className='research-range-inputs'>
+              <NumField key='low' label='下限' value={ranges[name].low} percentValue={pctRange.has(name)} step={pctRange.has(name) ? '.01' : String(unit)} min={minimum} onChange={next => next != null && updateRange(name, 'low', next)} />
+              <NumField key='high' label='上限' value={ranges[name].high} percentValue={pctRange.has(name)} step={pctRange.has(name) ? '.01' : String(unit)} min={minimum} onChange={next => next != null && updateRange(name, 'high', next)} />
+            </div>
+            <NumField label='研究细粒度' value={granularity[name]} percentValue={pctRange.has(name)} step={pctRange.has(name) ? '.01' : String(unit)} min={pctRange.has(name) ? .01 : unit} onChange={next => next != null && updateSettings({ granularity: { ...granularity, [name]: next } })} hint='仅控制搜索采样间隔' />
+          </div>
+        })}</div>
+        <Button variant='quiet' onClick={() => updateSettings({ ranges: defaultSearchRanges() })}><RotateCcw size={14} />恢复默认范围</Button>
+      </>,
+    },
+    {
+      id: 'research-robust-j',
+      title: '稳健 J 目标与峰区评分',
+      summary: 'α ' + percent(alpha) + ' · β ' + scoreBeta.toFixed(2) + ' · σ ' + sigma.toFixed(2) + ' · τ ' + percent(tau),
+      content: <>
+        <div className='form-grid two'>
+          <NumField label='中心超额权重 α' min={0} max={100} step='1' percentValue suffix='%' value={alpha} onChange={next => next != null && updateSettings({ alpha: next })} />
+          <NumField label='下行风险系数 β' min={0} max={100} step='.1' value={scoreBeta} onChange={next => next != null && updateSettings({ beta: next })} />
+          <NumField label='安全垫阈值 τ（训练期累计）' min={-100} max={1000} step='1' percentValue suffix='%' value={tau} onChange={next => next != null && updateSettings({ tau: next })} />
+          <NumField label='高斯核宽度 σ（刻度）' min={.01} max={100} step='.1' value={sigma} onChange={next => next != null && updateSettings({ sigma: next })} />
+          <NumField label='持仓免罚上限 η limit' min={0} max={1000} step='.1' value={etaLimit} onChange={next => next != null && updateSettings({ eta_limit: next })} />
+          <NumField label='最大持仓淘汰阈值（0 表示关闭）' min={0} max={1000} step='.1' value={etaHardCap ?? 0} onChange={next => next != null && updateSettings({ eta_hard_cap: next > 0 ? next : null })} hint='仅判断中心是否合格，不提前停止回测或截断买入。' />
+          <NumField label='上界二次惩罚 γ max' min={0} max={1000} step='.05' value={gammaMax} onChange={next => next != null && updateSettings({ gamma_max: next })} hint={'例如实际最大持仓 2.5 倍、免罚上限 2、γ=0.4 时扣 0.1。'} />
+          <NumField label='底仓保护下限 η floor' min={0} max={100} step='1' percentValue suffix='%' value={etaFloor} onChange={next => next != null && updateSettings({ eta_floor: next })} />
+          <NumField label='底仓整格惩罚 γ min' min={0} max={1000} step='.05' value={gammaMin} onChange={next => next != null && updateSettings({ gamma_min: next })} />
+          <NumField label='底仓参考格数 K ref' min={.01} max={1000000} step='.1' value={floorKRef} onChange={next => next != null && updateSettings({ floor_k_ref: next })} hint='每段按该候选的卖出间距计整格；扣分为 γ min × Σ(k/K ref)²。' />
+          <NumField label='峰值比较绝对容差' min={1e-15} max={.1} step='any' value={peakTolerance} onChange={next => next != null && updateSettings({ peak_tolerance: next })} />
+        </div>
+        <p className='field-hint'>J = αR + (1−α)μΩ − βσ⁻Ω − Cpos。底仓惩罚按每段触底后继续上涨的卖出整格数累计，首次触底和底仓附近震荡不扣分；原始 R 只作为中心收益与诊断。</p>
+      </>,
+    },
+    {
+      id: 'research-robust-search',
+      title: '多起点搜索与预算控制',
+      summary: `起点 ${startMin}–${startMax} · 每候选 ${startsPerCandidate} · 核验预留 ${percent(validationReserveFraction)}`,
+      content: <>
+        <div className='form-grid two'>
+          <NumField label='最少起点数' min={1} max={1000} step='1' value={startMin} onChange={next => next != null && updateSettings({ start_min: next })} />
+          <NumField label='最多起点数' min={1} max={1000} step='1' value={startMax} onChange={next => next != null && updateSettings({ start_max: next })} />
+          <NumField label='每个推荐候选对应起点数' min={1} max={100} step='1' value={startsPerCandidate} onChange={next => next != null && updateSettings({ starts_per_candidate: next })} />
+          <Field label='初始局部步长（刻度，逗号分隔）'><TextInput value={initialStrides.join(',')} onChange={event => { const values = event.target.value.split(',').map(value => Number(value.trim())).filter(value => Number.isSafeInteger(value) && value > 0); updateSettings({ initial_strides: values.length ? values : [1] }) }} /></Field>
+          <NumField label='大步长倍率' min={2} max={16} step='1' value={strideMultiplier} onChange={next => next != null && updateSettings({ stride_multiplier: next })} />
+          <NumField label='大步长最大跨度比例' min={1} max={100} step='1' percentValue suffix='%' value={maxStrideFraction} onChange={next => next != null && updateSettings({ max_stride_fraction: next })} />
+          <NumField label='峰值核验预算预留' min={0} max={100} step='1' percentValue suffix='%' value={validationReserveFraction} onChange={next => next != null && updateSettings({ validation_reserve_fraction: next })} />
+          <NumField label='穷举工作内存上限（MiB）' min={16} max={65536} step='16' value={exhaustiveMemoryLimitMb} onChange={next => next != null && updateSettings({ exhaustive_memory_limit_mb: next })} />
+          <NumField label='单点预算内存估计（字节）' min={64} max={65536} step='64' value={estimatedBytesPerPoint} onChange={next => next != null && updateSettings({ estimated_bytes_per_point: next })} hint='用于自动搜索预检和穷举工作内存估算，不改变回测结果。' />
+        </div>
+        <p className='field-hint'>自动模式只在训练预算和工作内存均允许时完整枚举；否则使用打乱 Sobol 覆盖、统计启发式种子和多起点轮转局部搜索。所有输出峰区必须完成一格联合邻域核验。</p>
+      </>,
+    },
+    {
+      id: 'research-robust-window',
+      title: '训练窗口、预算与费用压力',
+      summary: `${trainingMinDays}–${trainingMaxDays} 日训练 · ${trainingWindowMode === 'same_price' ? '同价日起点' : '固定天数'} · 费用 ×${stressCostMultiplier}`,
+      content: <div className='form-grid two'>
+        <NumField label='训练回看最短交易日' min={20} max={5000} step='1' value={trainingMinDays} onChange={next => next != null && updateSettings({ training_min_days: next })} />
+        <NumField label='训练回看最长交易日' min={20} max={5000} step='1' value={trainingMaxDays} onChange={next => next != null && updateSettings({ training_max_days: next })} />
+        <Field label='训练窗口模式'><SelectInput value={trainingWindowMode} onChange={event => updateSettings({ training_window_mode: event.target.value as ResearchDefaults['training_window_mode'] })}><option value='same_price'>同价日起点</option><option value='fixed'>固定天数</option></SelectInput></Field>
+        <NumField label='任务总评价预算（留空表示自动有效上限）' min={1} max={10000000} step='1' value={totalEvaluationBudget ?? null} onChange={next => updateSettings({ total_evaluation_budget: next })} hint='留空时由搜索上限、评估决策数与回放次数自动形成有效上限。' />
+        <NumField label='最长运行时间（秒）' min={1} max={86400} step='1' value={maxRuntimeSeconds} onChange={next => next != null && updateSettings({ max_runtime_seconds: next })} />
+        <NumField label='费用压力倍率' min={1.01} max={20} step='.1' value={stressCostMultiplier} onChange={next => next != null && updateSettings({ stress_cost_multiplier: next })} />
+        <NumField label='费用压力推荐峰区数' min={0} max={50} step='1' value={stressRegionCount} onChange={next => next != null && updateSettings({ stress_region_count: next })} />
+      </div>,
+    },
+    {
+      id: 'research-constraints',
+      title: '选择与样本约束',
+      summary: '本金回撤 ≤ ' + percent(maxPrincipalDrawdown) + ' · 成交 ≥ ' + minTrades + ' · 分钟覆盖 ≥ ' + percent(minMinuteRatio),
+      content: <>
+        <div className='form-grid two'>
+          <NumField label='最大本金回撤约束' min={1} max={100} step='1' percentValue suffix='%' value={maxPrincipalDrawdown} onChange={next => next != null && updateSettings({ max_principal_drawdown: next })} hint='按峰值外部本金口径的盈利回撤，与旧单位净值回撤不可直接比较。' />
+          <NumField label='最少成交笔数' min={0} step='1' value={minTrades} onChange={next => next != null && updateSettings({ min_trades: next })} />
+          <NumField label='最小分钟覆盖率' min={0} max={100} step='1' percentValue suffix='%' value={minMinuteRatio} onChange={next => next != null && updateSettings({ min_minute_ratio: next })} />
+        </div>
+        <p className='field-hint'>候选的相对排名与约束是否满足会分别展示。</p>
+      </>,
+    },
+  ]
+
   return <>
     <PageHeader eyebrow='PARAMETER RESEARCH' title='参数研究' description='用历史训练选择参数，在所选日期内检验固定与自适应方案。' action={<Button busy={busy} disabled={!base.symbol || !preflightReady} onClick={() => void submit()}><FlaskConical size={15} />启动参数研究</Button>} />
+    <section className={`research-preflight-bar ${preflightReady ? 'ready' : preflight.status === 'loading' ? 'loading' : preflight.status === 'idle' ? 'idle' : 'blocked'}`} aria-live='polite'>
+      <div className='research-preflight-bar-main'>
+        <div className='research-preflight-status'><Badge tone={preflightTone}>{preflightStatusLabel}</Badge><small>只读搜索预检</small></div>
+        {preflightReady ? <div className='research-preflight-metrics'>
+          <div><small>训练时段</small><strong>{String(previewTraining?.start ?? '—')} 至 {String(previewTraining?.end ?? '—')}</strong><span>{String(preflight.preview?.training_days ?? '—')} 个交易日{previewTraining?.matched ? ' · 同价日起点' : ' · 固定天数'}</span></div>
+          <div><small>搜索组合</small><strong>{Number(preflight.preview?.legal_combination_count ?? 0).toLocaleString()} 个</strong><span>{String(preflight.preview?.search_method ?? '—')} · 单峰支持 {String(preflight.preview?.estimated_peak_support_points ?? '—')} 点</span></div>
+          <div><small>评价预算</small><strong>{Number(preflight.preview?.effective_total_evaluation_budget ?? 0).toLocaleString()} 点</strong><span>任务上限 {Number(preflight.preview?.task_evaluation_upper_bound ?? 0).toLocaleString()} · 邻域 {Number(preflight.preview?.neighborhood_budget ?? validationBudget).toLocaleString()}</span></div>
+          <div><small>预计内存</small><strong>{Number(preflight.preview?.estimated_task_memory_mb ?? 0).toFixed(1)} MiB</strong><span>工作区上限 {Number(preflight.preview?.workspace_budget_mb ?? 0).toFixed(1)} MiB</span></div>
+        </div> : <p className='research-preflight-bar-note'>{preflight.message || '相关设置稳定后会自动更新预检；也可手动重新预检。'}</p>}
+      </div>
+      <Button variant='quiet' onClick={() => setPreflightToken(token => token + 1)}><RefreshCw size={14} />重新预检</Button>
+    </section>
     <div className='research-guide'>
       <p><strong>研究流程</strong><span>设置标的与评估期 → 选择方案并启动 → 查看样本外表现与补算 → 载入回测</span></p>
       <Disclosure id='research-method-help' title='如何理解日期、方案与收益口径' summary={`评估日期 · ${trainingMinDays}–${trainingMaxDays} 日训练 · 峰值本金口径`}>
@@ -771,7 +967,7 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
     </div>
     {error && <ErrorBox message={error} onClose={() => setError('')} onRetry={retryable ? () => { setError(''); setRetryToken(token => token + 1) } : undefined} />}
     {dataIssue && <div className='notice'><span>本次研究缺少本地行情或质量依据。请在数据管理中显式准备所需周期和前置历史。</span><Button variant='secondary' onClick={() => onPrepareData?.(dataIssue)}>去准备数据</Button></div>}
-    {sourceEtf && <Card className='research-source-card' title='ETF 来源草稿' subtitle='来源只用于先验与追溯；本次提交的数据版本来自下方最新预检，不使用来源结果的历史版本。' action={<Badge tone={researchDraft.state.prior_policy === 'daily_state_v1' ? 'blue' : 'neutral'}>{researchPriorPolicyLabel(researchDraft.state.prior_policy)}</Badge>}>
+    {sourceEtf && <Card className='research-source-card' title='ETF 来源草稿' subtitle='来源只用于先验与追溯；本次提交的数据版本来自最新预检，不使用来源结果的历史版本。' action={<Badge tone={researchDraft.state.prior_policy === 'daily_state_v1' ? 'blue' : 'neutral'}>{researchPriorPolicyLabel(researchDraft.state.prior_policy)}</Badge>}>
       <div className='research-source-summary'>
         <div><small>来源 ETF</small><strong>{displayedDraftSummary?.symbol_name || displayedDraftSummary?.symbol || base.symbol || '—'}</strong><span>{displayedDraftSummary?.symbol || base.symbol} · 截止 {displayedDraftSummary?.as_of || base.end_date || '—'}</span></div>
         <div><small>来源结果</small><strong title={sourceEtf.result_id}>{sourceEtf.result_id}</strong><span>{displayedDraftSummary ? `${displayedDraftSummary.method_version} · ${displayedDraftSummary.archived ? '归档来源快照' : resultStatusLabel(displayedDraftSummary.status)}` : '结果摘要未载入'}</span></div>
@@ -796,117 +992,10 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
     {!sourceEtf && !showArchivedSource && <div className='research-source-empty'><Link2 size={14} /><span>独立参数研究 · 默认先验 <b>off</b>，可手动开启日线状态先验；可从 ETF 详情任一有效标的建立带来源的草稿。清除来源、换标的或恢复默认会回到 off。</span><div className='research-prior-toggle' role='group' aria-label='独立研究先验策略'><button type='button' className={researchDraft.state.prior_policy === 'off' ? 'selected' : ''} aria-pressed={researchDraft.state.prior_policy === 'off'} onClick={() => researchDraft.setPriorPolicy('off')}>关闭</button><button type='button' className={researchDraft.state.prior_policy === 'daily_state_v1' ? 'selected' : ''} aria-pressed={researchDraft.state.prior_policy === 'daily_state_v1'} onClick={() => researchDraft.setPriorPolicy('daily_state_v1')}>日线状态先验</button></div></div>}
     <div className='research-workspace'>
       <aside className='research-config-column'>
-        <Card title='研究对象' subtitle='所选日期是样本外评估期，系统另取之前的历史训练。'>
-          <ConfigForm onDateReadinessChange={setDateReady} onDateIntentChange={onDateIntentChange} datesExplicit={datesExplicit} value={base} onChange={changeBase} purpose='research' researchProtocol={protocolVersion} onFeeDefaultsEdit={onFeeDefaultsEdit} onDefaultsEdit={onDefaultsEdit} />
-          <Button variant='quiet' disabled={!base.symbol} onClick={() => {
-            get<{ first_date?: string }>('/data/coverage/' + base.symbol).then(value => {
-              if (value.first_date) onBaseChange(previous => ({ ...previous, start_date: new Date(Date.parse(value.first_date! + 'T00:00:00Z') + 86400000).toISOString().slice(0, 10), reference_price_mode: 'auto', reference_price: null }))
-            }).catch(cause => reportError(err(cause)))
-          }}>使用全部本地历史</Button>
-        </Card>
-        <Card title='研究设置' className='research-launch-card' action={onRestore && <Button variant='quiet' onClick={onRestore}><RotateCcw size={14} />恢复默认</Button>}>
-          <div className='field-label'>参数方案</div>
-          <div className='research-scheme-tabs' role='group' aria-label='参数方案'>
-            {([['fixed', '固定参数'], ['adaptive', '每季自适应'], ['both', '两者对照']] as const).map(([value, label]) => <button type='button' className={selectionTarget === value ? 'selected' : ''} key={value} aria-pressed={selectionTarget === value} onClick={() => updateSettings({ selection_target: value })}>{label}</button>)}
-          </div>
-          <p className='field-hint'>{selectionTarget === 'fixed' ? '评估开始前锁定一组参数，整个评估期不变。' : selectionTarget === 'adaptive' ? '每隔 ' + rebalanceDays + ' 个交易日重选，账户连续运行。' : '同时比较一次锁定与每隔 ' + rebalanceDays + ' 个交易日重选。'}</p>
-          <div className='form-grid two'>
-            <NumField label='超正方体边长（研究刻度）' min={1} max={99} step='2' value={hypercubeEdge} onChange={next => next != null && updateSettings({ hypercube_edge: next })} hint='奇数边长使中心落在整数刻度；边长 3 表示每个维度取中心及两侧各一格。' />
-            <Field label='搜索方法'><SelectInput value={searchMethod} onChange={event => updateSettings({ search_method: event.target.value as ResearchDefaults['search_method'] })}><option value='auto'>自动（小空间穷举）</option><option value='hierarchical'>分层搜索</option><option value='exhaustive'>完整枚举</option></SelectInput></Field>
-            <NumField label='训练回测预算（唯一参数点）' min={1} max={1000000} step='1' value={trainingBudget} onChange={next => next != null && updateSettings({ training_budget: next })} />
-            <NumField label='邻域与峰值核验预算（唯一参数点）' min={1} max={2000000} step='1' value={validationBudget} onChange={next => next != null && updateSettings({ validation_budget: next })} />
-            <NumField label='展示补算预算（唯一参数点）' min={0} max={2000000} step='1' value={reportingBudget} onChange={next => next != null && updateSettings({ reporting_budget: next })} hint='用于对已归档候选做展示补算；不参与择参评分。' />
-            <NumField label='推荐参数个数' min={1} max={100} step='1' value={recommendationCount} onChange={next => next != null && updateSettings({ recommendation_count: next })} />
-            <Field label='滑点处理'><SelectInput value={slippageMode} onChange={event => updateSettings({ slippage_mode: event.target.value as ResearchDefaults['slippage_mode'] })}><option value='configured'>按当前配置</option><option value='zero'>不考虑滑点</option></SelectInput></Field>
-          </div>
-          <p className='field-hint'>本版本使用等比网格 v5 · 稳健 J 排名。间距与份额可分别统一，按实际自由参数搜索；最低持仓固定为零、最高持仓自然放开。买卖比例仅由股数除以初始持股派生，持仓上限作为回测后的风险资格与惩罚，不会提前截断成交。</p>
-          <Disclosure id='research-robust-j' title='稳健 J 目标与峰区评分' summary={'α ' + percent(alpha) + ' · β ' + scoreBeta.toFixed(2) + ' · σ ' + sigma.toFixed(2) + ' · τ ' + percent(tau)}>
-            <div className='form-grid two'>
-              <NumField label='中心超额权重 α' min={0} max={100} step='1' percentValue suffix='%' value={alpha} onChange={next => next != null && updateSettings({ alpha: next })} />
-              <NumField label='下行风险系数 β' min={0} max={100} step='.1' value={scoreBeta} onChange={next => next != null && updateSettings({ beta: next })} />
-              <NumField label='安全垫阈值 τ（训练期累计）' min={-100} max={1000} step='1' percentValue suffix='%' value={tau} onChange={next => next != null && updateSettings({ tau: next })} />
-              <NumField label='高斯核宽度 σ（刻度）' min={.01} max={100} step='.1' value={sigma} onChange={next => next != null && updateSettings({ sigma: next })} />
-              <NumField label='持仓免罚上限 η limit' min={0} max={1000} step='.1' value={etaLimit} onChange={next => next != null && updateSettings({ eta_limit: next })} />
-              <NumField label='最大持仓淘汰阈值（0 表示关闭）' min={0} max={1000} step='.1' value={etaHardCap ?? 0} onChange={next => next != null && updateSettings({ eta_hard_cap: next > 0 ? next : null })} hint='仅判断中心是否合格，不提前停止回测或截断买入。' />
-              <NumField label='上界二次惩罚 γ max' min={0} max={1000} step='.05' value={gammaMax} onChange={next => next != null && updateSettings({ gamma_max: next })} hint={'例如实际最大持仓 2.5 倍、免罚上限 2、γ=0.4 时扣 0.1。'} />
-              <NumField label='底仓保护下限 η floor' min={0} max={100} step='1' percentValue suffix='%' value={etaFloor} onChange={next => next != null && updateSettings({ eta_floor: next })} />
-              <NumField label='底仓整格惩罚 γ min' min={0} max={1000} step='.05' value={gammaMin} onChange={next => next != null && updateSettings({ gamma_min: next })} />
-              <NumField label='底仓参考格数 K ref' min={.01} max={1000000} step='.1' value={floorKRef} onChange={next => next != null && updateSettings({ floor_k_ref: next })} hint='每段按该候选的卖出间距计整格；扣分为 γ min × Σ(k/K ref)²。' />
-              <NumField label='峰值比较绝对容差' min={1e-15} max={.1} step='any' value={peakTolerance} onChange={next => next != null && updateSettings({ peak_tolerance: next })} />
-            </div>
-            <p className='field-hint'>J = αR + (1−α)μΩ − βσ⁻Ω − Cpos。底仓惩罚按每段触底后继续上涨的卖出整格数累计，首次触底和底仓附近震荡不扣分；原始 R 只作为中心收益与诊断。</p>
-          </Disclosure>
-          <Disclosure id='research-robust-search' title='多起点搜索与预算控制' summary={`起点 ${startMin}–${startMax} · 每候选 ${startsPerCandidate} · 核验预留 ${percent(validationReserveFraction)}`}>
-            <div className='form-grid two'>
-              <NumField label='最少起点数' min={1} max={1000} step='1' value={startMin} onChange={next => next != null && updateSettings({ start_min: next })} />
-              <NumField label='最多起点数' min={1} max={1000} step='1' value={startMax} onChange={next => next != null && updateSettings({ start_max: next })} />
-              <NumField label='每个推荐候选对应起点数' min={1} max={100} step='1' value={startsPerCandidate} onChange={next => next != null && updateSettings({ starts_per_candidate: next })} />
-              <Field label='初始局部步长（刻度，逗号分隔）'><TextInput value={initialStrides.join(',')} onChange={event => { const values = event.target.value.split(',').map(value => Number(value.trim())).filter(value => Number.isSafeInteger(value) && value > 0); updateSettings({ initial_strides: values.length ? values : [1] }) }} /></Field>
-              <NumField label='大步长倍率' min={2} max={16} step='1' value={strideMultiplier} onChange={next => next != null && updateSettings({ stride_multiplier: next })} />
-              <NumField label='大步长最大跨度比例' min={1} max={100} step='1' percentValue suffix='%' value={maxStrideFraction} onChange={next => next != null && updateSettings({ max_stride_fraction: next })} />
-              <NumField label='峰值核验预算预留' min={0} max={100} step='1' percentValue suffix='%' value={validationReserveFraction} onChange={next => next != null && updateSettings({ validation_reserve_fraction: next })} />
-              <NumField label='穷举工作内存上限（MiB）' min={16} max={65536} step='16' value={exhaustiveMemoryLimitMb} onChange={next => next != null && updateSettings({ exhaustive_memory_limit_mb: next })} />
-              <NumField label='单点预算内存估计（字节）' min={64} max={65536} step='64' value={estimatedBytesPerPoint} onChange={next => next != null && updateSettings({ estimated_bytes_per_point: next })} hint='用于自动搜索预检和穷举工作内存估算，不改变回测结果。' />
-            </div>
-            <p className='field-hint'>自动模式只在训练预算和工作内存均允许时完整枚举；否则使用打乱 Sobol 覆盖、统计启发式种子和多起点轮转局部搜索。所有输出峰区必须完成一格联合邻域核验。</p>
-          </Disclosure>
-          <Disclosure id='research-robust-window' title='训练窗口、预算与费用压力' summary={`${trainingMinDays}–${trainingMaxDays} 日训练 · ${trainingWindowMode === 'same_price' ? '同价日起点' : '固定天数'} · 费用 ×${stressCostMultiplier}`}>
-            <div className='form-grid two'>
-              <NumField label='训练回看最短交易日' min={20} max={5000} step='1' value={trainingMinDays} onChange={next => next != null && updateSettings({ training_min_days: next })} />
-              <NumField label='训练回看最长交易日' min={20} max={5000} step='1' value={trainingMaxDays} onChange={next => next != null && updateSettings({ training_max_days: next })} />
-              <Field label='训练窗口模式'><SelectInput value={trainingWindowMode} onChange={event => updateSettings({ training_window_mode: event.target.value as ResearchDefaults['training_window_mode'] })}><option value='same_price'>同价日起点</option><option value='fixed'>固定天数</option></SelectInput></Field>
-              <NumField label='任务总评价预算（留空表示自动有效上限）' min={1} max={10000000} step='1' value={totalEvaluationBudget ?? null} onChange={next => updateSettings({ total_evaluation_budget: next })} hint='留空时由搜索上限、评估决策数与回放次数自动形成有效上限。' />
-              <NumField label='最长运行时间（秒）' min={1} max={86400} step='1' value={maxRuntimeSeconds} onChange={next => next != null && updateSettings({ max_runtime_seconds: next })} />
-              <NumField label='费用压力倍率' min={1.01} max={20} step='.1' value={stressCostMultiplier} onChange={next => next != null && updateSettings({ stress_cost_multiplier: next })} />
-              <NumField label='费用压力推荐峰区数' min={0} max={50} step='1' value={stressRegionCount} onChange={next => next != null && updateSettings({ stress_region_count: next })} />
-            </div>
-          </Disclosure>
-          <section className={`research-preflight ${preflightReady ? 'ready' : preflight.status === 'loading' ? 'loading' : 'blocked'}`} aria-live='polite'>
-            <div className='research-preflight-head'><div><strong>只读搜索预检</strong><small>相关设置稳定 1.5 秒后更新；费用、评分权重等不重估计算量</small></div><Badge tone={preflightReady ? 'green' : preflight.status === 'loading' ? 'blue' : 'amber'}>{preflightReady ? '可以启动' : preflight.status === 'loading' ? '检查中' : '存在阻断项'}</Badge></div>
-            {preflight.status === 'loading' ? <Loading label={preflight.message} /> : preflightReady ? <div className='research-preflight-grid'>
-              <div><small>训练时段</small><strong>{String(previewTraining?.start ?? '—')} 至 {String(previewTraining?.end ?? '—')}</strong><span>{String(preflight.preview?.training_days ?? '—')} 个交易日{previewTraining?.matched ? ' · 同价日起点' : ' · 固定天数'}</span></div>
-              <div><small>搜索组合</small><strong>{Number(preflight.preview?.legal_combination_count ?? 0).toLocaleString()} 个</strong><span>{String(preflight.preview?.search_method ?? '—')} · 单峰支持 {String(preflight.preview?.estimated_peak_support_points ?? '—')} 点</span></div>
-              <div><small>评价预算</small><strong>{Number(preflight.preview?.effective_total_evaluation_budget ?? 0).toLocaleString()} 点</strong><span>任务上限 {Number(preflight.preview?.task_evaluation_upper_bound ?? 0).toLocaleString()} · 邻域 {Number(preflight.preview?.neighborhood_budget ?? validationBudget).toLocaleString()}</span></div>
-              <div><small>预计内存</small><strong>{Number(preflight.preview?.estimated_task_memory_mb ?? 0).toFixed(1)} MiB</strong><span>工作区上限 {Number(preflight.preview?.workspace_budget_mb ?? 0).toFixed(1)} MiB</span></div>
-              <div><small>数据前置</small><strong>训练窗口可用</strong><span>提交目标版本 {requestedDataVersionFromPreview(preflight.preview) || '由预检返回'}；提交时仍会重新核验</span></div>
-            </div> : <div className='research-preflight-blocked'><p>{preflight.message || '预检尚未完成。'}</p>{dataIssue?.gaps?.length ? <ul>{dataIssue.gaps.map((gap, index) => <li key={index}>{String(gap.message ?? gap.kind ?? '数据缺口')}</li>)}</ul> : null}<Button variant='quiet' onClick={() => setPreflightToken(token => token + 1)}><RefreshCw size={14} />重新预检</Button></div>}
-          </section>
-          <div className='research-launch-action'><Button busy={busy} disabled={!preflightReady} onClick={() => void submit()}><FlaskConical size={15} />启动参数研究</Button><small>{schemeLabel(selectionTarget, rebalanceDays)} · {trainingMinDays}–{trainingMaxDays} 日训练时段 · 设置自动记忆</small></div>
-          <Disclosure id='research-search-ranges' title='可调搜索范围' summary={rangesSummary}>
-            <p className='field-hint'>四个轴各自只有一个步长来源。研究细粒度就是该轴整数刻度宽度，间距以 0.01 个百分点为最小单位，股数以 100 股 / 份为最小单位。</p>
-            <div className='research-range-grid'>{robustFields.filter(name => !(links.spacing && name === 'sell_step') && !(links.shares && name === 'sell_shares')).map(name => {
-              const unit = researchQuantityUnit(name)
-              const minimum = name === 'buy_shares' ? isStarBoard ? 200 : 100 : name === 'sell_shares' ? 100 : 0
-              return <div className='research-range-card' key={name}>
-                <div className='research-range-heading'>
-                  <div className='research-range-title'><strong>{name === 'buy_step' && links.spacing ? '统一买卖间距' : name === 'buy_shares' && links.shares ? '统一买卖份额' : labels[name]}</strong></div>
-                  <small>单位 {pctRange.has(name) ? '0.01 个百分点' : `${unit} 股 / 份`}</small>
-                </div>
-                <div className='research-range-inputs'>
-                  <NumField key='low' label='下限' value={ranges[name].low} percentValue={pctRange.has(name)} step={pctRange.has(name) ? '.01' : String(unit)} min={pctRange.has(name) ? .01 : minimum} onChange={next => next != null && updateRange(name, 'low', next)} />
-                  <NumField key='high' label='上限' value={ranges[name].high} percentValue={pctRange.has(name)} step={pctRange.has(name) ? '.01' : String(unit)} min={pctRange.has(name) ? .01 : minimum} onChange={next => next != null && updateRange(name, 'high', next)} />
-                </div>
-                <NumField label='研究细粒度' value={granularity[name]} percentValue={pctRange.has(name)} step={pctRange.has(name) ? '.01' : String(unit)} min={pctRange.has(name) ? .01 : unit} onChange={next => next != null && updateSettings({ granularity: { ...granularity, [name]: next } })} hint='仅控制搜索采样间隔' />
-              </div>
-            })}</div>
-            <Button variant='quiet' onClick={() => updateSettings({ ranges: defaultSearchRanges() })}><RotateCcw size={14} />恢复默认范围</Button>
-          </Disclosure>
-          <Disclosure id='research-constraints' title='选择与样本约束' summary={'本金回撤 ≤ ' + percent(maxPrincipalDrawdown) + ' · 成交 ≥ ' + minTrades + ' · 分钟覆盖 ≥ ' + percent(minMinuteRatio)}>
-            <div className='form-grid two'>
-              <NumField label='最大本金回撤约束' min={1} max={100} step='1' percentValue suffix='%' value={maxPrincipalDrawdown} onChange={next => next != null && updateSettings({ max_principal_drawdown: next })} hint='按峰值外部本金口径的盈利回撤，与旧单位净值回撤不可直接比较。' />
-              <NumField label='最少成交笔数' min={0} step='1' value={minTrades} onChange={next => next != null && updateSettings({ min_trades: next })} />
-              <NumField label='最小分钟覆盖率' min={0} max={100} step='1' percentValue suffix='%' value={minMinuteRatio} onChange={next => next != null && updateSettings({ min_minute_ratio: next })} />
-            </div>
-            <p className='field-hint'>候选的相对排名与约束是否满足会分别展示。</p>
-          </Disclosure>
-          <Disclosure id='research-reproducibility' title='换参与复现设置' summary={`${rebalanceDays} 日换参 · 种子 ${seed} · 展示 ${topCandidates} 组`}>
-            <div className='form-grid two'>
-              <NumField label='自适应换参周期（交易日）' min={1} max={504} step='1' value={rebalanceDays} onChange={next => next != null && updateSettings({ rebalance_days: next })} />
-              <NumField label='随机种子' step='1' value={seed} onChange={next => next != null && updateSettings({ seed: next })} />
-              <NumField label='结果候选展示上限' min={1} max={100} step='1' value={topCandidates} onChange={next => next != null && updateSettings({ top_candidates: next })} hint='只限制页面展示数量，不截断研究评价。' />
-            </div>
-          </Disclosure>
-        </Card>
+        <ResearchSectionStack
+          sections={researchSections}
+          headerAction={onRestore && <Button variant='quiet' onClick={onRestore}><RotateCcw size={14} />恢复默认设置</Button>}
+        />
       </aside>
       <main className='research-main-column' aria-label='参数研究结果'>
         <div className='research-result-toolbar'>

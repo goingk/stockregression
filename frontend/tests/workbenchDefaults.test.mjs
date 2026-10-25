@@ -159,13 +159,44 @@ test('v5 budgets and the training window default to the protocol values and keep
   assert.equal(normalized.training_window_mode, 'fixed')
 })
 
-test('research submission always uses an unlimited geometric grid', () => {
-  const base = { initial_shares: 100000, max_shares: 2000, grid_mode: 'trailing' }
+test('research submission cleans hidden search fields while preserving the research account', () => {
+  const base = {
+    schema_version: 3,
+    symbol: '600000.SH',
+    start_date: '2025-01-02',
+    end_date: '2025-12-31',
+    frequency: '1m',
+    initial_shares: 100000,
+    min_shares: 500,
+    max_shares: 2000,
+    buy_shares: 600,
+    sell_shares: 700,
+    grid_mode: 'trailing',
+    buy_step: .065,
+    sell_step: .045,
+    lower_price: 8,
+    upper_price: 30,
+    reference_price: 12,
+    reference_price_mode: 'manual',
+    fees: { commission_rate: .00005, min_commission: .1, slippage_bps: 5 },
+    dca: { frequency: 'monthly', shares: 100, initial_shares: 0 },
+    parameter_links: { spacing: true, shares: false },
+  }
+  const original = structuredClone(base)
   const submitted = researchConfigForSubmission(base)
-  assert.equal(submitted.max_shares, null)
   assert.equal(submitted.grid_mode, 'geometric')
+  assert.equal(submitted.min_shares, 0)
+  assert.equal(submitted.max_shares, null)
+  assert.equal(submitted.buy_step, .03)
+  assert.equal(submitted.sell_step, .03)
+  assert.equal(submitted.buy_shares, 100)
+  assert.equal(submitted.sell_shares, 100)
   assert.equal(submitted.initial_shares, 100000)
-  assert.equal(base.max_shares, 2000)
+  assert.equal(submitted.start_date, base.start_date)
+  assert.equal(submitted.end_date, base.end_date)
+  assert.deepEqual(submitted.fees, base.fees)
+  assert.deepEqual(submitted.parameter_links, base.parameter_links)
+  assert.deepEqual(base, original)
 })
 
 test('only the v5 protocol passes research validation', () => {

@@ -11,6 +11,7 @@
   },
   "backtest": {
     "grid": {
+      "link_spacing": true,
       "grid_mode": "geometric",
       "buy_step": 0.065,
       "sell_step": 0.065,
@@ -18,6 +19,7 @@
       "upper_price": null
     },
     "position": {
+      "link_shares": true,
       "initial_shares": 20000,
       "min_shares": 0,
       "max_shares": null,
@@ -30,7 +32,7 @@
       "initial_shares": 0
     },
     "fees": {
-      "commission_rate": 0.0005,
+      "commission_rate": 5e-05,
       "min_commission": 0.1
     }
   },
@@ -104,9 +106,9 @@
       "tau": 0.05,
       "eta_limit": 1.8,
       "eta_hard_cap": 3.5,
-      "gamma_max": 2.0,
+      "gamma_max": 1.0,
       "eta_floor": 0.2,
-      "gamma_min": 10.0,
+      "gamma_min": 1.0,
       "floor_k_ref": 10.0,
       "training_min_days": 250,
       "training_max_days": 500,
@@ -183,5 +185,5 @@
     "subprocess_timeout_seconds": 45,
     "lock_timeout_seconds": 30
   },
-  "config_revision": "806f0394c23bdacff68bca911111963c63f49b58541751119b680faffc030528"
+  "config_revision": "ed93efe623f2eb55c0b6b631e6411d74ded9772374b03e01ade5b27beb423be6"
 }

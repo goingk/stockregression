@@ -96,7 +96,16 @@ export function researchRangesForSymbol(ranges: Record<string, SearchRange>, sym
 
 /** Research always submits an unlimited geometric grid. */
 export function researchConfigForSubmission(value: BacktestConfig): BacktestConfig {
-  return { ...value, grid_mode: 'geometric', max_shares: null }
+  return {
+    ...value,
+    grid_mode: 'geometric',
+    min_shares: 0,
+    max_shares: null,
+    buy_step: .03,
+    sell_step: .03,
+    buy_shares: 100,
+    sell_shares: 100,
+  }
 }
 
 export function defaultWorkbenchDefaults(): WorkbenchDefaults {
