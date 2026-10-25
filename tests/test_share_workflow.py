@@ -645,7 +645,7 @@ def test_latest_preview_edit_reuses_inflight_same_range_preparation(tmp_path, mo
             preparation_checks[-1] = bool(cancelled())
         return kwargs.get("cached_bundle") or bundle
 
-    def run(config, data, progress=None, cancelled=None, preview=False):
+    def run(config, data, progress=None, cancelled=None, preview=False, cancel_flag=None):
         calculated.append(config.buy_shares)
         return {"shares": config.buy_shares}
 
@@ -667,6 +667,68 @@ def test_latest_preview_edit_reuses_inflight_same_range_preparation(tmp_path, mo
     finally:
         release.set()
         manager.stop()
+
+
+def test_share_kernel_preview_cancel_flag_interrupts_at_first_bar():
+    import numpy as np
+
+    config, bundle = fixture()
+    with pytest.raises(InterruptedError, match="回测已取消"):
+        engine.run_backtest(config, bundle, preview=True, cancel_flag=np.ones(1, dtype=np.int32))
+
+
+def test_share_kernel_running_preview_cancels_from_another_thread(monkeypatch):
+    import threading
+
+    import stockregression.share_kernel as share_kernel
+    from stockregression.engine import _NUMBA_FASTPATH_ENABLED
+
+    assert _NUMBA_FASTPATH_ENABLED, "该回归测试需要 Numba fast path"
+    config, bundle = fixture()
+    flag = np.zeros(1, dtype=np.int32)
+    expected = engine.run_backtest(config, bundle, summary_only=True, preview=True)
+    warm = engine.run_backtest(config, bundle, summary_only=True, preview=True,
+                               cancel_flag=flag)
+    assert warm == expected
+
+    first_bar = bundle.bars.iloc[[0]]
+    long_bars = first_bar.loc[first_bar.index.repeat(250_000)].reset_index(drop=True)
+    long_bundle = DataBundle(
+        symbol=bundle.symbol, bars=long_bars, daily=bundle.daily.copy(),
+        actions=bundle.actions.copy(), calendar=bundle.calendar.copy(),
+        quality=bundle.quality.copy(), version="long-preview-cancel",
+        metadata=bundle.metadata.copy(), warnings=list(bundle.warnings),
+    )
+    entered_kernel = threading.Event()
+    release_kernel = threading.Event()
+    original_simulate = share_kernel.simulate
+
+    def signal_then_simulate(*args, **kwargs):
+        entered_kernel.set()
+        assert release_kernel.wait(10)
+        return original_simulate(*args, **kwargs)
+
+    monkeypatch.setattr(share_kernel, "simulate", signal_then_simulate)
+    long_flag = np.zeros(1, dtype=np.int32)
+    outcome = []
+
+    def run():
+        try:
+            engine.run_backtest(config, long_bundle, summary_only=True,
+                                preview=True, cancel_flag=long_flag)
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    assert entered_kernel.wait(10), "long preview never entered the compiled kernel"
+    canceller = threading.Thread(target=lambda: (time.sleep(.005), long_flag.__setitem__(0, 1)))
+    canceller.start()
+    release_kernel.set()
+    worker.join(10)
+    canceller.join(2)
+    assert not worker.is_alive(), "cancelled kernel worker did not exit"
+    assert len(outcome) == 1 and isinstance(outcome[0], InterruptedError)
 
 
 

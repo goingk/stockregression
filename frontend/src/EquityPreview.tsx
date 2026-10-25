@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { del, get, post } from './api'
+import { del, get, isAbortError, post } from './api'
 import EquityCurve from './EquityCurve'
 import DataDiagnosticsPanel from './DataDiagnosticsPanel'
 import Disclosure from './Disclosure'
@@ -9,18 +9,22 @@ import { useWorkbenchDefaults } from './useWorkbenchDefaults'
 
 type Preview = { revision: number; status: string; progress?: number; message?: string; error?: string; result?: BacktestResult }
 
-export default function EquityPreview({ config, onFunding }: { config: BacktestConfig; onFunding?: (funding: NonNullable<BacktestResult['funding']>, context: { symbol: string; start_date: string }) => void }) {
+export default function EquityPreview({ config, onFunding, enabled = true }: { config: BacktestConfig; onFunding?: (funding: NonNullable<BacktestResult['funding']>, context: { symbol: string; start_date: string }) => void; enabled?: boolean }) {
   const configuration = useWorkbenchDefaults()
   const ui = (configuration.document.ui ?? {}) as Record<string, unknown>
-  const previewDebounceMs = Math.max(50, Number(ui.preview_debounce_ms) || 300)
+  const previewDebounceMs = Math.max(50, Number(ui.preview_debounce_ms) || 1500)
   const pollingMs = Math.max(500, Number(ui.polling_interval_ms) || 2000)
   const session = useRef(`preview_${Math.random().toString(36).slice(2)}`)
   const revision = useRef(0)
+  const onFundingRef = useRef(onFunding)
+  onFundingRef.current = onFunding
   const [result, setResult] = useState<BacktestResult | null>(null)
   const [status, setStatus] = useState('等待参数')
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
-  const payload = JSON.stringify(configPayload(config))
+  const previewConfig = configPayload(config)
+  if (config.reference_price_mode === 'auto') previewConfig.reference_price = null
+  const payload = JSON.stringify(previewConfig)
   const shareUnit = /^[15]/.test(config.symbol) ? '份' : '股'
   const quality = result?.quality ?? {}
   const minuteRatio = Number(result?.diagnostics?.minute_ratio ?? quality.minute_ratio)
@@ -30,10 +34,12 @@ export default function EquityPreview({ config, onFunding }: { config: BacktestC
     const current = ++revision.current
     let active = true
     let poll: number | undefined
+    let controller: AbortController | undefined
     const validation = configError(config)
+    if (!enabled) { setStatus('等待日期就绪'); return () => { active = false } }
     if (!config.symbol) {
       setResult(null); setError(''); setStatus('等待选择标的'); setMessage('')
-      void del(`/backtests/preview/${session.current}`).catch(() => undefined)
+      void del(`/backtests/preview/${session.current}?through_revision=${current}`).catch(() => undefined)
       return () => { active = false }
     }
     setError(validation); setStatus(validation ? '参数待完善' : '等待计算'); setMessage('')
@@ -41,21 +47,22 @@ export default function EquityPreview({ config, onFunding }: { config: BacktestC
       if (!active || current !== revision.current || value.revision !== current) return
       if (value.status === 'completed' && value.result) {
         setResult(value.result); setError(''); setStatus('已更新'); setMessage(value.message ?? '')
-        if (value.result.funding) onFunding?.(value.result.funding, { symbol: config.symbol, start_date: config.start_date })
+        if (value.result.funding) onFundingRef.current?.(value.result.funding, { symbol: config.symbol, start_date: config.start_date })
         return
       }
       if (value.status === 'failed') { setError(value.error ?? '预览计算失败'); setStatus('计算失败'); setMessage(value.message ?? ''); return }
       setStatus(value.status === 'queued' ? '排队中' : '计算中'); setMessage(value.message ?? '')
-      poll = window.setTimeout(() => { get<Preview>(`/backtests/preview/${session.current}`).then(accept).catch(fail) }, pollingMs)
+      poll = window.setTimeout(() => { controller = new AbortController(); get<Preview>(`/backtests/preview/${session.current}`, { signal: controller.signal }).then(accept).catch(fail) }, pollingMs)
     }
-    const fail = (value: unknown) => { if (active) { setStatus('无法预览'); setError(value instanceof Error ? value.message : String(value)) } }
+    const fail = (value: unknown) => { if (active && !isAbortError(value)) { setStatus('无法预览'); setError(value instanceof Error ? value.message : String(value)) } }
     const timer = validation ? undefined : window.setTimeout(() => {
       setStatus('计算中')
-      post<Preview>('/backtests/preview', { session_id: session.current, revision: current, config: JSON.parse(payload) }).then(accept).catch(fail)
+      controller = new AbortController()
+      post<Preview>('/backtests/preview', { session_id: session.current, revision: current, config: JSON.parse(payload) }, { signal: controller.signal }).then(accept).catch(fail)
     }, previewDebounceMs)
-    return () => { active = false; clearTimeout(timer); clearTimeout(poll) }
-  }, [payload, onFunding, pollingMs, previewDebounceMs])
-  useEffect(() => () => { void del(`/backtests/preview/${session.current}`).catch(() => undefined) }, [])
+    return () => { active = false; clearTimeout(timer); clearTimeout(poll); controller?.abort(); void del(`/backtests/preview/${session.current}?through_revision=${current}`).catch(() => undefined) }
+  }, [payload, enabled, pollingMs, previewDebounceMs])
+  useEffect(() => () => { void del(`/backtests/preview/${session.current}?through_revision=${revision.current}`).catch(() => undefined) }, [])
   return <Card title="收益率预览" subtitle="峰值本金收益 · 修改参数后自动重算" className="preview-card" action={<span title={message}><Badge tone={status === '已更新' ? 'green' : 'amber'}>{status}</Badge></span>}>
     {result && <div className="preview-summary-strip"><span>{result.config.frequency === '1d' ? '日线模式' : `分钟覆盖 ${Number.isFinite(minuteRatio) ? `${(minuteRatio * 100).toFixed(1)}%` : '—'}`} · 日线降级 {result.config.frequency === '1d' ? 0 : Number.isFinite(fallbackDays) ? Math.max(0, fallbackDays) : '—'} 天</span>{result.funding && <span>峰值本金 <strong>{money(result.funding.peak_invested ?? result.funding.initial_equity)}</strong> 元 · 外部补款 <strong>{money(result.funding.external_topups ?? result.funding.topups)}</strong> 元 · 起始资产 <strong>{money(result.funding.initial_equity)}</strong> 元</span>}</div>}
     {result && result.config.frequency !== '1d' && pendingCalibrationDays > 0 && <p className="inline-warning" role="status">{pendingCalibrationDays} 个交易日的分钟数据待校准，当前采用日线；展开账户与数据详情查看。</p>}

@@ -160,7 +160,7 @@
   "ui": {
     "autosave_debounce_ms": 500,
     "polling_interval_ms": 2000,
-    "preview_debounce_ms": 300,
+    "preview_debounce_ms": 1500,
     "page_size": 50,
     "chart_points": 2000,
     "default_ma": [

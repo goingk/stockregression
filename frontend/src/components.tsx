@@ -4,8 +4,13 @@ import Disclosure from './Disclosure'
 import type { ButtonHTMLAttributes, ChangeEvent, InputHTMLAttributes, ReactNode, SelectHTMLAttributes } from 'react'
 import { AlertCircle, Check, ChevronRight, LoaderCircle, X } from 'lucide-react'
 import type { BacktestConfig, FeeConfig, Instrument } from './types'
+import type { TradingCalendar } from './types'
 import { strategyDefaults, validWorkbenchGroup } from './workbenchDefaults'
 import type { StrategyDefaultsGroup } from './workbenchDefaults'
+import { setParameterLink } from './parameterLinks'
+import { useTradingCalendar } from './useTradingCalendar'
+import { defaultTradingRange, resolveMissingEndDate, shouldInitializeDefaultWindow, tradingDayCount, trailingTradingRange } from './tradingCalendar'
+import './dateRange.css'
 
 export function PageHeader({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) {
   return <div className="page-heading"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{action && <div className="heading-action">{action}</div>}</div>
@@ -138,6 +143,7 @@ export function defaultConfig(feeDefaults: FeeDefaults = baseFeeDefaults): Backt
   return {
     schema_version: 3, symbol: '600000.SH', start_date: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`, end_date: current,
     frequency: '1m', initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 100,
+    parameter_links: { spacing: false, shares: false },
     grid_mode: 'trailing', buy_step: .03, sell_step: .03,
     reference_price: null, reference_price_mode: 'auto', lower_price: null, upper_price: null,
     fees: { ...feeDefaults, slippage_bps: 5 }, dca: { frequency: 'monthly', shares: 100, initial_shares: 0 },
@@ -161,6 +167,7 @@ export function loadConfig(value: BacktestConfig): { config: BacktestConfig; not
   return { notice: '已载入当前股数配置', config: {
     ...defaults,
     ...value,
+    parameter_links: { ...{ spacing: false, shares: false }, ...value.parameter_links },
     ...provenance,
     fees: { ...defaults.fees, ...value.fees },
     dca: { ...defaults.dca, ...value.dca },
@@ -254,15 +261,107 @@ export function revealConfigError(message: string) {
   })
 }
 
-export function ConfigForm({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit, purpose = 'backtest', researchProtocol = 1 }: { purpose?: 'backtest' | 'research'; researchProtocol?: number; value: BacktestConfig; onChange: (next: BacktestConfig | ((previous: BacktestConfig) => BacktestConfig)) => void; onFeeDefaultsEdit?: (next: FeeDefaults) => void; onDefaultsEdit?: (group: StrategyDefaultsGroup, next: BacktestConfig) => void }) {
+export function DateRangeField({ calendar, start, end, startLabel = '开始日期', endLabel = '结束日期', onStart, onEnd }: { calendar: TradingCalendar | null; start: string; end: string; startLabel?: string; endLabel?: string; onStart: (value: string) => void; onEnd: (value: string) => void }) {
+  const dates = calendar?.calendar_available ? calendar.trading_dates : []
+  const window = trailingTradingRange(dates, end, Number.MAX_SAFE_INTEGER)
+  const endIndex = window?.endIndex ?? -1
+  const actualCount = tradingDayCount(dates, start, end)
+  const count = Math.max(1, actualCount)
+  const [draft, setDraft] = useState(count)
+  useEffect(() => setDraft(count), [count, calendar?.symbol, calendar?.frequency])
+  const commit = (nextCount: number) => {
+    if (!dates.length || endIndex < 0) return
+    const size = Math.max(1, Math.min(endIndex + 1, Math.trunc(nextCount)))
+    const selected = trailingTradingRange(dates, end, size)
+    if (!selected) return
+    onStart(selected.start)
+    setDraft(size)
+  }
+  return <div className="date-range-control">
+    <div className="form-grid two">
+      <label className="date-input-field"><span>{startLabel}</span><TextInput aria-label={startLabel} type="date" value={start} onChange={event => onStart(event.target.value)} /></label>
+      <label className="date-input-field"><span>{endLabel}</span><TextInput aria-label={endLabel} type="date" value={end} onChange={event => onEnd(event.target.value)} /></label>
+    </div>
+    <div className="date-window-control"><label>交易日窗口 <TextInput aria-label="交易日数量" type="number" min={1} max={endIndex >= 0 ? endIndex + 1 : undefined} value={draft} disabled={!dates.length} onChange={event => setDraft(Math.max(1, Number(event.target.value) || 1))} onBlur={() => commit(draft)} onKeyDown={event => { if (event.key === 'Enter') commit(draft) }} /> 日</label>
+      <input aria-label="交易日范围" type="range" min={1} max={Math.max(1, endIndex + 1)} value={Math.min(draft, Math.max(1, endIndex + 1))} disabled={!dates.length || endIndex < 0} onChange={event => setDraft(Number(event.target.value))} onPointerUp={event => commit(Number(event.currentTarget.value))} onKeyUp={event => { if (event.key.startsWith('Arrow')) commit(Number(event.currentTarget.value)) }} />
+    </div>{dates.length > 0 && <small className="date-calendar-note">区间共 {actualCount} 个交易日（含首尾）；拖动可调整时长。</small>}{calendar && !calendar.calendar_available && <small className="date-calendar-note">该标的暂无交易日历，日期可手动填写。</small>}
+  </div>
+}
+
+export function ConfigForm({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit, onDateReadinessChange, onDateIntentChange, datesExplicit = false, purpose = 'backtest', researchProtocol = 1 }: { purpose?: 'backtest' | 'research'; researchProtocol?: number; value: BacktestConfig; datesExplicit?: boolean; onChange: (next: BacktestConfig | ((previous: BacktestConfig) => BacktestConfig)) => void; onFeeDefaultsEdit?: (next: FeeDefaults) => void; onDefaultsEdit?: (group: StrategyDefaultsGroup, next: BacktestConfig) => void; onDateReadinessChange?: (ready: boolean) => void; onDateIntentChange?: (explicit: boolean) => void }) {
   const [reference, setReference] = useState<{ reference_date: string; reference_price: number } | null>(null)
   const [referenceError, setReferenceError] = useState('')
+  const calendarState = useTradingCalendar(value.symbol, value.frequency)
+  const calendar = calendarState.calendar
+  const latestOnChange = useRef(onChange)
+  latestOnChange.current = onChange
+  const previousSymbol = useRef(value.symbol)
+  const autoEnd = useRef(true)
+  const symbolChangeRequested = useRef(false)
+  const firstCalendarResolved = useRef(false)
+  const priorCalendarKey = useRef(`${value.symbol}|${value.frequency}`)
+  const previousWindowCount = useRef(252)
+  const [datesInitialized, setDatesInitialized] = useState(false)
+  useEffect(() => { onDateReadinessChange?.(calendarState.ready && datesInitialized && calendarState.available && Boolean(value.end_date)) }, [calendarState.ready, calendarState.available, datesInitialized, value.end_date, onDateReadinessChange])
+  useEffect(() => { if (!calendarState.ready) setDatesInitialized(false) }, [calendarState.ready, value.symbol, value.frequency])
+  useEffect(() => {
+    const result = calendar
+    if (!calendarState.ready || !result) return
+      const changed = previousSymbol.current !== value.symbol
+      const frequencyChanged = priorCalendarKey.current.split('|')[1] !== value.frequency
+      priorCalendarKey.current = `${value.symbol}|${value.frequency}`
+      previousSymbol.current = value.symbol
+      setDatesInitialized(true)
+      const dates = result.calendar_available ? result.trading_dates : []
+      const wasAuto = autoEnd.current
+      const firstResolution = !firstCalendarResolved.current
+      const initialDefaultWindow = shouldInitializeDefaultWindow(firstResolution, datesExplicit, wasAuto, value.end_date, result.last_date)
+      if (firstResolution && datesExplicit && dates.length && value.start_date && value.end_date
+        && value.start_date <= result.last_date! && value.end_date >= dates[0]) {
+        const count = tradingDayCount(dates, value.start_date, value.end_date)
+        if (count > 0) previousWindowCount.current = count
+      }
+      const missingEndResolution = resolveMissingEndDate(value.start_date, value.end_date, datesExplicit, result.last_date)
+      if (missingEndResolution) {
+        // ETF after-cutoff drafts already carry the causal start (cutoff + 1);
+        // calendar resolution must only fill their end date.
+        latestOnChange.current(previous => previous.end_date ? previous : { ...previous, end_date: missingEndResolution.end })
+      } else if (value.end_date && (changed && symbolChangeRequested.current || frequencyChanged && wasAuto || initialDefaultWindow) && result.last_date) {
+        const nextEnd = result.last_date
+        const initialWindow = initialDefaultWindow && dates.length ? defaultTradingRange(dates, nextEnd) : null
+        const nextStart = initialWindow?.start ?? (dates.length
+          ? trailingTradingRange(dates, nextEnd, previousWindowCount.current)?.start ?? result.first_date ?? nextEnd
+          : value.start_date)
+        if (initialWindow) previousWindowCount.current = initialWindow.count
+        latestOnChange.current(previous => ({ ...previous, end_date: nextEnd, start_date: nextStart, reference_price_mode: 'auto', reference_price: null }))
+      }
+      symbolChangeRequested.current = false
+      firstCalendarResolved.current = true
+  }, [calendarState.ready, calendar, value.symbol, value.frequency, datesExplicit])
   const set = <K extends keyof BacktestConfig>(key: K, next: BacktestConfig[K]) => {
-    onChange(previous => ({ ...previous, [key]: next }))
+    onChange(previous => {
+      const updated = { ...previous, [key]: next }
+      const links = previous.parameter_links ?? { spacing: false, shares: false }
+      if (key === 'buy_step' && links.spacing) updated.sell_step = next as number
+      if (key === 'sell_step' && links.spacing) updated.buy_step = next as number
+      if (key === 'buy_shares' && links.shares) updated.sell_shares = next as number
+      if (key === 'sell_shares' && links.shares) updated.buy_shares = next as number
+      return updated
+    })
     const group = key === 'dca' ? 'dca' : ['grid_mode', 'buy_step', 'sell_step', 'lower_price', 'upper_price'].includes(key) ? 'grid' : ['initial_shares', 'min_shares', 'max_shares', 'buy_shares', 'sell_shares'].includes(key) ? 'position' : null
-    if (group) onDefaultsEdit?.(group, { ...value, [key]: next })
+    if (group) {
+      let defaultsConfig = { ...value, [key]: next } as BacktestConfig
+      const links = value.parameter_links ?? { spacing: false, shares: false }
+      if (key === 'buy_step' && links.spacing) defaultsConfig.sell_step = next as number
+      if (key === 'sell_step' && links.spacing) defaultsConfig.buy_step = next as number
+      if (key === 'buy_shares' && links.shares) defaultsConfig.sell_shares = next as number
+      if (key === 'sell_shares' && links.shares) defaultsConfig.buy_shares = next as number
+      onDefaultsEdit?.(group, defaultsConfig)
+    }
   }
   const unit = /^[15]/.test(value.symbol) ? '份' : '股'
+  const spacingLinked = value.parameter_links?.spacing ?? false
+  const sharesLinked = value.parameter_links?.shares ?? false
   const fees: Required<FeeConfig> = { share_face_value: 1, legacy_sh_transfer_rate: .001, legacy_sh_min_transfer: 1, legacy_sz_transfer_rate: .0000255, ...value.fees }
   const setFees = (next: Partial<FeeConfig>) => {
     onChange(previous => ({ ...previous, fees: { ...previous.fees, ...next } }))
@@ -278,26 +377,36 @@ export function ConfigForm({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit,
     get<{ reference_date: string; reference_price: number }>(`/data/reference-price/${encodeURIComponent(value.symbol)}?start_date=${value.start_date}`).then(context => {
       if (!active) return
       setReference(context)
-      onChange(previous => previous.reference_price_mode === 'auto' ? { ...previous, reference_price: context.reference_price } : previous)
+      latestOnChange.current(previous => previous.reference_price_mode === 'auto' ? previous.reference_price === context.reference_price ? previous : { ...previous, reference_price: context.reference_price } : previous)
     }).catch(error => { if (active) setReferenceError(error instanceof Error ? error.message : String(error)) })
     return () => { active = false }
-  }, [value.symbol, value.start_date, onChange])
+  }, [value.symbol, value.start_date])
   const isStarBoard = value.symbol.startsWith('688') || value.symbol.startsWith('689')
   const share = (key: 'initial_shares' | 'min_shares' | 'buy_shares' | 'sell_shares', label: string) => <NumField key={key} label={label} value={value[key]} onChange={next => next != null && set(key, next)} suffix={unit} min={key === 'buy_shares' ? isStarBoard ? 200 : 100 : key === 'sell_shares' ? 100 : 0} step="100" />
   const maxShares = <NumField label="最高持股" value={value.max_shares} onChange={next => set('max_shares', next)} suffix={unit} min={0} step="100" hint="留空表示不限制持股数量；买入时按需补足现金。" />
   const fundingNote = '现金不足时仅在成功买入时补足差额，收益率按峰值净投入计算'
   return <div className="config-form share-config-form">
     <div className="form-section" data-validation-group="symbol"><div className="section-title"><span>01</span><strong>{purpose === 'research' ? '研究对象与评估区间' : '标的与区间'}</strong></div><div className="form-grid two">
-      <Field label="股票 / ETF" className="full-width"><SymbolPicker value={value.symbol} onChange={symbol => onChange(previous => ({ ...previous, symbol, reference_price_mode: 'auto', reference_price: null }))} /></Field>
-      <Field label={purpose === 'research' ? '评估开始日期' : '开始日期'}><TextInput type="date" value={value.start_date} onChange={event => onChange(previous => ({ ...previous, start_date: event.target.value, reference_price_mode: 'auto', reference_price: null }))} /></Field>
-      <Field label={purpose === 'research' ? '评估结束日期' : '结束日期'}><TextInput type="date" value={value.end_date ?? ''} onChange={event => set('end_date', event.target.value || null)} /></Field>
+      <Field label="股票 / ETF" className="full-width"><SymbolPicker value={value.symbol} onChange={symbol => {
+        if (calendar?.trading_dates?.length && value.start_date && value.end_date) {
+          const count = tradingDayCount(calendar.trading_dates, value.start_date, value.end_date)
+          if (count > 0) previousWindowCount.current = count
+        }
+        symbolChangeRequested.current = true
+        autoEnd.current = true
+        onDateIntentChange?.(false)
+        onChange(previous => ({ ...previous, symbol, reference_price_mode: 'auto', reference_price: null }))
+      }} /></Field>
+      <div className="field full-width"><span className="field-label">日期区间</span><DateRangeField calendar={calendar} start={value.start_date} end={value.end_date ?? ''} startLabel={purpose === 'research' ? '评估开始日期' : '开始日期'} endLabel={purpose === 'research' ? '评估结束日期' : '结束日期'} onStart={next => { onDateIntentChange?.(true); onChange(previous => ({ ...previous, start_date: next, reference_price_mode: 'auto', reference_price: null })) }} onEnd={next => { autoEnd.current = false; onDateIntentChange?.(true); set('end_date', next || null) }} /></div>
+      {calendarState.ready && !value.end_date && calendar?.last_date && calendar.last_date < value.start_date && <p className="inline-warning full-width">暂无截止日后数据：本地数据截止 {calendar.last_date}，所选起始日为 {value.start_date}。</p>}
       <Field label="数据频率"><SelectInput value={value.frequency} onChange={event => set('frequency', event.target.value as BacktestConfig['frequency'])}>{['1m', '5m', '15m', '30m', '60m', '1d'].map(item => <option key={item}>{item}</option>)}</SelectInput></Field>
       <NumField label="参考价格" value={value.reference_price} onChange={next => onChange(previous => ({ ...previous, reference_price: next, reference_price_mode: next == null ? 'auto' : 'manual' }))} suffix="元" min={.001} hint={reference ? `${reference.reference_date} 收盘 ${reference.reference_price} 元 · ${value.reference_price_mode === 'auto' ? '自动' : '手动'}` : '开始日期前最近交易日收盘价'} />
     </div>{referenceError && value.reference_price == null && value.reference_price_mode === 'auto' && <p className="inline-warning">{referenceError}</p>}</div>
     <div className="form-section" data-validation-group="grid"><div className="section-title"><span>02</span><strong>网格规则</strong></div><div className="form-grid two">
-      {purpose === 'research' ? <Field label="研究网格"><div className="result-meta"><Badge tone="blue">等比网格</Badge><span>买卖间距分别搜索与展示</span></div></Field> : <Field label="网格模式"><SelectInput value={value.grid_mode} onChange={event => set('grid_mode', event.target.value as BacktestConfig['grid_mode'])}><option value="trailing">移动网格</option><option value="arithmetic">等差网格</option><option value="geometric">等比网格</option></SelectInput></Field>}
-      <NumField label="买入间距" value={value.buy_step ?? .03} onChange={next => next != null && set('buy_step', next)} percentValue suffix="%" min={.01} max={100} hint="参考价下方每隔该幅度设置买入网格" />
-      <NumField label="卖出间距" value={value.sell_step ?? .03} onChange={next => next != null && set('sell_step', next)} percentValue suffix="%" min={.01} max={100} hint={purpose === 'research' ? '参考价上方每隔该幅度设置卖出网格；正式刻度 0.01 个百分点' : '参考价上方每隔该幅度设置卖出网格'} />
+      {purpose === 'research' ? <Field label="研究网格"><div className="result-meta"><Badge tone="blue">等比网格</Badge><span>{spacingLinked ? '买卖间距共用一个参数' : '买卖间距分别搜索与展示'}</span></div></Field> : <Field label="网格模式"><SelectInput value={value.grid_mode} onChange={event => set('grid_mode', event.target.value as BacktestConfig['grid_mode'])}><option value="trailing">移动网格</option><option value="arithmetic">等差网格</option><option value="geometric">等比网格</option></SelectInput></Field>}
+      <NumField label={spacingLinked ? '统一买卖间距' : '买入间距'} value={value.buy_step ?? .03} onChange={next => next != null && set('buy_step', next)} percentValue suffix="%" min={.01} max={100} hint={spacingLinked ? '参考价上下网格共用此间距' : '参考价下方每隔该幅度设置买入网格'} />
+      {!spacingLinked && <NumField label="卖出间距" value={value.sell_step ?? .03} onChange={next => next != null && set('sell_step', next)} percentValue suffix="%" min={.01} max={100} hint={purpose === 'research' ? '参考价上方每隔该幅度设置卖出网格；正式刻度 0.01 个百分点' : '参考价上方每隔该幅度设置卖出网格'} />}
+      <div className="field full-width"><span className="field-label">间距参数联动</span><label className="link-toggle"><input type="checkbox" checked={spacingLinked} onChange={event => { const next = setParameterLink(value, 'spacing', event.target.checked); onChange(next); onDefaultsEdit?.('grid', next) }} /><span>统一买卖间距</span></label>{spacingLinked && <small>已采用当前买入值，双向共用</small>}</div>
       <Disclosure id={`config-${purpose}-price-bounds`} title="价格边界" summary={`${value.lower_price ?? '不限'} ～ ${value.upper_price ?? '不限'}`} className="form-disclosure full-width"><div className="form-grid two">
       <NumField label="价格下限" value={value.lower_price} onChange={next => set('lower_price', next)} suffix="元" min={.001} />
       <NumField label="价格上限" value={value.upper_price} onChange={next => set('upper_price', next)} suffix="元" min={.001} />
@@ -305,8 +414,9 @@ export function ConfigForm({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit,
     </div></div>
     <div className="form-section" data-validation-group="position"><div className="section-title"><span>03</span><div><strong>{purpose === 'research' ? '固定账户' : '仓位与交易量'}</strong><small>{fundingNote}</small></div></div><div className="form-grid two">
       {share('initial_shares', '初始持股')}
-      {purpose === 'backtest' && <>{share('min_shares', '最低持股')}{maxShares}{share('buy_shares', '每次买入')}{share('sell_shares', '每次卖出')}</>}
-    </div>{purpose === 'research' && researchProtocol !== 5 && <Disclosure id="config-research-baseline-position" title="对照策略仓位与交易量" summary={`${value.min_shares}～${value.max_shares ?? '不限'} ${unit}`} className="form-disclosure"><div className="form-grid two">{share('min_shares', '最低持股')}{maxShares}{share('buy_shares', '每次买入')}{share('sell_shares', '每次卖出')}</div></Disclosure>}</div>
+      {purpose === 'backtest' && <>{share('min_shares', '最低持股')}{maxShares}{share('buy_shares', sharesLinked ? '每次买卖' : '每次买入')}{!sharesLinked && share('sell_shares', '每次卖出')}</>}
+      <div className="field full-width"><span className="field-label">交易量参数联动</span><label className="link-toggle"><input type="checkbox" checked={sharesLinked} onChange={event => { const next = setParameterLink(value, 'shares', event.target.checked); onChange(next); onDefaultsEdit?.('position', next) }} /><span>统一买卖份额</span></label>{sharesLinked && <small>已采用当前买入值，双向共用</small>}</div>
+    </div>{purpose === 'research' && researchProtocol !== 5 && <Disclosure id="config-research-baseline-position" title="对照策略仓位与交易量" summary={`${value.min_shares}～${value.max_shares ?? '不限'} ${unit}`} className="form-disclosure"><div className="form-grid two">{share('min_shares', '最低持股')}{maxShares}{share('buy_shares', sharesLinked ? '每次买卖' : '每次买入')}{!sharesLinked && share('sell_shares', '每次卖出')}</div></Disclosure>}</div>
     <div data-validation-group="dca"><Disclosure id={`config-${purpose}-dca`} title="定投设置" summary={`${{daily: '每天', weekly: '每周', monthly: '每月'}[value.dca.frequency]} ${value.dca.shares} ${unit}`} className="form-disclosure"><div className="form-grid two">
       <Field label="定投频率"><SelectInput value={value.dca.frequency} onChange={event => set('dca', { ...value.dca, frequency: event.target.value as BacktestConfig['dca']['frequency'] })}><option value="daily">每天</option><option value="weekly">每周</option><option value="monthly">每月</option></SelectInput></Field>
       <NumField label="每期定投" value={value.dca.shares} onChange={next => next != null && set('dca', { ...value.dca, shares: next })} suffix={unit} min={isStarBoard ? 200 : 100} step="100" />

@@ -19,7 +19,7 @@ import math
 import pandas as pd
 import pytest
 
-from stockregression.models import BacktestConfig, DataBundle, OptimizationConfig, ResearchStrategySpec
+from stockregression.models import BacktestConfig, DataBundle, OptimizationConfig, ParameterLinks, ResearchStrategySpec
 from stockregression.numerics.robust import (
     NeighborhoodOperator,
     PeakAnalyzer,
@@ -37,6 +37,7 @@ from stockregression.research.robust import (
     select_robust_at,
 )
 from stockregression.research.space import ParameterSpace
+from stockregression.research.window import TrainingWindowPolicy
 
 
 def make_config(*, buy_high: float = .005, share_high: int = 500, strategy: dict | None = None) -> OptimizationConfig:
@@ -102,6 +103,54 @@ def test_public_robust_coordinate_order_is_the_four_axis_contract():
         "buy_step": .002, "sell_step": .001, "buy_shares": 200,
         "sell_shares": 100, "initial_shares": 1000, "min_shares": 0, "max_shares": None,
     }
+
+
+@pytest.mark.parametrize("spacing,shares,expected_axes", [
+    (False, False, 4), (True, False, 3), (False, True, 3), (True, True, 2),
+])
+def test_shared_parameter_axes_keep_four_field_coordinates(spacing, shares, expected_axes):
+    config = make_config(buy_high=.003, share_high=300)
+    ranges = dict(config.ranges)
+    ranges["sell_step"] = {"low": .001, "high": .003}
+    ranges["sell_shares"] = {"low": 100, "high": 300}
+    if spacing:
+        ranges["sell_step"] = ranges["buy_step"]
+    if shares:
+        ranges["sell_shares"] = ranges["buy_shares"]
+    base = config.base.model_copy(update={"parameter_links": ParameterLinks(spacing=spacing, shares=shares)})
+    config = config.model_copy(update={"base": base, "ranges": ranges})
+    space = ParameterSpace(config)
+    coords = list(space.iterate())
+    assert len(space.active) == expected_axes
+    assert all(len(point) == 4 for point in coords)
+    assert len(coords) == space.size()
+    assert space.metadata() == {
+        "version": 1,
+        "parameter_links": {"spacing": spacing, "shares": shares},
+        "independent_axes": [
+            {"id": "buy_step", "members": ["buy_step", "sell_step"] if spacing else ["buy_step"]},
+            *([] if spacing else [{"id": "sell_step", "members": ["sell_step"]}]),
+            {"id": "buy_shares", "members": ["buy_shares", "sell_shares"] if shares else ["buy_shares"]},
+            *([] if shares else [{"id": "sell_shares", "members": ["sell_shares"]}]),
+        ],
+        "active_axes": list(space.active),
+    }
+    assert all((point[0] == point[1]) if spacing else True for point in coords)
+    assert all((point[2] == point[3]) if shares else True for point in coords)
+    assert space.coordinate(space.params(coords[0])) == coords[0]
+    if spacing:
+        mismatched = space.params(coords[0])
+        mismatched["sell_step"] = .002 if mismatched["buy_step"] != .002 else .003
+        with pytest.raises(ValueError, match="linked_parameter_mismatch:spacing"):
+            space.coordinate(mismatched)
+    if shares:
+        mismatched = space.params(coords[0])
+        mismatched["sell_shares"] = mismatched["buy_shares"] + 100
+        with pytest.raises(ValueError, match="linked_parameter_mismatch:shares"):
+            space.coordinate(mismatched)
+    left, right = coords[0], coords[-1]
+    distance = NeighborhoodOperator(space, 1).distance_squared(left, right)
+    assert distance == sum((left[space.fields.index(axis)] - right[space.fields.index(axis)]) ** 2 for axis in space.active)
 
 
 def test_direct_and_tensor_j_agree_and_boundary_weights_are_renormalised():
@@ -507,6 +556,23 @@ def test_exhaustive_preflight_does_not_charge_cached_points_to_validation_budget
     preview = estimate_robust_search(config.model_copy(update={"base": base}), data)
     assert preview["status"] == "ready"
     assert preview["search_method"] == "exhaustive"
+
+
+def test_preflight_reuses_supplied_training_window_with_identical_result(monkeypatch):
+    data, evaluation_start = _long_history_data()
+    config = make_config(buy_high=.003, share_high=300, strategy={"stress_region_count": 0})
+    base = config.base.model_copy(update={"start_date": evaluation_start.date(), "end_date": data.calendar[-1].date()})
+    config = config.model_copy(update={"base": base})
+    asof = data.calendar[data.calendar < evaluation_start][-1]
+    strategy = config.strategy
+    window = TrainingWindowPolicy(
+        int(strategy.training_min_days), int(strategy.training_max_days),
+        mode=str(strategy.training_window_mode),
+    ).window(data, asof)
+    expected = estimate_robust_search(config, data)
+    monkeypatch.setattr(TrainingWindowPolicy, "window", lambda *args, **kwargs: pytest.fail("window should be reused"))
+    actual = estimate_robust_search(config, data, training_window=window)
+    assert actual == expected
 
 
 def test_exhaustive_scoring_can_be_complete_without_a_qualified_peak(monkeypatch):

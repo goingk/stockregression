@@ -44,10 +44,12 @@ def patch_workbench(patch: dict) -> dict:
 def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(settings_file):
     defaults = settings.load_settings().workbench_defaults.model_dump()
     assert defaults["grid"] == {
+        "link_spacing": False,
         "grid_mode": "trailing", "buy_step": 0.03, "sell_step": 0.03,
         "lower_price": None, "upper_price": None,
     }
     assert defaults["position"] == {
+        "link_shares": False,
         "initial_shares": 1000, "min_shares": 0, "max_shares": 2000,
         "buy_shares": 100, "sell_shares": 100,
     }

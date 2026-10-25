@@ -19,6 +19,7 @@ export default function BacktestPage({ onResearch, onPrepareData }: { onResearch
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [formRevision, setFormRevision] = useState(0)
+  const [dateReady, setDateReady] = useState(false)
   const [saveDialog, setSaveDialog] = useState<{ copy: boolean; name: string } | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<ConfigRecord | null>(null)
   const [dialogError, setDialogError] = useState('')
@@ -71,7 +72,7 @@ export default function BacktestPage({ onResearch, onPrepareData }: { onResearch
   }
   const loadExplicitConfig = (value: BacktestConfig, copied = false) => {
     const loaded = loadConfig(value)
-    updateConfig(structuredClone(loaded.config)); setFormRevision(current => current + 1)
+    workspace.setBacktestDatesExplicit(true); updateConfig(structuredClone(loaded.config)); setFormRevision(current => current + 1)
     setNotice((copied ? '已复制配置草稿。' : '已载入配置。') + loaded.notice)
   }
   const removeConfig = (record: ConfigRecord) => { setDialogError(''); setDeleteTarget(record) }
@@ -100,10 +101,10 @@ export default function BacktestPage({ onResearch, onPrepareData }: { onResearch
     {config.selection_asof && <div className="selection-context"><Badge tone="amber">研究参数</Badge><span>选参截止 {config.selection_asof}{config.start_date <= config.selection_asof ? ' · 当前区间为样本内历史回看' : ''}</span></div>}
     <div className="workbench-layout">
       <section className="workbench-config-column"><Card title="策略配置" subtitle="常用参数直接调整，其他设置可展开。">
-        <div className="parameter-scroll"><ConfigForm key={formRevision} value={config} onChange={updateConfig} onFeeDefaultsEdit={workspace.rememberFees} onDefaultsEdit={workspace.rememberStrategy} /></div>
+        <div className="parameter-scroll"><ConfigForm key={formRevision} onDateReadinessChange={setDateReady} onDateIntentChange={workspace.setBacktestDatesExplicit} datesExplicit={workspace.backtestDatesExplicit} value={config} onChange={updateConfig} onFeeDefaultsEdit={workspace.rememberFees} onDefaultsEdit={workspace.rememberStrategy} /></div>
         <div className="form-footer"><Button variant="secondary" busy={busy} onClick={() => saveConfig(true)}><Copy size={14} />复制</Button><Button variant="secondary" busy={busy} onClick={() => saveConfig()}><Save size={14} />保存配置</Button><Button busy={busy} onClick={() => void runOne()}><Play size={14} />运行回测</Button></div>
       </Card></section>
-      <section className="workbench-preview-column"><EquityPreview config={config} onFunding={acceptPreviewFunding} /><div className="workbench-run-actions"><span>有效修改后自动重算预览</span><Button variant="secondary" disabled={busy} onClick={() => { if (validate()) onResearch(config) }}><FlaskConical size={15} />用当前配置研究</Button></div></section>
+      <section className="workbench-preview-column"><EquityPreview enabled={dateReady} config={config} onFunding={acceptPreviewFunding} /><div className="workbench-run-actions"><span>参数稳定 1.5 秒后更新预览</span><Button variant="secondary" disabled={busy} onClick={() => { if (validate()) onResearch(config) }}><FlaskConical size={15} />用当前配置研究</Button></div></section>
     </div>
     <Disclosure id="backtest-saved-configs" title="已保存配置与批量回测" summary={`${records.length} 份配置`}>
       {loading ? <Loading /> : !records.length ? <Empty title="还没有保存的配置" detail="保存当前参数后即可复用或批量比较。" /> : <div className="saved-list">{records.map(record => <div className="saved-row" key={record.id}><label className="check-label"><input type="checkbox" checked={selected.includes(record.id)} onChange={event => setSelected(old => event.target.checked ? [...old, record.id] : old.filter(id => id !== record.id))} /><span className="saved-copy"><strong>{record.name}</strong><small>{record.config.symbol} · {record.config.frequency} · {record.config.grid_mode}</small></span></label><div className="saved-actions"><button title="载入" onClick={() => { try { loadExplicitConfig(record.config) } catch (cause) { setError(err(cause)) } }}><RefreshCw size={14} /></button><button title="复制" onClick={() => { try { loadExplicitConfig(record.config, true) } catch (cause) { setError(err(cause)) } }}><Copy size={14} /></button><button title="删除" className="danger-icon" onClick={() => removeConfig(record)}><Trash2 size={14} /></button></div></div>)}</div>}

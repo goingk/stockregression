@@ -288,6 +288,13 @@ class PreviewRequest(BaseModel):
     config: BacktestConfig
 
 
+class ResearchPreviewRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$")
+    revision: int = Field(ge=1)
+    config: OptimizationConfig | ResearchRequestV5
+    estimate_key: str | None = Field(default=None, max_length=100000)
+
+
 class BatchRequest(BaseModel):
     configs: list[BacktestConfig] = Field(min_length=1, max_length=100)
 
@@ -1256,6 +1263,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             manager.start()
         yield
         previews.stop()
+        research_previews.stop()
         if start_jobs:
             manager.stop()
 
@@ -1352,10 +1360,19 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         # 256 bytes per row is deliberately conservative for the preflight guard.
         return int(estimated_rows * 256)
 
-    def _research_preflight(config):
+    preflight_cache = {}
+    training_window_cache = {}
+    preflight_cache_lock = threading.RLock()
+
+    def _research_preflight(config, cancelled=lambda: False):
+        def checkpoint():
+            if cancelled():
+                raise InterruptedError("研究预估已取消")
+        checkpoint()
         if config.protocol_version != 5:
             raise HTTPException(422, "旧研究协议已移除；请使用 protocol_version=5")
         manifest = store.snapshot(config.base.symbol, config.requested_data_version)
+        checkpoint()
         if config.requested_data_version and manifest is None:
             require_ready(config.base, config.requested_data_version)
         version = str(manifest["version"]) if manifest else None
@@ -1363,22 +1380,67 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             store, config.base, version=version,
             lookback_days=int(config.strategy.training_max_days),
         )
+        checkpoint()
         version = require_ready(prepared, version)
-        bundle = DataService(store).load_bundle(prepared, version, summary_only=True)
+        checkpoint()
+        data_key = (version, prepared.symbol, str(prepared.start_date), str(prepared.end_date), prepared.frequency)
+        with preflight_cache_lock:
+            bundle = preflight_cache.get(data_key)
+        if bundle is None:
+            bundle = DataService(store).load_bundle(prepared, version, summary_only=True)
+            checkpoint()
+            with preflight_cache_lock:
+                preflight_cache[data_key] = bundle
+                if len(preflight_cache) > 8:
+                    preflight_cache.pop(next(iter(preflight_cache)))
+        checkpoint()
         from .research.robust import estimate_robust_search
+        from .research.window import TrainingWindowPolicy
+        strategy = config.strategy
+        window_key = (data_key, str(config.base.start_date), int(strategy.training_min_days),
+                      int(strategy.training_max_days), str(strategy.training_window_mode))
+        with preflight_cache_lock:
+            window = training_window_cache.get(window_key)
+        if window is None:
+            dates = pd.DatetimeIndex(bundle.calendar)
+            eval_start = pd.Timestamp(config.base.start_date).normalize()
+            prior = dates[dates < eval_start]
+            asof = prior[-1] if len(prior) else eval_start - pd.Timedelta(days=1)
+            window = TrainingWindowPolicy(int(strategy.training_min_days), int(strategy.training_max_days),
+                                          mode=str(strategy.training_window_mode)).window(bundle, asof)
+            checkpoint()
+            with preflight_cache_lock:
+                training_window_cache[window_key] = window
+                if len(training_window_cache) > 32:
+                    training_window_cache.pop(next(iter(training_window_cache)))
         try:
             preview = estimate_robust_search(
                 config, bundle,
+                training_window=window,
                 bars_memory_bytes=_preflight_bar_memory_bytes(
                     manifest, bundle, prepared.frequency,
                 ),
             )
+            checkpoint()
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
         from .research_origin import prior_contract_hash
         preview.update(data_version=version, prior_policy_hash=prior_contract_hash(config),
                        research_origin=config.research_origin)
         return preview, version
+
+    def run_research_preview(config, cancelled):
+        if isinstance(config, ResearchRequestV5):
+            config = config.to_optimization()
+        if cancelled():
+            raise InterruptedError("研究预估已取消")
+        config = resolve_optimization_source(config)
+        preview, _ = _research_preflight(config, cancelled=cancelled)
+        return preview
+
+    from .research_preview import ResearchPreviewManager
+    research_previews = ResearchPreviewManager(run_research_preview)
+    app.state.research_previews = research_previews
 
     @app.get("/api/v1/health")
     def health():
@@ -1960,6 +2022,16 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         except (ValueError, TypeError) as exc:
             raise HTTPException(422, str(exc)) from exc
 
+    @app.get("/api/v1/data/calendar/{symbol}")
+    def data_calendar(symbol: str, frequency: str = "1m", data_version: str | None = None):
+        from .workbench_calendar import workbench_calendar
+        try:
+            return workbench_calendar(store, symbol, frequency, data_version)
+        except LookupError as exc:
+            raise HTTPException(409, {"code": "DATA_VERSION_UNAVAILABLE", "message": str(exc)}) from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
     @app.get("/api/v1/market/bars/{symbol}")
     def market_bars(symbol: str, frequency: str = "1d", start_date: str | None = None, end_date: str | None = None, before: str | None = None, limit: int = Query(600, ge=1, le=5000), ma: str = "5,10,20,60", adjustment: Literal["none", "qfq"] = "none", adjustment_anchor: str | None = None):
         try:
@@ -1993,8 +2065,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         return json_safe(status)
 
     @app.delete("/api/v1/backtests/preview/{session_id}")
-    def cancel_preview(session_id: str):
-        previews.cancel(session_id)
+    def cancel_preview(session_id: str, through_revision: int | None = Query(None, ge=1)):
+        previews.cancel(session_id, through_revision=through_revision)
         return {"cancelled": True}
 
     @app.post("/api/v1/backtests/batch")
@@ -2055,6 +2127,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             "configuration_revision": config.configuration_revision,
             "budget_contract": {
                 "data_version": version,
+                "parameter_space": preview.get("parameter_space"),
                 "prior_policy_hash": preview["prior_policy_hash"],
                 "effective_total_evaluation_budget": preview["effective_total_evaluation_budget"],
                 "task_evaluation_upper_bound": preview["task_evaluation_upper_bound"],
@@ -2072,6 +2145,23 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         config = resolve_optimization_source(config)
         preview, _ = _research_preflight(config)
         return json_safe(preview)
+
+    @app.post("/api/v1/optimizations/preview-sessions", status_code=202)
+    def research_preview_submit(payload: ResearchPreviewRequest):
+        return json_safe(research_previews.submit(payload.session_id, payload.revision,
+                                                  payload.config, estimate_key=payload.estimate_key))
+
+    @app.get("/api/v1/optimizations/preview-sessions/{session_id}")
+    def research_preview_status(session_id: str):
+        status = research_previews.snapshot(session_id)
+        if status is None:
+            raise HTTPException(404, "预估已过期")
+        return json_safe(status)
+
+    @app.delete("/api/v1/optimizations/preview-sessions/{session_id}")
+    def research_preview_cancel(session_id: str, through_revision: int | None = Query(None, ge=1)):
+        research_previews.cancel(session_id, through_revision=through_revision)
+        return {"cancelled": True}
 
     @app.get("/api/v1/research/strategies")
     def research_strategies():
@@ -2357,10 +2447,14 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         fold: int | None = Query(None, ge=0),
         region_id: int | None = Query(None, ge=1),
         offset: int = Query(0, ge=0),
-        limit: int = Query(1000, ge=1, le=10000),
-        view: str = Query("sample", pattern="^(sample|members|slice|projection)$"),
+        limit: int | None = Query(None, ge=1, le=10000),
+        view: str = Query("sample", pattern="^(sample|members|slice|projection|space)$"),
         x: str | None = None,
         y: str | None = None,
+        z: str | None = None,
+        fixed_axis: str | None = None,
+        fixed_tick: int | None = None,
+        selected_candidate_id: int | None = Query(None, ge=1),
         anchor: str = Query("stable", pattern="^(stable|peak)$"),
         revision: int | None = Query(None, ge=1),
     ):
@@ -2380,12 +2474,21 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
                 "code": "NO_INTERNAL_VALIDATION_LANDSCAPE",
                 "message": "v5 只有单段训练和真实连续样本外账本，没有内部验证候选分布",
             })
+        if limit is None:
+            limit = 5000 if view == "space" else 1000
         try:
-            payload = _robust_training_landscape(
-                store, result, result_id, decision=decision,
-                decision_index=decision_index, region_id=region_id,
-                offset=offset, limit=limit, revision=revision,
-            )
+            if view == "space":
+                from .landscape_space import landscape_space
+                payload = landscape_space(store, result, result_id, decision=decision,
+                    decision_index=decision_index, region_id=region_id, revision=revision,
+                    limit=limit, x=x, y=y, z=z, fixed_axis=fixed_axis, fixed_tick=fixed_tick,
+                    selected_candidate_id=selected_candidate_id)
+            else:
+                payload = _robust_training_landscape(
+                    store, result, result_id, decision=decision,
+                    decision_index=decision_index, region_id=region_id,
+                    offset=offset, limit=limit, revision=revision,
+                )
             if revision is not None:
                 payload["revision_scope"] = _revision_scope(
                     store.completion_revision(result_id, revision)
@@ -2398,6 +2501,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             raise _revision_conflict(exc) from exc
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
 
     @app.post("/api/v1/results/{result_id}/completion", status_code=202)
     def submit_result_completion(result_id: str, request: ResearchCompletionRequest):

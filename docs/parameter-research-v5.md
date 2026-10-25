@@ -189,3 +189,15 @@ POST /api/v1/results/{result_id}/completion
   --total-evaluation-budget 1000 --max-runtime-seconds 180 --seed 42 `
   --output docs/research-priors-comparison.json
 ```
+
+## 参数空间与训练分布视图
+
+`base.parameter_links` 的 `spacing`、`shares` 两项默认关闭，分别约束买卖间距和买卖份额。共享轴以买入字段为代表，搜索时只扰动一次；执行坐标、候选档案和导出仍保留四字段。共享执行值、研究范围和粒度必须一致，不一致返回 422；先验候选不满足联动时跳过并记录 `linked_parameter_mismatch`，不隐式投影。
+
+协议、预检和决策记录 `parameter_space`（`version=1`），包含 `parameter_links`、`independent_axes`（每个轴的 `id` 和 `members`）与 `active_axes`。固定范围不算活动自由轴；邻域距离、体积、峰值支持、内存和预算均按活动自由轴计算。旧结果缺少该段时按原独立四轴配置读取。
+
+`GET /api/v1/results/{id}/landscape?view=space` 支持 `x/y/z`、`fixed_axis/fixed_tick` 与 `selected_candidate_id`。二维请求将其他自由轴固定在训练超额最高点处；四维通过固定一轴得到三维切片。数据库先过滤和计数，再进行有界、稳定的空间抽样；返回全决策色标、轴范围、归档总数与抽样标记。每个点均是实际评价，不补齐或插值未知格点。
+
+自动研究预估使用 `POST /api/v1/optimizations/preview-sessions`，请求携带 `session_id`、递增 `revision`、完整 `config` 和 `estimate_key`；GET 同名会话端点查询状态，DELETE 通过 `through_revision` 取消不高于该代次的计算。取消水位阻止迟到提交复活、迟到取消影响新代次。此链路不创建正式作业；原同步预检接口继续可用，正式提交始终全量重验和冻结。
+
+日期控件使用 `GET /api/v1/data/calendar/{symbol}?frequency=...&data_version=...` 的本地数据边界与交易日历，未知冻结版本不会回退当前版本。日历缺失时不猜交易日数，保留手动日期输入。

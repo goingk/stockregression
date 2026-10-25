@@ -302,7 +302,8 @@ def _return_days(prepared):
 
 
 def run_share_backtest(config, data, progress=None, cancelled=None, summary_only=False, preview=False,
-                       parameter_schedule=None, passive_grid=False, daily_details=False):
+                       parameter_schedule=None, passive_grid=False, daily_details=False,
+                       cancel_flag=None):
     from . import engine
     from .share_kernel import ACCOUNT_MODE_FULL, simulate
     if cancelled and cancelled():
@@ -317,7 +318,7 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
     runner = simulate if engine._NUMBA_FASTPATH_ENABLED else getattr(simulate, "py_func", simulate)
     output = runner(*prepared["arrays"], *options, change_days, change_values,
                     np.full(len(prepared["days"]), -1, dtype=np.int64), 0, False, passive_grid,
-                    ACCOUNT_MODE_FULL)
+                    ACCOUNT_MODE_FULL, cancel_flag if preview else None)
     if cancelled and cancelled():
         raise InterruptedError("回测已取消")
     metrics, eq, cash, shares, drawdown, periods, tb, ta, ts, tq, tp, tf, tc, th, tr, ttop, rb, rt, ra, rs, rr, rq, invested, _, floor_episode_grids, funding_stats = output

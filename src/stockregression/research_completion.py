@@ -149,7 +149,8 @@ def complete_research_result(
             ]
         for row in store.candidate_archive(
             result, group, decision, decision_index,
-            in_filters=choices, sort_by="ordinal", limit=max(1, int(config.strategy.hypercube_edge) ** 4 + 8),
+            in_filters=choices, sort_by="ordinal",
+            limit=max(1, int(config.strategy.hypercube_edge) ** max(1, len(space.active)) + 8),
         )["rows"]:
             if isinstance(row.get("params"), dict):
                 rows[space.coordinate(row["params"])] = row

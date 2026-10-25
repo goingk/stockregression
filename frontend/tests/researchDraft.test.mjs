@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   archivedResearchSource, clearResearchDraftSource, dateNextDay, dateYearsAgo, defaultResearchDraftContext, etfSourceCandidateIds,
-  isMissingResearchSourceError, requestedDataVersionFromPreview, researchDraftFromEtfSource,
+  isMissingResearchSourceError, requestedDataVersionFromPreview, researchDraftFromEtfSource, resolveAfterCutoffEnd,
   researchSourceRequestFields, setResearchPriorPolicy, shanghaiDateToday, sourceResearchDraftContext,
 } from '../src/researchDraft.ts'
 
@@ -139,20 +139,23 @@ test('calendar-year subtraction clamps leap day', () => {
   assert.equal(dateYearsAgo('not-a-date'), '')
 })
 
-test('after-cutoff drafts use the next day through Shanghai today without auto-starting', () => {
+test('after-cutoff drafts wait for the target trading calendar to resolve their end date', () => {
   const { result, row } = sourceFixture()
   const converted = researchDraftFromEtfSource({
     result, row, current, settings, range_mode: 'after_cutoff', shanghai_today: '2026-03-10',
   })
   assert.ok(converted.draft)
   assert.equal(converted.draft.config.start_date, '2026-03-01')
-  assert.equal(converted.draft.config.end_date, '2026-03-10')
+  assert.equal(converted.draft.config.end_date, null)
   assert.equal(converted.draft.context.prior_policy, 'daily_state_v1')
   const noLaterData = researchDraftFromEtfSource({
     result, row, current, settings, range_mode: 'after_cutoff', shanghai_today: '2026-02-15',
   })
   assert.equal(noLaterData.draft.config.start_date, '2026-03-01')
-  assert.equal(noLaterData.draft.config.end_date, '2026-03-01')
+  assert.equal(noLaterData.draft.config.end_date, null)
+  assert.equal(resolveAfterCutoffEnd('2026-03-01', { calendar_available: true, last_date: '2026-03-06' }), '2026-03-06')
+  assert.equal(resolveAfterCutoffEnd('2026-03-01', { calendar_available: false, last_date: '2026-03-06' }), null)
+  assert.equal(resolveAfterCutoffEnd('2026-03-01', { calendar_available: true, last_date: '2026-02-27' }), null)
 })
 
 test('next-day and Shanghai-date helpers cross month and timezone boundaries', () => {

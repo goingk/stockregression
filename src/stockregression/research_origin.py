@@ -76,8 +76,14 @@ def resolve_research_origin(store, config) -> dict | None:
 
 def prior_contract_hash(config) -> str:
     """Bind rules and the resolved source without changing sampling seeds."""
-    return origin_fingerprint({"prior_policy": config.prior_policy,
-                               "research_origin": config.research_origin})
+    contract = {"prior_policy": config.prior_policy,
+                "research_origin": config.research_origin}
+    links = getattr(config.base, "parameter_links", None)
+    if links and (links.spacing or links.shares):
+        contract["parameter_links"] = {
+            "spacing": bool(links.spacing), "shares": bool(links.shares),
+        }
+    return origin_fingerprint(contract)
 
 
 def linked_result_summary(result: dict | None) -> dict:

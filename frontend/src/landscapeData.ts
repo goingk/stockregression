@@ -84,6 +84,39 @@ export type LandscapeResponse = {
   /** The branch the applied completion revision covers. */
   revision_scope?: LandscapeRevisionScope | null
   completion?: LandscapeCompletion | null
+  parameter_space?: ParameterSpace | null
+  axis_values?: Record<string, unknown[]>
+  axis_ticks?: Record<string, number[]>
+  axis_bounds?: Record<string, { min: number; max: number }>
+  fixed_parameters?: Record<string, unknown>
+  fixed_axis?: string | null
+  fixed_tick?: number | null
+  returned_count?: number
+  metric_bounds?: Record<'excess' | 'grid', { min: number; max: number }>
+}
+
+export type ParameterSpace = {
+  version: 1
+  parameter_links: { spacing: boolean; shares: boolean }
+  independent_axes: Array<{ id: string; members: string[] }>
+  active_axes: string[]
+}
+
+export const canonicalParameter = (name: string, space?: ParameterSpace | null) =>
+  space?.independent_axes.find(axis => axis.members.includes(name))?.id ?? name
+
+export function parameterSpaceAxes(parameters: string[], space?: ParameterSpace | null) {
+  if (space && Array.isArray(space.active_axes)) return space.active_axes.filter(axis => parameters.includes(axis))
+  return [...new Set(parameters.map(name => canonicalParameter(name, space)))]
+}
+
+export function canonicalLandscapePoint(point: LandscapePoint, space?: ParameterSpace | null): LandscapePoint {
+  const params = { ...point.params }
+  for (const axis of space?.independent_axes ?? []) {
+    const found = axis.members.find(member => params[member] != null)
+    if (found) for (const member of axis.members) params[member] = params[found]
+  }
+  return { ...point, params }
 }
 
 export type LandscapeNeighborhood = {
@@ -114,6 +147,12 @@ export type LandscapeSlice = {
 export const landscapeLabels: Record<string, string> = {
   buy_step: '买入间距', sell_step: '卖出间距',
   buy_shares: '每次买入', sell_shares: '每次卖出',
+}
+
+export function landscapeParameterLabel(name: string, space?: ParameterSpace | null) {
+  if (space?.parameter_links.spacing && (name === 'buy_step' || name === 'sell_step')) return '统一间距'
+  if (space?.parameter_links.shares && (name === 'buy_shares' || name === 'sell_shares')) return '统一份额'
+  return landscapeLabels[name] ?? name
 }
 
 export function distinctParameterValues(points: LandscapePoint[], name: string) {

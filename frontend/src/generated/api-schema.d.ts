@@ -654,6 +654,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/data/calendar/{symbol}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Data Calendar */
+        get: operations["data_calendar_api_v1_data_calendar__symbol__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/market/bars/{symbol}": {
         parameters: {
             query?: never;
@@ -769,6 +786,41 @@ export interface paths {
         /** Optimization Preview */
         post: operations["optimization_preview_api_v1_optimizations_preview_post"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/optimizations/preview-sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Research Preview Submit */
+        post: operations["research_preview_submit_api_v1_optimizations_preview_sessions_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/optimizations/preview-sessions/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Research Preview Status */
+        get: operations["research_preview_status_api_v1_optimizations_preview_sessions__session_id__get"];
+        put?: never;
+        post?: never;
+        /** Research Preview Cancel */
+        delete: operations["research_preview_cancel_api_v1_optimizations_preview_sessions__session_id__delete"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1271,6 +1323,7 @@ export interface components {
              * @default 100
              */
             sell_shares: number;
+            parameter_links?: components["schemas"]["ParameterLinks"];
             dca?: components["schemas"]["DcaConfig"];
             /**
              * Reference Price Mode
@@ -1653,6 +1706,11 @@ export interface components {
         };
         /** GridDefaults */
         GridDefaults: {
+            /**
+             * Link Spacing
+             * @default false
+             */
+            link_spacing: boolean;
             /**
              * Grid Mode
              * @default trailing
@@ -2217,6 +2275,22 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /**
+         * ParameterLinks
+         * @description Independent buy/sell equality constraints; execution retains four fields.
+         */
+        ParameterLinks: {
+            /**
+             * Spacing
+             * @default false
+             */
+            spacing: boolean;
+            /**
+             * Shares
+             * @default false
+             */
+            shares: boolean;
+        };
         /** PathsSection */
         PathsSection: {
             /** Data Dir */
@@ -2272,6 +2346,11 @@ export interface components {
         };
         /** PositionDefaults */
         PositionDefaults: {
+            /**
+             * Link Shares
+             * @default false
+             */
+            link_shares: boolean;
             /**
              * Initial Shares
              * @default 1000
@@ -2390,6 +2469,7 @@ export interface components {
             /** Upper Price */
             upper_price?: number | null;
             dca?: components["schemas"]["DcaConfig"];
+            parameter_links?: components["schemas"]["ParameterLinks"];
         };
         /** ResearchDefaults */
         ResearchDefaults: {
@@ -2645,6 +2725,17 @@ export interface components {
              * @default 3
              */
             stress_region_count: number;
+        };
+        /** ResearchPreviewRequest */
+        ResearchPreviewRequest: {
+            /** Session Id */
+            session_id: string;
+            /** Revision */
+            revision: number;
+            /** Config */
+            config: components["schemas"]["OptimizationConfig"] | components["schemas"]["ResearchRequestV5"];
+            /** Estimate Key */
+            estimate_key?: string | null;
         };
         /** ResearchRangeDefaults */
         ResearchRangeDefaults: {
@@ -3008,7 +3099,7 @@ export interface components {
             polling_interval_ms: number;
             /**
              * Preview Debounce Ms
-             * @default 300
+             * @default 1500
              */
             preview_debounce_ms: number;
             /**
@@ -4289,6 +4380,40 @@ export interface operations {
             };
         };
     };
+    data_calendar_api_v1_data_calendar__symbol__get: {
+        parameters: {
+            query?: {
+                frequency?: string;
+                data_version?: string | null;
+            };
+            header?: never;
+            path: {
+                symbol: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     market_bars_api_v1_market_bars__symbol__get: {
         parameters: {
             query?: {
@@ -4395,7 +4520,9 @@ export interface operations {
     };
     cancel_preview_api_v1_backtests_preview__session_id__delete: {
         parameters: {
-            query?: never;
+            query?: {
+                through_revision?: number | null;
+            };
             header?: never;
             path: {
                 session_id: string;
@@ -4537,6 +4664,103 @@ export interface operations {
                 "application/json": components["schemas"]["OptimizationConfig"] | components["schemas"]["ResearchRequestV5"];
             };
         };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    research_preview_submit_api_v1_optimizations_preview_sessions_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResearchPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    research_preview_status_api_v1_optimizations_preview_sessions__session_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    research_preview_cancel_api_v1_optimizations_preview_sessions__session_id__delete: {
+        parameters: {
+            query?: {
+                through_revision?: number | null;
+            };
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {
@@ -4966,10 +5190,14 @@ export interface operations {
                 fold?: number | null;
                 region_id?: number | null;
                 offset?: number;
-                limit?: number;
+                limit?: number | null;
                 view?: string;
                 x?: string | null;
                 y?: string | null;
+                z?: string | null;
+                fixed_axis?: string | null;
+                fixed_tick?: number | null;
+                selected_candidate_id?: number | null;
                 anchor?: string;
                 revision?: number | null;
             };

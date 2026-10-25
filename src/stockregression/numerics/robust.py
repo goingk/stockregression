@@ -4,10 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from itertools import product
 import math
-from typing import Any, Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping
 
 from ..models import ResearchStrategySpec
-from ..research.space import ParameterSpace
+if TYPE_CHECKING:
+    from ..research.space import ParameterSpace
 
 
 def _finite(value: Any) -> bool:

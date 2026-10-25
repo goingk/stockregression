@@ -214,7 +214,7 @@ def _nb_attempt(
     return True, cash_after, shares - quantity, sellable - quantity, quantity, price, fee, notional, normalized_request, 0, 0.0
 
 
-@_jit(cache=True)
+@_jit(cache=True, nogil=True)
 def simulate(
     opens: np.ndarray, closes: np.ndarray, volumes: np.ndarray,
     tradable_mask: np.ndarray,
@@ -242,6 +242,7 @@ def simulate(
     parameter_days: np.ndarray, parameter_values: np.ndarray,
     fold_ids: np.ndarray, fold_count: int,
     grid_only: bool, passive_grid: bool, account_mode: int,
+    cancel_flag: np.ndarray | None = None,
 ) -> tuple:
     keep_details = output_mode >= 2
     top_up_mode = funding_mode == 1
@@ -436,6 +437,8 @@ def simulate(
     current_day_id = -1
     dca_day_index = 0
     for i in range(n):
+        if cancel_flag is not None and (i & 511) == 0 and cancel_flag[0] != 0:
+            raise InterruptedError("回测已取消")
         floor_position_changed = False
         day_id = day_ids[i]
         if day_id != current_day_id:

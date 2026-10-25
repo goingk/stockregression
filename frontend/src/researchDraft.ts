@@ -279,10 +279,9 @@ export function researchDraftFromEtfSource(input: {
   const afterCutoff = input.range_mode === 'after_cutoff'
   const start = afterCutoff ? dateNextDay(cutoff) : dateYearsAgo(cutoff)
   if (!start) return { error: afterCutoff ? 'ETF 结果没有有效的截止日，无法确定截止日后的研究起点。' : 'ETF 结果没有有效的截止日，无法确定默认研究区间。' }
-  const shanghaiToday = input.shanghai_today ?? shanghaiDateToday()
-  const end = afterCutoff
-    ? (/^\d{4}-\d{2}-\d{2}$/.test(shanghaiToday) && shanghaiToday > start ? shanghaiToday : start)
-    : cutoff
+  // The after-cutoff end is resolved asynchronously from the target ETF's
+  // trading calendar by ConfigForm; never guess using the wall-clock date.
+  const end = afterCutoff ? null : cutoff
   const execution = result.request?.execution
   const sourceFees = execution?.fees
   const fees = normalizeFeeConfig({ ...current.fees, ...(sourceFees ?? {}) })
@@ -324,6 +323,11 @@ export function researchDraftFromEtfSource(input: {
       context: withResearchDraftSource(source, etfSourceSummary(result, row)),
     },
   }
+}
+
+/** Resolve an after-cutoff draft only when the target calendar has a date at or after its start. */
+export function resolveAfterCutoffEnd(start: string, calendar: { calendar_available: boolean; last_date: string | null }): string | null {
+  return calendar.calendar_available && calendar.last_date && calendar.last_date >= start ? calendar.last_date : null
 }
 
 /** Submit the data version locked by the latest preview; source versions are display-only. */

@@ -1,7 +1,7 @@
 import type { BacktestConfig } from './types'
 
-export type GridDefaults = Pick<BacktestConfig, 'grid_mode' | 'buy_step' | 'sell_step' | 'lower_price' | 'upper_price'>
-export type PositionDefaults = Pick<BacktestConfig, 'initial_shares' | 'min_shares' | 'max_shares' | 'buy_shares' | 'sell_shares'>
+export type GridDefaults = Pick<BacktestConfig, 'grid_mode' | 'buy_step' | 'sell_step' | 'lower_price' | 'upper_price'> & { link_spacing: boolean }
+export type PositionDefaults = Pick<BacktestConfig, 'initial_shares' | 'min_shares' | 'max_shares' | 'buy_shares' | 'sell_shares'> & { link_shares: boolean }
 export type SearchRange = { low: number; high: number; step?: number | null }
 
 /** Research defaults of the v5 robust-J research protocol. */
@@ -101,8 +101,8 @@ export function researchConfigForSubmission(value: BacktestConfig): BacktestConf
 
 export function defaultWorkbenchDefaults(): WorkbenchDefaults {
   return {
-    grid: { grid_mode: 'trailing', buy_step: .03, sell_step: .03, lower_price: null, upper_price: null },
-    position: { initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 100 },
+    grid: { grid_mode: 'trailing', buy_step: .03, sell_step: .03, lower_price: null, upper_price: null, link_spacing: false },
+    position: { initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 100, link_shares: false },
     dca: { frequency: 'monthly', shares: 100, initial_shares: 0 },
     research: {
       strategy_id: 'geometric_robust_j', protocol_version: 5, strategy_version: 5, ranking_mode: 'robust_j',
@@ -307,8 +307,10 @@ export function validWorkbenchGroup<K extends WorkbenchGroup>(group: K, value: u
   if (group === 'grid') return ['trailing', 'arithmetic', 'geometric'].includes(String(item.grid_mode))
     && step(item.buy_step) && step(item.sell_step) && price(item.lower_price) && price(item.upper_price)
     && (item.lower_price == null || item.upper_price == null || (item.lower_price as number) < (item.upper_price as number))
+    && (item.link_spacing === undefined || typeof item.link_spacing === 'boolean')
   if (group === 'position') return quantity(item.initial_shares) && quantity(item.min_shares) && (item.max_shares === null || quantity(item.max_shares))
     && quantity(item.buy_shares, 100) && quantity(item.sell_shares, 100)
+    && (item.link_shares === undefined || typeof item.link_shares === 'boolean')
     && (item.min_shares as number) <= (item.initial_shares as number) && (item.max_shares === null || (item.initial_shares as number) <= (item.max_shares as number))
   return ['daily', 'weekly', 'monthly'].includes(String(item.frequency)) && quantity(item.shares, 100) && quantity(item.initial_shares)
 }
@@ -317,8 +319,8 @@ export function normalizeWorkbenchDefaults(value: unknown): WorkbenchDefaults {
   const item = record(value)
   const defaults = defaultWorkbenchDefaults()
   return {
-    grid: validWorkbenchGroup('grid', item?.grid) ? structuredClone(item.grid) : defaults.grid,
-    position: validWorkbenchGroup('position', item?.position) ? structuredClone(item.position) : defaults.position,
+    grid: validWorkbenchGroup('grid', item?.grid) ? { ...defaults.grid, ...structuredClone(item.grid) } : defaults.grid,
+    position: validWorkbenchGroup('position', item?.position) ? { ...defaults.position, ...structuredClone(item.position) } : defaults.position,
     dca: validWorkbenchGroup('dca', item?.dca) ? structuredClone(item.dca) : defaults.dca,
     research: structuredClone(normalizeResearchDefaults(item?.research)),
   }
@@ -349,13 +351,16 @@ export function mergeEditedResearchDefaults(
 
 export function strategyDefaults(config: BacktestConfig): Pick<WorkbenchDefaults, StrategyDefaultsGroup> {
   const { grid_mode, buy_step, sell_step, lower_price, upper_price, initial_shares, min_shares, max_shares, buy_shares, sell_shares } = config
+  const links = config.parameter_links ?? { spacing: false, shares: false }
   return {
-    grid: { grid_mode, buy_step, sell_step, lower_price, upper_price },
-    position: { initial_shares, min_shares, max_shares, buy_shares, sell_shares },
+    grid: { grid_mode, buy_step, sell_step, lower_price, upper_price, link_spacing: links.spacing },
+    position: { initial_shares, min_shares, max_shares, buy_shares, sell_shares, link_shares: links.shares },
     dca: { ...config.dca },
   }
 }
 
 export function workbenchConfig(base: BacktestConfig, defaults: WorkbenchDefaults): BacktestConfig {
-  return { ...base, ...defaults.grid, ...defaults.position, dca: { ...defaults.dca }, symbol: '', reference_price: null, reference_price_mode: 'auto' }
+  const { link_spacing, ...grid } = defaults.grid
+  const { link_shares, ...position } = defaults.position
+  return { ...base, ...grid, ...position, parameter_links: { spacing: link_spacing, shares: link_shares }, dca: { ...defaults.dca }, symbol: '', reference_price: null, reference_price_mode: 'auto' }
 }

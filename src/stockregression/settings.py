@@ -66,6 +66,7 @@ class _WorkbenchPreference(BaseModel):
 
 
 class GridDefaults(_WorkbenchPreference):
+    link_spacing: bool = False
     grid_mode: Literal["trailing", "arithmetic", "geometric"] = "trailing"
     buy_step: float = Field(default=0.03, gt=0, le=1)
     sell_step: float = Field(default=0.03, gt=0, le=1)
@@ -74,12 +75,15 @@ class GridDefaults(_WorkbenchPreference):
 
     @model_validator(mode="after")
     def ordered_prices(self):
+        if self.link_spacing and self.buy_step != self.sell_step:
+            raise ValueError("统一买卖间距时默认买卖间距必须相等")
         if self.lower_price is not None and self.upper_price is not None and self.lower_price >= self.upper_price:
             raise ValueError("网格价格下限必须小于上限")
         return self
 
 
 class PositionDefaults(_WorkbenchPreference):
+    link_shares: bool = False
     initial_shares: int = Field(default=1000, ge=0, multiple_of=100)
     min_shares: int = Field(default=0, ge=0, multiple_of=100)
     max_shares: int | None = Field(default=2000, ge=0, multiple_of=100)
@@ -88,6 +92,8 @@ class PositionDefaults(_WorkbenchPreference):
 
     @model_validator(mode="after")
     def ordered_positions(self):
+        if self.link_shares and self.buy_shares != self.sell_shares:
+            raise ValueError("统一买卖份额时默认买卖份额必须相等")
         if self.max_shares is not None and not self.min_shares <= self.initial_shares <= self.max_shares:
             raise ValueError("最低持股 ≤ 初始持股 ≤ 最高持股")
         if self.min_shares > self.initial_shares:
@@ -280,7 +286,7 @@ class UiSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
     autosave_debounce_ms: int = Field(default=500, ge=100, le=10_000)
     polling_interval_ms: int = Field(default=2_000, ge=500, le=60_000)
-    preview_debounce_ms: int = Field(default=300, ge=50, le=10_000)
+    preview_debounce_ms: int = Field(default=1500, ge=50, le=10_000)
     page_size: int = Field(default=50, ge=10, le=500)
     chart_points: int = Field(default=2_000, ge=100, le=5_000)
     default_ma: list[int] = Field(default_factory=lambda: [5, 20, 60])

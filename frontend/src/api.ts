@@ -54,11 +54,15 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return payload as T
 }
 
-export const get = <T,>(path: string) => request<T>(path)
-export const post = <T,>(path: string, body?: unknown) => request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) })
+export function isAbortError(error: unknown): boolean {
+  return !!error && typeof error === 'object' && 'name' in error && (error as { name?: unknown }).name === 'AbortError'
+}
+
+export const get = <T,>(path: string, opts?: RequestInit) => request<T>(path, opts)
+export const post = <T,>(path: string, body?: unknown, opts?: RequestInit) => request<T>(path, { ...opts, method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) })
 export const postForm = <T,>(path: string, body: FormData) => request<T>(path, { method: 'POST', body })
 export const put = <T,>(path: string, body: unknown) => request<T>(path, { method: 'PUT', body: JSON.stringify(body) })
-export const del = <T,>(path: string) => request<T>(path, { method: 'DELETE' })
+export const del = <T,>(path: string, opts?: RequestInit) => request<T>(path, { ...opts, method: 'DELETE' })
 
 export async function download(path: string, filename: string) {
   const response = await fetch(`${API_ROOT}${path}`)

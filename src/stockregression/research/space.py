@@ -90,6 +90,22 @@ class ParameterSpace:
             raise ValueError("v4 参数研究只支持等比网格")
         self.initial_shares = int(self.base.initial_shares)
         self.strategy = config.strategy
+        links = getattr(self.base, "parameter_links", None)
+        self.parameter_links = {
+            "spacing": bool(getattr(links, "spacing", False)),
+            "shares": bool(getattr(links, "shares", False)),
+        }
+        self._members = {
+            "buy_step": ("buy_step", "sell_step") if self.parameter_links["spacing"] else ("buy_step",),
+            "sell_step": ("sell_step",),
+            "buy_shares": ("buy_shares", "sell_shares") if self.parameter_links["shares"] else ("buy_shares",),
+            "sell_shares": ("sell_shares",),
+        }
+        self._canonical = {name: name for name in ROBUST_FIELDS}
+        if self.parameter_links["spacing"]:
+            self._canonical["sell_step"] = "buy_step"
+        if self.parameter_links["shares"]:
+            self._canonical["sell_shares"] = "buy_shares"
         self.granularity = {
             name: float(self.strategy.granularity.get(name, DEFAULT_GRANULARITY[name]))
             for name in ALL_FIELDS
@@ -139,7 +155,6 @@ class ParameterSpace:
         self.dimensions = {name: dimensions[name] for name in self.order if name in dimensions}
         self.max_unlimited = unlimited
         self.fixed = {name: dim.low for name, dim in self.dimensions.items() if dim.fixed}
-        self.active = tuple(name for name, dim in self.dimensions.items() if not dim.fixed)
         self.fields = tuple(self.dimensions)
         if self.max_unlimited:
             self.fixed["max_shares"] = -1
@@ -154,7 +169,19 @@ class ParameterSpace:
                 dim = self.dimensions["buy_shares"]
             if dim.low > dim.high:
                 raise ValueError("每次买入数量低于该标的最低买入量")
-        self.active = tuple(name for name, dim in self.dimensions.items() if not dim.fixed)
+        # A linked axis shares one tick lattice; config validation guarantees
+        # equal ranges and granularities for the linked pair.
+        for axis, members in self._members.items():
+            if len(members) > 1 and all(name in self.dimensions for name in members):
+                self.dimensions[axis] = self.dimensions[members[0]]
+                for name in members[1:]:
+                    self.dimensions[name] = self.dimensions[members[0]]
+        # The shared range may have been tightened by symbol-specific rules;
+        # derive active axes only after every member has the final dimension.
+        self.active = tuple(
+            name for name, dim in self.dimensions.items()
+            if not dim.fixed and self._canonical.get(name, name) == name
+        )
         self.fixed = {name: dim.low for name, dim in self.dimensions.items() if dim.fixed}
         self._field_index = {name: index for index, name in enumerate(self.fields)}
         self._active_indices = tuple(self._field_index[name] for name in self.active)
@@ -163,6 +190,19 @@ class ParameterSpace:
         self._min_index = self._field_index.get("min_shares")
         self._max_index = self._field_index.get("max_shares")
         self._check_fixed_values()
+
+    def metadata(self) -> dict[str, Any]:
+        """Stable protocol description of independent and currently active axes."""
+        axes = []
+        seen = set()
+        for name in self.order:
+            axis = self._canonical.get(name, name)
+            if axis in seen:
+                continue
+            seen.add(axis)
+            axes.append({"id": axis, "members": list(self._members.get(axis, (name,)))})
+        return {"version": 1, "parameter_links": dict(self.parameter_links),
+                "independent_axes": axes, "active_axes": list(self.active)}
 
     def _check_fixed_values(self) -> None:
         for name, tick in self.fixed.items():
@@ -205,6 +245,10 @@ class ParameterSpace:
 
     def full_coordinate(self, active_coords: Iterable[int]) -> tuple[int, ...]:
         values = dict(zip(self.active, (int(value) for value in active_coords)))
+        for axis, members in self._members.items():
+            if axis in values:
+                for member in members:
+                    values[member] = values[axis]
         output = []
         for name in self.order:
             if name in values:
@@ -232,6 +276,17 @@ class ParameterSpace:
 
     def coordinate(self, params: dict[str, Any]) -> tuple[int, ...]:
         values = {name: self.value_to_ticks(name, params[name]) for name in self.order if name in params and params[name] is not None}
+        for flag, axis, members in (
+            ("spacing", "buy_step", self._members["buy_step"]),
+            ("shares", "buy_shares", self._members["buy_shares"]),
+        ):
+            if len(members) > 1 and any(name in values for name in members):
+                present = [name for name in members if name in values]
+                if len(present) == len(members) and len({values[name] for name in members}) != 1:
+                    raise ValueError(f"linked_parameter_mismatch:{flag}")
+                value = values[axis] if axis in values else values[present[0]]
+                for member in members:
+                    values[member] = value
         if self.max_unlimited:
             values["max_shares"] = -1
         return tuple(values[name] for name in self.order)
@@ -241,6 +296,10 @@ class ParameterSpace:
         for name in self.active:
             if not self.dimensions[name].low <= vals[name] <= self.dimensions[name].high:
                 return False
+        expanded = self.full_coordinate(tuple(vals[name] for name in self.active))
+        by_name = dict(zip(self.order, expanded))
+        if any(by_name[member] != by_name[members[0]] for members in self._members.values() if len(members) > 1 for member in members[1:]):
+            return False
         if "min_shares" in vals and "max_shares" in vals and vals["min_shares"] > vals["max_shares"]:
             return False
         if "min_shares" not in vals and "max_shares" in vals and int(self.value("max_shares", vals["max_shares"])) < self.initial_shares:
@@ -302,7 +361,7 @@ class ParameterSpace:
             if values[min_index] > values[max_index]:
                 values[min_index] = min(min_dim.high - 1, max(min_dim.low + 1, values[max_index]))
                 values[max_index] = max(max_dim.low + 1, min(max_dim.high - 1, values[min_index]))
-        return tuple(values)
+        return self.normalize(tuple(values))
 
     def normalize(self, coordinate: tuple[int, ...]) -> tuple[int, ...]:
         return self.full_coordinate(self.active_coords(coordinate))
@@ -311,7 +370,8 @@ class ParameterSpace:
         by_name = dict(zip(self.order, coordinate))
         bounds = {}
         for name in self.dimensions:
-            radius = int(radii.get(name, 0))
+            axis = self._canonical.get(name, name)
+            radius = int(radii.get(axis, radii.get(name, 0)))
             dim = self.dimensions[name]
             low, high = by_name[name] - radius, by_name[name] + radius
             bounds[name] = {
@@ -354,11 +414,14 @@ class ParameterSpace:
 
     def neighbor(self, coordinate: tuple[int, ...], offset: tuple[int, ...]) -> tuple[int, ...] | None:
         values = list(coordinate)
-        for active_index, index in enumerate(self._active_indices):
+        for active_index, name in enumerate(self.active):
+            index = self._field_index[name]
             value = values[index] + offset[active_index]
             if value < self._active_lows[active_index] or value > self._active_highs[active_index]:
                 return None
-            values[index] = value
+            for member in self._members.get(name, (name,)):
+                if member in self._field_index:
+                    values[self._field_index[member]] = value
         if self._min_index is not None and self._max_index is not None and values[self._min_index] > values[self._max_index]:
             return None
         return tuple(values)

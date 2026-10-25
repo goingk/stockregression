@@ -8,12 +8,13 @@ import pandas as pd
 import pytest
 
 from stockregression.models import (
-    BacktestConfig, DataBundle, OptimizationConfig, ResearchRequestV5, ResearchStrategySpec,
+    BacktestConfig, DataBundle, OptimizationConfig, ParameterLinks, ResearchRequestV5, ResearchStrategySpec,
 )
 from stockregression.research import robust as robust_research
 from stockregression.research_origin import prior_contract_hash
 from stockregression.research.robust import (
-    _attach_prior_sources, _build_research_prior, _initial_coordinates, _public_row,
+    _attach_prior_sources, _build_research_prior, _initial_coordinates, _public_row, _source_prior_candidate,
+    _state_prior_candidate,
     estimate_robust_search, select_robust_at,
 )
 from stockregression.research.search import coarse_coordinates
@@ -106,6 +107,25 @@ def _row(space: ParameterSpace, coordinate: tuple[int, ...], value: float) -> di
         "actual_max_pos_ratio": 1.0, "actual_min_pos_ratio": .5,
         "floor_episode_count": 0, "floor_episode_grids": [], "floor_penalty": 0.0,
     }
+
+
+def test_linked_prior_candidates_with_unequal_source_values_are_skipped():
+    config = _config()
+    config = config.model_copy(update={
+        "base": config.base.model_copy(update={
+            "parameter_links": ParameterLinks(spacing=True, shares=False),
+        }),
+    })
+    space = ParameterSpace(config)
+    source = _source_prior_candidate(
+        space, _seed(1, buy_step=.02, sell_step=.03),
+        source_check={"status": "eligible"}, origin={}, ordinal=1,
+    )
+    state = _state_prior_candidate(
+        space, {"buy_step": .02, "sell_step": .03, "source": "test"}, ordinal=1,
+    )
+    assert source["reason"] == "linked_parameter_mismatch"
+    assert state["reason"] == "linked_parameter_mismatch"
 
 
 class _FakeEvaluator:

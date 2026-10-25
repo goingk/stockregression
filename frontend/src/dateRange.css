@@ -1,0 +1,11 @@
+.date-range-control { display:grid; gap:10px; }
+.date-range-control .form-grid { gap:10px; }
+.date-input-field { display:grid; gap:5px; color:#64748b; font-size:12px; }
+.date-window-control { display:grid; grid-template-columns:minmax(140px,auto) 1fr; align-items:center; gap:14px; color:#64748b; font-size:12px; }
+.date-window-control label { display:flex; align-items:center; gap:8px; white-space:nowrap; }
+.date-window-control .input { width:82px; padding:7px 9px; }
+.date-window-control input[type="range"] { width:100%; accent-color:#3b72c4; }
+.date-calendar-note { color:#8a6b35; }
+.link-toggle { display:flex; align-items:center; gap:9px; color:#475569; font-size:13px; }
+.link-toggle input { accent-color:#356eb8; }
+@media (max-width:640px) { .date-window-control { grid-template-columns:1fr; gap:7px; } }

@@ -73,7 +73,7 @@ def test_api_freezes_target_version_and_source_and_indexes_submission(tmp_path, 
     monkeypatch.setattr(MarketDataService, "readiness", lambda self, cfg, version=None: seen.append(version) or {"ready": True})
     monkeypatch.setattr("stockregression.api.preparation_config", lambda store, base, **kw: base)
     # No minute-row estimate is needed for a manifest without market_versions.
-    bundle = SimpleNamespace(version="target-frozen", bars=pd.DataFrame(), daily=pd.DataFrame())
+    bundle = SimpleNamespace(version="target-frozen", bars=pd.DataFrame(), daily=pd.DataFrame(), calendar=pd.DatetimeIndex([]))
     monkeypatch.setattr(DataService, "load_bundle", lambda *a, **kw: bundle)
     monkeypatch.setattr("stockregression.research.robust.estimate_robust_search", lambda cfg, data, **kw: {
         "status": "ready", "effective_total_evaluation_budget": 100,

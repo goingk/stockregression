@@ -27,6 +27,10 @@ def test_strategy_catalog_and_result_protocol_share_the_same_fact_source():
     catalog = strategy_descriptions()["strategies"][0]
     protocol = config.protocol_description()
 
+    space = protocol.pop("parameter_space")
+    assert space["version"] == 1
+    assert space["parameter_links"] == {"spacing": False, "shares": False}
+    assert space["active_axes"] == ["buy_step", "sell_step", "buy_shares", "sell_shares"]
     assert protocol == research_protocol_description(
         config.strategy, config.selection_target,
         max_principal_drawdown=config.max_principal_drawdown,

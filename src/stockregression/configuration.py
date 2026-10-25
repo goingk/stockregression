@@ -75,6 +75,7 @@ _FIELD_LABELS = {
     "data_refresh_interval_ms": "数据刷新间隔", "data_health_page_size": "数据体检分页",
     "inventory_page_size": "库存分页", "instrument_lookup_limit": "证券搜索条数",
     "instrument_lookup_debounce_ms": "证券搜索防抖", "enabled": "启用状态",
+    "link_spacing": "统一买卖间距", "link_shares": "统一买卖份额",
     "daily_time": "每日更新时间", "weekly_day": "每周核对日", "weekly_time": "每周核对时间",
     "subprocess_timeout_seconds": "计划子进程超时", "lock_timeout_seconds": "计划任务锁超时",
 }

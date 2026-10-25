@@ -10,6 +10,9 @@ import type { BacktestConfig } from './types'
 type ConfigUpdate = BacktestConfig | ((previous: BacktestConfig) => BacktestConfig)
 type Workspace = {
   backtest: BacktestConfig | null; research: BacktestConfig | null; researchSettings: ResearchDefaults | null; error: string
+  backtestDatesExplicit: boolean; researchDatesExplicit: boolean
+  setBacktestDatesExplicit: (next: boolean | ((previous: boolean) => boolean)) => void
+  setResearchDatesExplicit: (next: boolean | ((previous: boolean) => boolean)) => void
   updateBacktest: (next: ConfigUpdate) => void; updateResearch: (next: ConfigUpdate) => void
   updateResearchSettings: (next: ResearchDefaults, remember?: boolean) => void
   loadResearchDraft: (config: BacktestConfig, settings: ResearchDefaults) => void
@@ -32,6 +35,8 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
   const [backtest, setBacktest] = useState<BacktestConfig | null>(null)
   const [research, setResearch] = useState<BacktestConfig | null>(null)
   const [researchSettings, setResearchSettings] = useState<ResearchDefaults | null>(null)
+  const [backtestDatesExplicit, setBacktestDatesExplicit] = useState(false)
+  const [researchDatesExplicit, setResearchDatesExplicit] = useState(false)
   const [error, setError] = useState('')
   const feeDefaults = useRef<FeeDefaults>({ commission_rate: .0005, min_commission: .1 })
   const rememberedResearch = useRef<ResearchDefaults | null>(null)
@@ -74,19 +79,21 @@ export function WorkbenchProvider({ children }: { children: ReactNode }) {
   const loadResearchDraft = useCallback((config: BacktestConfig, settings: ResearchDefaults) => {
     setResearch(structuredClone(config))
     setResearchSettings(structuredClone(settings))
+    setResearchDatesExplicit(Boolean(config.end_date))
   }, [])
   const rememberStrategy = useCallback((group: StrategyDefaultsGroup, next: BacktestConfig) => { rememberWorkbenchGroup(group, strategyDefaults(next)[group]) }, [])
   const restore = (page: 'backtest' | 'research') => {
     const initial = workbenchConfig(defaultConfig(feeDefaults.current), preferences.value)
-    if (page === 'backtest') setBacktest(initial)
-    else { setResearch(initial); setResearchSettings(structuredClone(preferences.value.research)) }
+    if (page === 'backtest') { setBacktest(initial); setBacktestDatesExplicit(false) }
+    else { setResearch(initial); setResearchSettings(structuredClone(preferences.value.research)); setResearchDatesExplicit(false) }
   }
   const transfer = (page: 'backtest' | 'research', config: BacktestConfig) => {
-    if (page === 'backtest') setBacktest(structuredClone(config))
-    else setResearch(structuredClone(config))
+    if (page === 'backtest') { setBacktest(structuredClone(config)); setBacktestDatesExplicit(true) }
+    else { setResearch(structuredClone(config)); setResearchDatesExplicit(true) }
   }
   return <WorkspaceContext.Provider value={{
-    backtest, research, researchSettings, error: error || preferences.error,
+    backtest, research, researchSettings, backtestDatesExplicit, researchDatesExplicit,
+    setBacktestDatesExplicit, setResearchDatesExplicit, error: error || preferences.error,
     updateBacktest, updateResearch, updateResearchSettings, loadResearchDraft, rememberFees: saveFees, rememberStrategy, restore, transfer,
     configuration: preferences.document, pendingRestart: preferences.pendingRestart,
     flushConfiguration, rememberConfiguration: rememberConfigurationPatch,

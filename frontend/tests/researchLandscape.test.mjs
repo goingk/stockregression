@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { chooseLandscapeAxes, landscapeSliceKey, revisionMatchesScope } from '../src/landscapeData.ts'
+import { canonicalLandscapePoint, chooseLandscapeAxes, landscapeSliceKey, parameterSpaceAxes, revisionMatchesScope } from '../src/landscapeData.ts'
 
 function point(params) {
   return { params, candidate_id: 1, is_center: false, is_baseline: false, is_focus: false, status: 'completed', excess_return: 0, grid_return: 0, baseline_return: null, drawdown: 0, trade_count: 1, peak_invested: null, neighbor_candidate_ids: [], neighbor_of_candidate_ids: [], robustness_status: null, neighbor_positive_ratio: null, neighbor_q25_excess: null, island_suspect: false }
@@ -52,4 +52,21 @@ test('an adaptive revision only covers its own decision index', () => {
   const scope = { revision: 2, decision: 'adaptive', decision_index: 1 }
   assert.equal(revisionMatchesScope(scope, 'adaptive', 1), true)
   assert.equal(revisionMatchesScope(scope, 'adaptive', 0), false)
+})
+
+test('linked candidate fields collapse to metadata active canonical axes', () => {
+  const space = { version: 1, parameter_links: { spacing: true, shares: false }, independent_axes: [
+    { id: 'buy_step', members: ['buy_step', 'sell_step'] },
+    { id: 'buy_shares', members: ['buy_shares'] },
+    { id: 'sell_shares', members: ['sell_shares'] },
+  ], active_axes: ['buy_step', 'buy_shares', 'sell_shares'] }
+  assert.deepEqual(parameterSpaceAxes(fourAxes, space), space.active_axes)
+  const normalized = canonicalLandscapePoint(point({ buy_step: .025, sell_step: .025, buy_shares: 500, sell_shares: 500 }), space)
+  assert.equal(normalized.params.sell_step, .025)
+})
+
+test('legacy landscape metadata derives distinct parameters without assuming links', () => {
+  assert.deepEqual(parameterSpaceAxes(fourAxes), fourAxes)
+  assert.deepEqual(parameterSpaceAxes(fourAxes, { version: 1, parameter_links: { spacing: false, shares: false }, independent_axes: [], active_axes: [] }), [])
+  assert.deepEqual(parameterSpaceAxes(['buy_step', 'sell_step'], { version: 1, parameter_links: { spacing: true, shares: true }, independent_axes: [{ id: 'buy_step', members: ['buy_step', 'sell_step'] }], active_axes: ['buy_step'] }), ['buy_step'])
 })

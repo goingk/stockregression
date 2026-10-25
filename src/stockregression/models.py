@@ -66,6 +66,14 @@ class FloorPenaltyConfig(BaseModel):
     floor_k_ref: float = Field(default=10.0, gt=0, le=1_000_000)
 
 
+class ParameterLinks(BaseModel):
+    """Independent buy/sell equality constraints; execution retains four fields."""
+
+    model_config = ConfigDict(extra="forbid")
+    spacing: bool = False
+    shares: bool = False
+
+
 class BacktestConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     # Unversioned records retain their original accounting. New clients send 3.
@@ -79,6 +87,7 @@ class BacktestConfig(BaseModel):
     max_shares: int | None = Field(default=2000, ge=0, multiple_of=100)
     buy_shares: int = Field(default=100, ge=100, multiple_of=100)
     sell_shares: int = Field(default=100, ge=100, multiple_of=100)
+    parameter_links: ParameterLinks = Field(default_factory=ParameterLinks)
     dca: DcaConfig = Field(default_factory=DcaConfig)
     reference_price_mode: Literal["auto", "manual"] = "auto"
     initial_cash: float = Field(default=100_000, gt=0)
@@ -149,6 +158,10 @@ class BacktestConfig(BaseModel):
 
     @model_validator(mode="after")
     def valid_range(self):
+        if self.parameter_links.spacing and self.buy_step != self.sell_step:
+            raise ValueError("统一买卖间距时 buy_step 与 sell_step 必须相等")
+        if self.parameter_links.shares and self.buy_shares != self.sell_shares:
+            raise ValueError("统一买卖份额时 buy_shares 与 sell_shares 必须相等")
         if self.end_date and self.end_date < self.start_date:
             raise ValueError("结束日期不能早于开始日期")
         if not self.min_position <= self.initial_position <= self.max_position:
@@ -386,6 +399,7 @@ class ResearchContext(BaseModel):
     lower_price: float | None = Field(default=None, gt=0)
     upper_price: float | None = Field(default=None, gt=0)
     dca: DcaConfig = Field(default_factory=DcaConfig)
+    parameter_links: ParameterLinks = Field(default_factory=ParameterLinks)
 
     _symbol = field_validator("symbol")(normalize_symbol)
 
@@ -467,6 +481,7 @@ class ResearchRequestV5(BaseModel):
             fees=context.fees, reference_price_mode=context.reference_price_mode,
             reference_price=context.reference_price, lower_price=context.lower_price,
             upper_price=context.upper_price, dca=context.dca,
+            parameter_links=context.parameter_links,
         )
         return OptimizationConfig(
             base=base, protocol_version=5, selection_target=self.selection_target,
@@ -520,11 +535,14 @@ class OptimizationConfig(BaseModel):
 
     def protocol_description(self) -> dict[str, Any]:
         """Single source of protocol facts for preflight, results and exports."""
-        return research_protocol_description(
+        description = research_protocol_description(
             self.strategy, self.selection_target,
             max_principal_drawdown=self.max_principal_drawdown,
             min_trades=self.min_trades,
         )
+        from .research.space import ParameterSpace, ROBUST_FIELDS
+        description["parameter_space"] = ParameterSpace(self, field_order=ROBUST_FIELDS).metadata()
+        return description
 
     @model_validator(mode="after")
     def valid_v4_ranges(self):
@@ -534,6 +552,16 @@ class OptimizationConfig(BaseModel):
                 raise ValueError("稳健 J 研究范围必须且只能包含四个搜索轴")
             if any(value.step is not None for value in self.ranges.values()):
                 raise ValueError("稳健 J 研究的步长只能配置在 strategy.granularity 中")
+            for enabled, left, right in (
+                (self.base.parameter_links.spacing, "buy_step", "sell_step"),
+                (self.base.parameter_links.shares, "buy_shares", "sell_shares"),
+            ):
+                if not enabled:
+                    continue
+                if self.ranges[left] != self.ranges[right]:
+                    raise ValueError(f"统一参数时 {left} 与 {right} 的研究范围必须相等")
+                if self.strategy.granularity[left] != self.strategy.granularity[right]:
+                    raise ValueError(f"统一参数时 {left} 与 {right} 的研究粒度必须相等")
         return self
 
     @model_validator(mode="before")
@@ -551,6 +579,15 @@ class OptimizationConfig(BaseModel):
         if context is not None:
             context = context if isinstance(context, ResearchContext) else ResearchContext.model_validate(context)
             context_values = context.model_dump(mode="python")
+            if "parameter_links" not in context.model_fields_set:
+                # Old context records did not carry links: retain the explicit
+                # base contract rather than replacing it with default false.
+                inherited_links = ParameterLinks.model_validate(base_values.get("parameter_links") or {})
+                context = context.model_copy(update={"parameter_links": inherited_links})
+                values["research_context"] = context
+                context_values["parameter_links"] = inherited_links
+            elif "parameter_links" in base_values and ParameterLinks.model_validate(base_values["parameter_links"]) != context.parameter_links:
+                raise ValueError("research_context 与 base 的参数联动设置不一致")
             fees = context_values.pop("fees")
             base_values.update(context_values)
             base_values["fees"] = fees
@@ -579,6 +616,7 @@ class OptimizationConfig(BaseModel):
                 "reference_price": base_values.get("reference_price"),
                 "lower_price": base_values.get("lower_price"), "upper_price": base_values.get("upper_price"),
                 "dca": base_values.get("dca") or {},
+                "parameter_links": base_values.get("parameter_links") or {},
             }
         values["base"] = base_values
         base = values["base"]

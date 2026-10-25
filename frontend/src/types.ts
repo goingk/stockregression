@@ -179,6 +179,16 @@ export interface DataPreparationPlan {
   config: BacktestConfig
 }
 export type QuantityMode = 'shares' | 'cash' | 'equity_ratio'
+export interface ParameterLinks { spacing: boolean; shares: boolean }
+export interface TradingCalendar {
+  symbol: string
+  frequency: Frequency
+  data_version: string | number | null
+  first_date: string | null
+  last_date: string | null
+  trading_dates: string[]
+  calendar_available: boolean
+}
 export interface FeeConfig {
   commission_rate: number
   min_commission: number
@@ -211,6 +221,7 @@ export interface BacktestConfig {
   max_shares: number | null
   buy_shares: number
   sell_shares: number
+  parameter_links: ParameterLinks
   dca: { frequency: 'daily' | 'weekly' | 'monthly'; shares: number; initial_shares: number }
   reference_price_mode: 'auto' | 'manual'
   initial_cash?: number

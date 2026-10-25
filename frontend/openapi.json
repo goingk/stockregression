@@ -1728,6 +1728,69 @@
         }
       }
     },
+    "/api/v1/data/calendar/{symbol}": {
+      "get": {
+        "summary": "Data Calendar",
+        "operationId": "data_calendar_api_v1_data_calendar__symbol__get",
+        "parameters": [
+          {
+            "name": "symbol",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "frequency",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "1m",
+              "title": "Frequency"
+            }
+          },
+          {
+            "name": "data_version",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Data Version"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/market/bars/{symbol}": {
       "get": {
         "summary": "Market Bars",
@@ -1959,6 +2022,23 @@
               "type": "string",
               "title": "Session Id"
             }
+          },
+          {
+            "name": "through_revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Through Revision"
+            }
           }
         ],
         "responses": {
@@ -2154,6 +2234,131 @@
           },
           "required": true
         },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/optimizations/preview-sessions": {
+      "post": {
+        "summary": "Research Preview Submit",
+        "operationId": "research_preview_submit_api_v1_optimizations_preview_sessions_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResearchPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/optimizations/preview-sessions/{session_id}": {
+      "get": {
+        "summary": "Research Preview Status",
+        "operationId": "research_preview_status_api_v1_optimizations_preview_sessions__session_id__get",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Research Preview Cancel",
+        "operationId": "research_preview_cancel_api_v1_optimizations_preview_sessions__session_id__delete",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          },
+          {
+            "name": "through_revision",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Through Revision"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -2944,10 +3149,16 @@
             "in": "query",
             "required": false,
             "schema": {
-              "type": "integer",
-              "maximum": 10000,
-              "minimum": 1,
-              "default": 1000,
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 10000,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
               "title": "Limit"
             }
           },
@@ -2957,7 +3168,7 @@
             "required": false,
             "schema": {
               "type": "string",
-              "pattern": "^(sample|members|slice|projection)$",
+              "pattern": "^(sample|members|slice|projection|space)$",
               "default": "sample",
               "title": "View"
             }
@@ -2992,6 +3203,71 @@
                 }
               ],
               "title": "Y"
+            }
+          },
+          {
+            "name": "z",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Z"
+            }
+          },
+          {
+            "name": "fixed_axis",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Fixed Axis"
+            }
+          },
+          {
+            "name": "fixed_tick",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Fixed Tick"
+            }
+          },
+          {
+            "name": "selected_candidate_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Selected Candidate Id"
             }
           },
           {
@@ -3613,6 +3889,9 @@
             "minimum": 100.0,
             "title": "Sell Shares",
             "default": 100
+          },
+          "parameter_links": {
+            "$ref": "#/components/schemas/ParameterLinks"
           },
           "dca": {
             "$ref": "#/components/schemas/DcaConfig"
@@ -4410,6 +4689,11 @@
       },
       "GridDefaults": {
         "properties": {
+          "link_spacing": {
+            "type": "boolean",
+            "title": "Link Spacing",
+            "default": false
+          },
           "grid_mode": {
             "type": "string",
             "enum": [
@@ -5854,6 +6138,24 @@
         ],
         "title": "OptimizationConfig"
       },
+      "ParameterLinks": {
+        "properties": {
+          "spacing": {
+            "type": "boolean",
+            "title": "Spacing",
+            "default": false
+          },
+          "shares": {
+            "type": "boolean",
+            "title": "Shares",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ParameterLinks",
+        "description": "Independent buy/sell equality constraints; execution retains four fields."
+      },
       "PathsSection": {
         "properties": {
           "data_dir": {
@@ -5959,6 +6261,11 @@
       },
       "PositionDefaults": {
         "properties": {
+          "link_shares": {
+            "type": "boolean",
+            "title": "Link Shares",
+            "default": false
+          },
           "initial_shares": {
             "type": "integer",
             "multipleOf": 100.0,
@@ -6188,6 +6495,9 @@
           },
           "dca": {
             "$ref": "#/components/schemas/DcaConfig"
+          },
+          "parameter_links": {
+            "$ref": "#/components/schemas/ParameterLinks"
           }
         },
         "additionalProperties": false,
@@ -6581,6 +6891,52 @@
         "additionalProperties": false,
         "type": "object",
         "title": "ResearchDefaults"
+      },
+      "ResearchPreviewRequest": {
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_-]+$",
+            "title": "Session Id"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Revision"
+          },
+          "config": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OptimizationConfig"
+              },
+              {
+                "$ref": "#/components/schemas/ResearchRequestV5"
+              }
+            ],
+            "title": "Config"
+          },
+          "estimate_key": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Estimate Key"
+          }
+        },
+        "type": "object",
+        "required": [
+          "session_id",
+          "revision",
+          "config"
+        ],
+        "title": "ResearchPreviewRequest"
       },
       "ResearchRangeDefaults": {
         "properties": {
@@ -7205,7 +7561,7 @@
             "maximum": 10000.0,
             "minimum": 50.0,
             "title": "Preview Debounce Ms",
-            "default": 300
+            "default": 1500
           },
           "page_size": {
             "type": "integer",

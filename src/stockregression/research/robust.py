@@ -114,6 +114,11 @@ def _stable_seed(config: OptimizationConfig, asof: str, purpose: str) -> int:
         "ranges": {name: value.model_dump(mode="json") for name, value in config.ranges.items() if name in ROBUST_FIELDS},
         "initial_shares": int(config.base.initial_shares),
     }
+    links = getattr(config.base, "parameter_links", None)
+    if links and (links.spacing or links.shares):
+        payload["parameter_links"] = {
+            "spacing": bool(links.spacing), "shares": bool(links.shares),
+        }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).digest()
     return int.from_bytes(digest[:4], "little")
 
@@ -287,6 +292,13 @@ def _source_prior_candidate(
             candidate["reason"] = f"invalid_source_granularity:{name}"
             return candidate
         ticks[name] = tick
+    for enabled, left, right in (
+        (space.parameter_links["spacing"], "buy_step", "sell_step"),
+        (space.parameter_links["shares"], "buy_shares", "sell_shares"),
+    ):
+        if enabled and ticks[left] != ticks[right]:
+            candidate["reason"] = "linked_parameter_mismatch"
+            return candidate
     coordinate = tuple(ticks[name] for name in space.order)
     if not space.legal(space.active_coords(coordinate)):
         candidate["reason"] = "illegal_coordinate"
@@ -325,9 +337,16 @@ def _state_prior_candidate(
             candidate["reason"] = f"{error}:{name}"
             return candidate
         ticks[name] = tick
+    if space.parameter_links["spacing"] and ticks["buy_step"] != ticks["sell_step"]:
+        candidate["reason"] = "linked_parameter_mismatch"
+        return candidate
     for name in ("buy_shares", "sell_shares"):
         dim = space.dimensions[name]
         ticks[name] = (dim.low + dim.high) // 2
+    if space.parameter_links["shares"]:
+        # Expand one midpoint for the shared share axis.
+        midpoint = (space.dimensions["buy_shares"].low + space.dimensions["buy_shares"].high) // 2
+        ticks["buy_shares"] = ticks["sell_shares"] = midpoint
     coordinate = tuple(ticks[name] for name in space.order)
     if not space.legal(space.active_coords(coordinate)):
         candidate["reason"] = "illegal_coordinate"
@@ -628,7 +647,7 @@ class EvaluationSession:
         strategy = self.config.strategy
         return int(
             strategy.training_budget + strategy.validation_budget + strategy.reporting_budget
-            + strategy.stress_region_count * max(1, strategy.hypercube_edge ** 4)
+            + strategy.stress_region_count * max(1, strategy.hypercube_edge ** max(1, len(self.space.active)))
         )
 
     def _budget_remaining(self) -> int:
@@ -1318,6 +1337,7 @@ def select_robust_at(
         diagnostics = {
             "status": "completed", "protocol_version": 5, "strategy_id": "geometric_robust_j",
             "strategy_version": 5, "geometry": "robust_j", "connectivity": "fixed_edge_cube",
+            "parameter_space": space.metadata(),
             "search_method": method, "ranking_mode": "robust_j",
             "fields": list(ROBUST_FIELDS), "active_fields": list(active),
             "legal_combination_count": int(total), "neighborhood_edge": edge,
@@ -1431,6 +1451,7 @@ def _empty_result(
     diagnostics = {
         "status": status, "protocol_version": 5, "strategy_id": "geometric_robust_j",
         "strategy_version": 5, "geometry": "robust_j",
+        "parameter_space": space.metadata(),
         "selection_history_days": len(history), "candidate_count": 0, "eligible_count": 0,
         "training_only": True, "internal_validation_folds": 0,
         "search_method": config.strategy.search_method,
@@ -1474,6 +1495,7 @@ def _cancelled_selection(
     diagnostics = {
         "status": "cancelled", "protocol_version": 5,
         "strategy_id": "geometric_robust_j", "strategy_version": 5,
+        "parameter_space": space.metadata(),
         "training_window": window.diagnostic(),
         "training_start": window.start.date().isoformat() if window.start is not None else None,
         "training_end": window.end.date().isoformat() if window.end is not None else None,
@@ -1515,6 +1537,7 @@ def _cancelled_selection(
 def estimate_robust_search(
     config: OptimizationConfig, data: DataBundle, *,
     bars_memory_bytes: int | None = None,
+    training_window: TrainingWindow | None = None,
 ) -> dict[str, Any]:
     if config.protocol_version != 5 or config.strategy.strategy_version != 5:
         raise ValueError("稳健 J 预检需要 protocol_version=5 和 strategy_version=5")
@@ -1532,7 +1555,7 @@ def estimate_robust_search(
         int(strategy.training_min_days), int(strategy.training_max_days),
         mode=str(strategy.training_window_mode),
     )
-    window = policy.window(data, asof)
+    window = training_window if training_window is not None else policy.window(data, asof)
     prior_plan = (
         _build_research_prior(normalized, space, data, window.end)
         if normalized.prior_policy == "daily_state_v1" else None
@@ -1541,7 +1564,7 @@ def estimate_robust_search(
     method = _method(normalized, total, space)
     edge = int(strategy.hypercube_edge)
     active = tuple(name for name in space.active)
-    volume = edge ** max(1, len(active)) if active else 1
+    volume = edge ** len(active) if active else 1
     peak_support = int(math.prod(min(space.dimensions[name].count, edge + 2) for name in space.active)) if space.active else 1
     reasons: list[str] = []
     impossible = [name for name in active if space.dimensions[name].count < edge]
@@ -1615,6 +1638,7 @@ def estimate_robust_search(
     preview = {
         "status": status, "protocol_version": 5, "strategy_id": "geometric_robust_j",
         "strategy_version": 5, "geometry": "robust_j", "grid_mode": "geometric",
+        "parameter_space": space.metadata(),
         "protocol": config.protocol_description(),
         "fields": list(ROBUST_FIELDS), "active_fields": list(active),
         "granularity": {name: space.granularity[name] for name in ROBUST_FIELDS},
