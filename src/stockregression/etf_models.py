@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .models import BacktestConfig, FeeConfig, normalize_symbol
 
-METHOD_VERSION = "etf_min_grid_v3"
+METHOD_VERSION = "etf_min_grid_v4"
 RESULT_SCHEMA_VERSION = 1
 MIN_COMPLETE_DAY_RATIO = 0.90
 MIN_OBSERVED_MINUTE_RATIO = 0.95

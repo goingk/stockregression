@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  buildEtfResearchRequest, dataStatusLabel, dataStatusTone, etfDataStatusCounts, etfMetricRows, etfMetricText,
+  buildEtfResearchRequest, dataStatusLabel, dataStatusTone, etfDataStatusCounts, etfMarketStateMetricText, etfMetricRows, etfMetricText,
   etfResearchStartCount, samplingCoverageText, samplingStatisticsText,
   etfSymbolValidationPath, executionError, executionFromBacktest, filterReasonLabel, filterReasonsText,
   gapText, isEtfResearchResult, isEtfValidationResult, itemsPageCount, parseSelectedEtfSymbols,
+  marketStateStatusLabel, researchLinkResourceId, researchLinkStatusLabel, researchLinkSummaryText,
   resultStatusLabel, safeItemsOffset, scoreDisplay, settingsError, stopReasonLabel,
 } from '../src/etfResearch.ts'
 
@@ -182,4 +183,28 @@ test('ETF result kinds keep validation reports out of ranking rendering', () => 
   assert.equal(isEtfResearchResult({ kind: 'etf_research' }), true)
   assert.equal(isEtfResearchResult({ kind: 'etf_validation' }), false)
   assert.equal(isEtfValidationResult(null), false)
+})
+
+test('daily market state formats its six metrics and labels empty reasons', () => {
+  assert.equal(etfMarketStateMetricText('natr14', .0182), '1.82%')
+  assert.equal(etfMarketStateMetricText('amplitude_q75', .026), '2.60%')
+  assert.equal(etfMarketStateMetricText('hv_ratio', 1.23456), '1.235')
+  assert.equal(etfMarketStateMetricText('adx14', 18.126), '18.13')
+  assert.equal(etfMarketStateMetricText('adx14', null), '—')
+  assert.equal(marketStateStatusLabel('insufficient_history'), '历史不足')
+  assert.equal(marketStateStatusLabel('empty'), '无有效样本')
+})
+
+test('research links prefer immutable results and keep summaries compact', () => {
+  assert.equal(researchLinkResourceId({ job_id: 'job-1', result_id: 'result-1' }), 'result-1')
+  assert.equal(researchLinkResourceId({ job_id: 'job-1', result_id: null }), 'job-1')
+  assert.equal(researchLinkStatusLabel('running'), '运行中')
+  const summary = researchLinkSummaryText({
+    fixed: { status: 'completed', prior_policy: 'daily_state_v1', selected_count: 3 },
+    adaptive: { status: 'running' },
+    current: { status: 'no_qualified', candidate_count: 12 },
+  })
+  assert.match(summary, /固定 已完成 · 先验 daily_state_v1 · 入选 3/)
+  assert.match(summary, /自适应 运行中/)
+  assert.match(summary, /当前建议 无合格候选 · 候选 12/)
 })

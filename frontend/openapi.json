@@ -2019,6 +2019,75 @@
         }
       }
     },
+    "/api/v1/etf-research/{result_id}/research-links": {
+      "get": {
+        "summary": "Etf Research Links",
+        "operationId": "etf_research_links_api_v1_etf_research__result_id__research_links_get",
+        "parameters": [
+          {
+            "name": "result_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Result Id"
+            }
+          },
+          {
+            "name": "symbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Symbol"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0,
+              "title": "Offset"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 20,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/optimizations": {
       "post": {
         "summary": "Optimization",
@@ -5734,6 +5803,48 @@
               }
             ],
             "title": "Configuration Revision"
+          },
+          "prior_policy": {
+            "type": "string",
+            "enum": [
+              "off",
+              "daily_state_v1"
+            ],
+            "title": "Prior Policy",
+            "default": "off"
+          },
+          "source_etf": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResearchSourceRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "requested_data_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Data Version"
+          },
+          "research_origin": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Research Origin"
           }
         },
         "additionalProperties": false,
@@ -6581,6 +6692,48 @@
               }
             ],
             "title": "Configuration Revision"
+          },
+          "prior_policy": {
+            "type": "string",
+            "enum": [
+              "off",
+              "daily_state_v1"
+            ],
+            "title": "Prior Policy",
+            "default": "off"
+          },
+          "source_etf": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ResearchSourceRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "requested_data_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Data Version"
+          },
+          "research_origin": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Research Origin"
           }
         },
         "additionalProperties": false,
@@ -6601,6 +6754,36 @@
         "additionalProperties": false,
         "type": "object",
         "title": "ResearchSection"
+      },
+      "ResearchSourceRef": {
+        "properties": {
+          "result_id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Result Id"
+          },
+          "candidate_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate Ids"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "result_id"
+        ],
+        "title": "ResearchSourceRef",
+        "description": "Frozen reference to candidates selected from an ETF research result."
       },
       "ResearchStrategySpec": {
         "properties": {

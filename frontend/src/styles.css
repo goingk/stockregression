@@ -1305,3 +1305,67 @@ td small.table-sub, .muted-cell { color:#64748b; }
   .etf-history-select .input { min-width:0; }
   .etf-sample-banner { padding:10px 12px; }
 }
+.research-source-card { margin-bottom: 14px; border-color: #cadcf7; background: linear-gradient(135deg, #f7fbff 0%, #ffffff 60%); }
+.research-source-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr)); gap: 10px; margin-bottom: 12px; }
+.research-source-summary > div { min-width: 0; padding: 11px 12px; border: 1px solid #e0e9f6; border-radius: 8px; background: #fff; }
+.research-source-summary small, .research-prior-summary small, .research-prior-market-grid small { display: block; margin-bottom: 5px; color: #64748b; font-size: 11px; }
+.research-source-summary strong { display: block; color: #253b5c; font-size: 13px; line-height: 1.45; overflow-wrap: anywhere; }
+.research-source-summary span { display: block; margin-top: 4px; color: #748196; font-size: 10px; line-height: 1.6; overflow-wrap: anywhere; }
+.research-source-summary .source-version { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; font-weight: 500; }
+.research-prior-control { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; padding: 12px; border: 1px solid #dfe9f7; border-radius: 8px; background: #f8fbff; }
+.research-prior-control > div:first-child { min-width: 0; flex: 1 1 420px; }
+.research-prior-control strong { color: #334155; font-size: 13px; }
+.research-prior-control span { display: block; margin-top: 4px; color: #64748b; font-size: 11px; line-height: 1.7; }
+.research-prior-toggle { display: inline-flex; padding: 3px; border: 1px solid #d9e4f4; border-radius: 8px; background: #eef4fd; }
+.research-prior-toggle button { border: 0; border-radius: 6px; padding: 7px 12px; color: #5a6f8e; background: transparent; font: inherit; font-size: 11px; cursor: pointer; }
+.research-prior-toggle button.selected { color: #1d4ed8; background: #fff; box-shadow: 0 1px 3px rgba(30, 64, 175, .16); font-weight: 600; }
+.research-source-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.research-source-actions > span { display: inline-flex; align-items: center; gap: 5px; margin-left: auto; color: #64748b; font-size: 10px; line-height: 1.6; }
+.research-source-error { margin: 12px 0 0; }
+.research-source-empty { display: flex; align-items: center; gap: 8px; padding: 9px 13px; margin-bottom: 14px; border: 1px dashed #d8e2ef; border-radius: 8px; color: #64748b; background: #fbfdff; font-size: 11px; line-height: 1.6; }
+.research-source-empty > span { flex: 1 1 420px; }
+.research-source-empty b { color: #334155; }
+.research-prior-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-bottom: 12px; }
+.research-prior-summary > div { min-width: 0; padding: 10px 11px; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; }
+.research-prior-summary strong { color: #334155; font-size: 12px; line-height: 1.6; }
+.research-prior-market, .research-prior-gate, .research-prior-counts { margin-top: 10px; padding: 11px 12px; border: 1px solid #e4ebf4; border-radius: 8px; background: #fff; }
+.research-prior-market h3, .research-prior-gate h3, .research-prior-counts h3 { margin: 0 0 8px; color: #334155; font-size: 12px; }
+.research-prior-market-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 7px; }
+.research-prior-market-grid > span { min-width: 0; padding: 8px; border-radius: 6px; background: #f8fafc; }
+.research-prior-market-grid strong { color: #334155; font-size: 12px; }
+.etf-market-state-card { margin-bottom: 14px; padding: 13px 14px; border: 1px solid #dbe6f5; border-radius: 10px; background: linear-gradient(135deg, #f8fbff 0%, #fff 62%); }
+.etf-market-state-card.legacy { border-style: dashed; background: #fbfcfe; }
+.etf-market-state-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 10px 16px; }
+.etf-market-state-head h3 { margin: 0 0 5px; color: #2d405b; font-size: 14px; }
+.etf-market-state-head p { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin: 0; color: #64748b; font-size: 11px; line-height: 1.65; }
+.etf-market-state-head > span { color: #64748b; font-size: 11px; }
+.etf-market-state-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; margin: 11px 0 9px; }
+.etf-market-state-grid > div { min-width: 0; padding: 9px; border: 1px solid #e5edf7; border-radius: 7px; background: #fff; }
+.etf-market-state-grid small { display: block; color: #64748b; font-size: 10px; }
+.etf-market-state-grid strong { display: block; margin: 4px 0 2px; color: #27384f; font-size: 13px; font-variant-numeric: tabular-nums; }
+.etf-market-state-grid span { display: block; color: #748196; font-size: 9px; line-height: 1.55; }
+.etf-research-entry { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; padding: 12px 13px; border: 1px solid #d5e4f8; border-radius: 9px; background: #f4f9ff; }
+.etf-research-entry > div { min-width: 0; flex: 1 1 460px; }
+.etf-research-entry strong { color: #28466f; font-size: 13px; }
+.etf-research-entry p { margin: 4px 0 0; color: #526179; font-size: 11px; line-height: 1.7; }
+.etf-related-research { margin-top: 16px; padding: 14px; border: 1px solid #e0e7f0; border-radius: 10px; background: #fcfdff; }
+.etf-related-research-head { display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between; gap: 10px 16px; margin-bottom: 10px; }
+.etf-related-research-head > div:first-child { min-width: 0; flex: 1 1 460px; }
+.etf-related-research-head h3 { margin: 0 0 4px; color: #334155; font-size: 14px; }
+.etf-related-research-head p { margin: 0; color: #64748b; font-size: 11px; line-height: 1.7; }
+.etf-related-research-table td { vertical-align: top; }
+.etf-related-research-table td small { display: block; max-width: 300px; color: #64748b; line-height: 1.55; overflow-wrap: anywhere; }
+.etf-related-research-table td:first-child strong { display: block; max-width: 240px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10px; overflow-wrap: anywhere; }
+
+@media (max-width: 1200px) {
+  .research-source-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .research-prior-market-grid, .etf-market-state-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 760px) {
+  .research-source-summary, .research-prior-summary, .research-prior-market-grid, .etf-market-state-grid { grid-template-columns: minmax(0, 1fr); }
+  .research-prior-control, .research-source-actions, .research-source-empty, .etf-research-entry { align-items: stretch; flex-direction: column; }
+  .research-source-actions > span { margin-left: 0; }
+  .research-prior-toggle { width: 100%; }
+  .research-prior-toggle button { flex: 1; }
+}

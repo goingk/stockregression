@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { defaultWorkbenchDefaults, normalizeRememberedResearchDefaults, normalizeWorkbenchDefaults, researchConfigForSubmission, researchRangesForSymbol, strategyDefaults, validResearchDefaults, validWorkbenchGroup, workbenchConfig } from '../src/workbenchDefaults.ts'
+import { defaultWorkbenchDefaults, mergeEditedResearchDefaults, normalizeRememberedResearchDefaults, normalizeWorkbenchDefaults, researchConfigForSubmission, researchRangesForSymbol, strategyDefaults, validResearchDefaults, validWorkbenchGroup, workbenchConfig } from '../src/workbenchDefaults.ts'
 
 const ROBUST_AXES = ['buy_step', 'sell_step', 'buy_shares', 'sell_shares']
 const RETIRED_FIELDS = [
@@ -320,4 +320,21 @@ test('legacy range names do not survive the v5 migration', () => {
   assert.equal('grid_step' in migrated.ranges, false)
   assert.equal('initial_shares' in migrated.ranges, false)
   assert.equal(migrated.ranges.buy_step.step, null)
+})
+
+test('source-imported constraints are only remembered after their own edit', () => {
+  const remembered = defaultWorkbenchDefaults().research
+  const sourceDraft = { ...remembered, min_trades: 22, max_principal_drawdown: .31 }
+  const rangeEdit = {
+    ...sourceDraft,
+    ranges: { ...sourceDraft.ranges, buy_step: { ...sourceDraft.ranges.buy_step, high: .12 } },
+  }
+  const merged = mergeEditedResearchDefaults(sourceDraft, rangeEdit, remembered)
+  assert.equal(merged.min_trades, remembered.min_trades)
+  assert.equal(merged.max_principal_drawdown, remembered.max_principal_drawdown)
+  assert.equal(merged.ranges.buy_step.high, .12)
+  const constraintEdit = { ...rangeEdit, min_trades: 35 }
+  const next = mergeEditedResearchDefaults(rangeEdit, constraintEdit, merged)
+  assert.equal(next.min_trades, 35)
+  assert.equal(next.max_principal_drawdown, remembered.max_principal_drawdown)
 })

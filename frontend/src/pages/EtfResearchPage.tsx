@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Download, FlaskConical, RefreshCw, SearchCheck, ShieldCheck } from 'lucide-react'
+import { ArrowUpRight, Download, FlaskConical, Link2, RefreshCw, SearchCheck, ShieldCheck } from 'lucide-react'
 import { download, get, post } from '../api'
 import { LatestRequest } from '../requestState'
 import { resultsPageQuery } from '../resultsReview'
@@ -8,21 +8,24 @@ import { useTasks } from '../TaskCenter'
 import { useWorkspaces } from '../WorkbenchState'
 import { flushConfiguration } from '../useWorkbenchDefaults'
 import { isEtfResearchJob } from '../taskState'
+import { researchDraftFromEtfSource } from '../researchDraft.ts'
+import type { ResearchDraftBundle } from '../researchDraft.ts'
 import {
   Badge, Button, Card, Empty, ErrorBox, Field, Loading, NumField, PageHeader, SelectInput, Stat,
   TextInput, dateText, money, percent, useErrorMessage,
 } from '../components'
 import type { BacktestConfig, FeeConfig, ResultSummary } from '../types'
 import {
-  ETF_METRIC_DEFINITIONS, buildEtfResearchRequest, dataStatusLabel, dataStatusTone, etfDataStatusCounts, etfMetricRows, etfMetricText,
+  ETF_MARKET_STATE_METRICS, ETF_METRIC_DEFINITIONS, buildEtfResearchRequest, dataStatusLabel, dataStatusTone, etfDataStatusCounts, etfMarketStateMetricText, etfMetricRows, etfMetricText,
   etfResearchStartCount, samplingCoverageText, samplingStatisticsText,
   etfRequestKey, etfSymbolValidationPath, executionFromBacktest, filterReasonsText, gapText, itemsPageCount,
-  parseSelectedEtfSymbols, resultStatusLabel, resultStatusTone, safeItemsOffset, scoreDisplay, settingsError,
+  marketStateStatusLabel, marketStateStatusTone, parseSelectedEtfSymbols, researchLinkActive, researchLinkResourceId,
+  researchLinkStatusLabel, researchLinkStatusTone, researchLinkSummaryText, resultStatusLabel, resultStatusTone, safeItemsOffset, scoreDisplay, settingsError,
   stopReasonLabel, validationStatusLabel,
 } from '../etfResearch.ts'
 import type {
-  EtfCandidate, EtfExecution, EtfItemsResponse, EtfPreflight, EtfResearchRequest,
-  EtfResearchSettings, EtfResult, EtfRow, EtfValidationRow,
+  EtfCandidate, EtfExecution, EtfItemsResponse, EtfPreflight, EtfResearchLink, EtfResearchLinksResponse,
+  EtfResearchRequest, EtfResearchSettings, EtfResult, EtfRow, EtfValidationRow,
 } from '../etfResearch.ts'
 import { isEtfResearchResult, isEtfValidationResult } from '../etfResearch.ts'
 
@@ -30,6 +33,8 @@ type Props = {
   requestedResult?: string | null
   onSelectedResultChange?: (resultId: string) => void
   onLoadBacktest?: (config: BacktestConfig, message?: string) => void
+  onResearchSource?: (draft: ResearchDraftBundle) => void
+  onOpenResearchResource?: (resource: string) => void
 }
 
 type PreflightState = {
@@ -93,7 +98,7 @@ function MetricHelpList({ items }: { items: readonly { label: string; text: stri
   return <dl className='etf-help-list'>{items.map(item => <div key={item.label}><dt>{item.label}</dt><dd>{item.text}</dd></div>)}</dl>
 }
 
-export default function EtfResearchPage({ requestedResult, onSelectedResultChange, onLoadBacktest }: Props) {
+export default function EtfResearchPage({ requestedResult, onSelectedResultChange, onLoadBacktest, onResearchSource, onOpenResearchResource }: Props) {
   const workspace = useWorkspaces()
   const tasks = useTasks()
   const err = useErrorMessage()
@@ -128,11 +133,18 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
   const [selectedSymbol, setSelectedSymbol] = useState('')
   const [detail, setDetail] = useState<EtfRow | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [researchLinks, setResearchLinks] = useState<EtfResearchLink[]>([])
+  const [researchLinksTotal, setResearchLinksTotal] = useState(0)
+  const [researchLinksOffset, setResearchLinksOffset] = useState(0)
+  const [researchLinksLoading, setResearchLinksLoading] = useState(false)
+  const [researchLinksError, setResearchLinksError] = useState('')
+  const [researchLinksToken, setResearchLinksToken] = useState(0)
 
   const preflightLatest = useRef(new LatestRequest<string>())
   const historyLatest = useRef(new LatestRequest<string>())
   const itemLatest = useRef(new LatestRequest<string>())
   const detailLatest = useRef(new LatestRequest<string>())
+  const researchLinksLatest = useRef(new LatestRequest<string>())
   const taskSnapshotReady = useRef(false)
   const seenTerminalEtfJobs = useRef('')
   const seenTerminalEtfResearchJobs = useRef('')
@@ -215,6 +227,12 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
       setSelectedSymbol('')
       setDetail(null)
       setDetailLoading(false)
+      researchLinksLatest.current.invalidate()
+      setResearchLinks([])
+      setResearchLinksTotal(0)
+      setResearchLinksOffset(0)
+      setResearchLinksLoading(false)
+      setResearchLinksError('')
     }
     setSelectedResultId(resultId)
     setItemsOffset(0)
@@ -280,6 +298,7 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
     const existing = items.find(item => item.symbol === symbol)
     setSelectedSymbol(symbol)
     setDetail(existing ?? null)
+    setResearchLinksOffset(0)
     const key = selectedResultId + ':' + symbol
     const ticket = detailLatest.current.begin(key)
     setDetailLoading(true)
@@ -292,6 +311,47 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
       if (detailLatest.current.isCurrent(ticket)) setDetailLoading(false)
     }
   }
+
+  useEffect(() => {
+    if (!selectedResultId || !detail?.symbol) {
+      setResearchLinks([])
+      setResearchLinksTotal(0)
+      return
+    }
+    let active = true
+    const key = `${selectedResultId}:${detail.symbol}:${researchLinksOffset}:${researchLinksToken}`
+    const ticket = researchLinksLatest.current.begin(key)
+    setResearchLinksLoading(true)
+    setResearchLinksError('')
+    const query = new URLSearchParams({
+      symbol: detail.symbol,
+      offset: String(researchLinksOffset),
+      limit: '20',
+    })
+    get<EtfResearchLinksResponse>(`/etf-research/${encodeURIComponent(selectedResultId)}/research-links?${query.toString()}`)
+      .then(value => {
+        if (!active || !researchLinksLatest.current.isCurrent(ticket)) return
+        setResearchLinks(Array.isArray(value.items) ? value.items : [])
+        setResearchLinksTotal(Number.isFinite(Number(value.total)) ? Number(value.total) : 0)
+      })
+      .catch(cause => {
+        if (!active || !researchLinksLatest.current.isCurrent(ticket)) return
+        setResearchLinks([])
+        setResearchLinksTotal(0)
+        setResearchLinksError(err(cause))
+      })
+      .finally(() => {
+        if (active && researchLinksLatest.current.isCurrent(ticket)) setResearchLinksLoading(false)
+      })
+    return () => { active = false }
+  }, [selectedResultId, detail?.symbol, researchLinksOffset, researchLinksToken, err])
+
+  const hasActiveResearchLinks = researchLinks.some(researchLinkActive)
+  useEffect(() => {
+    if (!hasActiveResearchLinks || !detail?.symbol) return
+    const timer = window.setTimeout(() => setResearchLinksToken(value => value + 1), 5_000)
+    return () => window.clearTimeout(timer)
+  }, [hasActiveResearchLinks, detail?.symbol, researchLinksToken])
 
   const etfJobs = useMemo(() => tasks.jobs.filter(isEtfResearchJob), [tasks.jobs])
   const terminalEtfSignature = etfJobs
@@ -402,6 +462,22 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
     onLoadBacktest?.(next, 'ETF 候选参数已载入回测草稿，未自动提交。尚无选参截止日后的本地行情时，仅保留草稿。')
   }
 
+  const enterResearchDraft = (row: EtfRow, rangeMode: 'prior_year' | 'after_cutoff' = 'prior_year') => {
+    if (!researchResult) { setError('请先打开一条已保存的 ETF 研究排名。'); return }
+    if (!workspace.research || !workspace.researchSettings) { setError('当前研究工作区尚未载入。'); return }
+    if (!onResearchSource) { setError('参数研究导航尚未初始化。'); return }
+    const converted = researchDraftFromEtfSource({
+      result: researchResult,
+      row,
+      current: workspace.research,
+      settings: workspace.researchSettings,
+      range_mode: rangeMode,
+    })
+    if (converted.error || !converted.draft) { setError(converted.error || '无法建立参数研究草稿。'); return }
+    setError(''); setNotice('')
+    onResearchSource(converted.draft)
+  }
+
   const exportResult = async () => {
     if (!selectedResultId) return
     setError('')
@@ -429,7 +505,8 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
   const pageCount = itemsPageCount(visibleItemsTotal, pageSize)
   const currentPage = Math.floor(safeItemsOffset(itemsOffset, visibleItemsTotal, pageSize) / pageSize) + 1
   const metricRows = detail ? etfMetricRows(detail.metrics ?? {}, detail.metric_details ?? {}) : []
-  const isV3 = researchResult?.method_version === 'etf_min_grid_v3'
+  const isV3 = researchResult?.method_version === 'etf_min_grid_v3' || researchResult?.method_version === 'etf_min_grid_v4'
+  const isV4Method = researchResult?.method_version === 'etf_min_grid_v4'
   const redundancyDaily = (row: typeof items[number]) => row.metrics.path_redundancy_daily_mean
   const redundancy5d = (row: typeof items[number]) => row.metrics.path_redundancy_5d_mean
   const redundancy20d = (row: typeof items[number]) => row.metrics.path_redundancy_20d_mean
@@ -440,6 +517,14 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
   const detailFilterReasons = detail?.filter_reasons ?? []
   const detailGaps = detail?.gaps ?? []
   const detailWarnings = detail?.warnings ?? []
+  const detailMarketState = detail?.market_state ?? null
+  const marketStateSamples = detailMarketState?.samples ?? null
+  const marketStateSampleCount = detailMarketState?.sample_count ?? marketStateSamples?.daily_rows ?? null
+  const marketStateMessage = detailMarketState?.reason || detailMarketState?.empty_reason || detailMarketState?.message || null
+  const marketStateMetrics = ETF_MARKET_STATE_METRICS.filter(metric => detailMarketState?.metrics && Object.prototype.hasOwnProperty.call(detailMarketState.metrics, metric.key))
+  const researchLinkLimit = 20
+  const researchLinkPages = itemsPageCount(researchLinksTotal, researchLinkLimit)
+  const researchLinkPage = Math.floor(safeItemsOffset(researchLinksOffset, researchLinksTotal, researchLinkLimit) / researchLinkLimit) + 1
   const historyControls = <div className='result-select etf-history-select'>
     <SelectInput aria-label='选择 ETF 研究历史' value={selectedResultId} onChange={event => selectResult(event.target.value)}>
       <option value=''>选择研究历史</option>
@@ -550,8 +635,19 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
             {!itemsLoading && !items.length && <Empty title='没有排名行' detail='当前研究范围可能全部历史不足或数据未就绪。' />}
             <div className='pagination-row etf-ranking-pagination'><span>第 {currentPage} / {pageCount} 页 · 共 {itemsTotal} 行</span><div><Button variant='quiet' disabled={itemsOffset <= 0 || itemsLoading} onClick={() => setItemsOffset(current => safeItemsOffset(current - pageSize, itemsTotal, pageSize))}>上一页</Button><Button variant='quiet' disabled={itemsOffset + pageSize >= itemsTotal || itemsLoading} onClick={() => setItemsOffset(current => safeItemsOffset(current + pageSize, itemsTotal, pageSize))}>下一页</Button></div></div>
             {detail && <section className='etf-detail-section'>
-              <div className='etf-detail-heading'><div><h2>{detail.symbol_name || detail.symbol}</h2><span>{detail.symbol} · {dateText(detail.window_start)} 至 {dateText(detail.window_end)} · 数据版本 {detail.version || '—'}</span></div><div><Badge tone={dataStatusTone(detail.data_status)}>{dataStatusLabel(detail.data_status)}</Badge><Badge tone={detail.eligible ? 'green' : 'red'}>{detail.eligible ? '符合硬过滤' : '未通过硬过滤'}</Badge><Badge tone='blue'>样本内</Badge></div></div>
+              <div className='etf-detail-heading'><div><h2>{detail.symbol_name || detail.symbol}</h2><span>{detail.symbol} · {dateText(detail.window_start)} 至 {dateText(detail.window_end)} · 数据版本 {detail.version || '—'}</span></div><div><Badge tone={dataStatusTone(detail.data_status)}>{dataStatusLabel(detail.data_status)}</Badge><Badge tone={detail.eligible ? 'green' : 'red'}>{detail.eligible ? '符合硬过滤' : '未通过硬过滤'}</Badge><Badge tone='blue'>样本内</Badge>{detailMarketState && <Badge tone={marketStateStatusTone(detailMarketState.status)}>日线状态 · {marketStateStatusLabel(detailMarketState.status)}</Badge>}</div></div>
               {(detailFilterReasons.length > 0 || detailGaps.length > 0 || detailWarnings.length > 0) && <div className='etf-filter-reasons'>{detailFilterReasons.length > 0 && <p><strong>过滤原因：</strong>{filterReasonsText(detailFilterReasons)}</p>}{detailGaps.length > 0 && <div className='etf-gap-list'><strong>数据缺口：</strong><ul>{detailGaps.map((gap, index) => <li key={`${gap.timeframe ?? ''}-${gap.kind}-${index}`}>{gapText(gap)}</li>)}</ul></div>}{detailWarnings.length > 0 && <p><strong>数据提示：</strong>{detailWarnings.join('；')}</p>}</div>}
+              {detailMarketState ? <section className='etf-market-state-card' aria-label='日线市场状态先验'>
+                <div className='etf-market-state-head'><div><h3>日线市场状态先验</h3><p><Badge tone={marketStateStatusTone(detailMarketState.status)}>{marketStateStatusLabel(detailMarketState.status)}</Badge><span>{detailMarketState.method_version || 'daily_state_v1'} · 截止 {dateText(detailMarketState.as_of)}</span></p></div><span>{marketStateSampleCount != null ? `样本 ${marketStateSampleCount} 个日线交易日` : '样本数未提供'}</span></div>
+                {marketStateMessage && <p className='inline-warning'>{marketStateMessage}</p>}
+                {marketStateMetrics.length > 0 ? <div className='etf-market-state-grid'>{marketStateMetrics.map(metric => {
+                  const detailValue = detailMarketState.metric_details?.[metric.key]
+                  return <div key={metric.key}><small>{metric.label}</small><strong>{etfMarketStateMetricText(metric.key, detailMarketState.metrics?.[metric.key])}</strong>{(detailValue?.sample_count != null || detailValue?.reason) && <span>{detailValue?.sample_count != null ? `样本 ${detailValue.sample_count}` : '样本未提供'}{detailValue?.reason ? ' · ' + detailValue.reason : ''}</span>}</div>
+                })}</div> : <p className='field-hint'>该状态对象没有可展示的六项指标；请查看空原因或原始诊断。</p>}
+                {Object.entries(detailMarketState.metrics ?? {}).some(([key, value]) => !ETF_MARKET_STATE_METRICS.some(metric => metric.key === key) && value != null) && <p className='field-hint'>状态对象还包含额外指标，完整值见下方诊断。</p>}
+                {(marketStateSamples?.selected_start || marketStateSamples?.selected_end || marketStateSamples?.gap_before_start) && <p className='field-hint'>有效样本区间 {dateText(marketStateSamples?.selected_start)} 至 {dateText(marketStateSamples?.selected_end)}；前置连续缺口 {marketStateSamples?.gap_before_start ? dateText(marketStateSamples.gap_before_start) : '无'}；缺失处断开计算，不跨缺口拼接。</p>}
+                <Disclosure id={'etf-market-state-' + detail.symbol} title='状态诊断与空原因' summary={`${detailMarketState.method_version || 'daily_state_v1'} · ${marketStateMetrics.length} 项指标`}><pre className='json-preview'>{jsonText(detailMarketState)}</pre></Disclosure>
+              </section> : <section className='etf-market-state-card legacy'><div className='etf-market-state-head'><div><h3>日线市场状态先验</h3><p>{isV4Method ? '该 ETF 行尚未计算日线状态；原有统计、过滤和候选仍可正常查看。' : '这条历史 ETF 结果未包含 market_state；原有统计、过滤和候选仍按历史版本正常展示。'}</p></div><Badge tone='neutral'>{isV4Method ? '状态待计算' : '旧 ETF 版本'}</Badge></div></section>}
               <div className='etf-detail-score-row'><div><small>GSS 横截面评分</small><strong>{scoreDisplay(detail)}</strong><span>样本数 {detail.score_cohort_size}{detail.rank != null ? ` · 排名 ${detail.rank}` : ''}</span><span>本次候选池内的相对适用性评分，越高越符合网格特征。</span></div><div><small>网格基准</small><strong>{money(gridBasis?.reference_price, 3)} 元</strong><span>当前 {money(gridBasis?.current_raw_price, 3)} · 下轨 {money(gridBasis?.lower_price, 3)} · 上轨 {money(gridBasis?.upper_price, 3)}</span><span>参考价为网格中心，上下轨限定候选价格范围。</span></div><div><small>网格参数核验</small><ValidationBadge status={detailValidation?.status ?? 'not_selected'} /><span>{detailCandidates.length} 个候选</span></div></div>
               {detail.sampling && <Disclosure id='etf-statistical-sample' title='统计样本与排除日期' summary={samplingStatisticsText(detail.sampling)}>
                 <p>{samplingCoverageText(detail.sampling)} · {samplingStatisticsText(detail.sampling)} · {detail.sampling.comparable ? '同池统计日期已对齐' : '仅诊断，不参与 GSS'}</p>
@@ -559,14 +655,20 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
               </Disclosure>}
               <div className='etf-metric-grid'>{metricRows.map(metric => <div key={metric.key}><small>{metric.label}</small><strong>{metric.value}</strong>{metric.meaning && <p className='etf-metric-copy'><b>含义：</b>{metric.meaning}</p>}{metric.usage && <p className='etf-metric-copy'><b>用途：</b>{metric.usage}</p>}{metric.detail?.reason && <span>{metric.detail.reason}</span>}{metric.detail?.sample_count != null && <span>{metric.key.startsWith('path_redundancy_') && metric.key !== 'path_redundancy' ? `有效窗口 ${metric.detail.sample_count} 个` : `样本 ${metric.detail.sample_count}`}</span>}</div>)}</div>
               <div className='etf-grid-basis-grid'><span><small>ATR30</small><strong>{percent(gridBasis?.atr30_pct)}</strong></span><span><small>SVR</small><strong>{money(gridBasis?.svr, 3)}</strong></span><span><small>已实现偏度</small><strong>{money(gridBasis?.realized_skewness, 3)}</strong></span><span><small>已实现峰度</small><strong>{money(gridBasis?.realized_kurtosis, 3)}</strong></span><span><small>最小报价</small><strong>{money(gridBasis?.price_tick, 3)} 元</strong></span></div><Disclosure id='etf-grid-basis-help' title='网格参数说明' summary='ATR30、SVR、偏度、峰度与报价单位'><MetricHelpList items={gridBasisHelp} /></Disclosure>
-              {Object.keys(detail.score_contributions ?? {}).length > 0 && <Disclosure id='etf-score-contributions' title='GSS 分项贡献' summary={`${Object.keys(detail.score_contributions).length} 项`}><p className='etf-help-intro'>各项为加权后的得分贡献（分），相加得到 GSS。{isV3 ? 'v3 权重：RV 25%、日均 PR 10%、5 日 PR 10%、反向 VR240 20%、IOVR 15%、过零率 10%、反向跳跃占比 10%；20 日 PR 与 1 分钟对照不计分。' : '历史 v1/v2 权重：RV 25%、全窗口路径冗余 20%、反向 VR240 20%、IOVR 15%、过零率 10%、反向跳跃占比 10%。'}反向表示原值越低，得分越高。</p><div className='etf-contribution-grid'>{Object.entries(detail.score_contributions).map(([key, value]) => <span key={key}><small>{ETF_METRIC_DEFINITIONS.find(metric => metric.key === key)?.label ?? key.replaceAll('_', ' ')}</small><strong>{value.toFixed(4)} 分</strong></span>)}</div></Disclosure>}
+              {Object.keys(detail.score_contributions ?? {}).length > 0 && <Disclosure id='etf-score-contributions' title='GSS 分项贡献' summary={`${Object.keys(detail.score_contributions).length} 项`}><p className='etf-help-intro'>各项为加权后的得分贡献（分），相加得到 GSS。{isV3 ? 'v3/v4 权重：RV 25%、日均 PR 10%、5 日 PR 10%、反向 VR240 20%、IOVR 15%、过零率 10%、反向跳跃占比 10%；20 日 PR 与 1 分钟对照不计分。' : '历史 v1/v2 权重：RV 25%、全窗口路径冗余 20%、反向 VR240 20%、IOVR 15%、过零率 10%、反向跳跃占比 10%。'}反向表示原值越低，得分越高。</p><div className='etf-contribution-grid'>{Object.entries(detail.score_contributions).map(([key, value]) => <span key={key}><small>{ETF_METRIC_DEFINITIONS.find(metric => metric.key === key)?.label ?? key.replaceAll('_', ' ')}</small><strong>{value.toFixed(4)} 分</strong></span>)}</div></Disclosure>}
               <div className='etf-validation-section'><div className='etf-validation-title'><div><h3>参数核验与候选</h3><p>候选指标为样本内自动回放；GSS 与硬过滤资格独立展示。</p></div><ValidationBadge status={detailValidation?.status ?? 'not_selected'} /></div>
                 {detailValidation?.reason && <p className='inline-warning'>核验原因：{detailValidation.reason}</p>}
                 {detailValidation?.stop_reason && <p className='inline-warning'>核验停止原因：{stopReasonLabel(detailValidation.stop_reason)}</p>}
                 <Disclosure id='etf-candidate-metrics-help' title='候选指标说明' summary='步长、收益、超额、回撤、成交和费用'><MetricHelpList items={candidateHelp} /></Disclosure>
                 {detailCandidates.length ? <div className='table-wrap scroll-table etf-candidate-table'><table><thead><tr><th>候选</th><th>基准 / 买入 / 卖出步长</th><th>参考 / 上下轨</th><th>网格上下格数</th><th>峰值本金收益</th><th>同资金持有</th><th>差值超额</th><th>最大回撤</th><th>成交 / 买卖</th><th>费用</th><th>资格</th><th>操作</th></tr></thead><tbody>{detailCandidates.map(candidate => <tr key={String(candidate.id)}><td><strong>#{String(candidate.id)}</strong>{detailValidation?.recommendation?.id === candidate.id && <Badge tone='blue'>推荐</Badge>}{candidate.asymmetric && <Badge tone='amber'>非对称</Badge>}</td><td>{percent(candidate.base_step)} / {percent(candidate.buy_step)} / {percent(candidate.sell_step)}</td><td>{money(candidate.reference_price, 3)} / {money(candidate.lower_price, 3)} / {money(candidate.upper_price, 3)}</td><td>{candidate.grids_down_count} / {candidate.grids_up_count}</td><td>{percent(candidate.metrics.peak_principal_return)}</td><td>{percent(candidate.metrics.matched_funding_hold_return)}</td><td>{percent(candidate.metrics.excess_return)}</td><td>{percent(candidate.metrics.max_principal_drawdown)}</td><td>{candidate.metrics.trade_count ?? '—'} / {candidate.metrics.buy_count ?? '—'} / {candidate.metrics.sell_count ?? '—'}</td><td>{money(candidate.metrics.total_fees)}</td><td><Badge tone={candidate.qualified ? 'green' : 'amber'}>{candidate.qualified ? '合格' : '未合格'}</Badge>{candidate.reasons.length > 0 && <small>{candidate.reasons.join('；')}</small>}</td><td><div className='button-row etf-candidate-actions'><Button variant='quiet' busy={rowBusy === 'replay:' + String(candidate.id)} onClick={() => void replayCandidate(detail, candidate)}>按此复现</Button></div></td></tr>)}</tbody></table></div> : <Empty title='没有参数候选' detail={validationStatusLabel(detailValidation?.status ?? 'not_selected')} />}
-                <div className='etf-detail-actions'><Button variant='secondary' busy={rowBusy === detail.symbol} disabled={detail.data_status === 'limited'} onClick={() => void validateSingleSymbol(detail)}><SearchCheck size={15} />按原数据核验此 ETF</Button>{detail.data_status === 'limited' && <span>统计可用（受限）：请处理诊断原因后再进行参数核验。</span>}<Button variant='quiet' disabled={!detail.validation.forward_config} onClick={() => loadForwardConfig(detail)}>载入截止日后回测草稿</Button>{!detail.validation.forward_config && <span>尚无选参截止日后的回测配置。</span>}</div>
+                <div className='etf-detail-actions'><Button busy={rowBusy === detail.symbol} disabled={detail.data_status === 'limited'} onClick={() => void validateSingleSymbol(detail)}><SearchCheck size={15} />按原数据核验此 ETF</Button>{detail.data_status === 'limited' && <span>统计可用（受限）：请处理诊断原因后再进行参数核验。</span>}<Button variant='quiet' disabled={!detail.validation.forward_config} onClick={() => loadForwardConfig(detail)}>载入截止日后回测草稿</Button>{!detail.validation.forward_config && <span>尚无选参截止日后的回测配置。</span>}</div>
+                <div className='etf-research-entry'><div><strong>进入参数研究</strong><p>按来源截止日前一年或截止日之后建立草稿。可在参数研究中调整日期和设置；提交前检查目标行情。</p></div><div className='button-row'><Button variant='secondary' onClick={() => enterResearchDraft(detail)}><FlaskConical size={15} />默认前一年草稿</Button><Button variant='quiet' onClick={() => enterResearchDraft(detail, 'after_cutoff')}><FlaskConical size={15} />研究截止日之后</Button></div></div>
               </div>
+              <section className='etf-related-research' aria-label='关联参数研究'>
+                <div className='etf-related-research-head'><div><h3>关联参数研究</h3><p>展示由此 ETF 发起的任务与结果，运行中自动更新。</p></div><div className='button-row'><Button variant='quiet' busy={researchLinksLoading} onClick={() => setResearchLinksToken(value => value + 1)}><RefreshCw size={14} />刷新关联</Button><Link2 size={14} /></div></div>
+                {researchLinksError ? <div className='notice error'><span>关联任务读取失败：{researchLinksError}</span><Button variant='quiet' onClick={() => setResearchLinksToken(value => value + 1)}>重试</Button></div> : researchLinksLoading && !researchLinks.length ? <Loading label='读取关联研究…' /> : !researchLinks.length ? <Empty title='尚无关联参数研究' detail='从当前 ETF 行建立参数研究后，任务和结果会通过只读链接出现在这里。' /> : <div className='table-wrap scroll-table etf-related-research-table'><table><thead><tr><th>任务 / 结果</th><th>状态</th><th>更新时间</th><th>先验摘要</th><th>错误</th><th>操作</th></tr></thead><tbody>{researchLinks.map(link => <tr key={link.job_id}><td><strong>{link.job_id}</strong><small>{link.result_id ? '结果 ' + link.result_id : '任务尚未保存结果'}</small></td><td><Badge tone={researchLinkStatusTone(link.status)}>{researchLinkStatusLabel(link.status)}</Badge></td><td><small>{dateText(link.updated_at || link.created_at)}</small></td><td><small>{researchLinkSummaryText(link.summary)}</small></td><td><small>{link.error ? (typeof link.error === 'string' ? link.error : jsonText(link.error)) : '—'}</small></td><td><Button variant='quiet' onClick={() => onOpenResearchResource?.(researchLinkResourceId(link))}><ArrowUpRight size={14} />打开研究</Button></td></tr>)}</tbody></table></div>}
+                {researchLinksTotal > researchLinkLimit && <div className='pagination-row etf-ranking-pagination'><span>第 {researchLinkPage} / {researchLinkPages} 页 · 共 {researchLinksTotal} 条</span><div><Button variant='quiet' disabled={researchLinksOffset <= 0 || researchLinksLoading} onClick={() => setResearchLinksOffset(value => safeItemsOffset(value - researchLinkLimit, researchLinksTotal, researchLinkLimit))}>上一页</Button><Button variant='quiet' disabled={researchLinksOffset + researchLinkLimit >= researchLinksTotal || researchLinksLoading} onClick={() => setResearchLinksOffset(value => safeItemsOffset(value + researchLinkLimit, researchLinksTotal, researchLinkLimit))}>下一页</Button></div></div>}
+              </section>
               <Disclosure id='etf-detail-diagnostics' title='诊断字段与版本' summary={'版本 ' + (detail.version || '—')}><pre className='json-preview'>{jsonText(detail.diagnostics)}</pre></Disclosure>
             </section>}
           </>}

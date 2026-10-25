@@ -425,6 +425,14 @@ class RecommendationRegion(BaseModel):
     stress: dict[str, Any] = Field(default_factory=dict)
 
 
+class ResearchSourceRef(BaseModel):
+    """Frozen reference to candidates selected from an ETF research result."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    result_id: str = Field(min_length=1)
+    candidate_ids: list[int] | None = None
+
+
 class ResearchRequestV5(BaseModel):
     """Standalone public request that does not carry backtest search defaults."""
 
@@ -441,6 +449,10 @@ class ResearchRequestV5(BaseModel):
     min_history_days: int = Field(default=250, ge=20)
     min_minute_ratio: float = Field(default=0.95, ge=0, le=1)
     configuration_revision: str | None = None
+    prior_policy: Literal["off", "daily_state_v1"] = "off"
+    source_etf: ResearchSourceRef | None = None
+    requested_data_version: str | None = None
+    research_origin: dict[str, Any] | None = None
 
 
     def to_optimization(self) -> OptimizationConfig:
@@ -464,6 +476,9 @@ class ResearchRequestV5(BaseModel):
             min_minute_ratio=self.min_minute_ratio, strategy=self.strategy,
             research_context=self.research_context, ranges=self.ranges,
             configuration_revision=self.configuration_revision,
+            prior_policy=self.prior_policy, source_etf=self.source_etf,
+            requested_data_version=self.requested_data_version,
+            research_origin=self.research_origin,
         )
 
 
@@ -494,6 +509,12 @@ class OptimizationConfig(BaseModel):
     # Submission metadata is retained for audit but does not change the model
     # identifier or enter any numerical calculation.
     configuration_revision: str | None = None
+    prior_policy: Literal["off", "daily_state_v1"] = "off"
+    source_etf: ResearchSourceRef | None = None
+    requested_data_version: str | None = None
+    # The API replaces this value with the server-resolved frozen source before
+    # preflight or execution.  Workers only consume this audit snapshot.
+    research_origin: dict[str, Any] | None = None
 
 
 

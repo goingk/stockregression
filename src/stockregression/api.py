@@ -390,6 +390,7 @@ def _landscape_point(row: dict, sample: str, cost: str, fold: int | None, fallba
         "stability_margin": row.get("stability_margin"),
         "constraint_eligible": row.get("constraint_eligible"),
         "constraint_reasons": row.get("constraint_reasons", []),
+        "prior_sources": row.get("prior_sources", []),
         **{name: row.get(name) for name in (
             "actual_min_pos_ratio", "actual_max_pos_ratio", "neighborhood_max_eta",
             "stockout_count", "tplus1_block_count", "buy_count", "sell_count",
@@ -1354,7 +1355,9 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
     def _research_preflight(config):
         if config.protocol_version != 5:
             raise HTTPException(422, "旧研究协议已移除；请使用 protocol_version=5")
-        manifest = store.snapshot(config.base.symbol)
+        manifest = store.snapshot(config.base.symbol, config.requested_data_version)
+        if config.requested_data_version and manifest is None:
+            require_ready(config.base, config.requested_data_version)
         version = str(manifest["version"]) if manifest else None
         prepared = preparation_config(
             store, config.base, version=version,
@@ -1372,6 +1375,9 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
+        from .research_origin import prior_contract_hash
+        preview.update(data_version=version, prior_policy_hash=prior_contract_hash(config),
+                       research_origin=config.research_origin)
         return preview, version
 
     @app.get("/api/v1/health")
@@ -1998,11 +2004,40 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             raise HTTPException(422, "批量回测只接受 schema_version=3 的当前股数配置")
         return {"job_ids": [submit("backtest", {"config": config.model_dump(mode="json"), "version": version})["job_id"] for config, version in zip(payload.configs, versions)]}
 
+    def resolve_optimization_source(config):
+        from .research_origin import ResearchOriginError, resolve_research_origin
+        try:
+            # A saved config can round-trip through the public API, but its
+            # resolved metadata must come from the original server artifact.
+            origin = resolve_research_origin(store, config)
+        except ResearchOriginError as exc:
+            raise HTTPException(exc.status, detail={"code": "RESEARCH_SOURCE_INVALID", "message": str(exc)}) from exc
+        return config.model_copy(update={"research_origin": origin})
+
+    @app.get("/api/v1/etf-research/{result_id}/research-links")
+    def etf_research_links(result_id: str, symbol: str,
+                           offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100)):
+        try:
+            original = store.result(result_id)
+        except (OSError, ValueError):
+            original = None
+        if not original or original.get("kind") != "etf_research":
+            raise HTTPException(404, "ETF 研究结果不存在")
+        try:
+            symbol = normalize_symbol(symbol)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if not any(row.get("symbol") == symbol for row in original.get("rows", [])):
+            raise HTTPException(404, "该 ETF 不在原始候选池中")
+        return json_safe(store.research_links(result_id, symbol, offset=offset, limit=limit))
+
     @app.post("/api/v1/optimizations")
     def optimization(config: OptimizationConfig | ResearchRequestV5):
         if isinstance(config, ResearchRequestV5):
             config = config.to_optimization()
+        config = resolve_optimization_source(config)
         preview, version = _research_preflight(config)
+        config = config.model_copy(update={"requested_data_version": version})
         if preview.get("status") == "budget_exceeded":
             reason = next((value for value in preview.get("reasons", []) if "超正方体" in str(value) or "预算" in str(value)), None)
             raise HTTPException(422, {
@@ -2010,24 +2045,31 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
                 "message": reason or f"完整枚举需要 {preview.get('legal_combination_count')} 个验证点，超过预算 {preview.get('validation_budget')}",
                 **preview,
             })
+        frozen_config = config.model_dump(mode="json")
+        dedupe_key = "optimization:" + hashlib.sha256(json.dumps(
+            {"config": {k: v for k, v in frozen_config.items() if k != "configuration_revision"}, "version": version},
+            sort_keys=True, ensure_ascii=False,
+        ).encode("utf-8")).hexdigest()
         submitted = submit("optimization", {
-            "config": config.model_dump(mode="json"), "version": version,
+            "config": frozen_config, "version": version,
             "configuration_revision": config.configuration_revision,
             "budget_contract": {
                 "data_version": version,
+                "prior_policy_hash": preview["prior_policy_hash"],
                 "effective_total_evaluation_budget": preview["effective_total_evaluation_budget"],
                 "task_evaluation_upper_bound": preview["task_evaluation_upper_bound"],
                 "max_runtime_seconds": preview["max_runtime_seconds"],
                 "estimated_task_memory_mb": preview["estimated_task_memory_mb"],
                 "workspace_budget_mb": preview["workspace_budget_mb"],
             },
-        })
+        }, dedupe_key=dedupe_key)
         return {**submitted, "search_preview": preview}
 
     @app.post("/api/v1/optimizations/preview")
     def optimization_preview(config: OptimizationConfig | ResearchRequestV5):
         if isinstance(config, ResearchRequestV5):
             config = config.to_optimization()
+        config = resolve_optimization_source(config)
         preview, _ = _research_preflight(config)
         return json_safe(preview)
 

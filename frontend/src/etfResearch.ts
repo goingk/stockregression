@@ -95,6 +95,31 @@ export interface EtfMetricDetail {
   status: string
   reason?: string
   sample_count?: number
+  required_samples?: number
+  reason_code?: string | null
+}
+
+export interface EtfMarketState {
+  method_version?: 'daily_state_v1' | string
+  as_of?: string | null
+  status?: string
+  reason?: string | null
+  empty_reason?: string | null
+  message?: string | null
+  sample_count?: number | null
+  samples?: {
+    daily_rows?: number | null
+    selected_start?: string | null
+    selected_end?: string | null
+    prior_close_date?: string | null
+    gap_before_start?: string | null
+    invalid_daily_dates?: string[]
+    [key: string]: unknown
+  } | null
+  metrics?: Partial<Record<'natr14' | 'hv_ratio' | 'adx14' | 'plus_di14' | 'minus_di14' | 'amplitude_q75', number | null>> & Record<string, number | null | undefined>
+  metric_details?: Record<string, EtfMetricDetail>
+  diagnostics?: Record<string, unknown>
+  [key: string]: unknown
 }
 
 export interface EtfGridBasis {
@@ -157,6 +182,8 @@ export interface EtfRow {
   window_end: string
   metrics: Record<string, number | null>
   metric_details: Record<string, EtfMetricDetail>
+  /** Added by daily-state-aware ETF results; historical rows legitimately omit it. */
+  market_state?: EtfMarketState | null
   gaps: EtfGap[]
   eligible: boolean
   filter_reasons: string[]
@@ -168,6 +195,30 @@ export interface EtfRow {
   score_cohort_size: number
   score_contributions: Record<string, number>
   validation: EtfValidation
+}
+
+export interface EtfResearchLinkSummary {
+  fixed?: Record<string, unknown> | null
+  adaptive?: Record<string, unknown> | null
+  current?: Record<string, unknown> | null
+  [key: string]: unknown
+}
+
+export interface EtfResearchLink {
+  job_id: string
+  result_id: string | null
+  status: string
+  created_at: string
+  updated_at: string
+  error?: unknown
+  summary?: EtfResearchLinkSummary | null
+}
+
+export interface EtfResearchLinksResponse {
+  items: EtfResearchLink[]
+  total: number
+  offset: number
+  limit: number
 }
 
 export interface EtfResearchResultCounts {
@@ -187,7 +238,7 @@ export interface EtfResearchResultCounts {
 export interface EtfResearchResult {
   id: string
   kind: 'etf_research'
-  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2' | 'etf_min_grid_v3'
+  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2' | 'etf_min_grid_v3' | 'etf_min_grid_v4'
   result_schema_version: 1
   status: 'completed' | 'partial' | 'cancelled'
   as_of: string
@@ -221,7 +272,7 @@ export interface EtfValidationResultCounts {
 export interface EtfValidationResult {
   id: string
   kind: 'etf_validation'
-  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2' | 'etf_min_grid_v3'
+  method_version: 'etf_min_grid_v1' | 'etf_min_grid_v2' | 'etf_min_grid_v3' | 'etf_min_grid_v4'
   result_schema_version: 1
   status: 'completed' | 'partial' | 'cancelled' | 'failed'
   as_of: string
@@ -421,6 +472,99 @@ export function etfMetricText(key: string, value: number | null | undefined): st
   if (definition?.unit === 'price') return value.toFixed(3) + ' 元'
   if (definition?.unit === 'ratio') return value.toFixed(3)
   return Number(value.toPrecision(5)).toString()
+}
+
+export const ETF_MARKET_STATE_METRICS = [
+  { key: 'natr14', label: 'NATR14', unit: 'percent' },
+  { key: 'hv_ratio', label: 'HV 比率', unit: 'ratio' },
+  { key: 'adx14', label: 'ADX14', unit: 'number' },
+  { key: 'plus_di14', label: '+DI14', unit: 'number' },
+  { key: 'minus_di14', label: '-DI14', unit: 'number' },
+  { key: 'amplitude_q75', label: '振幅 Q75', unit: 'percent' },
+] as const
+
+export function etfMarketStateMetricText(key: string, value: number | null | undefined): string {
+  if (!finite(value)) return '—'
+  if (key === 'natr14' || key === 'amplitude_q75') return Math.abs(value) <= 1.5
+    ? `${(value * 100).toFixed(2)}%`
+    : `${value.toFixed(2)}%`
+  if (key === 'hv_ratio') return value.toFixed(3)
+  return value.toFixed(2)
+}
+
+export function marketStateStatusLabel(status?: string | null): string {
+  if (!status) return '未提供状态'
+  return ({
+    ready: '状态可用', available: '状态可用', completed: '状态可用',
+    insufficient_history: '历史不足', insufficient: '样本不足', empty: '无有效样本',
+    unavailable: '状态不可用', failed: '状态计算失败', pending: '待计算',
+  } as Record<string, string>)[status] ?? status
+}
+
+export function marketStateStatusTone(status?: string | null): 'neutral' | 'blue' | 'green' | 'red' | 'amber' {
+  if (status === 'ready' || status === 'available' || status === 'completed') return 'green'
+  if (status === 'pending') return 'blue'
+  if (status === 'insufficient_history' || status === 'insufficient' || status === 'empty') return 'amber'
+  if (status === 'unavailable' || status === 'failed') return 'red'
+  return 'neutral'
+}
+
+export function researchLinkActive(link: Pick<EtfResearchLink, 'status'>): boolean {
+  return ['queued', 'running'].includes(link.status)
+}
+
+export function researchLinkStatusLabel(status: string): string {
+  return ({
+    queued: '排队中', running: '运行中', completed: '已完成', partial: '部分完成',
+    failed: '失败', cancelled: '已取消',
+  } as Record<string, string>)[status] ?? status
+}
+
+export function researchLinkStatusTone(status: string): 'neutral' | 'blue' | 'green' | 'red' | 'amber' {
+  if (status === 'completed') return 'green'
+  if (status === 'running' || status === 'queued') return 'blue'
+  if (status === 'partial') return 'amber'
+  if (status === 'failed') return 'red'
+  return 'neutral'
+}
+
+/** Use the immutable result when available, otherwise the task's research resource. */
+export function researchLinkResourceId(link: Pick<EtfResearchLink, 'job_id' | 'result_id'>): string {
+  return link.result_id || link.job_id
+}
+
+function linkBranchText(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return ''
+  const item = value as Record<string, unknown>
+  const parts: string[] = []
+  if (typeof item.status === 'string' && item.status) {
+    const status = ['queued', 'running'].includes(item.status)
+      ? researchLinkStatusLabel(item.status)
+      : ['no_qualified', 'not_selected', 'unavailable'].includes(item.status)
+      ? validationStatusLabel(item.status)
+      : resultStatusLabel(item.status)
+    parts.push(status)
+  }
+  if (typeof item.prior_policy === 'string' && item.prior_policy) parts.push('先验 ' + item.prior_policy)
+  if (finite(item.score)) parts.push(`评分 ${item.score.toFixed(2)}`)
+  if (typeof item.eligible === 'boolean') parts.push(item.eligible ? '合格' : '未合格')
+  for (const key of ['selected_count', 'selection_count', 'eligible_count', 'candidate_count']) {
+    if (finite(item[key])) {
+      const label = ({ selected_count: '入选', selection_count: '入选', eligible_count: '合格', candidate_count: '候选' } as Record<string, string>)[key]
+      parts.push(`${label} ${item[key]}`); break
+    }
+  }
+  return parts.join(' · ')
+}
+
+export function researchLinkSummaryText(summary?: EtfResearchLinkSummary | null): string {
+  if (!summary || typeof summary !== 'object') return '尚无摘要'
+  const labels: Record<string, string> = { fixed: '固定', adaptive: '自适应', current: '当前建议' }
+  const parts = Object.entries(labels).map(([key, label]) => {
+    const text = linkBranchText(summary[key])
+    return text ? `${label} ${text}` : ''
+  }).filter(Boolean)
+  return parts.length ? parts.join(' · ') : '尚无先验摘要'
 }
 
 export function dataStatusLabel(status: string): string {

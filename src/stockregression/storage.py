@@ -316,6 +316,11 @@ def _merge_candidate_archives(root: Path, base: dict[str, Any], overlay: dict[st
                             payload["region_ids"] = regions
                         if payload.get("candidate_id") is None and candidate_id is not None:
                             payload["candidate_id"] = candidate_id
+                        if base_payload.get("prior_sources"):
+                            payload["prior_sources"] = list(dict.fromkeys([
+                                *(base_payload.get("prior_sources") or []),
+                                *(payload.get("prior_sources") or []),
+                            ]))
                         _insert_archive_payload(connection, ordinal, payload, axis)
                         replaced.add(axis)
                     ordinal += 1
@@ -643,6 +648,12 @@ class Store:
                 CREATE TABLE IF NOT EXISTS configs(id TEXT PRIMARY KEY,name TEXT,config TEXT,created_at TEXT);
                 CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT);
                 CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status,created_at);
+                CREATE TABLE IF NOT EXISTS research_origins(
+                    job_id TEXT PRIMARY KEY, etf_result_id TEXT NOT NULL,
+                    symbol TEXT NOT NULL, source_data_version TEXT, created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS research_origins_source
+                    ON research_origins(etf_result_id,symbol,created_at);
             """)
             if "metadata" not in {row[1] for row in db.execute("PRAGMA table_info(instruments)")}:
                 db.execute("ALTER TABLE instruments ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'")
@@ -1247,7 +1258,54 @@ class Store:
                 "VALUES(?,?,?,?,?,?,?,?,?)",
                 (job_id, kind, "queued", 0, "等待执行", dumps(stored_payload), created_at, created_at, dedupe_key),
             )
+            origin = (stored_payload.get("config") or {}).get("research_origin")
+            if kind == "optimization" and isinstance(origin, dict) and origin.get("etf_result_id"):
+                db.execute(
+                    "INSERT INTO research_origins VALUES(?,?,?,?,?)",
+                    (job_id, origin["etf_result_id"], origin["symbol"],
+                     origin.get("source_data_version"), created_at),
+                )
         return job_id, True
+
+    def rebuild_research_origins(self) -> int:
+        """Rebuild the derived source index from frozen queue payloads."""
+        count = 0
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for row in db.execute("SELECT id,payload,created_at FROM jobs WHERE kind='optimization'").fetchall():
+                origin = (json.loads(row["payload"]).get("config") or {}).get("research_origin")
+                if isinstance(origin, dict) and origin.get("etf_result_id"):
+                    db.execute("INSERT OR REPLACE INTO research_origins VALUES(?,?,?,?,?)",
+                               (row["id"], origin["etf_result_id"], origin["symbol"],
+                                origin.get("source_data_version"), row["created_at"]))
+                    count += 1
+        return count
+
+    def research_links(self, result_id: str, symbol: str, *, offset=0, limit=20) -> dict:
+        """Read bounded task/result summaries, without loading candidate archives."""
+        from .research_origin import linked_result_summary
+        offset, limit = max(0, int(offset)), max(1, min(100, int(limit)))
+        with self.db() as db:
+            total = db.execute(
+                "SELECT COUNT(*) FROM research_origins o JOIN jobs j ON j.id=o.job_id "
+                "WHERE o.etf_result_id=? AND o.symbol=?", (result_id, symbol),
+            ).fetchone()[0]
+            rows = [dict(row) for row in db.execute(
+                "SELECT j.id AS job_id,j.result_id,j.status,j.progress,j.message,j.error,"
+                "j.created_at,j.updated_at FROM research_origins o JOIN jobs j ON j.id=o.job_id "
+                "WHERE o.etf_result_id=? AND o.symbol=? ORDER BY j.created_at DESC,j.id DESC LIMIT ? OFFSET ?",
+                (result_id, symbol, limit, offset),
+            )]
+        for row in rows:
+            result = None
+            if row["result_id"]:
+                try:
+                    result = self.result(row["result_id"])
+                except (OSError, ValueError):
+                    pass
+            row["result_available"] = result is not None
+            row["summary"] = linked_result_summary(result)
+        return {"items": rows, "total": total, "offset": offset, "limit": limit}
 
     def new_job(self, kind: str, payload: dict, dedupe_key: str | None = None) -> str:
         return self.new_job_info(kind, payload, dedupe_key=dedupe_key)[0]

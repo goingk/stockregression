@@ -1,0 +1,3137 @@
+{
+  "schema_version": 1,
+  "kind": "research_priors_comparison",
+  "generated_at": "2026-10-25T03:34:03.369575+00:00",
+  "status": "partial",
+  "benchmark_run": true,
+  "diagnostic_code": {
+    "market_state_sha256": "a3c250810c1aae86bde048fb6b7518d239f9a9b4e5770565af26128aa6d2f08a",
+    "market_state_test_sha256": "d9a1e3b44b5ead0d49fbdcad1afa97732c10e51f31817cecb3f216aa29bea009",
+    "adx_golden": "test_wilder_adx_and_natr_match_fixed_talib_064_golden",
+    "adx_golden_reference": "C TA-Lib 0.6.4"
+  },
+  "experiment": {
+    "hypothesis": "在同一评估区间比较 off 与 daily_state_v1；不预设正收益或优越性",
+    "selection": "从最近共同截止日回溯，取正式研究 ready 且快照可重载的 ETF，按代码取前三只",
+    "frequency": "1m",
+    "evaluation_trading_days": 250,
+    "training_days": {
+      "minimum": 250,
+      "maximum": 500,
+      "window_mode": "settings"
+    },
+    "selection_target": "fixed",
+    "current_semantics": "current reuses the same evaluation-start fixed_selection; it is not a latest-market recommendation",
+    "seed": 42,
+    "source_etf": null,
+    "prior_policy_order": [
+      "off",
+      "daily_state_v1"
+    ],
+    "persisted_application_result": false
+  },
+  "budgets": {
+    "training": 100,
+    "validation": 200,
+    "reporting": 20,
+    "total": 1000,
+    "max_runtime_seconds_per_run": 180
+  },
+  "catalog": {
+    "inventory_1min_rows": 2188,
+    "latest_catalog_ready_count": 2,
+    "ready_count": 3,
+    "requested_symbol_count": 3,
+    "selected_symbols": [
+      "159611.SZ",
+      "159995.SZ",
+      "512880.SH"
+    ],
+    "unfilled_symbol_slots": 0,
+    "source_versions": {
+      "159611.SZ": "mkt-7a988f71944d6ea3cf32c2c8",
+      "159995.SZ": "mkt-e21502ab6499ee768e58fb41",
+      "512880.SH": "mkt-ab3af88482d8f8c4e6804eb2"
+    }
+  },
+  "symbols": {
+    "159611.SZ": {
+      "symbol": "159611.SZ",
+      "source_version": "mkt-7a988f71944d6ea3cf32c2c8",
+      "target_version": "mkt-7a988f71944d6ea3cf32c2c8",
+      "source_etf": null,
+      "evaluation": {
+        "start": "2025-09-18",
+        "end": "2026-09-30",
+        "frequency": "1m",
+        "trading_days": 250
+      },
+      "readiness": {
+        "ready": true,
+        "symbol": "159611.SZ",
+        "frequency": "1m",
+        "asset_type": "etf",
+        "gaps": [],
+        "degraded_days": [],
+        "warnings": [],
+        "checked_start": "2023-07-11",
+        "checked_end": "2026-09-30",
+        "package_id": "pkg-2e5ee3ab541c457485dd4435",
+        "snapshot_version": "mkt-7a988f71944d6ea3cf32c2c8",
+        "calendar_version": "market-sync-v2-package",
+        "preparation": {
+          "symbol": "159611.SZ",
+          "frequency": "1min",
+          "start": "2023-07-11",
+          "end": "2026-09-30"
+        }
+      },
+      "runs": {
+        "off": {
+          "status": "partial",
+          "partial": true,
+          "policy": "off",
+          "elapsed_seconds": 5.090492,
+          "runtime_limit_seconds": 180,
+          "runtime_limit_hit": false,
+          "data_version": "mkt-7a988f71944d6ea3cf32c2c8",
+          "fixed_status": "partial",
+          "j": {
+            "score": null,
+            "selected_eligible": null,
+            "qualified_count": 0,
+            "recommendation_count": 0,
+            "candidate_count": 240,
+            "score_complete": false,
+            "coverage_status": "budgeted_local_peaks",
+            "training_unique_count": 100,
+            "neighborhood_unique_count": 140,
+            "reporting_unique_count": 0
+          },
+          "candidate_evaluations": 240,
+          "ledger_evaluations": 480,
+          "budget": {
+            "training": 100,
+            "validation": 200,
+            "reporting": 20,
+            "total": 1000,
+            "effective": 1000,
+            "used": 240,
+            "remaining": 760,
+            "stopped": false,
+            "reason": null
+          },
+          "training_window": {
+            "start": "2024-05-27",
+            "end": "2025-09-17",
+            "days": 323,
+            "anchor_date": "2025-09-17",
+            "anchor_price": 1.021,
+            "matched_date": "2024-05-27",
+            "matched": true,
+            "fallback": false,
+            "start_reason": "same_price_farthest",
+            "search_start": "2023-08-28",
+            "search_end": "2024-09-06",
+            "min_offset_trading_days": 250,
+            "max_offset_trading_days": 500,
+            "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "reason": "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 500 个交易日内距离评估日最远的一天作为训练时段起点",
+            "mode": "same_price",
+            "price_basis": "decision_date_adjusted",
+            "actions_applied": [],
+            "action_factor_fingerprint": null,
+            "data_issue": null
+          },
+          "selected_params": null,
+          "prior_source_labelled_candidate_count": 0,
+          "prior": null,
+          "candidate_failure_reasons": {
+            "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 500 个交易日内距离评估日最远的一天作为训练时段起点": 1,
+            "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值": 1,
+            "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值": 1
+          },
+          "failure_reasons": [
+            "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 500 个交易日内距离评估日最远的一天作为训练时段起点",
+            "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+            "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值",
+            "181 个交易日分钟与日线成交量比存在偏差；分钟数据已保留，请核对来源单位或成交量口径。"
+          ],
+          "oos": {
+            "excess_return": null,
+            "grid_peak_principal_return": null,
+            "matched_funding_hold_return": null,
+            "grid_principal_drawdown": null,
+            "matched_funding_hold_drawdown": null,
+            "trade_count": null
+          },
+          "current": {
+            "semantics": "same evaluation-start anchor as fixed; independent display only",
+            "same_anchor_as_fixed": true,
+            "status": "no_qualified",
+            "decision_date": "2025-09-17",
+            "selected_params": null,
+            "score": null,
+            "eligible": false,
+            "candidate_count": 240,
+            "eligible_count": 0,
+            "reasons": [
+              "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 500 个交易日内距离评估日最远的一天作为训练时段起点",
+              "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+              "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值"
+            ]
+          },
+          "config_fingerprint": "15fa7e00e399503d51b3bb159baeedff8ef2d61d077cc0dda1d76a62382c4995",
+          "last_progress": {
+            "fraction": 1.0,
+            "message": "新版稳健 J 研究完成"
+          }
+        },
+        "daily_state_v1": {
+          "status": "partial",
+          "partial": true,
+          "policy": "daily_state_v1",
+          "elapsed_seconds": 1.999066,
+          "runtime_limit_seconds": 180,
+          "runtime_limit_hit": false,
+          "data_version": "mkt-7a988f71944d6ea3cf32c2c8",
+          "fixed_status": "partial",
+          "j": {
+            "score": null,
+            "selected_eligible": null,
+            "qualified_count": 0,
+            "recommendation_count": 0,
+            "candidate_count": 240,
+            "score_complete": false,
+            "coverage_status": "budgeted_local_peaks",
+            "training_unique_count": 100,
+            "neighborhood_unique_count": 140,
+            "reporting_unique_count": 0
+          },
+          "candidate_evaluations": 240,
+          "ledger_evaluations": 480,
+          "budget": {
+            "training": 100,
+            "validation": 200,
+            "reporting": 20,
+            "total": 1000,
+            "effective": 1000,
+            "used": 240,
+            "remaining": 760,
+            "stopped": false,
+            "reason": null
+          },
+          "training_window": {
+            "start": "2024-05-27",
+            "end": "2025-09-17",
+            "days": 323,
+            "anchor_date": "2025-09-17",
+            "anchor_price": 1.021,
+            "matched_date": "2024-05-27",
+            "matched": true,
+            "fallback": false,
+            "start_reason": "same_price_farthest",
+            "search_start": "2023-08-28",
+            "search_end": "2024-09-06",
+            "min_offset_trading_days": 250,
+            "max_offset_trading_days": 500,
+            "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "reason": "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 500 个交易日内距离评估日最远的一天作为训练时段起点",
+            "mode": "same_price",
+            "price_basis": "decision_date_adjusted",
+            "actions_applied": [],
+            "action_factor_fingerprint": null,
+            "data_issue": null
+          },
+          "selected_params": null,
+          "prior_source_labelled_candidate_count": 2,
+          "prior": {
+            "policy": "daily_state_v1",
+            "decision_date": "2025-09-17",
+            "phase": "final",
+            "execution_data_version": "mkt-7a988f71944d6ea3cf32c2c8",
+            "quota": 8,
+            "planned_count": 2,
+            "quota_used": 1,
+            "actually_evaluated_count": 2,
+            "annotation_only_count": 1,
+            "source_seed_count": 0,
+            "state_candidate_count": 2,
+            "market_state": {
+              "method_version": "daily_state_v1",
+              "as_of": "2025-09-17",
+              "status": "completed",
+              "metrics": {
+                "natr14": 0.011710212561187643,
+                "hv_ratio": 0.9580971068584514,
+                "adx14": 14.034700130803413,
+                "plus_di14": 25.030769461291136,
+                "minus_di14": 24.413170865759785,
+                "amplitude_q75": 0.014673643759218247
+              },
+              "metric_details": {
+                "natr14": {
+                  "status": "available",
+                  "reason": "Wilder ATR14 除以最新有效收盘价；内部使用小数比例",
+                  "reason_code": null,
+                  "sample_count": 250,
+                  "required_samples": 14
+                },
+                "hv_ratio": {
+                  "status": "available",
+                  "reason": "最近10日与60日对数收益标准差之比，std(ddof=1)",
+                  "reason_code": null,
+                  "sample_count": 60,
+                  "required_samples": 60,
+                  "hv10": 0.007126470161477778,
+                  "hv60": 0.0074381501733629994
+                },
+                "adx14": {
+                  "status": "available",
+                  "reason": "Wilder ADX14；14 个初始 DX 均值后递推平滑",
+                  "reason_code": null,
+                  "sample_count": 237,
+                  "required_samples": 27,
+                  "direction": "up"
+                },
+                "plus_di14": {
+                  "status": "available",
+                  "reason": "Wilder +DI14；以 14 周期平滑 TR 归一",
+                  "reason_code": null,
+                  "sample_count": 250,
+                  "required_samples": 14,
+                  "direction": "up"
+                },
+                "minus_di14": {
+                  "status": "available",
+                  "reason": "Wilder -DI14；以 14 周期平滑 TR 归一",
+                  "reason_code": null,
+                  "sample_count": 250,
+                  "required_samples": 14,
+                  "direction": "up"
+                },
+                "amplitude_q75": {
+                  "status": "available",
+                  "reason": "最近20日 (high-low)/前收 的线性插值75分位；零振幅保留",
+                  "reason_code": null,
+                  "sample_count": 20,
+                  "required_samples": 20
+                }
+              },
+              "samples": {
+                "truncated_at_limit": true,
+                "gap_before_start": null,
+                "invalid_daily_dates": [],
+                "calendar_earliest": "2023-07-11",
+                "calendar_latest": "2025-09-17",
+                "latest_expected_date": "2025-09-17",
+                "missing_latest_date": null,
+                "daily_rows": 250,
+                "selected_start": "2024-09-06",
+                "selected_end": "2025-09-17",
+                "prior_close_date": "2024-09-05",
+                "prior_close": 0.957,
+                "prior_high": 0.965,
+                "prior_low": 0.953,
+                "prior_close_source": "preceding_daily_row",
+                "close_samples_hv": 251,
+                "return_10_samples": 10,
+                "return_60_samples": 60,
+                "atr_samples": 14,
+                "adx_samples": 27,
+                "amplitude_samples": 20,
+                "enabled_calendar_days": 534
+              },
+              "warmup": {
+                "maximum_trading_days": 250,
+                "preceding_close_required": true,
+                "natr14_daily_periods": 14,
+                "hv10_log_returns": 10,
+                "hv60_log_returns": 60,
+                "hv60_daily_days_with_preclose": 60,
+                "adx14_daily_periods": 27,
+                "amplitude20_daily_days_with_prior_close": 20
+              },
+              "price_basis": {
+                "method": "raw_to_as_of_corporate_action_factor",
+                "as_of": "2025-09-17",
+                "actions_applied": [],
+                "action_count": 0,
+                "error": null,
+                "source_prices": "DataBundle.daily raw (unadjusted)",
+                "adjusted_columns": [
+                  "high",
+                  "low",
+                  "close",
+                  "preclose"
+                ]
+              },
+              "input_fingerprint": "1fc97015e085e4985bafbb4d81dbd86483d57c4f93b053483a2d36bc249eff26"
+            },
+            "market_state_error": null,
+            "source_check": {
+              "gate": "source_as_of_lte_decision_date",
+              "decision_date": "2025-09-17",
+              "source_as_of": null,
+              "status": "unavailable",
+              "eligible": false,
+              "requested_data_version": "mkt-7a988f71944d6ea3cf32c2c8",
+              "source_data_version": null,
+              "source_hash": null,
+              "source_result_id": null,
+              "reason": "source_as_of_missing",
+              "execution_data_version": "mkt-7a988f71944d6ea3cf32c2c8",
+              "requested_data_version_matches": true
+            },
+            "candidate_check_status_counts": {
+              "actually_evaluated": 1,
+              "annotation_only": 1
+            },
+            "candidate_checks": [
+              {
+                "ordinal": 1,
+                "kind": "market_state",
+                "source": "natr_hv_symmetric",
+                "status": "annotation_only",
+                "reason": "duplicate_initial_coordinate",
+                "original": {
+                  "buy_step": 0.007611638164771968,
+                  "sell_step": 0.007611638164771968
+                },
+                "coordinate": [
+                  2,
+                  2,
+                  20,
+                  20
+                ],
+                "converted": {
+                  "buy_step": 0.01,
+                  "sell_step": 0.01,
+                  "buy_shares": 2000,
+                  "sell_shares": 2000
+                },
+                "share_axis_midpoint_ticks": {
+                  "buy_shares": 20,
+                  "sell_shares": 20
+                },
+                "quota_rank": 1,
+                "actually_evaluated": true
+              },
+              {
+                "ordinal": 2,
+                "kind": "market_state",
+                "source": "amplitude_q75_symmetric",
+                "status": "actually_evaluated",
+                "reason": null,
+                "original": {
+                  "buy_step": 0.014673643759218247,
+                  "sell_step": 0.014673643759218247
+                },
+                "coordinate": [
+                  3,
+                  3,
+                  20,
+                  20
+                ],
+                "converted": {
+                  "buy_step": 0.015,
+                  "sell_step": 0.015,
+                  "buy_shares": 2000,
+                  "sell_shares": 2000
+                },
+                "share_axis_midpoint_ticks": {
+                  "buy_shares": 20,
+                  "sell_shares": 20
+                },
+                "quota_rank": 2,
+                "actually_evaluated": true
+              }
+            ],
+            "candidate_checks_truncated": false,
+            "coordinate_values": [
+              {
+                "buy_step": 0.01,
+                "sell_step": 0.01,
+                "buy_shares": 2000,
+                "sell_shares": 2000,
+                "initial_shares": 20000,
+                "min_shares": 0,
+                "max_shares": null
+              },
+              {
+                "buy_step": 0.015,
+                "sell_step": 0.015,
+                "buy_shares": 2000,
+                "sell_shares": 2000,
+                "initial_shares": 20000,
+                "min_shares": 0,
+                "max_shares": null
+              }
+            ]
+          },
+          "candidate_failure_reasons": {
+            "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 500 个交易日内距离评估日最远的一天作为训练时段起点": 1,
+            "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值": 1,
+            "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值": 1
+          },
+          "failure_reasons": [
+            "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 500 个交易日内距离评估日最远的一天作为训练时段起点",
+            "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+            "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值",
+            "181 个交易日分钟与日线成交量比存在偏差；分钟数据已保留，请核对来源单位或成交量口径。"
+          ],
+          "oos": {
+            "excess_return": null,
+            "grid_peak_principal_return": null,
+            "matched_funding_hold_return": null,
+            "grid_principal_drawdown": null,
+            "matched_funding_hold_drawdown": null,
+            "trade_count": null
+          },
+          "current": {
+            "semantics": "same evaluation-start anchor as fixed; independent display only",
+            "same_anchor_as_fixed": true,
+            "status": "no_qualified",
+            "decision_date": "2025-09-17",
+            "selected_params": null,
+            "score": null,
+            "eligible": false,
+            "candidate_count": 240,
+            "eligible_count": 0,
+            "reasons": [
+              "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 500 个交易日内距离评估日最远的一天作为训练时段起点",
+              "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+              "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值"
+            ]
+          },
+          "config_fingerprint": "165b6c5833fe4d24c18fa4cf46e39d850aefae8543ffe19d9d898c9a834406ec",
+          "last_progress": {
+            "fraction": 1.0,
+            "message": "新版稳健 J 研究完成"
+          }
+        }
+      },
+      "preparation": {
+        "requested_start": "2023-07-11",
+        "bundle_version": "mkt-7a988f71944d6ea3cf32c2c8",
+        "prior_trading_days": 534,
+        "warning_count": 1,
+        "warnings": [
+          "181 个交易日分钟与日线成交量比存在偏差；分钟数据已保留，请核对来源单位或成交量口径。"
+        ]
+      },
+      "configs": {
+        "off": {
+          "base": {
+            "schema_version": 3,
+            "symbol": "159611.SZ",
+            "start_date": "2025-09-18",
+            "end_date": "2026-09-30",
+            "frequency": "1m",
+            "initial_shares": 20000,
+            "min_shares": 0,
+            "max_shares": null,
+            "buy_shares": 2000,
+            "sell_shares": 2000,
+            "dca": {
+              "frequency": "monthly",
+              "shares": 1000,
+              "initial_shares": 0
+            },
+            "reference_price_mode": "auto",
+            "selection_asof": null,
+            "grid_mode": "geometric",
+            "buy_step": 0.065,
+            "sell_step": 0.065,
+            "reference_price": null,
+            "lower_price": null,
+            "upper_price": null,
+            "floor_penalty_config": {
+              "eta_floor": 0.2,
+              "gamma_min": 10.0,
+              "floor_k_ref": 10.0
+            },
+            "fees": {
+              "commission_rate": 0.0005,
+              "min_commission": 0.1,
+              "slippage_bps": 0.0,
+              "share_face_value": 1.0,
+              "legacy_sh_transfer_rate": 0.001,
+              "legacy_sh_min_transfer": 1.0,
+              "legacy_sz_transfer_rate": 2.55e-05
+            }
+          },
+          "protocol_version": 5,
+          "selection_target": "fixed",
+          "rebalance_days": 63,
+          "seed": 42,
+          "top_candidates": 100,
+          "max_principal_drawdown": 0.25,
+          "min_trades": 10,
+          "min_history_days": 504,
+          "min_minute_ratio": 0.95,
+          "strategy": {
+            "strategy_id": "geometric_robust_j",
+            "strategy_version": 5,
+            "search_method": "auto",
+            "ranking_mode": "robust_j",
+            "hypercube_edge": 3,
+            "granularity": {
+              "buy_step": 0.005,
+              "sell_step": 0.005,
+              "sell_shares": 100.0,
+              "buy_shares": 100.0
+            },
+            "training_budget": 100,
+            "validation_budget": 200,
+            "reporting_budget": 20,
+            "total_evaluation_budget": 1000,
+            "max_runtime_seconds": 180,
+            "recommendation_count": 5,
+            "max_shares_mode": "unlimited",
+            "slippage_mode": "zero",
+            "neighborhood_fields": [
+              "buy_step",
+              "sell_step",
+              "buy_shares",
+              "sell_shares"
+            ],
+            "fixed_half_widths": {
+              "buy_step": 0.001,
+              "sell_step": 0.001,
+              "sell_shares": 100.0,
+              "buy_shares": 100.0
+            },
+            "sigma": 1.0,
+            "alpha": 0.3,
+            "beta": 1.0,
+            "tau": 0.05,
+            "eta_limit": 1.8,
+            "eta_hard_cap": 3.5,
+            "gamma_max": 2.0,
+            "eta_floor": 0.2,
+            "gamma_min": 10.0,
+            "floor_k_ref": 10.0,
+            "training_min_days": 250,
+            "training_max_days": 500,
+            "training_window_mode": "same_price",
+            "peak_tolerance": 1e-12,
+            "start_min": 20,
+            "start_max": 64,
+            "starts_per_candidate": 4,
+            "initial_strides": [
+              1,
+              2
+            ],
+            "stride_multiplier": 2,
+            "max_stride_fraction": 0.25,
+            "validation_reserve_fraction": 0.25,
+            "exhaustive_memory_limit_mb": 512,
+            "estimated_bytes_per_point": 512,
+            "stress_cost_multiplier": 2.0,
+            "stress_region_count": 3
+          },
+          "research_context": {
+            "symbol": "159611.SZ",
+            "start_date": "2025-09-18",
+            "end_date": "2026-09-30",
+            "frequency": "1m",
+            "initial_shares": 20000,
+            "grid_mode": "geometric",
+            "fees": {
+              "commission_rate": 0.0005,
+              "min_commission": 0.1,
+              "slippage_bps": 0.0,
+              "share_face_value": 1.0,
+              "legacy_sh_transfer_rate": 0.001,
+              "legacy_sh_min_transfer": 1.0,
+              "legacy_sz_transfer_rate": 2.55e-05
+            },
+            "reference_price_mode": "auto",
+            "reference_price": null,
+            "lower_price": null,
+            "upper_price": null,
+            "dca": {
+              "frequency": "monthly",
+              "shares": 1000,
+              "initial_shares": 0
+            }
+          },
+          "ranges": {
+            "buy_step": {
+              "low": 0.005,
+              "high": 0.08,
+              "step": null
+            },
+            "sell_step": {
+              "low": 0.005,
+              "high": 0.08,
+              "step": null
+            },
+            "buy_shares": {
+              "low": 1500.0,
+              "high": 2500.0,
+              "step": null
+            },
+            "sell_shares": {
+              "low": 1500.0,
+              "high": 2500.0,
+              "step": null
+            }
+          },
+          "configuration_revision": null,
+          "prior_policy": "off",
+          "source_etf": null,
+          "requested_data_version": "mkt-7a988f71944d6ea3cf32c2c8",
+          "research_origin": null
+        },
+        "daily_state_v1": {
+          "base": {
+            "schema_version": 3,
+            "symbol": "159611.SZ",
+            "start_date": "2025-09-18",
+            "end_date": "2026-09-30",
+            "frequency": "1m",
+            "initial_shares": 20000,
+            "min_shares": 0,
+            "max_shares": null,
+            "buy_shares": 2000,
+            "sell_shares": 2000,
+            "dca": {
+              "frequency": "monthly",
+              "shares": 1000,
+              "initial_shares": 0
+            },
+            "reference_price_mode": "auto",
+            "selection_asof": null,
+            "grid_mode": "geometric",
+            "buy_step": 0.065,
+            "sell_step": 0.065,
+            "reference_price": null,
+            "lower_price": null,
+            "upper_price": null,
+            "floor_penalty_config": {
+              "eta_floor": 0.2,
+              "gamma_min": 10.0,
+              "floor_k_ref": 10.0
+            },
+            "fees": {
+              "commission_rate": 0.0005,
+              "min_commission": 0.1,
+              "slippage_bps": 0.0,
+              "share_face_value": 1.0,
+              "legacy_sh_transfer_rate": 0.001,
+              "legacy_sh_min_transfer": 1.0,
+              "legacy_sz_transfer_rate": 2.55e-05
+            }
+          },
+          "protocol_version": 5,
+          "selection_target": "fixed",
+          "rebalance_days": 63,
+          "seed": 42,
+          "top_candidates": 100,
+          "max_principal_drawdown": 0.25,
+          "min_trades": 10,
+          "min_history_days": 504,
+          "min_minute_ratio": 0.95,
+          "strategy": {
+            "strategy_id": "geometric_robust_j",
+            "strategy_version": 5,
+            "search_method": "auto",
+            "ranking_mode": "robust_j",
+            "hypercube_edge": 3,
+            "granularity": {
+              "buy_step": 0.005,
+              "sell_step": 0.005,
+              "sell_shares": 100.0,
+              "buy_shares": 100.0
+            },
+            "training_budget": 100,
+            "validation_budget": 200,
+            "reporting_budget": 20,
+            "total_evaluation_budget": 1000,
+            "max_runtime_seconds": 180,
+            "recommendation_count": 5,
+            "max_shares_mode": "unlimited",
+            "slippage_mode": "zero",
+            "neighborhood_fields": [
+              "buy_step",
+              "sell_step",
+              "buy_shares",
+              "sell_shares"
+            ],
+            "fixed_half_widths": {
+              "buy_step": 0.001,
+              "sell_step": 0.001,
+              "sell_shares": 100.0,
+              "buy_shares": 100.0
+            },
+            "sigma": 1.0,
+            "alpha": 0.3,
+            "beta": 1.0,
+            "tau": 0.05,
+            "eta_limit": 1.8,
+            "eta_hard_cap": 3.5,
+            "gamma_max": 2.0,
+            "eta_floor": 0.2,
+            "gamma_min": 10.0,
+            "floor_k_ref": 10.0,
+            "training_min_days": 250,
+            "training_max_days": 500,
+            "training_window_mode": "same_price",
+            "peak_tolerance": 1e-12,
+            "start_min": 20,
+            "start_max": 64,
+            "starts_per_candidate": 4,
+            "initial_strides": [
+              1,
+              2
+            ],
+            "stride_multiplier": 2,
+            "max_stride_fraction": 0.25,
+            "validation_reserve_fraction": 0.25,
+            "exhaustive_memory_limit_mb": 512,
+            "estimated_bytes_per_point": 512,
+            "stress_cost_multiplier": 2.0,
+            "stress_region_count": 3
+          },
+          "research_context": {
+            "symbol": "159611.SZ",
+            "start_date": "2025-09-18",
+            "end_date": "2026-09-30",
+            "frequency": "1m",
+            "initial_shares": 20000,
+            "grid_mode": "geometric",
+            "fees": {
+              "commission_rate": 0.0005,
+              "min_commission": 0.1,
+              "slippage_bps": 0.0,
+              "share_face_value": 1.0,
+              "legacy_sh_transfer_rate": 0.001,
+              "legacy_sh_min_transfer": 1.0,
+              "legacy_sz_transfer_rate": 2.55e-05
+            },
+            "reference_price_mode": "auto",
+            "reference_price": null,
+            "lower_price": null,
+            "upper_price": null,
+            "dca": {
+              "frequency": "monthly",
+              "shares": 1000,
+              "initial_shares": 0
+            }
+          },
+          "ranges": {
+            "buy_step": {
+              "low": 0.005,
+              "high": 0.08,
+              "step": null
+            },
+            "sell_step": {
+              "low": 0.005,
+              "high": 0.08,
+              "step": null
+            },
+            "buy_shares": {
+              "low": 1500.0,
+              "high": 2500.0,
+              "step": null
+            },
+            "sell_shares": {
+              "low": 1500.0,
+              "high": 2500.0,
+              "step": null
+            }
+          },
+          "configuration_revision": null,
+          "prior_policy": "daily_state_v1",
+          "source_etf": null,
+          "requested_data_version": "mkt-7a988f71944d6ea3cf32c2c8",
+          "research_origin": null
+        }
+      },
+      "config_fingerprints": {
+        "off": "15fa7e00e399503d51b3bb159baeedff8ef2d61d077cc0dda1d76a62382c4995",
+        "daily_state_v1": "165b6c5833fe4d24c18fa4cf46e39d850aefae8543ffe19d9d898c9a834406ec"
+      },
+      "previews": {
+        "off": {
+          "status": "ready",
+          "reasons": [],
+          "training_window": {
+            "start": "2024-05-27",
+            "end": "2025-09-17",
+            "days": 323,
+            "anchor_date": "2025-09-17",
+            "anchor_price": 1.021,
+            "matched_date": "2024-05-27",
+            "matched": true,
+            "fallback": false,
+            "start_reason": "same_price_farthest",
+            "search_start": "2023-08-28",
+            "search_end": "2024-09-06",
+            "min_offset_trading_days": 250,
+            "max_offset_trading_days": 500,
+            "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "reason": "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 500 个交易日内距离评估日最远的一天作为训练时段起点",
+            "mode": "same_price",
+            "price_basis": "decision_date_adjusted",
+            "actions_applied": [],
+            "action_factor_fingerprint": null,
+            "data_issue": null
+          },
+          "minimum_neighborhood_size": 81,
+          "validation_budget": 200,
+          "stress_points_at_three_regions": 1875,
+          "task_evaluation_upper_bound": 4391,
+          "effective_total_evaluation_budget": 1000,
+          "decision_count_estimate": 2,
+          "estimated_task_memory_mb": 91.72027111053467,
+          "workspace_budget_mb": 8192.0,
+          "prior_quota": null,
+          "prior_quota_used": null
+        },
+        "daily_state_v1": {
+          "status": "ready",
+          "reasons": [],
+          "training_window": {
+            "start": "2024-05-27",
+            "end": "2025-09-17",
+            "days": 323,
+            "anchor_date": "2025-09-17",
+            "anchor_price": 1.021,
+            "matched_date": "2024-05-27",
+            "matched": true,
+            "fallback": false,
+            "start_reason": "same_price_farthest",
+            "search_start": "2023-08-28",
+            "search_end": "2024-09-06",
+            "min_offset_trading_days": 250,
+            "max_offset_trading_days": 500,
+            "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "reason": "找到同价日（当日最低价 < 评估前最后收盘价 < 当日最高价），取 250 至 500 个交易日内距离评估日最远的一天作为训练时段起点",
+            "mode": "same_price",
+            "price_basis": "decision_date_adjusted",
+            "actions_applied": [],
+            "action_factor_fingerprint": null,
+            "data_issue": null
+          },
+          "minimum_neighborhood_size": 81,
+          "validation_budget": 200,
+          "stress_points_at_three_regions": 1875,
+          "task_evaluation_upper_bound": 4391,
+          "effective_total_evaluation_budget": 1000,
+          "decision_count_estimate": 2,
+          "estimated_task_memory_mb": 91.72027111053467,
+          "workspace_budget_mb": 8192.0,
+          "prior_quota": 8,
+          "prior_quota_used": 0
+        }
+      },
+      "comparison": {
+        "daily_state_minus_off": {
+          "oos_excess_return": null,
+          "oos_principal_drawdown": null,
+          "j_score": null
+        },
+        "outcome_claim": "仅记录差异；单次小预算对照不能证明先验带来正收益"
+      },
+      "status": "partial"
+    },
+    "159995.SZ": {
+      "symbol": "159995.SZ",
+      "source_version": "mkt-e21502ab6499ee768e58fb41",
+      "target_version": "mkt-e21502ab6499ee768e58fb41",
+      "source_etf": null,
+      "evaluation": {
+        "start": "2025-09-18",
+        "end": "2026-09-30",
+        "frequency": "1m",
+        "trading_days": 250
+      },
+      "readiness": {
+        "ready": true,
+        "symbol": "159995.SZ",
+        "frequency": "1m",
+        "asset_type": "etf",
+        "gaps": [],
+        "degraded_days": [],
+        "warnings": [],
+        "checked_start": "2023-07-11",
+        "checked_end": "2026-09-30",
+        "package_id": "pkg-2e5ee3ab541c457485dd4435",
+        "snapshot_version": "mkt-e21502ab6499ee768e58fb41",
+        "calendar_version": "market-sync-v2-package",
+        "preparation": {
+          "symbol": "159995.SZ",
+          "frequency": "1min",
+          "start": "2023-07-11",
+          "end": "2026-09-30"
+        }
+      },
+      "runs": {
+        "off": {
+          "status": "partial",
+          "partial": true,
+          "policy": "off",
+          "elapsed_seconds": 2.546519,
+          "runtime_limit_seconds": 180,
+          "runtime_limit_hit": false,
+          "data_version": "mkt-e21502ab6499ee768e58fb41",
+          "fixed_status": "partial",
+          "j": {
+            "score": null,
+            "selected_eligible": null,
+            "qualified_count": 0,
+            "recommendation_count": 0,
+            "candidate_count": 240,
+            "score_complete": false,
+            "coverage_status": "budgeted_local_peaks",
+            "training_unique_count": 100,
+            "neighborhood_unique_count": 140,
+            "reporting_unique_count": 0
+          },
+          "candidate_evaluations": 240,
+          "ledger_evaluations": 480,
+          "budget": {
+            "training": 100,
+            "validation": 200,
+            "reporting": 20,
+            "total": 1000,
+            "effective": 1000,
+            "used": 240,
+            "remaining": 760,
+            "stopped": false,
+            "reason": null
+          },
+          "training_window": {
+            "start": "2023-08-28",
+            "end": "2025-09-17",
+            "days": 500,
+            "anchor_date": "2025-09-17",
+            "anchor_price": 1.697,
+            "matched_date": null,
+            "matched": false,
+            "fallback": true,
+            "start_reason": "five_hundred_day_fallback",
+            "search_start": "2023-08-28",
+            "search_end": "2024-09-06",
+            "min_offset_trading_days": 250,
+            "max_offset_trading_days": 500,
+            "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "reason": "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+            "mode": "same_price",
+            "price_basis": "decision_date_adjusted",
+            "actions_applied": [],
+            "action_factor_fingerprint": null,
+            "data_issue": null
+          },
+          "selected_params": null,
+          "prior_source_labelled_candidate_count": 0,
+          "prior": null,
+          "candidate_failure_reasons": {
+            "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段": 1,
+            "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值": 1,
+            "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值": 1
+          },
+          "failure_reasons": [
+            "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+            "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+            "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值"
+          ],
+          "oos": {
+            "excess_return": null,
+            "grid_peak_principal_return": null,
+            "matched_funding_hold_return": null,
+            "grid_principal_drawdown": null,
+            "matched_funding_hold_drawdown": null,
+            "trade_count": null
+          },
+          "current": {
+            "semantics": "same evaluation-start anchor as fixed; independent display only",
+            "same_anchor_as_fixed": true,
+            "status": "no_qualified",
+            "decision_date": "2025-09-17",
+            "selected_params": null,
+            "score": null,
+            "eligible": false,
+            "candidate_count": 240,
+            "eligible_count": 0,
+            "reasons": [
+              "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+              "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+              "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值"
+            ]
+          },
+          "config_fingerprint": "ec77e1aa7be552c407ed8e940747e4a9cdfa9d8698e72417f96ef420cba0a119",
+          "last_progress": {
+            "fraction": 1.0,
+            "message": "新版稳健 J 研究完成"
+          }
+        },
+        "daily_state_v1": {
+          "status": "partial",
+          "partial": true,
+          "policy": "daily_state_v1",
+          "elapsed_seconds": 2.242993,
+          "runtime_limit_seconds": 180,
+          "runtime_limit_hit": false,
+          "data_version": "mkt-e21502ab6499ee768e58fb41",
+          "fixed_status": "partial",
+          "j": {
+            "score": null,
+            "selected_eligible": null,
+            "qualified_count": 0,
+            "recommendation_count": 0,
+            "candidate_count": 240,
+            "score_complete": false,
+            "coverage_status": "budgeted_local_peaks",
+            "training_unique_count": 100,
+            "neighborhood_unique_count": 140,
+            "reporting_unique_count": 0
+          },
+          "candidate_evaluations": 240,
+          "ledger_evaluations": 480,
+          "budget": {
+            "training": 100,
+            "validation": 200,
+            "reporting": 20,
+            "total": 1000,
+            "effective": 1000,
+            "used": 240,
+            "remaining": 760,
+            "stopped": false,
+            "reason": null
+          },
+          "training_window": {
+            "start": "2023-08-28",
+            "end": "2025-09-17",
+            "days": 500,
+            "anchor_date": "2025-09-17",
+            "anchor_price": 1.697,
+            "matched_date": null,
+            "matched": false,
+            "fallback": true,
+            "start_reason": "five_hundred_day_fallback",
+            "search_start": "2023-08-28",
+            "search_end": "2024-09-06",
+            "min_offset_trading_days": 250,
+            "max_offset_trading_days": 500,
+            "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "reason": "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+            "mode": "same_price",
+            "price_basis": "decision_date_adjusted",
+            "actions_applied": [],
+            "action_factor_fingerprint": null,
+            "data_issue": null
+          },
+          "selected_params": null,
+          "prior_source_labelled_candidate_count": 3,
+          "prior": {
+            "policy": "daily_state_v1",
+            "decision_date": "2025-09-17",
+            "phase": "final",
+            "execution_data_version": "mkt-e21502ab6499ee768e58fb41",
+            "quota": 8,
+            "planned_count": 3,
+            "quota_used": 3,
+            "actually_evaluated_count": 3,
+            "annotation_only_count": 0,
+            "source_seed_count": 0,
+            "state_candidate_count": 4,
+            "market_state": {
+              "method_version": "daily_state_v1",
+              "as_of": "2025-09-17",
+              "status": "completed",
+              "metrics": {
+                "natr14": 0.036667487513249435,
+                "hv_ratio": 1.4988310198859445,
+                "adx14": 51.09839221890372,
+                "plus_di14": 34.44782236755415,
+                "minus_di14": 11.545555723416262,
+                "amplitude_q75": 0.057595483155200605
+              },
+              "metric_details": {
+                "natr14": {
+                  "status": "available",
+                  "reason": "Wilder ATR14 除以最新有效收盘价；内部使用小数比例",
+                  "reason_code": null,
+                  "sample_count": 250,
+                  "required_samples": 14
+                },
+                "hv_ratio": {
+                  "status": "available",
+                  "reason": "最近10日与60日对数收益标准差之比，std(ddof=1)",
+                  "reason_code": null,
+                  "sample_count": 60,
+                  "required_samples": 60,
+                  "hv10": 0.03636348356394704,
+                  "hv60": 0.024261229639291934
+                },
+                "adx14": {
+                  "status": "available",
+                  "reason": "Wilder ADX14；14 个初始 DX 均值后递推平滑",
+                  "reason_code": null,
+                  "sample_count": 237,
+                  "required_samples": 27,
+                  "direction": "up"
+                },
+                "plus_di14": {
+                  "status": "available",
+                  "reason": "Wilder +DI14；以 14 周期平滑 TR 归一",
+                  "reason_code": null,
+                  "sample_count": 250,
+                  "required_samples": 14,
+                  "direction": "up"
+                },
+                "minus_di14": {
+                  "status": "available",
+                  "reason": "Wilder -DI14；以 14 周期平滑 TR 归一",
+                  "reason_code": null,
+                  "sample_count": 250,
+                  "required_samples": 14,
+                  "direction": "up"
+                },
+                "amplitude_q75": {
+                  "status": "available",
+                  "reason": "最近20日 (high-low)/前收 的线性插值75分位；零振幅保留",
+                  "reason_code": null,
+                  "sample_count": 20,
+                  "required_samples": 20
+                }
+              },
+              "samples": {
+                "truncated_at_limit": true,
+                "gap_before_start": null,
+                "invalid_daily_dates": [],
+                "calendar_earliest": "2023-07-11",
+                "calendar_latest": "2025-09-17",
+                "latest_expected_date": "2025-09-17",
+                "missing_latest_date": null,
+                "daily_rows": 250,
+                "selected_start": "2024-09-06",
+                "selected_end": "2025-09-17",
+                "prior_close_date": "2024-09-05",
+                "prior_close": 0.789,
+                "prior_high": 0.8,
+                "prior_low": 0.783,
+                "prior_close_source": "preceding_daily_row",
+                "close_samples_hv": 251,
+                "return_10_samples": 10,
+                "return_60_samples": 60,
+                "atr_samples": 14,
+                "adx_samples": 27,
+                "amplitude_samples": 20,
+                "enabled_calendar_days": 534
+              },
+              "warmup": {
+                "maximum_trading_days": 250,
+                "preceding_close_required": true,
+                "natr14_daily_periods": 14,
+                "hv10_log_returns": 10,
+                "hv60_log_returns": 60,
+                "hv60_daily_days_with_preclose": 60,
+                "adx14_daily_periods": 27,
+                "amplitude20_daily_days_with_prior_close": 20
+              },
+              "price_basis": {
+                "method": "raw_to_as_of_corporate_action_factor",
+                "as_of": "2025-09-17",
+                "actions_applied": [],
+                "action_count": 0,
+                "error": null,
+                "source_prices": "DataBundle.daily raw (unadjusted)",
+                "adjusted_columns": [
+                  "high",
+                  "low",
+                  "close",
+                  "preclose"
+                ]
+              },
+              "input_fingerprint": "ea3a415697c60e5fae01b16f80bb36dd8f0f761c8f3c95783a997b969ac61cb5"
+            },
+            "market_state_error": null,
+            "source_check": {
+              "gate": "source_as_of_lte_decision_date",
+              "decision_date": "2025-09-17",
+              "source_as_of": null,
+              "status": "unavailable",
+              "eligible": false,
+              "requested_data_version": "mkt-e21502ab6499ee768e58fb41",
+              "source_data_version": null,
+              "source_hash": null,
+              "source_result_id": null,
+              "reason": "source_as_of_missing",
+              "execution_data_version": "mkt-e21502ab6499ee768e58fb41",
+              "requested_data_version_matches": true
+            },
+            "candidate_check_status_counts": {
+              "actually_evaluated": 3,
+              "skipped": 1
+            },
+            "candidate_checks": [
+              {
+                "ordinal": 1,
+                "kind": "market_state",
+                "source": "natr_hv_symmetric",
+                "status": "actually_evaluated",
+                "reason": null,
+                "original": {
+                  "buy_step": 0.032979306980056806,
+                  "sell_step": 0.032979306980056806
+                },
+                "coordinate": [
+                  7,
+                  7,
+                  20,
+                  20
+                ],
+                "converted": {
+                  "buy_step": 0.035,
+                  "sell_step": 0.035,
+                  "buy_shares": 2000,
+                  "sell_shares": 2000
+                },
+                "share_axis_midpoint_ticks": {
+                  "buy_shares": 20,
+                  "sell_shares": 20
+                },
+                "quota_rank": 1,
+                "actually_evaluated": true
+              },
+              {
+                "ordinal": 2,
+                "kind": "market_state",
+                "source": "natr_hv_up_asymmetric",
+                "status": "actually_evaluated",
+                "reason": null,
+                "original": {
+                  "buy_step": 0.028032410933048285,
+                  "sell_step": 0.06211138155760408
+                },
+                "coordinate": [
+                  6,
+                  12,
+                  20,
+                  20
+                ],
+                "converted": {
+                  "buy_step": 0.03,
+                  "sell_step": 0.06,
+                  "buy_shares": 2000,
+                  "sell_shares": 2000
+                },
+                "share_axis_midpoint_ticks": {
+                  "buy_shares": 20,
+                  "sell_shares": 20
+                },
+                "quota_rank": 2,
+                "actually_evaluated": true
+              },
+              {
+                "ordinal": 3,
+                "kind": "market_state",
+                "source": "amplitude_q75_symmetric",
+                "status": "actually_evaluated",
+                "reason": null,
+                "original": {
+                  "buy_step": 0.057595483155200605,
+                  "sell_step": 0.057595483155200605
+                },
+                "coordinate": [
+                  12,
+                  12,
+                  20,
+                  20
+                ],
+                "converted": {
+                  "buy_step": 0.06,
+                  "sell_step": 0.06,
+                  "buy_shares": 2000,
+                  "sell_shares": 2000
+                },
+                "share_axis_midpoint_ticks": {
+                  "buy_shares": 20,
+                  "sell_shares": 20
+                },
+                "quota_rank": 3,
+                "actually_evaluated": true
+              },
+              {
+                "ordinal": 4,
+                "kind": "market_state",
+                "source": "amplitude_q75_up_asymmetric",
+                "status": "skipped",
+                "reason": "out_of_range:sell_step",
+                "original": {
+                  "buy_step": 0.04895616068192051,
+                  "sell_step": 0.10847211047856475
+                }
+              }
+            ],
+            "candidate_checks_truncated": false,
+            "coordinate_values": [
+              {
+                "buy_step": 0.035,
+                "sell_step": 0.035,
+                "buy_shares": 2000,
+                "sell_shares": 2000,
+                "initial_shares": 20000,
+                "min_shares": 0,
+                "max_shares": null
+              },
+              {
+                "buy_step": 0.03,
+                "sell_step": 0.06,
+                "buy_shares": 2000,
+                "sell_shares": 2000,
+                "initial_shares": 20000,
+                "min_shares": 0,
+                "max_shares": null
+              },
+              {
+                "buy_step": 0.06,
+                "sell_step": 0.06,
+                "buy_shares": 2000,
+                "sell_shares": 2000,
+                "initial_shares": 20000,
+                "min_shares": 0,
+                "max_shares": null
+              }
+            ]
+          },
+          "candidate_failure_reasons": {
+            "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段": 1,
+            "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值": 1,
+            "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值": 1
+          },
+          "failure_reasons": [
+            "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+            "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+            "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值"
+          ],
+          "oos": {
+            "excess_return": null,
+            "grid_peak_principal_return": null,
+            "matched_funding_hold_return": null,
+            "grid_principal_drawdown": null,
+            "matched_funding_hold_drawdown": null,
+            "trade_count": null
+          },
+          "current": {
+            "semantics": "same evaluation-start anchor as fixed; independent display only",
+            "same_anchor_as_fixed": true,
+            "status": "no_qualified",
+            "decision_date": "2025-09-17",
+            "selected_params": null,
+            "score": null,
+            "eligible": false,
+            "candidate_count": 240,
+            "eligible_count": 0,
+            "reasons": [
+              "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+              "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+              "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值"
+            ]
+          },
+          "config_fingerprint": "23381ca28a209fe99f7733c44d4eaf496b19fdbced135a742d3f1bcbf3e8f9fc",
+          "last_progress": {
+            "fraction": 1.0,
+            "message": "新版稳健 J 研究完成"
+          }
+        }
+      },
+      "preparation": {
+        "requested_start": "2023-07-11",
+        "bundle_version": "mkt-e21502ab6499ee768e58fb41",
+        "prior_trading_days": 534,
+        "warning_count": 0,
+        "warnings": []
+      },
+      "configs": {
+        "off": {
+          "base": {
+            "schema_version": 3,
+            "symbol": "159995.SZ",
+            "start_date": "2025-09-18",
+            "end_date": "2026-09-30",
+            "frequency": "1m",
+            "initial_shares": 20000,
+            "min_shares": 0,
+            "max_shares": null,
+            "buy_shares": 2000,
+            "sell_shares": 2000,
+            "dca": {
+              "frequency": "monthly",
+              "shares": 1000,
+              "initial_shares": 0
+            },
+            "reference_price_mode": "auto",
+            "selection_asof": null,
+            "grid_mode": "geometric",
+            "buy_step": 0.065,
+            "sell_step": 0.065,
+            "reference_price": null,
+            "lower_price": null,
+            "upper_price": null,
+            "floor_penalty_config": {
+              "eta_floor": 0.2,
+              "gamma_min": 10.0,
+              "floor_k_ref": 10.0
+            },
+            "fees": {
+              "commission_rate": 0.0005,
+              "min_commission": 0.1,
+              "slippage_bps": 0.0,
+              "share_face_value": 1.0,
+              "legacy_sh_transfer_rate": 0.001,
+              "legacy_sh_min_transfer": 1.0,
+              "legacy_sz_transfer_rate": 2.55e-05
+            }
+          },
+          "protocol_version": 5,
+          "selection_target": "fixed",
+          "rebalance_days": 63,
+          "seed": 42,
+          "top_candidates": 100,
+          "max_principal_drawdown": 0.25,
+          "min_trades": 10,
+          "min_history_days": 504,
+          "min_minute_ratio": 0.95,
+          "strategy": {
+            "strategy_id": "geometric_robust_j",
+            "strategy_version": 5,
+            "search_method": "auto",
+            "ranking_mode": "robust_j",
+            "hypercube_edge": 3,
+            "granularity": {
+              "buy_step": 0.005,
+              "sell_step": 0.005,
+              "sell_shares": 100.0,
+              "buy_shares": 100.0
+            },
+            "training_budget": 100,
+            "validation_budget": 200,
+            "reporting_budget": 20,
+            "total_evaluation_budget": 1000,
+            "max_runtime_seconds": 180,
+            "recommendation_count": 5,
+            "max_shares_mode": "unlimited",
+            "slippage_mode": "zero",
+            "neighborhood_fields": [
+              "buy_step",
+              "sell_step",
+              "buy_shares",
+              "sell_shares"
+            ],
+            "fixed_half_widths": {
+              "buy_step": 0.001,
+              "sell_step": 0.001,
+              "sell_shares": 100.0,
+              "buy_shares": 100.0
+            },
+            "sigma": 1.0,
+            "alpha": 0.3,
+            "beta": 1.0,
+            "tau": 0.05,
+            "eta_limit": 1.8,
+            "eta_hard_cap": 3.5,
+            "gamma_max": 2.0,
+            "eta_floor": 0.2,
+            "gamma_min": 10.0,
+            "floor_k_ref": 10.0,
+            "training_min_days": 250,
+            "training_max_days": 500,
+            "training_window_mode": "same_price",
+            "peak_tolerance": 1e-12,
+            "start_min": 20,
+            "start_max": 64,
+            "starts_per_candidate": 4,
+            "initial_strides": [
+              1,
+              2
+            ],
+            "stride_multiplier": 2,
+            "max_stride_fraction": 0.25,
+            "validation_reserve_fraction": 0.25,
+            "exhaustive_memory_limit_mb": 512,
+            "estimated_bytes_per_point": 512,
+            "stress_cost_multiplier": 2.0,
+            "stress_region_count": 3
+          },
+          "research_context": {
+            "symbol": "159995.SZ",
+            "start_date": "2025-09-18",
+            "end_date": "2026-09-30",
+            "frequency": "1m",
+            "initial_shares": 20000,
+            "grid_mode": "geometric",
+            "fees": {
+              "commission_rate": 0.0005,
+              "min_commission": 0.1,
+              "slippage_bps": 0.0,
+              "share_face_value": 1.0,
+              "legacy_sh_transfer_rate": 0.001,
+              "legacy_sh_min_transfer": 1.0,
+              "legacy_sz_transfer_rate": 2.55e-05
+            },
+            "reference_price_mode": "auto",
+            "reference_price": null,
+            "lower_price": null,
+            "upper_price": null,
+            "dca": {
+              "frequency": "monthly",
+              "shares": 1000,
+              "initial_shares": 0
+            }
+          },
+          "ranges": {
+            "buy_step": {
+              "low": 0.005,
+              "high": 0.08,
+              "step": null
+            },
+            "sell_step": {
+              "low": 0.005,
+              "high": 0.08,
+              "step": null
+            },
+            "buy_shares": {
+              "low": 1500.0,
+              "high": 2500.0,
+              "step": null
+            },
+            "sell_shares": {
+              "low": 1500.0,
+              "high": 2500.0,
+              "step": null
+            }
+          },
+          "configuration_revision": null,
+          "prior_policy": "off",
+          "source_etf": null,
+          "requested_data_version": "mkt-e21502ab6499ee768e58fb41",
+          "research_origin": null
+        },
+        "daily_state_v1": {
+          "base": {
+            "schema_version": 3,
+            "symbol": "159995.SZ",
+            "start_date": "2025-09-18",
+            "end_date": "2026-09-30",
+            "frequency": "1m",
+            "initial_shares": 20000,
+            "min_shares": 0,
+            "max_shares": null,
+            "buy_shares": 2000,
+            "sell_shares": 2000,
+            "dca": {
+              "frequency": "monthly",
+              "shares": 1000,
+              "initial_shares": 0
+            },
+            "reference_price_mode": "auto",
+            "selection_asof": null,
+            "grid_mode": "geometric",
+            "buy_step": 0.065,
+            "sell_step": 0.065,
+            "reference_price": null,
+            "lower_price": null,
+            "upper_price": null,
+            "floor_penalty_config": {
+              "eta_floor": 0.2,
+              "gamma_min": 10.0,
+              "floor_k_ref": 10.0
+            },
+            "fees": {
+              "commission_rate": 0.0005,
+              "min_commission": 0.1,
+              "slippage_bps": 0.0,
+              "share_face_value": 1.0,
+              "legacy_sh_transfer_rate": 0.001,
+              "legacy_sh_min_transfer": 1.0,
+              "legacy_sz_transfer_rate": 2.55e-05
+            }
+          },
+          "protocol_version": 5,
+          "selection_target": "fixed",
+          "rebalance_days": 63,
+          "seed": 42,
+          "top_candidates": 100,
+          "max_principal_drawdown": 0.25,
+          "min_trades": 10,
+          "min_history_days": 504,
+          "min_minute_ratio": 0.95,
+          "strategy": {
+            "strategy_id": "geometric_robust_j",
+            "strategy_version": 5,
+            "search_method": "auto",
+            "ranking_mode": "robust_j",
+            "hypercube_edge": 3,
+            "granularity": {
+              "buy_step": 0.005,
+              "sell_step": 0.005,
+              "sell_shares": 100.0,
+              "buy_shares": 100.0
+            },
+            "training_budget": 100,
+            "validation_budget": 200,
+            "reporting_budget": 20,
+            "total_evaluation_budget": 1000,
+            "max_runtime_seconds": 180,
+            "recommendation_count": 5,
+            "max_shares_mode": "unlimited",
+            "slippage_mode": "zero",
+            "neighborhood_fields": [
+              "buy_step",
+              "sell_step",
+              "buy_shares",
+              "sell_shares"
+            ],
+            "fixed_half_widths": {
+              "buy_step": 0.001,
+              "sell_step": 0.001,
+              "sell_shares": 100.0,
+              "buy_shares": 100.0
+            },
+            "sigma": 1.0,
+            "alpha": 0.3,
+            "beta": 1.0,
+            "tau": 0.05,
+            "eta_limit": 1.8,
+            "eta_hard_cap": 3.5,
+            "gamma_max": 2.0,
+            "eta_floor": 0.2,
+            "gamma_min": 10.0,
+            "floor_k_ref": 10.0,
+            "training_min_days": 250,
+            "training_max_days": 500,
+            "training_window_mode": "same_price",
+            "peak_tolerance": 1e-12,
+            "start_min": 20,
+            "start_max": 64,
+            "starts_per_candidate": 4,
+            "initial_strides": [
+              1,
+              2
+            ],
+            "stride_multiplier": 2,
+            "max_stride_fraction": 0.25,
+            "validation_reserve_fraction": 0.25,
+            "exhaustive_memory_limit_mb": 512,
+            "estimated_bytes_per_point": 512,
+            "stress_cost_multiplier": 2.0,
+            "stress_region_count": 3
+          },
+          "research_context": {
+            "symbol": "159995.SZ",
+            "start_date": "2025-09-18",
+            "end_date": "2026-09-30",
+            "frequency": "1m",
+            "initial_shares": 20000,
+            "grid_mode": "geometric",
+            "fees": {
+              "commission_rate": 0.0005,
+              "min_commission": 0.1,
+              "slippage_bps": 0.0,
+              "share_face_value": 1.0,
+              "legacy_sh_transfer_rate": 0.001,
+              "legacy_sh_min_transfer": 1.0,
+              "legacy_sz_transfer_rate": 2.55e-05
+            },
+            "reference_price_mode": "auto",
+            "reference_price": null,
+            "lower_price": null,
+            "upper_price": null,
+            "dca": {
+              "frequency": "monthly",
+              "shares": 1000,
+              "initial_shares": 0
+            }
+          },
+          "ranges": {
+            "buy_step": {
+              "low": 0.005,
+              "high": 0.08,
+              "step": null
+            },
+            "sell_step": {
+              "low": 0.005,
+              "high": 0.08,
+              "step": null
+            },
+            "buy_shares": {
+              "low": 1500.0,
+              "high": 2500.0,
+              "step": null
+            },
+            "sell_shares": {
+              "low": 1500.0,
+              "high": 2500.0,
+              "step": null
+            }
+          },
+          "configuration_revision": null,
+          "prior_policy": "daily_state_v1",
+          "source_etf": null,
+          "requested_data_version": "mkt-e21502ab6499ee768e58fb41",
+          "research_origin": null
+        }
+      },
+      "config_fingerprints": {
+        "off": "ec77e1aa7be552c407ed8e940747e4a9cdfa9d8698e72417f96ef420cba0a119",
+        "daily_state_v1": "23381ca28a209fe99f7733c44d4eaf496b19fdbced135a742d3f1bcbf3e8f9fc"
+      },
+      "previews": {
+        "off": {
+          "status": "ready",
+          "reasons": [],
+          "training_window": {
+            "start": "2023-08-28",
+            "end": "2025-09-17",
+            "days": 500,
+            "anchor_date": "2025-09-17",
+            "anchor_price": 1.697,
+            "matched_date": null,
+            "matched": false,
+            "fallback": true,
+            "start_reason": "five_hundred_day_fallback",
+            "search_start": "2023-08-28",
+            "search_end": "2024-09-06",
+            "min_offset_trading_days": 250,
+            "max_offset_trading_days": 500,
+            "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "reason": "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+            "mode": "same_price",
+            "price_basis": "decision_date_adjusted",
+            "actions_applied": [],
+            "action_factor_fingerprint": null,
+            "data_issue": null
+          },
+          "minimum_neighborhood_size": 81,
+          "validation_budget": 200,
+          "stress_points_at_three_regions": 1875,
+          "task_evaluation_upper_bound": 4391,
+          "effective_total_evaluation_budget": 1000,
+          "decision_count_estimate": 2,
+          "estimated_task_memory_mb": 91.74039459228516,
+          "workspace_budget_mb": 8192.0,
+          "prior_quota": null,
+          "prior_quota_used": null
+        },
+        "daily_state_v1": {
+          "status": "ready",
+          "reasons": [],
+          "training_window": {
+            "start": "2023-08-28",
+            "end": "2025-09-17",
+            "days": 500,
+            "anchor_date": "2025-09-17",
+            "anchor_price": 1.697,
+            "matched_date": null,
+            "matched": false,
+            "fallback": true,
+            "start_reason": "five_hundred_day_fallback",
+            "search_start": "2023-08-28",
+            "search_end": "2024-09-06",
+            "min_offset_trading_days": 250,
+            "max_offset_trading_days": 500,
+            "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "reason": "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+            "mode": "same_price",
+            "price_basis": "decision_date_adjusted",
+            "actions_applied": [],
+            "action_factor_fingerprint": null,
+            "data_issue": null
+          },
+          "minimum_neighborhood_size": 81,
+          "validation_budget": 200,
+          "stress_points_at_three_regions": 1875,
+          "task_evaluation_upper_bound": 4391,
+          "effective_total_evaluation_budget": 1000,
+          "decision_count_estimate": 2,
+          "estimated_task_memory_mb": 91.74039459228516,
+          "workspace_budget_mb": 8192.0,
+          "prior_quota": 8,
+          "prior_quota_used": 0
+        }
+      },
+      "comparison": {
+        "daily_state_minus_off": {
+          "oos_excess_return": null,
+          "oos_principal_drawdown": null,
+          "j_score": null
+        },
+        "outcome_claim": "仅记录差异；单次小预算对照不能证明先验带来正收益"
+      },
+      "status": "partial"
+    },
+    "512880.SH": {
+      "symbol": "512880.SH",
+      "source_version": "mkt-ab3af88482d8f8c4e6804eb2",
+      "target_version": "mkt-ab3af88482d8f8c4e6804eb2",
+      "source_etf": null,
+      "evaluation": {
+        "start": "2025-09-18",
+        "end": "2026-09-30",
+        "frequency": "1m",
+        "trading_days": 250
+      },
+      "readiness": {
+        "ready": true,
+        "symbol": "512880.SH",
+        "frequency": "1m",
+        "asset_type": "etf",
+        "gaps": [],
+        "degraded_days": [],
+        "warnings": [],
+        "checked_start": "2023-07-11",
+        "checked_end": "2026-09-30",
+        "package_id": "pkg-2e5ee3ab541c457485dd4435",
+        "snapshot_version": "mkt-ab3af88482d8f8c4e6804eb2",
+        "calendar_version": "market-sync-v2-package",
+        "preparation": {
+          "symbol": "512880.SH",
+          "frequency": "1min",
+          "start": "2023-07-11",
+          "end": "2026-09-30"
+        }
+      },
+      "runs": {
+        "off": {
+          "status": "partial",
+          "partial": true,
+          "policy": "off",
+          "elapsed_seconds": 2.501279,
+          "runtime_limit_seconds": 180,
+          "runtime_limit_hit": false,
+          "data_version": "mkt-ab3af88482d8f8c4e6804eb2",
+          "fixed_status": "partial",
+          "j": {
+            "score": null,
+            "selected_eligible": null,
+            "qualified_count": 0,
+            "recommendation_count": 0,
+            "candidate_count": 240,
+            "score_complete": false,
+            "coverage_status": "budgeted_local_peaks",
+            "training_unique_count": 100,
+            "neighborhood_unique_count": 140,
+            "reporting_unique_count": 0
+          },
+          "candidate_evaluations": 240,
+          "ledger_evaluations": 480,
+          "budget": {
+            "training": 100,
+            "validation": 200,
+            "reporting": 20,
+            "total": 1000,
+            "effective": 1000,
+            "used": 240,
+            "remaining": 760,
+            "stopped": false,
+            "reason": null
+          },
+          "training_window": {
+            "start": "2023-08-28",
+            "end": "2025-09-17",
+            "days": 500,
+            "anchor_date": "2025-09-17",
+            "anchor_price": 1.269,
+            "matched_date": null,
+            "matched": false,
+            "fallback": true,
+            "start_reason": "five_hundred_day_fallback",
+            "search_start": "2023-08-28",
+            "search_end": "2024-09-06",
+            "min_offset_trading_days": 250,
+            "max_offset_trading_days": 500,
+            "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "reason": "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+            "mode": "same_price",
+            "price_basis": "decision_date_adjusted",
+            "actions_applied": [],
+            "action_factor_fingerprint": null,
+            "data_issue": null
+          },
+          "selected_params": null,
+          "prior_source_labelled_candidate_count": 0,
+          "prior": null,
+          "candidate_failure_reasons": {
+            "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段": 1,
+            "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值": 1,
+            "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值": 1
+          },
+          "failure_reasons": [
+            "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+            "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+            "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值"
+          ],
+          "oos": {
+            "excess_return": null,
+            "grid_peak_principal_return": null,
+            "matched_funding_hold_return": null,
+            "grid_principal_drawdown": null,
+            "matched_funding_hold_drawdown": null,
+            "trade_count": null
+          },
+          "current": {
+            "semantics": "same evaluation-start anchor as fixed; independent display only",
+            "same_anchor_as_fixed": true,
+            "status": "no_qualified",
+            "decision_date": "2025-09-17",
+            "selected_params": null,
+            "score": null,
+            "eligible": false,
+            "candidate_count": 240,
+            "eligible_count": 0,
+            "reasons": [
+              "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+              "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+              "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值"
+            ]
+          },
+          "config_fingerprint": "fd40d9868d027e7b7e9a48eade2b5b4ebea986dc8cc8447c38af8422185dba83",
+          "last_progress": {
+            "fraction": 1.0,
+            "message": "新版稳健 J 研究完成"
+          }
+        },
+        "daily_state_v1": {
+          "status": "partial",
+          "partial": true,
+          "policy": "daily_state_v1",
+          "elapsed_seconds": 2.200545,
+          "runtime_limit_seconds": 180,
+          "runtime_limit_hit": false,
+          "data_version": "mkt-ab3af88482d8f8c4e6804eb2",
+          "fixed_status": "partial",
+          "j": {
+            "score": null,
+            "selected_eligible": null,
+            "qualified_count": 0,
+            "recommendation_count": 0,
+            "candidate_count": 240,
+            "score_complete": false,
+            "coverage_status": "budgeted_local_peaks",
+            "training_unique_count": 100,
+            "neighborhood_unique_count": 140,
+            "reporting_unique_count": 0
+          },
+          "candidate_evaluations": 240,
+          "ledger_evaluations": 480,
+          "budget": {
+            "training": 100,
+            "validation": 200,
+            "reporting": 20,
+            "total": 1000,
+            "effective": 1000,
+            "used": 240,
+            "remaining": 760,
+            "stopped": false,
+            "reason": null
+          },
+          "training_window": {
+            "start": "2023-08-28",
+            "end": "2025-09-17",
+            "days": 500,
+            "anchor_date": "2025-09-17",
+            "anchor_price": 1.269,
+            "matched_date": null,
+            "matched": false,
+            "fallback": true,
+            "start_reason": "five_hundred_day_fallback",
+            "search_start": "2023-08-28",
+            "search_end": "2024-09-06",
+            "min_offset_trading_days": 250,
+            "max_offset_trading_days": 500,
+            "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "reason": "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+            "mode": "same_price",
+            "price_basis": "decision_date_adjusted",
+            "actions_applied": [],
+            "action_factor_fingerprint": null,
+            "data_issue": null
+          },
+          "selected_params": null,
+          "prior_source_labelled_candidate_count": 4,
+          "prior": {
+            "policy": "daily_state_v1",
+            "decision_date": "2025-09-17",
+            "phase": "final",
+            "execution_data_version": "mkt-ab3af88482d8f8c4e6804eb2",
+            "quota": 8,
+            "planned_count": 4,
+            "quota_used": 3,
+            "actually_evaluated_count": 4,
+            "annotation_only_count": 1,
+            "source_seed_count": 0,
+            "state_candidate_count": 4,
+            "market_state": {
+              "method_version": "daily_state_v1",
+              "as_of": "2025-09-17",
+              "status": "completed",
+              "metrics": {
+                "natr14": 0.022225849350922807,
+                "hv_ratio": 0.8299074316627141,
+                "adx14": 26.061257880216836,
+                "plus_di14": 23.12090715022399,
+                "minus_di14": 19.661516092199257,
+                "amplitude_q75": 0.029360986547085268
+              },
+              "metric_details": {
+                "natr14": {
+                  "status": "available",
+                  "reason": "Wilder ATR14 除以最新有效收盘价；内部使用小数比例",
+                  "reason_code": null,
+                  "sample_count": 250,
+                  "required_samples": 14
+                },
+                "hv_ratio": {
+                  "status": "available",
+                  "reason": "最近10日与60日对数收益标准差之比，std(ddof=1)",
+                  "reason_code": null,
+                  "sample_count": 60,
+                  "required_samples": 60,
+                  "hv10": 0.011879509418025857,
+                  "hv60": 0.014314258391716456
+                },
+                "adx14": {
+                  "status": "available",
+                  "reason": "Wilder ADX14；14 个初始 DX 均值后递推平滑",
+                  "reason_code": null,
+                  "sample_count": 237,
+                  "required_samples": 27,
+                  "direction": "up"
+                },
+                "plus_di14": {
+                  "status": "available",
+                  "reason": "Wilder +DI14；以 14 周期平滑 TR 归一",
+                  "reason_code": null,
+                  "sample_count": 250,
+                  "required_samples": 14,
+                  "direction": "up"
+                },
+                "minus_di14": {
+                  "status": "available",
+                  "reason": "Wilder -DI14；以 14 周期平滑 TR 归一",
+                  "reason_code": null,
+                  "sample_count": 250,
+                  "required_samples": 14,
+                  "direction": "up"
+                },
+                "amplitude_q75": {
+                  "status": "available",
+                  "reason": "最近20日 (high-low)/前收 的线性插值75分位；零振幅保留",
+                  "reason_code": null,
+                  "sample_count": 20,
+                  "required_samples": 20
+                }
+              },
+              "samples": {
+                "truncated_at_limit": true,
+                "gap_before_start": null,
+                "invalid_daily_dates": [],
+                "calendar_earliest": "2023-07-11",
+                "calendar_latest": "2025-09-17",
+                "latest_expected_date": "2025-09-17",
+                "missing_latest_date": null,
+                "daily_rows": 250,
+                "selected_start": "2024-09-06",
+                "selected_end": "2025-09-17",
+                "prior_close_date": "2024-09-05",
+                "prior_close": 0.806,
+                "prior_high": 0.806,
+                "prior_low": 0.797,
+                "prior_close_source": "preceding_daily_row",
+                "close_samples_hv": 251,
+                "return_10_samples": 10,
+                "return_60_samples": 60,
+                "atr_samples": 14,
+                "adx_samples": 27,
+                "amplitude_samples": 20,
+                "enabled_calendar_days": 534
+              },
+              "warmup": {
+                "maximum_trading_days": 250,
+                "preceding_close_required": true,
+                "natr14_daily_periods": 14,
+                "hv10_log_returns": 10,
+                "hv60_log_returns": 60,
+                "hv60_daily_days_with_preclose": 60,
+                "adx14_daily_periods": 27,
+                "amplitude20_daily_days_with_prior_close": 20
+              },
+              "price_basis": {
+                "method": "raw_to_as_of_corporate_action_factor",
+                "as_of": "2025-09-17",
+                "actions_applied": [],
+                "action_count": 0,
+                "error": null,
+                "source_prices": "DataBundle.daily raw (unadjusted)",
+                "adjusted_columns": [
+                  "high",
+                  "low",
+                  "close",
+                  "preclose"
+                ]
+              },
+              "input_fingerprint": "787c804e4544441e0e4433a272e11ff189f54cae5771b022fd6b7679a843463e"
+            },
+            "market_state_error": null,
+            "source_check": {
+              "gate": "source_as_of_lte_decision_date",
+              "decision_date": "2025-09-17",
+              "source_as_of": null,
+              "status": "unavailable",
+              "eligible": false,
+              "requested_data_version": "mkt-ab3af88482d8f8c4e6804eb2",
+              "source_data_version": null,
+              "source_hash": null,
+              "source_result_id": null,
+              "reason": "source_as_of_missing",
+              "execution_data_version": "mkt-ab3af88482d8f8c4e6804eb2",
+              "requested_data_version_matches": true
+            },
+            "candidate_check_status_counts": {
+              "actually_evaluated": 3,
+              "annotation_only": 1
+            },
+            "candidate_checks": [
+              {
+                "ordinal": 1,
+                "kind": "market_state",
+                "source": "natr_hv_symmetric",
+                "status": "actually_evaluated",
+                "reason": null,
+                "original": {
+                  "buy_step": 0.014446802078099825,
+                  "sell_step": 0.014446802078099825
+                },
+                "coordinate": [
+                  3,
+                  3,
+                  20,
+                  20
+                ],
+                "converted": {
+                  "buy_step": 0.015,
+                  "sell_step": 0.015,
+                  "buy_shares": 2000,
+                  "sell_shares": 2000
+                },
+                "share_axis_midpoint_ticks": {
+                  "buy_shares": 20,
+                  "sell_shares": 20
+                },
+                "quota_rank": 1,
+                "actually_evaluated": true
+              },
+              {
+                "ordinal": 2,
+                "kind": "market_state",
+                "source": "natr_hv_up_asymmetric",
+                "status": "annotation_only",
+                "reason": "duplicate_initial_coordinate",
+                "original": {
+                  "buy_step": 0.012279781766384851,
+                  "sell_step": 0.016227922094745308
+                },
+                "coordinate": [
+                  2,
+                  3,
+                  20,
+                  20
+                ],
+                "converted": {
+                  "buy_step": 0.01,
+                  "sell_step": 0.015,
+                  "buy_shares": 2000,
+                  "sell_shares": 2000
+                },
+                "share_axis_midpoint_ticks": {
+                  "buy_shares": 20,
+                  "sell_shares": 20
+                },
+                "quota_rank": 2,
+                "actually_evaluated": true
+              },
+              {
+                "ordinal": 3,
+                "kind": "market_state",
+                "source": "amplitude_q75_symmetric",
+                "status": "actually_evaluated",
+                "reason": null,
+                "original": {
+                  "buy_step": 0.029360986547085268,
+                  "sell_step": 0.029360986547085268
+                },
+                "coordinate": [
+                  6,
+                  6,
+                  20,
+                  20
+                ],
+                "converted": {
+                  "buy_step": 0.03,
+                  "sell_step": 0.03,
+                  "buy_shares": 2000,
+                  "sell_shares": 2000
+                },
+                "share_axis_midpoint_ticks": {
+                  "buy_shares": 20,
+                  "sell_shares": 20
+                },
+                "quota_rank": 3,
+                "actually_evaluated": true
+              },
+              {
+                "ordinal": 4,
+                "kind": "market_state",
+                "source": "amplitude_q75_up_asymmetric",
+                "status": "actually_evaluated",
+                "reason": null,
+                "original": {
+                  "buy_step": 0.02495683856502248,
+                  "sell_step": 0.03298084930735302
+                },
+                "coordinate": [
+                  5,
+                  7,
+                  20,
+                  20
+                ],
+                "converted": {
+                  "buy_step": 0.025,
+                  "sell_step": 0.035,
+                  "buy_shares": 2000,
+                  "sell_shares": 2000
+                },
+                "share_axis_midpoint_ticks": {
+                  "buy_shares": 20,
+                  "sell_shares": 20
+                },
+                "quota_rank": 4,
+                "actually_evaluated": true
+              }
+            ],
+            "candidate_checks_truncated": false,
+            "coordinate_values": [
+              {
+                "buy_step": 0.015,
+                "sell_step": 0.015,
+                "buy_shares": 2000,
+                "sell_shares": 2000,
+                "initial_shares": 20000,
+                "min_shares": 0,
+                "max_shares": null
+              },
+              {
+                "buy_step": 0.01,
+                "sell_step": 0.015,
+                "buy_shares": 2000,
+                "sell_shares": 2000,
+                "initial_shares": 20000,
+                "min_shares": 0,
+                "max_shares": null
+              },
+              {
+                "buy_step": 0.03,
+                "sell_step": 0.03,
+                "buy_shares": 2000,
+                "sell_shares": 2000,
+                "initial_shares": 20000,
+                "min_shares": 0,
+                "max_shares": null
+              },
+              {
+                "buy_step": 0.025,
+                "sell_step": 0.035,
+                "buy_shares": 2000,
+                "sell_shares": 2000,
+                "initial_shares": 20000,
+                "min_shares": 0,
+                "max_shares": null
+              }
+            ]
+          },
+          "candidate_failure_reasons": {
+            "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段": 1,
+            "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值": 1,
+            "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值": 1
+          },
+          "failure_reasons": [
+            "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+            "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+            "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值"
+          ],
+          "oos": {
+            "excess_return": null,
+            "grid_peak_principal_return": null,
+            "matched_funding_hold_return": null,
+            "grid_principal_drawdown": null,
+            "matched_funding_hold_drawdown": null,
+            "trade_count": null
+          },
+          "current": {
+            "semantics": "same evaluation-start anchor as fixed; independent display only",
+            "same_anchor_as_fixed": true,
+            "status": "no_qualified",
+            "decision_date": "2025-09-17",
+            "selected_params": null,
+            "score": null,
+            "eligible": false,
+            "candidate_count": 240,
+            "eligible_count": 0,
+            "reasons": [
+              "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+              "大范围使用覆盖采样与多起点局部搜索；输出仅包含已完成一格邻域核验的局部峰值",
+              "没有发现满足交易、风险、持仓约束且 J>0 的已完成局部峰值"
+            ]
+          },
+          "config_fingerprint": "a3b59ec836b964ae2683a5858a671498e2c434a2a4ada8fbfad766818fa97c6b",
+          "last_progress": {
+            "fraction": 1.0,
+            "message": "新版稳健 J 研究完成"
+          }
+        }
+      },
+      "preparation": {
+        "requested_start": "2023-07-11",
+        "bundle_version": "mkt-ab3af88482d8f8c4e6804eb2",
+        "prior_trading_days": 534,
+        "warning_count": 0,
+        "warnings": []
+      },
+      "configs": {
+        "off": {
+          "base": {
+            "schema_version": 3,
+            "symbol": "512880.SH",
+            "start_date": "2025-09-18",
+            "end_date": "2026-09-30",
+            "frequency": "1m",
+            "initial_shares": 20000,
+            "min_shares": 0,
+            "max_shares": null,
+            "buy_shares": 2000,
+            "sell_shares": 2000,
+            "dca": {
+              "frequency": "monthly",
+              "shares": 1000,
+              "initial_shares": 0
+            },
+            "reference_price_mode": "auto",
+            "selection_asof": null,
+            "grid_mode": "geometric",
+            "buy_step": 0.065,
+            "sell_step": 0.065,
+            "reference_price": null,
+            "lower_price": null,
+            "upper_price": null,
+            "floor_penalty_config": {
+              "eta_floor": 0.2,
+              "gamma_min": 10.0,
+              "floor_k_ref": 10.0
+            },
+            "fees": {
+              "commission_rate": 0.0005,
+              "min_commission": 0.1,
+              "slippage_bps": 0.0,
+              "share_face_value": 1.0,
+              "legacy_sh_transfer_rate": 0.001,
+              "legacy_sh_min_transfer": 1.0,
+              "legacy_sz_transfer_rate": 2.55e-05
+            }
+          },
+          "protocol_version": 5,
+          "selection_target": "fixed",
+          "rebalance_days": 63,
+          "seed": 42,
+          "top_candidates": 100,
+          "max_principal_drawdown": 0.25,
+          "min_trades": 10,
+          "min_history_days": 504,
+          "min_minute_ratio": 0.95,
+          "strategy": {
+            "strategy_id": "geometric_robust_j",
+            "strategy_version": 5,
+            "search_method": "auto",
+            "ranking_mode": "robust_j",
+            "hypercube_edge": 3,
+            "granularity": {
+              "buy_step": 0.005,
+              "sell_step": 0.005,
+              "sell_shares": 100.0,
+              "buy_shares": 100.0
+            },
+            "training_budget": 100,
+            "validation_budget": 200,
+            "reporting_budget": 20,
+            "total_evaluation_budget": 1000,
+            "max_runtime_seconds": 180,
+            "recommendation_count": 5,
+            "max_shares_mode": "unlimited",
+            "slippage_mode": "zero",
+            "neighborhood_fields": [
+              "buy_step",
+              "sell_step",
+              "buy_shares",
+              "sell_shares"
+            ],
+            "fixed_half_widths": {
+              "buy_step": 0.001,
+              "sell_step": 0.001,
+              "sell_shares": 100.0,
+              "buy_shares": 100.0
+            },
+            "sigma": 1.0,
+            "alpha": 0.3,
+            "beta": 1.0,
+            "tau": 0.05,
+            "eta_limit": 1.8,
+            "eta_hard_cap": 3.5,
+            "gamma_max": 2.0,
+            "eta_floor": 0.2,
+            "gamma_min": 10.0,
+            "floor_k_ref": 10.0,
+            "training_min_days": 250,
+            "training_max_days": 500,
+            "training_window_mode": "same_price",
+            "peak_tolerance": 1e-12,
+            "start_min": 20,
+            "start_max": 64,
+            "starts_per_candidate": 4,
+            "initial_strides": [
+              1,
+              2
+            ],
+            "stride_multiplier": 2,
+            "max_stride_fraction": 0.25,
+            "validation_reserve_fraction": 0.25,
+            "exhaustive_memory_limit_mb": 512,
+            "estimated_bytes_per_point": 512,
+            "stress_cost_multiplier": 2.0,
+            "stress_region_count": 3
+          },
+          "research_context": {
+            "symbol": "512880.SH",
+            "start_date": "2025-09-18",
+            "end_date": "2026-09-30",
+            "frequency": "1m",
+            "initial_shares": 20000,
+            "grid_mode": "geometric",
+            "fees": {
+              "commission_rate": 0.0005,
+              "min_commission": 0.1,
+              "slippage_bps": 0.0,
+              "share_face_value": 1.0,
+              "legacy_sh_transfer_rate": 0.001,
+              "legacy_sh_min_transfer": 1.0,
+              "legacy_sz_transfer_rate": 2.55e-05
+            },
+            "reference_price_mode": "auto",
+            "reference_price": null,
+            "lower_price": null,
+            "upper_price": null,
+            "dca": {
+              "frequency": "monthly",
+              "shares": 1000,
+              "initial_shares": 0
+            }
+          },
+          "ranges": {
+            "buy_step": {
+              "low": 0.005,
+              "high": 0.08,
+              "step": null
+            },
+            "sell_step": {
+              "low": 0.005,
+              "high": 0.08,
+              "step": null
+            },
+            "buy_shares": {
+              "low": 1500.0,
+              "high": 2500.0,
+              "step": null
+            },
+            "sell_shares": {
+              "low": 1500.0,
+              "high": 2500.0,
+              "step": null
+            }
+          },
+          "configuration_revision": null,
+          "prior_policy": "off",
+          "source_etf": null,
+          "requested_data_version": "mkt-ab3af88482d8f8c4e6804eb2",
+          "research_origin": null
+        },
+        "daily_state_v1": {
+          "base": {
+            "schema_version": 3,
+            "symbol": "512880.SH",
+            "start_date": "2025-09-18",
+            "end_date": "2026-09-30",
+            "frequency": "1m",
+            "initial_shares": 20000,
+            "min_shares": 0,
+            "max_shares": null,
+            "buy_shares": 2000,
+            "sell_shares": 2000,
+            "dca": {
+              "frequency": "monthly",
+              "shares": 1000,
+              "initial_shares": 0
+            },
+            "reference_price_mode": "auto",
+            "selection_asof": null,
+            "grid_mode": "geometric",
+            "buy_step": 0.065,
+            "sell_step": 0.065,
+            "reference_price": null,
+            "lower_price": null,
+            "upper_price": null,
+            "floor_penalty_config": {
+              "eta_floor": 0.2,
+              "gamma_min": 10.0,
+              "floor_k_ref": 10.0
+            },
+            "fees": {
+              "commission_rate": 0.0005,
+              "min_commission": 0.1,
+              "slippage_bps": 0.0,
+              "share_face_value": 1.0,
+              "legacy_sh_transfer_rate": 0.001,
+              "legacy_sh_min_transfer": 1.0,
+              "legacy_sz_transfer_rate": 2.55e-05
+            }
+          },
+          "protocol_version": 5,
+          "selection_target": "fixed",
+          "rebalance_days": 63,
+          "seed": 42,
+          "top_candidates": 100,
+          "max_principal_drawdown": 0.25,
+          "min_trades": 10,
+          "min_history_days": 504,
+          "min_minute_ratio": 0.95,
+          "strategy": {
+            "strategy_id": "geometric_robust_j",
+            "strategy_version": 5,
+            "search_method": "auto",
+            "ranking_mode": "robust_j",
+            "hypercube_edge": 3,
+            "granularity": {
+              "buy_step": 0.005,
+              "sell_step": 0.005,
+              "sell_shares": 100.0,
+              "buy_shares": 100.0
+            },
+            "training_budget": 100,
+            "validation_budget": 200,
+            "reporting_budget": 20,
+            "total_evaluation_budget": 1000,
+            "max_runtime_seconds": 180,
+            "recommendation_count": 5,
+            "max_shares_mode": "unlimited",
+            "slippage_mode": "zero",
+            "neighborhood_fields": [
+              "buy_step",
+              "sell_step",
+              "buy_shares",
+              "sell_shares"
+            ],
+            "fixed_half_widths": {
+              "buy_step": 0.001,
+              "sell_step": 0.001,
+              "sell_shares": 100.0,
+              "buy_shares": 100.0
+            },
+            "sigma": 1.0,
+            "alpha": 0.3,
+            "beta": 1.0,
+            "tau": 0.05,
+            "eta_limit": 1.8,
+            "eta_hard_cap": 3.5,
+            "gamma_max": 2.0,
+            "eta_floor": 0.2,
+            "gamma_min": 10.0,
+            "floor_k_ref": 10.0,
+            "training_min_days": 250,
+            "training_max_days": 500,
+            "training_window_mode": "same_price",
+            "peak_tolerance": 1e-12,
+            "start_min": 20,
+            "start_max": 64,
+            "starts_per_candidate": 4,
+            "initial_strides": [
+              1,
+              2
+            ],
+            "stride_multiplier": 2,
+            "max_stride_fraction": 0.25,
+            "validation_reserve_fraction": 0.25,
+            "exhaustive_memory_limit_mb": 512,
+            "estimated_bytes_per_point": 512,
+            "stress_cost_multiplier": 2.0,
+            "stress_region_count": 3
+          },
+          "research_context": {
+            "symbol": "512880.SH",
+            "start_date": "2025-09-18",
+            "end_date": "2026-09-30",
+            "frequency": "1m",
+            "initial_shares": 20000,
+            "grid_mode": "geometric",
+            "fees": {
+              "commission_rate": 0.0005,
+              "min_commission": 0.1,
+              "slippage_bps": 0.0,
+              "share_face_value": 1.0,
+              "legacy_sh_transfer_rate": 0.001,
+              "legacy_sh_min_transfer": 1.0,
+              "legacy_sz_transfer_rate": 2.55e-05
+            },
+            "reference_price_mode": "auto",
+            "reference_price": null,
+            "lower_price": null,
+            "upper_price": null,
+            "dca": {
+              "frequency": "monthly",
+              "shares": 1000,
+              "initial_shares": 0
+            }
+          },
+          "ranges": {
+            "buy_step": {
+              "low": 0.005,
+              "high": 0.08,
+              "step": null
+            },
+            "sell_step": {
+              "low": 0.005,
+              "high": 0.08,
+              "step": null
+            },
+            "buy_shares": {
+              "low": 1500.0,
+              "high": 2500.0,
+              "step": null
+            },
+            "sell_shares": {
+              "low": 1500.0,
+              "high": 2500.0,
+              "step": null
+            }
+          },
+          "configuration_revision": null,
+          "prior_policy": "daily_state_v1",
+          "source_etf": null,
+          "requested_data_version": "mkt-ab3af88482d8f8c4e6804eb2",
+          "research_origin": null
+        }
+      },
+      "config_fingerprints": {
+        "off": "fd40d9868d027e7b7e9a48eade2b5b4ebea986dc8cc8447c38af8422185dba83",
+        "daily_state_v1": "a3b59ec836b964ae2683a5858a671498e2c434a2a4ada8fbfad766818fa97c6b"
+      },
+      "previews": {
+        "off": {
+          "status": "ready",
+          "reasons": [],
+          "training_window": {
+            "start": "2023-08-28",
+            "end": "2025-09-17",
+            "days": 500,
+            "anchor_date": "2025-09-17",
+            "anchor_price": 1.269,
+            "matched_date": null,
+            "matched": false,
+            "fallback": true,
+            "start_reason": "five_hundred_day_fallback",
+            "search_start": "2023-08-28",
+            "search_end": "2024-09-06",
+            "min_offset_trading_days": 250,
+            "max_offset_trading_days": 500,
+            "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "reason": "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+            "mode": "same_price",
+            "price_basis": "decision_date_adjusted",
+            "actions_applied": [],
+            "action_factor_fingerprint": null,
+            "data_issue": null
+          },
+          "minimum_neighborhood_size": 81,
+          "validation_budget": 200,
+          "stress_points_at_three_regions": 1875,
+          "task_evaluation_upper_bound": 4391,
+          "effective_total_evaluation_budget": 1000,
+          "decision_count_estimate": 2,
+          "estimated_task_memory_mb": 91.74005794525146,
+          "workspace_budget_mb": 8192.0,
+          "prior_quota": null,
+          "prior_quota_used": null
+        },
+        "daily_state_v1": {
+          "status": "ready",
+          "reasons": [],
+          "training_window": {
+            "start": "2023-08-28",
+            "end": "2025-09-17",
+            "days": 500,
+            "anchor_date": "2025-09-17",
+            "anchor_price": 1.269,
+            "matched_date": null,
+            "matched": false,
+            "fallback": true,
+            "start_reason": "five_hundred_day_fallback",
+            "search_start": "2023-08-28",
+            "search_end": "2024-09-06",
+            "min_offset_trading_days": 250,
+            "max_offset_trading_days": 500,
+            "match_rule": "daily_low_lt_anchor_close_lt_daily_high",
+            "reason": "250 至 500 个交易日内没有同价日，按评估日前 500 个交易日取训练时段",
+            "mode": "same_price",
+            "price_basis": "decision_date_adjusted",
+            "actions_applied": [],
+            "action_factor_fingerprint": null,
+            "data_issue": null
+          },
+          "minimum_neighborhood_size": 81,
+          "validation_budget": 200,
+          "stress_points_at_three_regions": 1875,
+          "task_evaluation_upper_bound": 4391,
+          "effective_total_evaluation_budget": 1000,
+          "decision_count_estimate": 2,
+          "estimated_task_memory_mb": 91.74005794525146,
+          "workspace_budget_mb": 8192.0,
+          "prior_quota": 8,
+          "prior_quota_used": 0
+        }
+      },
+      "comparison": {
+        "daily_state_minus_off": {
+          "oos_excess_return": null,
+          "oos_principal_drawdown": null,
+          "j_score": null
+        },
+        "outcome_claim": "仅记录差异；单次小预算对照不能证明先验带来正收益"
+      },
+      "status": "partial"
+    }
+  },
+  "failures": [],
+  "warnings": [
+    "159611.SZ 的三区域压力评价上界为 1875，不是约定的 81；请检查 3x3x3 邻域与压力区域数",
+    "159995.SZ 的三区域压力评价上界为 1875，不是约定的 81；请检查 3x3x3 邻域与压力区域数",
+    "512880.SH 的三区域压力评价上界为 1875，不是约定的 81；请检查 3x3x3 邻域与压力区域数"
+  ],
+  "selection": {
+    "method": "latest_common_formal_ready_backscan",
+    "cutoff": "2026-09-30",
+    "lookback_start": "2025-03-29",
+    "lookback_end": "2026-09-30",
+    "lookback_common_trading_days": 368,
+    "lookback_common_calendar_audit": {
+      "source_timestamps": 368,
+      "invalid_timestamps": 0,
+      "intraday_timestamps": 0,
+      "weekend_timestamps": 0,
+      "unique_dates_all_after_normalization": 368,
+      "outside_range_timestamps": 0,
+      "duplicate_dates_after_normalization": 0,
+      "unique_dates_after_normalization": 368,
+      "trading_days_after_weekday_filter": 368
+    },
+    "evaluation_trading_days_required": 250,
+    "evaluation_trading_days": 250,
+    "evaluation_start": "2025-09-18",
+    "evaluation_end": "2026-09-30",
+    "evaluation_weekend_days": 0,
+    "evaluation_duplicate_dates": 0,
+    "evaluation_intraday_timestamps": 0,
+    "calendar_audit_by_symbol": {
+      "159611.SZ": {
+        "lookback_start": "2025-03-29",
+        "lookback_end": "2026-09-30",
+        "auxiliary_calendar_version": "market-sync-v2-package",
+        "auxiliary_payload": {
+          "source_timestamps": 3,
+          "invalid_timestamps": 0,
+          "intraday_timestamps": 0,
+          "weekend_timestamps": 0,
+          "unique_dates_all_after_normalization": 3,
+          "outside_range_timestamps": 3,
+          "duplicate_dates_after_normalization": 0,
+          "unique_dates_after_normalization": 0,
+          "trading_days_after_weekday_filter": 0
+        },
+        "symbol_trading_calendar": {
+          "source_timestamps": 368,
+          "invalid_timestamps": 0,
+          "intraday_timestamps": 0,
+          "weekend_timestamps": 0,
+          "unique_dates_all_after_normalization": 368,
+          "outside_range_timestamps": 0,
+          "duplicate_dates_after_normalization": 0,
+          "unique_dates_after_normalization": 368,
+          "trading_days_after_weekday_filter": 368
+        },
+        "common_trading_calendar": {
+          "source_timestamps": 368,
+          "invalid_timestamps": 0,
+          "intraday_timestamps": 0,
+          "weekend_timestamps": 0,
+          "unique_dates_all_after_normalization": 368,
+          "outside_range_timestamps": 0,
+          "duplicate_dates_after_normalization": 0,
+          "unique_dates_after_normalization": 368,
+          "trading_days_after_weekday_filter": 368
+        },
+        "normalization": "source timestamps converted in memory to Asia/Shanghai, timezone removed, normalized to dates, deduplicated, range-filtered and weekend-filtered; source rows are unchanged"
+      },
+      "159995.SZ": {
+        "lookback_start": "2025-03-29",
+        "lookback_end": "2026-09-30",
+        "auxiliary_calendar_version": "market-sync-v2-package",
+        "auxiliary_payload": {
+          "source_timestamps": 3,
+          "invalid_timestamps": 0,
+          "intraday_timestamps": 0,
+          "weekend_timestamps": 0,
+          "unique_dates_all_after_normalization": 3,
+          "outside_range_timestamps": 3,
+          "duplicate_dates_after_normalization": 0,
+          "unique_dates_after_normalization": 0,
+          "trading_days_after_weekday_filter": 0
+        },
+        "symbol_trading_calendar": {
+          "source_timestamps": 368,
+          "invalid_timestamps": 0,
+          "intraday_timestamps": 0,
+          "weekend_timestamps": 0,
+          "unique_dates_all_after_normalization": 368,
+          "outside_range_timestamps": 0,
+          "duplicate_dates_after_normalization": 0,
+          "unique_dates_after_normalization": 368,
+          "trading_days_after_weekday_filter": 368
+        },
+        "common_trading_calendar": {
+          "source_timestamps": 368,
+          "invalid_timestamps": 0,
+          "intraday_timestamps": 0,
+          "weekend_timestamps": 0,
+          "unique_dates_all_after_normalization": 368,
+          "outside_range_timestamps": 0,
+          "duplicate_dates_after_normalization": 0,
+          "unique_dates_after_normalization": 368,
+          "trading_days_after_weekday_filter": 368
+        },
+        "normalization": "source timestamps converted in memory to Asia/Shanghai, timezone removed, normalized to dates, deduplicated, range-filtered and weekend-filtered; source rows are unchanged"
+      },
+      "512880.SH": {
+        "lookback_start": "2025-03-29",
+        "lookback_end": "2026-09-30",
+        "auxiliary_calendar_version": "market-sync-v2-package",
+        "auxiliary_payload": {
+          "source_timestamps": 3,
+          "invalid_timestamps": 0,
+          "intraday_timestamps": 0,
+          "weekend_timestamps": 0,
+          "unique_dates_all_after_normalization": 3,
+          "outside_range_timestamps": 3,
+          "duplicate_dates_after_normalization": 0,
+          "unique_dates_after_normalization": 0,
+          "trading_days_after_weekday_filter": 0
+        },
+        "symbol_trading_calendar": {
+          "source_timestamps": 368,
+          "invalid_timestamps": 0,
+          "intraday_timestamps": 0,
+          "weekend_timestamps": 0,
+          "unique_dates_all_after_normalization": 368,
+          "outside_range_timestamps": 0,
+          "duplicate_dates_after_normalization": 0,
+          "unique_dates_after_normalization": 368,
+          "trading_days_after_weekday_filter": 368
+        },
+        "common_trading_calendar": {
+          "source_timestamps": 368,
+          "invalid_timestamps": 0,
+          "intraday_timestamps": 0,
+          "weekend_timestamps": 0,
+          "unique_dates_all_after_normalization": 368,
+          "outside_range_timestamps": 0,
+          "duplicate_dates_after_normalization": 0,
+          "unique_dates_after_normalization": 368,
+          "trading_days_after_weekday_filter": 368
+        },
+        "normalization": "source timestamps converted in memory to Asia/Shanghai, timezone removed, normalized to dates, deduplicated, range-filtered and weekend-filtered; source rows are unchanged"
+      }
+    },
+    "shortened": false,
+    "sufficient_symbols": true,
+    "attempts": [
+      {
+        "cutoff": "2026-09-30",
+        "candidate_count": 8,
+        "preflight_counts": {
+          "total": 8,
+          "ready": 7,
+          "limited": 0,
+          "pending_validation": 0,
+          "insufficient_history": 0,
+          "data_not_ready": 1
+        },
+        "formal_ready": [
+          "159516.SZ",
+          "159611.SZ",
+          "159792.SZ",
+          "159995.SZ",
+          "512880.SH",
+          "515450.SH",
+          "517520.SH"
+        ],
+        "runnable_ready": [
+          "159516.SZ",
+          "159611.SZ",
+          "159995.SZ",
+          "512880.SH"
+        ],
+        "exact_snapshot_failures": [
+          {
+            "symbol": "159792.SZ",
+            "reason": "活动快照不能按版本重新加载"
+          },
+          {
+            "symbol": "515450.SH",
+            "reason": "活动快照不能按版本重新加载"
+          },
+          {
+            "symbol": "517520.SH",
+            "reason": "活动快照不能按版本重新加载"
+          }
+        ],
+        "training_ready": [
+          "159611.SZ",
+          "159995.SZ",
+          "512880.SH"
+        ],
+        "training_readiness_failures": [
+          {
+            "symbol": "159516.SZ",
+            "stage": "full_training_readiness",
+            "gaps": [
+              {
+                "kind": "quality",
+                "timeframe": "1min",
+                "message": "1min 在本次请求区间尚未完成质量核验"
+              },
+              {
+                "kind": "range",
+                "timeframe": "1day",
+                "message": "开始日期早于本地日线覆盖"
+              },
+              {
+                "kind": "quality",
+                "timeframe": "1day",
+                "message": "日线在本次请求区间尚未完成质量核验"
+              },
+              {
+                "kind": "reference_price",
+                "timeframe": "1day",
+                "message": "开始日期前缺少有效交易日收盘价，请补足前置历史"
+              },
+              {
+                "kind": "range",
+                "timeframe": "1min",
+                "message": "开始日期早于本地 1min 覆盖"
+              }
+            ]
+          }
+        ],
+        "selected": [
+          "159611.SZ",
+          "159995.SZ",
+          "512880.SH"
+        ],
+        "lookback_common_trading_days": 368,
+        "evaluation_trading_days": 250
+      }
+    ],
+    "preflight": {
+      "as_of": "2026-09-30",
+      "counts": {
+        "total": 8,
+        "ready": 7,
+        "limited": 0,
+        "pending_validation": 0,
+        "insufficient_history": 0,
+        "data_not_ready": 1
+      },
+      "rows": [
+        {
+          "symbol": "159611.SZ",
+          "status": "ready",
+          "version": "mkt-ce7c1e0ed7752db071cd81bc",
+          "snapshot_version": "mkt-7a988f71944d6ea3cf32c2c8",
+          "window_start": "2025-09-18",
+          "window_end": "2026-09-30",
+          "gaps": [],
+          "warnings": []
+        },
+        {
+          "symbol": "159995.SZ",
+          "status": "ready",
+          "version": "mkt-a241dd75803519d8ac36dc55",
+          "snapshot_version": "mkt-e21502ab6499ee768e58fb41",
+          "window_start": "2025-09-18",
+          "window_end": "2026-09-30",
+          "gaps": [],
+          "warnings": []
+        },
+        {
+          "symbol": "512880.SH",
+          "status": "ready",
+          "version": "mkt-f88d83909af7e56d106ad65e",
+          "snapshot_version": "mkt-ab3af88482d8f8c4e6804eb2",
+          "window_start": "2025-09-18",
+          "window_end": "2026-09-30",
+          "gaps": [],
+          "warnings": []
+        }
+      ]
+    }
+  },
+  "partial": true,
+  "provenance": {
+    "schema_version": 1,
+    "engine_version": "0.1.0",
+    "git_commit": "fcb740463eee96d10d6b34f8397bf4e36e23adc3",
+    "git_dirty": true,
+    "git_status_fingerprint": "c993ed6910626d87657cfc93f9b77c917adf18b00e7f6ec3d686362113d35154",
+    "uncommitted_diff_fingerprint": "51ec6f1b7b8033da6a38f7fed515e5a5be96c62a9ba91765a22d570177a743a1",
+    "source_fingerprint": "18f0d6feb78534897c293670ea30192b4016286aabed229b0c140fcd365ba18b",
+    "source_file_count": 69,
+    "dependency_lock_file": "uv.lock",
+    "dependency_lock_hash": "9d3d121779a463db61a0013fe58801f4063cc132386a7688fcb4d64da75aef4e",
+    "configuration_fingerprint": "87acd1c7feae0db705df4c65d9681ccb5657c6cd2f4af3a9b852b92047f3973c",
+    "runtime": {
+      "python": "3.12.13",
+      "implementation": "CPython",
+      "platform": "Windows-11-10.0.26200-SP0",
+      "packages": {
+        "numpy": "2.3.5",
+        "numba": "0.68.0",
+        "pandas": "2.3.3",
+        "scipy": "1.18.1",
+        "pyarrow": "23.0.1",
+        "pydantic": "2.14.1",
+        "stockregression": "0.1.0"
+      }
+    }
+  },
+  "script_sha256": "c2f400f5f31af29bfa2b9037ea5d8a074a0bda190a5053754f93faecd195bd2c"
+}

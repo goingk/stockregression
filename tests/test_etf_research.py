@@ -21,11 +21,15 @@ def test_request_fingerprint_changes_with_method_version(monkeypatch):
     plan = {
         "universe": {"package_id": "package-a", "generation": "generation-a", "symbols": ["159611.SZ"]}
     }
-    monkeypatch.setattr(research, "METHOD_VERSION", "etf_min_grid_v2")
-    previous = research.request_fingerprint(request, plan)
     monkeypatch.setattr(research, "METHOD_VERSION", "etf_min_grid_v3")
+    previous = research.request_fingerprint(request, plan)
+    monkeypatch.setattr(research, "METHOD_VERSION", "etf_min_grid_v4")
     current = research.request_fingerprint(request, plan)
     assert current != previous
+
+
+def test_current_etf_method_version_is_v4():
+    assert research.METHOD_VERSION == "etf_min_grid_v4"
 
 
 class CatalogOnlyRepository:

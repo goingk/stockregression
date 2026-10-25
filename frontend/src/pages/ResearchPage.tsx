@@ -1,6 +1,7 @@
 import { researchQuantityUnit } from '../workbenchDefaults'
+import { ETF_MARKET_STATE_METRICS, dataStatusLabel, etfMarketStateMetricText, resultStatusLabel, scoreDisplay, validationStatusLabel } from '../etfResearch'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Download, FlaskConical, RefreshCw, RotateCcw } from 'lucide-react'
+import { ArrowLeft, Download, FlaskConical, Link2, RefreshCw, RotateCcw, Unlink } from 'lucide-react'
 import { ApiError, download, get, post } from '../api'
 import { LatestRequest, PromiseCache } from '../requestState'
 import { resultsPageQuery } from '../resultsReview'
@@ -8,6 +9,11 @@ import ResearchLandscape from '../ResearchLandscape'
 import DataDiagnosticsPanel from '../DataDiagnosticsPanel'
 import Disclosure from '../Disclosure'
 import { useTasks } from '../TaskCenter'
+import { useResearchDraft } from '../ResearchDraftContext'
+import {
+  archivedResearchSource, isMissingResearchSourceError, requestedDataVersionFromPreview, researchPriorPolicyLabel,
+  researchSourceErrorFromPreview, researchSourceRequestFields,
+} from '../researchDraft.ts'
 import { Badge, Button, Card, ConfigForm, Empty, ErrorBox, Field, Loading, NumField, PageHeader, SelectInput, TextInput, configError, configPayload, loadConfig, percent, useErrorMessage } from '../components'
 import { flushConfiguration } from '../useWorkbenchDefaults'
 import type { BacktestConfig, BacktestResult, DataDiagnostics, DataPreparationRequest, DataSourceEvent, Job } from '../types'
@@ -24,6 +30,7 @@ type CompletionState = { status?: string; latest_revision?: Dict | null; selecte
 type OptimizationResult = {
   id?: string
   protocol_version?: number; result_schema_version?: number; seed?: number; data_version?: string; warnings?: string[]
+  research_origin?: Dict | null
   config?: SearchConfig; protocol?: Dict; is_demo?: boolean; quality?: Dict; diagnostics?: DataDiagnostics; source_events?: DataSourceEvent[]
   computation?: Dict; locked_funding?: Dict; configuration_snapshot?: Dict; execution?: Dict; performance?: Dict
   fixed?: { status?: string; params?: Dict; as_of?: string; test_result?: TestRun; current?: Recommendation; diagnostics?: Dict; oos_metrics?: Dict; [key: string]: unknown }
@@ -45,6 +52,7 @@ export type Props = {
   onDefaultsEdit?: (group: 'grid' | 'position' | 'dca', config: BacktestConfig) => void
   onRestore?: () => void
   onPrepareData?: (request: DataPreparationRequest) => void
+  onOpenEtfSource?: (resultId: string) => void
 }
 
 const robustFields = ['buy_step', 'sell_step', 'buy_shares', 'sell_shares'] as const
@@ -143,6 +151,30 @@ function shortSummary(value: unknown): string {
   const entries = Object.entries(item).filter(([, raw]) => raw == null || ['string', 'number', 'boolean'].includes(typeof raw)).slice(0, 4)
   return entries.length ? entries.map(([key, raw]) => `${labelOf(key)} ${valueText(key, raw)}`).join(' · ') : `${Object.keys(item).length} 项`
 }
+function usageRecord(value: unknown): Dict | undefined {
+  const item = record(value)
+  if (!item) return undefined
+  return record(item.research_prior) ?? record(item.research_prior_usage) ?? record(item.prior_usage)
+    ?? record(record(item.diagnostics)?.research_prior) ?? record(record(item.diagnostics)?.research_prior_usage)
+}
+function priorUsageText(value: unknown, topLevel?: Dict): string {
+  const item = record(value)
+  const diagnostic = record(item?.diagnostics)
+  const adaptivePriors = Array.isArray(diagnostic?.research_prior) ? diagnostic.research_prior : []
+  const usage = usageRecord(value) ?? record(adaptivePriors[adaptivePriors.length - 1]) ?? topLevel
+  const policy = firstString(item, ['prior_policy']) ?? firstString(usage, ['prior_policy', 'policy'])
+  const counts = record(usage?.selection_counts) ?? record(usage?.counts) ?? record(usage?.selected_counts)
+  const selected = counts?.selected ?? counts?.selected_count ?? usage?.selected_count ?? usage?.selection_count ?? usage?.quota_used
+  const eligible = counts?.eligible ?? counts?.eligible_count ?? usage?.eligible_count
+  const candidates = counts?.candidates ?? counts?.candidate_count ?? usage?.candidate_count
+    ?? (finite(usage?.source_seed_count) && finite(usage?.state_candidate_count) ? Number(usage.source_seed_count) + Number(usage.state_candidate_count) : undefined)
+  const parts = [policy ? researchPriorPolicyLabel(policy as 'off' | 'daily_state_v1') : '先验未记录']
+  if (adaptivePriors.length) parts.push(`${adaptivePriors.length} 个换参决策`)
+  if (finite(selected)) parts.push(`已评价先验起点 ${selected}`)
+  if (finite(eligible) && finite(candidates)) parts.push(`合格 ${eligible}/${candidates}`)
+  else if (finite(eligible)) parts.push(`合格 ${eligible}`)
+  return parts.join(' · ')
+}
 function metricRows(value: unknown, depth = 0, prefix = ''): Array<{ key: string; value: unknown }> {
   const item = record(value)
   if (!item) return []
@@ -219,9 +251,12 @@ type PreflightState = {
   message: string
 }
 
-export default function ResearchPage({ base, settings, onSettingsChange, onBaseChange, onLoadConfig, requestedResource, onSelectedResourceChange, completionDecision, onCompletionDecisionChange, onFeeDefaultsEdit, onDefaultsEdit, onRestore, onPrepareData }: Props) {
+export default function ResearchPage({ base, settings, onSettingsChange, onBaseChange, onLoadConfig, requestedResource, onSelectedResourceChange, completionDecision, onCompletionDecisionChange, onFeeDefaultsEdit, onDefaultsEdit, onRestore, onPrepareData, onOpenEtfSource }: Props) {
   const { protocol_version: protocolVersion, selection_target: selectionTarget, rebalance_days: rebalanceDays, seed, top_candidates: topCandidates, max_principal_drawdown: maxPrincipalDrawdown, min_trades: minTrades, min_history_days: minHistoryDays, min_minute_ratio: minMinuteRatio, strategy_version: strategyVersion, ranking_mode: rankingMode, hypercube_edge: hypercubeEdge, granularity, search_method: searchMethod, training_budget: trainingBudget, validation_budget: validationBudget, reporting_budget: reportingBudget, total_evaluation_budget: totalEvaluationBudget, max_runtime_seconds: maxRuntimeSeconds, recommendation_count: recommendationCount, slippage_mode: slippageMode, fixed_half_widths: fixedHalfWidths, sigma, alpha, beta: scoreBeta, tau, eta_limit: etaLimit, eta_hard_cap: etaHardCap, gamma_max: gammaMax, eta_floor: etaFloor, gamma_min: gammaMin, floor_k_ref: floorKRef, training_min_days: trainingMinDays, training_max_days: trainingMaxDays, training_window_mode: trainingWindowMode, peak_tolerance: peakTolerance, start_min: startMin, start_max: startMax, starts_per_candidate: startsPerCandidate, initial_strides: initialStrides, stride_multiplier: strideMultiplier, max_stride_fraction: maxStrideFraction, validation_reserve_fraction: validationReserveFraction, exhaustive_memory_limit_mb: exhaustiveMemoryLimitMb, estimated_bytes_per_point: estimatedBytesPerPoint, stress_cost_multiplier: stressCostMultiplier, stress_region_count: stressRegionCount } = settings
   const tasks = useTasks()
+  const researchDraft = useResearchDraft()
+  const sourceEtf = researchDraft.state.source_etf
+  const sourceSummary = researchDraft.state.source_summary
   const researchJobs = useMemo(() => tasks.jobs.filter(isOptimizationJob), [tasks.jobs])
   const ranges = useMemo(() => researchRangesForSymbol(settings.ranges, base.symbol), [base.symbol, settings.ranges])
   const updateSettings = (patch: Partial<ResearchDefaults>) => onSettingsChange({ ...settings, ...patch })
@@ -242,6 +277,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const [retryable, setRetryable] = useState(false)
   const [retryToken, setRetryToken] = useState(0)
   const [dataIssue, setDataIssue] = useState<DataPreparationRequest | null>(null)
+  const [sourceError, setSourceError] = useState('')
   const [completion, setCompletion] = useState<CompletionState | null>(null)
   const [completionBusy, setCompletionBusy] = useState(false)
   const [completionNote, setCompletionNote] = useState('')
@@ -253,13 +289,22 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const err = useErrorMessage()
   // Errors that are not a failed job or result read cannot be retried by reloading the task.
   const reportError = useCallback((message: string) => { setRetryable(false); setError(message) }, [])
-  useEffect(() => { setPreflight({ status: 'idle', preview: null, message: '' }); setError(''); setRetryable(false) }, [base, settings])
+  useEffect(() => { setPreflight({ status: 'idle', preview: null, message: '' }); setError(''); setRetryable(false); setSourceError('') }, [base, settings])
+  useEffect(() => {
+    if (sourceEtf && sourceSummary?.symbol && base.symbol !== sourceSummary.symbol) researchDraft.clearSource()
+  }, [base.symbol, sourceEtf, sourceSummary?.symbol, researchDraft])
   const isStarBoard = base.symbol.startsWith('688') || base.symbol.startsWith('689')
   const selectedJob = researchJobs.find(job => job.id === selectedJobId) ?? (fallbackJob?.id === selectedJobId ? fallbackJob : null)
   const selectedResultKey = selectedResultId
     ? 'result:' + selectedResultId
     : selectedJob?.result_id && ['completed', 'cancelled', 'partial'].includes(selectedJob.status) ? 'job:' + selectedJob.id + ':' + selectedJob.result_id : ''
   const result = loadedResult?.key === selectedResultKey ? loadedResult.value : null
+  const archivedDraft = useMemo(() => archivedResearchSource(result), [result])
+  const archivedMatchesDraft = Boolean(sourceEtf && archivedDraft?.source_etf?.result_id === sourceEtf.result_id)
+  const displayedDraftSummary = sourceSummary ?? (archivedMatchesDraft ? archivedDraft?.source_summary ?? null : null)
+  const showArchivedSource = Boolean(archivedDraft && !archivedMatchesDraft)
+  const archivedSourceEtf = showArchivedSource ? archivedDraft?.source_etf ?? null : null
+  const archivedSourceSummary = showArchivedSource ? archivedDraft?.source_summary ?? null : null
 
   const selectResult = (id: string) => {
     setSelectedResultId(id)
@@ -414,6 +459,20 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     updateSettings({ ranges: { ...settings.ranges, [name]: { ...settings.ranges[name], [key]: shown } } })
     setPreflight({ status: 'idle', preview: null, message: '' })
   }
+  const changeBase = (next: BacktestConfig | ((previous: BacktestConfig) => BacktestConfig)) => {
+    const resolved = typeof next === 'function' ? next(base) : next
+    if (resolved.symbol !== base.symbol) {
+      researchDraft.clearSource()
+      setSourceError('')
+    }
+    onBaseChange(next)
+  }
+  const removeSource = () => {
+    researchDraft.clearSource()
+    setSourceError('')
+    setPreflight({ status: 'idle', preview: null, message: '' })
+    setPreflightToken(token => token + 1)
+  }
   const researchValidationError = () => {
     const researchBase = researchConfigForSubmission(base)
     const baseError = configError(researchBase)
@@ -423,9 +482,10 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     if (ranges.buy_shares.low < minimumBuyShares || ranges.buy_shares.high < minimumBuyShares) return '每次买入搜索范围下限应至少为 ' + minimumBuyShares + ' 股 / 份。'
     return ''
   }
-  const buildResearchRequest = useCallback((configurationRevision?: string) => {
+  const buildResearchRequest = useCallback((configurationRevision?: string, requestedDataVersion?: string) => {
     const researchBase = researchConfigForSubmission(base)
     const submittedRanges = Object.fromEntries(Object.entries(ranges).map(([name, value]) => [name, { low: value.low, high: value.high }]))
+    const sourceFields = researchSourceRequestFields(researchDraft.state)
     return {
       base: configPayload(researchBase),
       protocol_version: 5,
@@ -456,9 +516,11 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
         estimated_bytes_per_point: estimatedBytesPerPoint,
         stress_cost_multiplier: stressCostMultiplier, stress_region_count: stressRegionCount,
       },
+      ...sourceFields,
       ...(configurationRevision ? { configuration_revision: configurationRevision } : {}),
+      ...(requestedDataVersion ? { requested_data_version: requestedDataVersion } : {}),
     }
-  }, [base, settings, ranges])
+  }, [base, settings, ranges, sourceEtf, researchDraft.state.prior_policy])
 
   useEffect(() => {
     const validation = researchValidationError()
@@ -472,29 +534,37 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     }
     const ticket = preflightRequest.current.begin(JSON.stringify(buildResearchRequest()))
     setPreflight({ status: 'loading', preview: null, message: '正在读取训练时段、预算与内存约束…' })
+    setSourceError('')
     const timer = window.setTimeout(() => {
       post<Dict>('/optimizations/preview', buildResearchRequest()).then(preview => {
         if (!preflightRequest.current.isCurrent(ticket)) return
         const reasons = Array.isArray(preview.reasons) ? preview.reasons.map(String).filter(Boolean) : []
+        const sourceProblem = researchSourceErrorFromPreview(preview)
+        const targetDataVersion = requestedDataVersionFromPreview(preview)
+        const dataVersionProblem = String(preview.status) === 'ready' && !targetDataVersion
+          ? '预检未返回目标数据版本（data_version），已阻止提交；请重新预检。'
+          : ''
         setPreflight({
-          status: String(preview.status) === 'ready' ? 'ready' : 'blocked',
+          status: String(preview.status) === 'ready' && !sourceProblem && !dataVersionProblem ? 'ready' : 'blocked',
           preview,
-          message: String(preview.status) === 'ready' ? '' : reasons.join('；') || '搜索预检未通过。',
+          message: sourceProblem || dataVersionProblem || (String(preview.status) === 'ready' ? '' : reasons.join('；') || '搜索预检未通过。'),
         })
-        if (String(preview.status) === 'ready') setDataIssue(null)
+        if (sourceProblem) setSourceError(sourceProblem)
         if (String(preview.status) === 'ready') setDataIssue(null)
       }).catch(cause => {
         if (!preflightRequest.current.isCurrent(ticket)) return
         const detail = cause instanceof ApiError ? record(cause.detail) ?? {} : {}
+        const missingSource = Boolean(sourceEtf) && isMissingResearchSourceError(cause)
+        if (missingSource) setSourceError('来源 ETF 研究结果不存在、已清理或不可读。请解除来源后继续研究；系统不会自动改用其他结果。')
         if (cause instanceof ApiError && cause.status === 409 && detail.code === 'DATA_NOT_READY') setDataIssue(detail as DataPreparationRequest)
         setPreflight({
           status: 'blocked', preview: Object.keys(detail).length ? detail : null,
-          message: String(detail.message ?? err(cause)),
+          message: missingSource ? '来源 ETF 研究结果不存在或不可读。' : String(detail.message ?? err(cause)),
         })
       })
     }, 600)
     return () => { window.clearTimeout(timer); preflightRequest.current.invalidate(ticket.key) }
-  }, [base, settings, ranges, buildResearchRequest, err, preflightToken])
+  }, [base, settings, ranges, buildResearchRequest, err, preflightToken, sourceEtf])
 
   const submit = async () => {
     const validation = researchValidationError()
@@ -502,15 +572,30 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
       reportError(validation); revealDisclosure('research-search-ranges'); return
     }
     if (preflight.status !== 'ready') { reportError(preflight.message || '请等待搜索预检完成并解决阻断项。'); return }
+    if (sourceError) { reportError(sourceError); return }
+    const requestedDataVersion = requestedDataVersionFromPreview(preflight.preview)
+    if (!requestedDataVersion) {
+      const message = '预检未返回目标数据版本（data_version），已阻止提交；请重新预检。'
+      setPreflight({ status: 'blocked', preview: preflight.preview, message })
+      reportError(message)
+      return
+    }
     setBusy(true); setError(''); setRetryable(false); setDataIssue(null)
     try {
       const configurationRevision = await flushConfiguration()
-      const request = buildResearchRequest(configurationRevision)
+      const request = buildResearchRequest(configurationRevision, requestedDataVersion)
       const response = await tasks.run('参数研究', () => post<{ job_id: string }>('/optimizations', request))
       selectJob(response.job_id)
       void loadResearchResults(0, false)
     } catch (cause) {
-      reportError(err(cause))
+      const missingSource = Boolean(sourceEtf) && isMissingResearchSourceError(cause)
+      if (missingSource) {
+        const message = err(cause) + ' 请解除来源后继续研究；系统不会自动改用其他结果。'
+        setSourceError(message)
+        setPreflight({ status: 'blocked', preview: null, message })
+      } else {
+        reportError(err(cause))
+      }
       if (cause instanceof ApiError && cause.status === 409 && cause.detail && typeof cause.detail === 'object' && (cause.detail as Record<string, unknown>).code === 'DATA_NOT_READY') setDataIssue(cause.detail as DataPreparationRequest)
       if (cause instanceof ApiError && cause.status === 422) {
         const detail = record(cause.detail) ?? {}
@@ -597,6 +682,29 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const explicitlyUnqualified = current?.recommendation_status === 'no_qualified' || current?.status === 'no_qualified'
   const currentRecommended = current?.recommended_params ?? (explicitlyUnqualified ? undefined : current?.params ?? undefined)
   const relativeBest = current?.diagnostic_params ?? (currentRecommended ? undefined : current?.params ?? undefined)
+  const fixedPrior = record(record(fixed?.diagnostics)?.research_prior)
+  const currentPrior = record(record(current?.diagnostics)?.research_prior)
+  const adaptivePriorList = Array.isArray(record(adaptive?.diagnostics)?.research_prior)
+    ? record(adaptive?.diagnostics)?.research_prior as unknown[]
+    : []
+  const adaptivePrior = record(adaptivePriorList[adaptivePriorList.length - 1])
+  const researchPrior = record(record(result?.diagnostics)?.research_prior) ?? currentPrior ?? fixedPrior ?? adaptivePrior
+  const priorMarketState = record(researchPrior?.market_state)
+  const priorSourceGate = record(researchPrior?.source_gate) ?? record(researchPrior?.source_check)
+  const priorCountSource = record(researchPrior?.selection_counts) ?? record(researchPrior?.counts) ?? record(researchPrior?.selected_counts)
+  const priorCounts = priorCountSource || researchPrior ? {
+    ...(priorCountSource ?? {}),
+    quota: priorCountSource?.quota ?? researchPrior?.quota,
+    quota_used: priorCountSource?.quota_used ?? researchPrior?.quota_used,
+    planned_count: priorCountSource?.planned_count ?? researchPrior?.planned_count,
+    actually_evaluated_count: priorCountSource?.actually_evaluated_count ?? researchPrior?.actually_evaluated_count,
+    annotation_only_count: priorCountSource?.annotation_only_count ?? researchPrior?.annotation_only_count,
+    source_seed_count: priorCountSource?.source_seed_count ?? researchPrior?.source_seed_count,
+    state_candidate_count: priorCountSource?.state_candidate_count ?? researchPrior?.state_candidate_count,
+  } : undefined
+  const priorFixed = priorUsageText(fixed, fixedPrior)
+  const priorAdaptive = priorUsageText(adaptive, record(researchPrior?.adaptive))
+  const priorCurrent = priorUsageText(current, currentPrior)
   const lockedFunding = record(result?.locked_funding) ?? {}
   const trainStart = firstString(protocol, ['train_start', 'training_start', 'training_start_date']) ?? firstString(protocolTraining, ['start', 'start_date', 'from'])
   const trainEnd = firstString(protocol, ['train_end', 'training_end', 'training_end_date']) ?? firstString(protocolTraining, ['end', 'end_date', 'to'])
@@ -606,7 +714,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
   const fixedMetrics = record(fixed?.oos_metrics) ?? record(fixed?.test_result?.strategies?.grid?.metrics)
   const adaptiveMetrics = record(adaptive?.oos_metrics) ?? record(adaptive?.test_result?.strategies?.grid?.metrics)
   const landscapeDecisions = [
-    { value: 'current:0', label: '评估起点建议的训练候选' },
+    { value: 'current:0', label: '评估开始日前选参的训练候选' },
     ...(adaptive?.schedule ?? []).map((item, index) => ({ value: `adaptive:${index}`, label: `自适应 ${item.effective_date ?? index + 1} 的训练候选` })),
     ...(fixed?.as_of ? [{ value: 'fixed:0', label: '固定方案决策的训练候选' }] : []),
   ]
@@ -620,9 +728,9 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     : completionDecisionKind === 'fixed' ? record(fixed) : record(current)
   const completionDecisionEligibility = eligibleOf(completionDecisionBranch, completionDecisionBranch?.diagnostics)
   const completionBlockedReasons = Array.from(new Set(reasonsOf(completionDecisionBranch)))
-  const completionDecisionLabel = landscapeDecisions.find(item => item.value === completionDecisionValue)?.label ?? '评估起点建议'
+  const completionDecisionLabel = landscapeDecisions.find(item => item.value === completionDecisionValue)?.label ?? '评估开始日前选参'
   const previewTraining = record(preflight.preview?.training_window)
-  const preflightReady = preflight.status === 'ready'
+  const preflightReady = preflight.status === 'ready' && Boolean(requestedDataVersionFromPreview(preflight.preview))
   const rangesSummary = robustFields.map(name => labels[name] + ' ' + rangeValue(name, ranges[name].low) + '–' + rangeValue(name, ranges[name].high)).join(' · ')
   const savedRanges = actualRanges && Object.keys(actualRanges).length ? <div className='table-wrap'><table><thead><tr><th>参数</th><th>下限</th><th>上限</th></tr></thead><tbody>{Object.entries(actualRanges).map(([key, raw]) => { const range = record(raw); return <tr key={key}><td>{labels[key] ?? key}</td><td>{range ? rangeValue(key, range.low) : '—'}</td><td>{range ? rangeValue(key, range.high) : '—'}</td></tr> })}</tbody></table></div> : <Empty title='任务中未保存搜索范围' />
   const revision = completion?.selected_revision ?? null
@@ -648,10 +756,33 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
     </div>
     {error && <ErrorBox message={error} onClose={() => setError('')} onRetry={retryable ? () => { setError(''); setRetryToken(token => token + 1) } : undefined} />}
     {dataIssue && <div className='notice'><span>本次研究缺少本地行情或质量依据。请在数据管理中显式准备所需周期和前置历史。</span><Button variant='secondary' onClick={() => onPrepareData?.(dataIssue)}>去准备数据</Button></div>}
+    {sourceEtf && <Card className='research-source-card' title='ETF 来源草稿' subtitle='来源只用于先验与追溯；本次提交的数据版本来自下方最新预检，不使用来源结果的历史版本。' action={<Badge tone={researchDraft.state.prior_policy === 'daily_state_v1' ? 'blue' : 'neutral'}>{researchPriorPolicyLabel(researchDraft.state.prior_policy)}</Badge>}>
+      <div className='research-source-summary'>
+        <div><small>来源 ETF</small><strong>{displayedDraftSummary?.symbol_name || displayedDraftSummary?.symbol || base.symbol || '—'}</strong><span>{displayedDraftSummary?.symbol || base.symbol} · 截止 {displayedDraftSummary?.as_of || base.end_date || '—'}</span></div>
+        <div><small>来源结果</small><strong title={sourceEtf.result_id}>{sourceEtf.result_id}</strong><span>{displayedDraftSummary ? `${displayedDraftSummary.method_version} · ${displayedDraftSummary.archived ? '归档来源快照' : resultStatusLabel(displayedDraftSummary.status)}` : '结果摘要未载入'}</span></div>
+        <div><small>来源候选</small><strong>{displayedDraftSummary ? `${displayedDraftSummary.qualified_count} / ${displayedDraftSummary.candidate_count} 合格` : `${sourceEtf.candidate_ids?.length ?? 0} 个候选编号`}</strong><span>候选可作为搜索起点，仍需通过参数研究验证。</span></div>
+        <div><small>GSS / 样本内核验</small><strong>{displayedDraftSummary ? `${scoreDisplay(displayedDraftSummary)} · ${validationStatusLabel(displayedDraftSummary.validation_status)}` : '摘要未载入'}</strong><span>{displayedDraftSummary ? (displayedDraftSummary.archived ? `归档来源含 ${displayedDraftSummary.qualified_count} 个入选候选；${displayedDraftSummary.validation_reason}` : `${displayedDraftSummary.eligible ? '符合硬过滤' : '未通过硬过滤'} · 数据 ${displayedDraftSummary.data_status ? dataStatusLabel(displayedDraftSummary.data_status) : '—'}${displayedDraftSummary.validation_reason ? ' · ' + displayedDraftSummary.validation_reason : ''}`) : 'GSS 与稳健 J 分属不同口径。'}</span></div>
+        <div><small>来源数据版本（仅追溯）</small><strong className='source-version'>{displayedDraftSummary?.data_version || '—'}</strong><span>提交目标版本：{requestedDataVersionFromPreview(preflight.preview) || '等待预检确认'}</span></div>
+      </div>
+      <div className='research-prior-control'><div><strong>研究先验</strong><span>来源候选仅在来源截止日不晚于该次决策日时使用；历史研究按当时日线重算。样本内 ETF 核验收益与稳健 J 不合并为一个分数，评估开始日前选参建议是训练候选，基于当时可见历史，不计作样本外结果。</span></div><div className='research-prior-toggle' role='group' aria-label='研究先验策略'><button type='button' className={researchDraft.state.prior_policy === 'off' ? 'selected' : ''} aria-pressed={researchDraft.state.prior_policy === 'off'} onClick={() => researchDraft.setPriorPolicy('off')}>关闭</button><button type='button' className={researchDraft.state.prior_policy === 'daily_state_v1' ? 'selected' : ''} aria-pressed={researchDraft.state.prior_policy === 'daily_state_v1'} onClick={() => researchDraft.setPriorPolicy('daily_state_v1')}>日线状态先验</button></div></div>
+      <div className='research-source-actions'><Button variant='quiet' onClick={() => onOpenEtfSource?.(sourceEtf.result_id)}><ArrowLeft size={14} />返回 ETF 研究</Button><Button variant='quiet' onClick={removeSource}><Unlink size={14} />解除来源并保留数值草稿</Button><span><Link2 size={13} /> 换标的、恢复默认或从回测转入研究会清除来源；切换页面保留。</span></div>
+      {sourceError && <div className='notice error research-source-error' role='alert'><span>{sourceError}</span><Button variant='secondary' onClick={removeSource}>解除来源并继续</Button></div>}
+    </Card>}
+    {archivedSourceEtf && archivedSourceSummary && <Card className='research-source-card' title='归档研究来源' subtitle='从该结果的 research_origin 恢复；此卡片只读，不改写当前研究草稿或数值参数。' action={<Badge tone={archivedDraft?.prior_policy === 'daily_state_v1' ? 'blue' : 'neutral'}>归档先验：{researchPriorPolicyLabel(archivedDraft?.prior_policy ?? 'off')}</Badge>}>
+      <div className='research-source-summary'>
+        <div><small>来源 ETF</small><strong>{archivedSourceSummary.symbol || '—'}</strong><span>截止 {archivedSourceSummary.as_of || '—'}</span></div>
+        <div><small>来源结果</small><strong title={archivedSourceEtf.result_id}>{archivedSourceEtf.result_id}</strong><span>{archivedSourceSummary.method_version || '—'} · 冻结来源快照</span></div>
+        <div><small>来源候选 / 样本内核验</small><strong>{`${archivedSourceSummary.qualified_count} 个入选`}</strong><span>归档只保留入选 seeds；原始候选总数与逐候选核验明细未随来源快照保存。</span></div>
+        <div><small>GSS / 样本内核验结论</small><strong>{`${scoreDisplay(archivedSourceSummary)} · ${validationStatusLabel(archivedSourceSummary.validation_status)}`}</strong><span>{archivedSourceSummary.validation_reason || 'GSS 与稳健 J 分属不同口径，不合并计分。'}</span></div>
+        <div><small>来源数据版本（仅追溯）</small><strong className='source-version'>{archivedSourceSummary.data_version || '—'}</strong><span>来源候选仅在来源截止日不晚于该次决策日时使用；历史研究按当时日线重算。</span></div>
+      </div>
+      <div className='research-source-actions'><Button variant='quiet' onClick={() => onOpenEtfSource?.(archivedSourceEtf.result_id)}><ArrowLeft size={14} />返回 ETF 研究</Button><span><Link2 size={13} /> 归档来源与当前草稿来源分开显示，修改草稿不会改写历史结果。</span></div>
+    </Card>}
+    {!sourceEtf && !showArchivedSource && <div className='research-source-empty'><Link2 size={14} /><span>独立参数研究 · 默认先验 <b>off</b>，可手动开启日线状态先验；可从 ETF 详情任一有效标的建立带来源的草稿。清除来源、换标的或恢复默认会回到 off。</span><div className='research-prior-toggle' role='group' aria-label='独立研究先验策略'><button type='button' className={researchDraft.state.prior_policy === 'off' ? 'selected' : ''} aria-pressed={researchDraft.state.prior_policy === 'off'} onClick={() => researchDraft.setPriorPolicy('off')}>关闭</button><button type='button' className={researchDraft.state.prior_policy === 'daily_state_v1' ? 'selected' : ''} aria-pressed={researchDraft.state.prior_policy === 'daily_state_v1'} onClick={() => researchDraft.setPriorPolicy('daily_state_v1')}>日线状态先验</button></div></div>}
     <div className='research-workspace'>
       <aside className='research-config-column'>
         <Card title='研究对象' subtitle='所选日期是样本外评估期，系统另取之前的历史训练。'>
-          <ConfigForm value={base} onChange={onBaseChange} purpose='research' researchProtocol={protocolVersion} onFeeDefaultsEdit={onFeeDefaultsEdit} onDefaultsEdit={onDefaultsEdit} />
+          <ConfigForm value={base} onChange={changeBase} purpose='research' researchProtocol={protocolVersion} onFeeDefaultsEdit={onFeeDefaultsEdit} onDefaultsEdit={onDefaultsEdit} />
           <Button variant='quiet' disabled={!base.symbol} onClick={() => {
             get<{ first_date?: string }>('/data/coverage/' + base.symbol).then(value => {
               if (value.first_date) onBaseChange(previous => ({ ...previous, start_date: new Date(Date.parse(value.first_date! + 'T00:00:00Z') + 86400000).toISOString().slice(0, 10), reference_price_mode: 'auto', reference_price: null }))
@@ -722,7 +853,7 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
               <div><small>搜索组合</small><strong>{Number(preflight.preview?.legal_combination_count ?? 0).toLocaleString()} 个</strong><span>{String(preflight.preview?.search_method ?? '—')} · 单峰支持 {String(preflight.preview?.estimated_peak_support_points ?? '—')} 点</span></div>
               <div><small>评价预算</small><strong>{Number(preflight.preview?.effective_total_evaluation_budget ?? 0).toLocaleString()} 点</strong><span>任务上限 {Number(preflight.preview?.task_evaluation_upper_bound ?? 0).toLocaleString()} · 邻域 {Number(preflight.preview?.neighborhood_budget ?? validationBudget).toLocaleString()}</span></div>
               <div><small>预计内存</small><strong>{Number(preflight.preview?.estimated_task_memory_mb ?? 0).toFixed(1)} MiB</strong><span>工作区上限 {Number(preflight.preview?.workspace_budget_mb ?? 0).toFixed(1)} MiB</span></div>
-              <div><small>数据前置</small><strong>训练窗口可用</strong><span>提交时仍会重新核验冻结的数据版本</span></div>
+              <div><small>数据前置</small><strong>训练窗口可用</strong><span>提交目标版本 {requestedDataVersionFromPreview(preflight.preview) || '由预检返回'}；提交时仍会重新核验</span></div>
             </div> : <div className='research-preflight-blocked'><p>{preflight.message || '预检尚未完成。'}</p>{dataIssue?.gaps?.length ? <ul>{dataIssue.gaps.map((gap, index) => <li key={index}>{String(gap.message ?? gap.kind ?? '数据缺口')}</li>)}</ul> : null}<Button variant='quiet' onClick={() => setPreflightToken(token => token + 1)}><RefreshCw size={14} />重新预检</Button></div>}
           </section>
           <div className='research-launch-action'><Button busy={busy} disabled={!preflightReady} onClick={() => void submit()}><FlaskConical size={15} />启动参数研究</Button><small>{schemeLabel(selectionTarget, rebalanceDays)} · {trainingMinDays}–{trainingMaxDays} 日训练时段 · 设置自动记忆</small></div>
@@ -788,16 +919,24 @@ export default function ResearchPage({ base, settings, onSettingsChange, onBaseC
             {isDemoResearch && <div className='demo-callout'>此研究使用演示行情生成，不能代表真实历史数据或投资结论。</div>}
             <div className='research-summary-states'>
               <div><small>训练时段</small><strong>{trainStart && trainEnd ? trainStart + ' 至 ' + trainEnd : `评估日前 ${trainingMinDays}–${trainingMaxDays} 个交易日`}</strong></div>
-              <div><small>评估起点推荐状态</small><Badge tone={currentRecommendationStatus === 'qualified' ? 'green' : 'amber'}>{currentRecommendationStatus === 'qualified' ? '按 J 排名推荐参数' : '暂无合格推荐'}</Badge></div>
+              <div><small>评估开始日前选参状态</small><Badge tone={currentRecommendationStatus === 'qualified' ? 'green' : 'amber'}>{currentRecommendationStatus === 'qualified' ? '训练候选 · 非样本外' : '暂无合格推荐'}</Badge><span>{priorCurrent}</span></div>
               <div><small>协议统计状态</small><Badge tone='neutral'>暂不提供显著性判断</Badge></div>
             </div>
             {researchWarnings.length > 0 && <div className='warning-list'>{researchWarnings.map((warning, index) => <div key={index}><span className='warning-dot' />{warning}</div>)}</div>}
           </Card>
+          {researchPrior && <Card title='研究先验与来源门控' subtitle='先验只改变训练候选的入口与约束；固定、自适应账本仍是样本外证据，评估开始日前选参保持为训练候选。'>
+            <div className='research-prior-summary'><div><small>固定参数</small><strong>{priorFixed}</strong></div><div><small>自适应参数</small><strong>{priorAdaptive}</strong></div><div><small>评估开始日前选参</small><strong>{priorCurrent}</strong></div></div>
+            {priorMarketState && <div className='research-prior-market'><h3>日线市场状态</h3><div className='research-prior-market-grid'>{ETF_MARKET_STATE_METRICS.map(metric => { const metrics = record(priorMarketState.metrics); const raw = metrics?.[metric.key]; return <span key={metric.key}><small>{metric.label}</small><strong>{etfMarketStateMetricText(metric.key, typeof raw === 'number' ? raw : null)}</strong></span> })}</div>{firstString(priorMarketState, ['reason', 'empty_reason', 'message']) && <p className='inline-warning'>{firstString(priorMarketState, ['reason', 'empty_reason', 'message'])}</p>}{firstString(researchPrior, ['market_state_error']) && <p className='inline-warning'>状态错误：{firstString(researchPrior, ['market_state_error'])}</p>}{record(priorMarketState.samples) && <EvidenceFields value={priorMarketState.samples} />}</div>}
+            {priorSourceGate && <div className='research-prior-gate'><h3>来源门控</h3><EvidenceFields value={priorSourceGate} /></div>}
+            {priorCounts && <div className='research-prior-counts'><h3>入选计数</h3><EvidenceFields value={priorCounts} /></div>}
+            <p className='field-hint'>GSS、稳健 J 与 ETF 样本内参数回放分属不同统计口径，不合并为单一分数；评估开始日前选参只表示当时训练候选，基于当时可见历史，不计作样本外表现。</p>
+            <Disclosure id='research-prior-raw' title='先验原始诊断' summary={shortSummary(researchPrior)}><pre className='json-preview'>{JSON.stringify(researchPrior, null, 2)}</pre></Disclosure>
+          </Card>}
           <Card title='样本外收益对照' subtitle='固定与自适应都是连续真实回测账本：账户在整个评估期连续运行，收益按峰值本金计算，差值超额为与同资金被动持有的配对差值。'>
-            {fixed && <div className='result-meta'><strong>固定参数</strong><span>锁定于 {fixed.as_of ?? '—'}</span><small>{constraintLabel(eligibleOf(fixed, fixed.diagnostics))}</small><Button variant='quiet' disabled={!fixed.params || !originalBase} onClick={() => loadV2(fixed.params, fixed.as_of)}>载入固定参数</Button></div>}
+            {fixed && <div className='result-meta'><strong>固定参数</strong><span>锁定于 {fixed.as_of ?? '—'}</span><small>{constraintLabel(eligibleOf(fixed, fixed.diagnostics))}</small><small>{priorFixed}</small><Button variant='quiet' disabled={!fixed.params || !originalBase} onClick={() => loadV2(fixed.params, fixed.as_of)}>载入固定参数</Button></div>}
             {fixed && <PrincipalMetricRow label='固定参数' metrics={fixedMetrics} />}
             {fixed?.params && <ParameterBadges params={fixed.params} compact />}
-            {adaptive && <div className='result-meta'><strong>自适应参数</strong><span>每 {rebalanceDays} 个交易日重选 · {adaptive.schedule?.length ?? 0} 次参数生效</span></div>}
+            {adaptive && <div className='result-meta'><strong>自适应参数</strong><span>每 {rebalanceDays} 个交易日重选 · {adaptive.schedule?.length ?? 0} 次参数生效</span><small>{priorAdaptive}</small></div>}
             {adaptive && <PrincipalMetricRow label='自适应参数' metrics={adaptiveMetrics} />}
             {!fixedMetrics && !adaptiveMetrics && <Empty title='本次没有可比较的样本外收益' detail='任务可能只完成了参数选择，或评估区间没有可用行情。' />}
             {fixedMetrics && <p className='field-hint'>这里只展示连续回测账本的收益与配对超额；训练候选的分布与稳健 J 排名在下方训练候选参数分布中，训练候选不是样本外结果。</p>}

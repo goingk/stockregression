@@ -723,6 +723,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/etf-research/{result_id}/research-links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Etf Research Links */
+        get: operations["etf_research_links_api_v1_etf_research__result_id__research_links_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/optimizations": {
         parameters: {
             query?: never;
@@ -2186,6 +2203,19 @@ export interface components {
             };
             /** Configuration Revision */
             configuration_revision?: string | null;
+            /**
+             * Prior Policy
+             * @default off
+             * @enum {string}
+             */
+            prior_policy: "off" | "daily_state_v1";
+            source_etf?: components["schemas"]["ResearchSourceRef"] | null;
+            /** Requested Data Version */
+            requested_data_version?: string | null;
+            /** Research Origin */
+            research_origin?: {
+                [key: string]: unknown;
+            } | null;
         };
         /** PathsSection */
         PathsSection: {
@@ -2679,10 +2709,33 @@ export interface components {
             min_minute_ratio: number;
             /** Configuration Revision */
             configuration_revision?: string | null;
+            /**
+             * Prior Policy
+             * @default off
+             * @enum {string}
+             */
+            prior_policy: "off" | "daily_state_v1";
+            source_etf?: components["schemas"]["ResearchSourceRef"] | null;
+            /** Requested Data Version */
+            requested_data_version?: string | null;
+            /** Research Origin */
+            research_origin?: {
+                [key: string]: unknown;
+            } | null;
         };
         /** ResearchSection */
         ResearchSection: {
             defaults?: components["schemas"]["ResearchDefaults"];
+        };
+        /**
+         * ResearchSourceRef
+         * @description Frozen reference to candidates selected from an ETF research result.
+         */
+        ResearchSourceRef: {
+            /** Result Id */
+            result_id: string;
+            /** Candidate Ids */
+            candidate_ids?: number[] | null;
         };
         /**
          * ResearchStrategySpec
@@ -4383,6 +4436,41 @@ export interface operations {
                 "application/json": components["schemas"]["BatchRequest"];
             };
         };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    etf_research_links_api_v1_etf_research__result_id__research_links_get: {
+        parameters: {
+            query: {
+                symbol: string;
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                result_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {

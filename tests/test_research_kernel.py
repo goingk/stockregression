@@ -219,11 +219,16 @@ def test_passive_market_reference_carries_dividend_and_bonus_claims():
         (grid["equity"][-1]["equity"] - metrics["total_invested"]) / metrics["peak_invested"])
     # Changing the rule while dividend/bonus rights are outstanding must retain
     # those exact claims rather than initialize a fresh account.
-    frozen = config.model_copy(update={"min_shares": 1000, "max_shares": 1000})
+    # Keep both runs trade-free without resubmitting pre-ex-date holding caps
+    # in a post-ex-date schedule (whose quantities use decision-date shares).
+    frozen = config.model_copy(update={"buy_step": .9, "sell_step": .9})
     schedule = [{"effective_date": str(bundle.calendar[3].date()),
                  "decision_date": str(bundle.calendar[2].date()), "params": {"buy_shares": 200}}]
     before = run_share_backtest(frozen, bundle)
     changed = run_share_backtest(frozen, bundle, parameter_schedule=schedule)
+    assert before["strategies"]["grid"]["trades"] == []
+    assert changed["strategies"]["grid"]["equity"][-1]["position"] == 1100
+    assert changed["strategies"]["grid"]["equity"][-1]["cash"] == 600
     assert before["strategies"]["grid"] == changed["strategies"]["grid"]
 
 

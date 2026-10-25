@@ -328,6 +328,25 @@ export function normalizeRememberedResearchDefaults(value: unknown): ResearchDef
   return structuredClone(normalizeResearchDefaults(value))
 }
 
+/**
+ * Merge only fields the user actually changed into the remembered defaults.
+ * Source drafts may temporarily carry ETF constraints, but unrelated edits
+ * must not persist those imported values as personal defaults.
+ */
+export function mergeEditedResearchDefaults(
+  current: ResearchDefaults,
+  next: ResearchDefaults,
+  remembered: ResearchDefaults,
+): ResearchDefaults {
+  const merged = structuredClone(remembered)
+  for (const key of Object.keys(next) as Array<keyof ResearchDefaults>) {
+    if (JSON.stringify(current[key]) !== JSON.stringify(next[key])) {
+      (merged as unknown as Record<string, unknown>)[key] = structuredClone(next[key])
+    }
+  }
+  return merged
+}
+
 export function strategyDefaults(config: BacktestConfig): Pick<WorkbenchDefaults, StrategyDefaultsGroup> {
   const { grid_mode, buy_step, sell_step, lower_price, upper_price, initial_shares, min_shares, max_shares, buy_shares, sell_shares } = config
   return {

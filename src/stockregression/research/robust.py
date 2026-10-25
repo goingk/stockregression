@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, ROUND_HALF_DOWN
 import hashlib
 import json
 import math
@@ -35,6 +36,15 @@ from .statistics import market_statistical_profile
 
 Progress = Callable[[float, str], None]
 Cancelled = Callable[[], bool]
+
+
+@dataclass
+class _PriorPlan:
+    """Decision-local prior audit and the coordinates eligible for injection."""
+
+    diagnostics: dict[str, Any]
+    coordinates: list[tuple[int, ...]]
+    sources: dict[tuple[int, ...], list[dict[str, Any]]]
 
 
 @dataclass
@@ -185,10 +195,374 @@ def _statistical_coordinates(space: ParameterSpace, profile: dict[str, Any]) -> 
     return output
 
 
-def _initial_coordinates(space: ParameterSpace, config: OptimizationConfig, asof: str, profile: dict[str, Any]) -> list[tuple[int, ...]]:
+def _prior_quota(config: OptimizationConfig) -> int:
+    """Small, budget-proportional prior quota shared by every source type."""
+    return max(0, min(8, int(config.strategy.training_budget) * 20 // 100))
+
+
+def _normalized_day(value: Any) -> pd.Timestamp | None:
+    if value in (None, ""):
+        return None
+    try:
+        stamp = pd.Timestamp(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if stamp is pd.NaT:
+        return None
+    if stamp.tzinfo is not None:
+        stamp = stamp.tz_convert("Asia/Shanghai").tz_localize(None)
+    return stamp.normalize()
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _nearest_axis_tick(space: ParameterSpace, name: str, value: Any) -> tuple[int | None, str | None]:
+    """Snap an in-range generated value to the nearest tick, with lower ties."""
+    number = _finite_number(value)
+    if number is None:
+        return None, "invalid_value"
+    dim = space.dimensions[name]
+    natural_low, natural_high = space.value(name, dim.low), space.value(name, dim.high)
+    if number < float(natural_low) or number > float(natural_high):
+        return None, "out_of_range"
+    try:
+        scaled = Decimal(str(number)) / Decimal(str(dim.unit))
+        tick = int(scaled.to_integral_value(rounding=ROUND_HALF_DOWN))
+    except (InvalidOperation, ValueError, OverflowError):
+        return None, "invalid_granularity"
+    return tick, None
+
+
+def _source_prior_candidate(
+    space: ParameterSpace,
+    raw_seed: Any,
+    *,
+    source_check: dict[str, Any],
+    origin: dict[str, Any],
+    ordinal: int,
+) -> dict[str, Any]:
+    candidate: dict[str, Any] = {
+        "ordinal": ordinal, "kind": "source_etf", "source": "etf_research",
+        "status": "skipped", "reason": None,
+    }
+    if not isinstance(raw_seed, dict):
+        candidate["reason"] = "invalid_seed"
+        return candidate
+    params = raw_seed.get("params")
+    if not isinstance(params, dict):
+        candidate["reason"] = "missing_params"
+        return candidate
+    candidate["candidate_id"] = raw_seed.get("candidate_id")
+    original = {name: params.get(name) for name in ROBUST_FIELDS}
+    candidate["original"] = deepcopy(original)
+    if source_check.get("status") != "eligible":
+        candidate["reason"] = source_check.get("status") or "source_time_unavailable"
+        return candidate
+    missing = [name for name, value in original.items() if value is None]
+    if missing:
+        candidate["reason"] = "missing_axes:" + ",".join(missing)
+        return candidate
+    ticks: dict[str, int] = {}
+    for name in ROBUST_FIELDS:
+        number = _finite_number(original[name])
+        if number is None:
+            candidate["reason"] = f"invalid_value:{name}"
+            return candidate
+        dim = space.dimensions[name]
+        natural_low, natural_high = space.value(name, dim.low), space.value(name, dim.high)
+        if number < float(natural_low) or number > float(natural_high):
+            candidate["reason"] = f"out_of_range:{name}"
+            return candidate
+        try:
+            tick = space.value_to_ticks(name, number)
+        except ValueError:
+            candidate["reason"] = f"invalid_source_granularity:{name}"
+            return candidate
+        ticks[name] = tick
+    coordinate = tuple(ticks[name] for name in space.order)
+    if not space.legal(space.active_coords(coordinate)):
+        candidate["reason"] = "illegal_coordinate"
+        return candidate
+    converted = {name: space.value(name, ticks[name]) for name in ROBUST_FIELDS}
+    candidate.update({
+        "coordinate": list(coordinate), "converted": converted,
+        "source_as_of": source_check.get("source_as_of"),
+        "source_result_id": origin.get("etf_result_id"),
+    })
+    return candidate
+
+
+def _state_prior_candidate(
+    space: ParameterSpace, raw_candidate: Any, *, ordinal: int,
+) -> dict[str, Any]:
+    candidate: dict[str, Any] = {
+        "ordinal": ordinal, "kind": "market_state", "source": None,
+        "status": "skipped", "reason": None,
+    }
+    if not isinstance(raw_candidate, dict):
+        candidate["reason"] = "invalid_state_candidate"
+        return candidate
+    source = raw_candidate.get("source")
+    candidate["source"] = source
+    original = {name: raw_candidate.get(name) for name in ("buy_step", "sell_step")}
+    candidate["original"] = deepcopy(original)
+    ticks: dict[str, int] = {}
+    for name in ("buy_step", "sell_step"):
+        number = _finite_number(original[name])
+        if number is None:
+            candidate["reason"] = f"invalid_value:{name}"
+            return candidate
+        tick, error = _nearest_axis_tick(space, name, number)
+        if tick is None:
+            candidate["reason"] = f"{error}:{name}"
+            return candidate
+        ticks[name] = tick
+    for name in ("buy_shares", "sell_shares"):
+        dim = space.dimensions[name]
+        ticks[name] = (dim.low + dim.high) // 2
+    coordinate = tuple(ticks[name] for name in space.order)
+    if not space.legal(space.active_coords(coordinate)):
+        candidate["reason"] = "illegal_coordinate"
+        return candidate
+    converted = {name: space.value(name, ticks[name]) for name in ROBUST_FIELDS}
+    candidate.update({
+        "coordinate": list(coordinate), "converted": converted,
+        "share_axis_midpoint_ticks": {
+            name: ticks[name] for name in ("buy_shares", "sell_shares")
+        },
+    })
+    return candidate
+
+
+def _source_time_check(config: OptimizationConfig, decision_date: pd.Timestamp | None) -> dict[str, Any]:
+    origin = config.research_origin if isinstance(config.research_origin, dict) else {}
+    raw_source_as_of = origin.get("source_as_of")
+    source_as_of = _normalized_day(raw_source_as_of)
+    check: dict[str, Any] = {
+        "gate": "source_as_of_lte_decision_date",
+        "decision_date": decision_date.date().isoformat() if decision_date is not None else None,
+        "source_as_of": source_as_of.date().isoformat() if source_as_of is not None else None,
+        "status": "unavailable", "eligible": False,
+        "requested_data_version": config.requested_data_version,
+        "source_data_version": origin.get("source_data_version"),
+        "source_hash": origin.get("source_hash"),
+        "source_result_id": origin.get("etf_result_id") or (
+            config.source_etf.result_id if config.source_etf is not None else None
+        ),
+    }
+    if raw_source_as_of in (None, ""):
+        check["reason"] = "source_as_of_missing"
+    elif source_as_of is None:
+        check["reason"] = "source_as_of_invalid"
+    elif decision_date is None:
+        check["reason"] = "decision_date_missing"
+    elif source_as_of > decision_date:
+        check.update({"status": "future_source", "reason": "source_as_of_after_decision_date"})
+    else:
+        check.update({"status": "eligible", "eligible": True, "reason": "source_as_of_not_after_decision_date"})
+    return check
+
+
+def _market_state_for_prior(data: DataBundle, as_of: pd.Timestamp) -> dict[str, Any]:
+    from ..market_state import daily_market_state
+    return daily_market_state(data, as_of)
+
+
+def _state_candidates_for_prior(state: dict[str, Any]) -> list[dict[str, Any]]:
+    from ..market_state import state_step_candidates
+    return state_step_candidates(state)
+
+
+def _build_research_prior(
+    config: OptimizationConfig,
+    space: ParameterSpace,
+    data: DataBundle,
+    decision_date: pd.Timestamp | None,
+) -> _PriorPlan:
+    """Freeze prior provenance for one decision without changing its objective."""
+    quota = _prior_quota(config)
+    origin = config.research_origin if isinstance(config.research_origin, dict) else {}
+    source_check = _source_time_check(config, decision_date)
+    source_check["execution_data_version"] = data.version
+    source_check["requested_data_version_matches"] = (
+        None if config.requested_data_version is None
+        else str(config.requested_data_version) == str(data.version)
+    )
+    market_state: dict[str, Any] = {"status": "unavailable"}
+    state_candidates: list[dict[str, Any]] = []
+    market_state_error: str | None = None
+    if decision_date is None:
+        market_state_error = "decision_date_missing"
+    else:
+        try:
+            market_state = _market_state_for_prior(data, decision_date)
+            if not isinstance(market_state, dict):
+                market_state = {"status": "unavailable", "reason": "invalid_market_state_result"}
+            state_candidates = _state_candidates_for_prior(market_state)
+            if not isinstance(state_candidates, list):
+                state_candidates = []
+                market_state_error = "invalid_state_candidates"
+        except Exception as exc:
+            market_state = {
+                "status": "unavailable",
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+            market_state_error = str(market_state["reason"])
+    raw_seeds = origin.get("seeds") if isinstance(origin.get("seeds"), list) else []
+    checks: list[dict[str, Any]] = []
+    for ordinal, raw_seed in enumerate(raw_seeds, 1):
+        checks.append(_source_prior_candidate(
+            space, raw_seed, source_check=source_check, origin=origin, ordinal=ordinal,
+        ))
+    for offset, raw_candidate in enumerate(state_candidates, 1):
+        checks.append(_state_prior_candidate(
+            space, raw_candidate, ordinal=len(raw_seeds) + offset,
+        ))
+
+    selected: list[tuple[int, ...]] = []
+    sources: dict[tuple[int, ...], list[dict[str, Any]]] = {}
+    seen: dict[tuple[int, ...], int] = {}
+    for check in checks:
+        if check.get("reason"):
+            continue
+        coordinate = tuple(int(value) for value in check["coordinate"])
+        provenance = {
+            key: deepcopy(check[key])
+            for key in (
+                "kind", "source", "candidate_id", "source_as_of", "source_result_id",
+                "original", "converted", "share_axis_midpoint_ticks",
+            )
+            if key in check
+        }
+        if coordinate in seen:
+            check.update({
+                "status": "skipped", "reason": "duplicate_coordinate",
+                "deduped_into": seen[coordinate],
+            })
+            sources[coordinate].append(provenance)
+            continue
+        if len(selected) >= quota:
+            check.update({"status": "skipped", "reason": "quota_exhausted"})
+            continue
+        seen[coordinate] = len(selected) + 1
+        selected.append(coordinate)
+        sources[coordinate] = [provenance]
+        check.update({"status": "planned", "quota_rank": len(selected)})
+
+    diagnostics = {
+        "policy": config.prior_policy,
+        "decision_date": decision_date.date().isoformat() if decision_date is not None else None,
+        "execution_data_version": data.version,
+        "quota": quota,
+        "phase": "planned",
+        "planned_count": len(selected),
+        "quota_used": 0,
+        "actually_evaluated_count": 0,
+        "annotation_only_count": 0,
+        "source_seed_count": len(raw_seeds),
+        "state_candidate_count": len(state_candidates),
+        "market_state": deepcopy(market_state),
+        "market_state_error": market_state_error,
+        "source_check": source_check,
+        "candidate_checks": checks,
+        "coordinates": [list(coordinate) for coordinate in selected],
+        "coordinate_values": [space.params(coordinate) for coordinate in selected],
+    }
+    return _PriorPlan(diagnostics=diagnostics, coordinates=selected, sources=sources)
+
+
+def _finalize_research_prior(
+    plan: _PriorPlan | None,
+    rows: dict[tuple[int, ...], dict[str, Any]],
+    initial: Iterable[tuple[int, ...]],
+    admission: dict[tuple[int, ...], str],
+    *, exhaustive: bool = False,
+) -> None:
+    """Reconcile planned provenance with actual sampling and evaluated rows."""
+    if plan is None:
+        return
+    initial_set = set(initial)
+    used = evaluated = annotated = 0
+    for check in plan.diagnostics["candidate_checks"]:
+        if "quota_rank" not in check:
+            continue
+        coordinate = tuple(check["coordinate"])
+        present = coordinate in rows
+        check["actually_evaluated"] = present
+        evaluated += int(present)
+        if exhaustive:
+            check.update(status="annotation_only", reason="exhaustive")
+            annotated += int(present)
+        elif coordinate not in initial_set:
+            check.update(
+                status="annotation_only" if present else "skipped",
+                reason="initial_budget_exhausted",
+            )
+            annotated += int(present)
+        elif admission.get(coordinate) == "duplicate_initial_coordinate":
+            check.update(
+                status="annotation_only" if present else "skipped",
+                reason="duplicate_initial_coordinate",
+            )
+            annotated += int(present)
+        elif present:
+            check.update(status="actually_evaluated", reason=None)
+            used += 1
+        else:
+            check.update(status="skipped", reason="not_evaluated")
+    plan.diagnostics.update(
+        phase="final", quota_used=used, actually_evaluated_count=evaluated,
+        annotation_only_count=annotated,
+    )
+    _attach_prior_sources(rows, plan)
+
+
+def _attach_prior_sources(rows: dict[tuple[int, ...], dict[str, Any]], plan: _PriorPlan | None) -> None:
+    if plan is None:
+        return
+    for coordinate, sources in plan.sources.items():
+        row = rows.get(coordinate)
+        if row is not None:
+            labels = []
+            for source in sources:
+                if source.get("kind") == "source_etf":
+                    result_id = source.get("source_result_id") or "unknown"
+                    candidate_id = source.get("candidate_id")
+                    labels.append(
+                        f"etf:{result_id}:{candidate_id}" if candidate_id is not None
+                        else f"etf:{result_id}:seed"
+                    )
+                else:
+                    labels.append(f"market_state:{source.get('source') or 'unknown'}")
+            # Storage archives merge this field for completion revisions, so a
+            # row carries compact hashable labels while the full provenance is
+            # retained under diagnostics.research_prior.
+            row["prior_sources"] = list(dict.fromkeys(labels))
+
+
+def _initial_coordinates(
+    space: ParameterSpace,
+    config: OptimizationConfig,
+    asof: str,
+    profile: dict[str, Any],
+    prior_coordinates: Iterable[tuple[int, ...]] = (),
+    prior_admission: dict[tuple[int, ...], str] | None = None,
+) -> list[tuple[int, ...]]:
     budget = int(config.strategy.training_budget)
     total = space.size()
     if total <= budget:
+        if prior_admission is not None:
+            prior_admission.update(
+                (coordinate, "duplicate_initial_coordinate") for coordinate in prior_coordinates
+            )
         return list(space.iterate(budget))
     seeds = [_stable_seed(config, asof, "robust_sample")]
     anchors: list[tuple[int, ...]] = []
@@ -204,7 +578,19 @@ def _initial_coordinates(space: ParameterSpace, config: OptimizationConfig, asof
     coarse_limit = max(1, budget // 4)
     statistical = _statistical_coordinates(space, profile)
     sobol = _sobol_coordinates(space, budget, seeds[0])
-    return _dedupe([*anchors, *statistical, *coarse_coordinates(space, coarse_limit), *sobol], budget)
+    prefix = [*anchors, *statistical, *coarse_coordinates(space, coarse_limit)]
+    prior_coordinates = list(prior_coordinates)
+    initial = _dedupe([
+        *prefix,
+        *prior_coordinates, *sobol,
+    ], budget)
+    if prior_admission is not None:
+        existing = set(prefix)
+        for coordinate in prior_coordinates:
+            prior_admission[coordinate] = (
+                "duplicate_initial_coordinate" if coordinate in existing else "planned"
+            )
+    return initial
 
 
 class EvaluationSession:
@@ -723,23 +1109,29 @@ def select_robust_at(
     as_of = window.end
     space = ParameterSpace(config, field_order=ROBUST_FIELDS)
     active = tuple(name for name in ROBUST_FIELDS if name in space.active)
+    prior_plan = (
+        _build_research_prior(config, space, data, as_of)
+        if config.prior_policy == "daily_state_v1" else None
+    )
+    prior_diagnostics = prior_plan.diagnostics if prior_plan is not None else None
     if window.data_issue:
         # A corporate-action or price problem is not a short history and must
         # never be reported as one.
         return _empty_result(
             config, space, as_of, [window.data_issue], window.dates,
-            status="data_issue", window=window,
+            status="data_issue", window=window, research_prior=prior_diagnostics,
         )
     if not active:
             return _empty_result(
                 config, space, as_of, ["四个搜索轴全部固定，无法形成稳健 J 峰值"],
                 window.dates, status="insufficient_range", window=window,
+                research_prior=prior_diagnostics,
             )
     if window.days < int(strategy.training_min_days):
         return _empty_result(
             config, space, as_of,
             [window.reason, f"训练时段只有 {window.days} 个交易日，少于最低 {strategy.training_min_days} 日"],
-            window.dates, window=window,
+            window.dates, window=window, research_prior=prior_diagnostics,
         )
     edge = int(strategy.hypercube_edge)
     impossible = [name for name in space.active if space.dimensions[name].count < edge]
@@ -748,6 +1140,7 @@ def select_robust_at(
             config, space, as_of,
             ["超正方体边长超出这些参数的有效范围：" + "、".join(impossible)],
             window.dates, status="insufficient_range", window=window,
+            research_prior=prior_diagnostics,
         )
     total = space.size()
     method = _method(config, total, space)
@@ -773,6 +1166,8 @@ def select_robust_at(
         chunk_size=getattr(runtime, "evaluation_chunk_size", None),
     )
     session = EvaluationSession(evaluator, space, config, cancelled, budget=budget)
+    initial: list[tuple[int, ...]] = []
+    prior_admission: dict[tuple[int, ...], str] = {}
     started_seconds = time.perf_counter()
     try:
         if method == "exhaustive":
@@ -780,13 +1175,22 @@ def select_robust_at(
             if len(coordinates) > int(strategy.training_budget):
                 raise ValueError(f"完整枚举需要 {total} 个训练点，超过训练预算 {strategy.training_budget}")
             session.ensure(coordinates, "training", len(coordinates))
+            # Full exhaustive research always evaluates the same lattice in the
+            # same order.  Prior data only labels rows that came from a frozen
+            # source candidate.
+            _attach_prior_sources(session.rows, prior_plan)
             session.scores.update(tensor_robust_scores(space, session.rows, strategy))
             _emit(progress, progress_start + .45 * progress_width, f"完整枚举完成：{len(session.rows):,} 点")
             scored_centers = list(coordinates)
         else:
             profile = market_statistical_profile(data, window.dates)
-            initial = _initial_coordinates(space, config, as_of.date().isoformat() if as_of is not None else "", profile)
+            initial = _initial_coordinates(
+                space, config, as_of.date().isoformat() if as_of is not None else "", profile,
+                prior_plan.coordinates if prior_plan is not None else (),
+                prior_admission,
+            )
             session.ensure(initial, "training", int(strategy.training_budget))
+            _attach_prior_sources(session.rows, prior_plan)
             _emit(progress, progress_start + .32 * progress_width, f"覆盖采样完成：{len(session.rows):,} 点")
             target_starts = min(
                 int(strategy.start_max),
@@ -891,6 +1295,9 @@ def select_robust_at(
         diagnostic = candidates[0] if candidates else next(iter(session.rows), fallback_coordinate)
         top = regions[0] if regions else None
         selected = deepcopy(top["center_params"]) if top else deepcopy(session.rows.get(diagnostic, {}).get("params", space.params(fallback_coordinate)))
+        _finalize_research_prior(
+            prior_plan, session.rows, initial, prior_admission, exhaustive=method == "exhaustive",
+        )
         public_rows = [_public_row(row, session.scores.get(tuple(row["key"]))) for row in session.rows.values()]
         public_rows.sort(key=lambda row: (-(float(row.get("j_score")) if row.get("j_score") is not None else -math.inf), tuple(row.get("key", ()))))
         for index, row in enumerate(public_rows, 1):
@@ -974,6 +1381,8 @@ def select_robust_at(
             "selected_constraint_reasons": [],
             "method_parameters": strategy.model_dump(mode="json"),
         }
+        if prior_diagnostics is not None:
+            diagnostics["research_prior"] = deepcopy(prior_diagnostics)
         record_seconds("robust_j_selection", time.perf_counter() - started_seconds)
         record_count("robust_j_training_points", session.spent["training"])
         record_count("robust_j_neighborhood_points", session.spent["validation"])
@@ -995,8 +1404,11 @@ def select_robust_at(
             "diagnostics": diagnostics,
         }
     except InterruptedError:
+        _finalize_research_prior(
+            prior_plan, session.rows, initial, prior_admission, exhaustive=method == "exhaustive",
+        )
         _emit(progress, .95, "稳健 J 研究已取消")
-        return _cancelled_selection(config, space, session, window, as_of)
+        return _cancelled_selection(config, space, session, window, as_of, prior_plan)
 
 
 def _empty_result(
@@ -1008,6 +1420,7 @@ def _empty_result(
     *,
     status: str = "insufficient_history",
     window: TrainingWindow | None = None,
+    research_prior: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fallback = space.params(space.full_coordinate(tuple(space.dimensions[name].low for name in space.active)))
     diagnostic = window.diagnostic() if window is not None else {
@@ -1015,6 +1428,21 @@ def _empty_result(
         "end": history[-1].date().isoformat() if len(history) else None,
         "days": len(history),
     }
+    diagnostics = {
+        "status": status, "protocol_version": 5, "strategy_id": "geometric_robust_j",
+        "strategy_version": 5, "geometry": "robust_j",
+        "selection_history_days": len(history), "candidate_count": 0, "eligible_count": 0,
+        "training_only": True, "internal_validation_folds": 0,
+        "search_method": config.strategy.search_method,
+        "ranking_mode": "robust_j", "training_window": diagnostic,
+        "data_issue": diagnostic.get("data_issue"),
+    }
+    if research_prior is not None:
+        diagnostics["research_prior"] = deepcopy(research_prior)
+        diagnostics["research_prior"]["phase"] = "final"
+        for check in diagnostics["research_prior"]["candidate_checks"]:
+            if check["status"] == "planned":
+                check.update(status="skipped", reason=status, actually_evaluated=False)
     return {
         "status": status, "recommendation_status": "no_qualified",
         "params": fallback, "recommended_params": None,
@@ -1022,21 +1450,14 @@ def _empty_result(
         "score": None, "raw_score": None, "eligible": False,
         "reasons": list(dict.fromkeys(reasons)), "candidates": [], "candidate_archive": [],
         "search_candidate_archive": [], "trial_archive": [], "recommendation_regions": [],
-        "diagnostics": {
-            "status": status, "protocol_version": 5, "strategy_id": "geometric_robust_j",
-            "strategy_version": 5, "geometry": "robust_j",
-            "selection_history_days": len(history), "candidate_count": 0, "eligible_count": 0,
-            "training_only": True, "internal_validation_folds": 0,
-            "search_method": config.strategy.search_method,
-            "ranking_mode": "robust_j", "training_window": diagnostic,
-            "data_issue": diagnostic.get("data_issue"),
-        },
+        "diagnostics": diagnostics,
     }
 
 
 def _cancelled_selection(
     config: OptimizationConfig, space: ParameterSpace, session: EvaluationSession,
     window: TrainingWindow, as_of: pd.Timestamp | None,
+    prior_plan: _PriorPlan | None = None,
 ) -> dict[str, Any]:
     public_rows = [_public_row(row, session.scores.get(tuple(row["key"]))) for row in session.rows.values()]
     public_rows.sort(
@@ -1050,6 +1471,34 @@ def _cancelled_selection(
     fallback = space.params(space.full_coordinate(tuple(space.dimensions[name].low for name in space.active)))
     diagnostic = next(iter(session.rows.values()), {})
     params = deepcopy(diagnostic.get("params", fallback))
+    diagnostics = {
+        "status": "cancelled", "protocol_version": 5,
+        "strategy_id": "geometric_robust_j", "strategy_version": 5,
+        "training_window": window.diagnostic(),
+        "training_start": window.start.date().isoformat() if window.start is not None else None,
+        "training_end": window.end.date().isoformat() if window.end is not None else None,
+        "selection_history_days": window.days,
+        "training_only": True, "internal_validation_folds": 0,
+        "candidate_count": len(session.rows),
+        "training_unique_count": session.spent["training"],
+        "neighborhood_unique_count": session.spent["validation"],
+        "reporting_unique_count": session.spent["reporting"],
+        "ledger_evaluation_count": session.ledger_evaluations,
+        "budget_stopped": session.budget_stopped,
+        "budget_reason": session.budget_reason,
+        "reporting_stopped": session.reporting_stopped,
+        "reporting_reason": session.reporting_reason,
+        "score_complete": False, "local_peak_verified": False,
+        "global_exhaustive": False, "coverage_status": "cancelled",
+        "return_basis": "peak_principal", "ranking_baseline": "matched_funding_hold",
+        "risk_basis": "principal_profit_drawdown",
+        "statistics_applicability": {
+            "status": "not_applicable",
+            "reason": "本版本未提供峰值本金超额收益的显著性检验",
+        },
+    }
+    if prior_plan is not None:
+        diagnostics["research_prior"] = deepcopy(prior_plan.diagnostics)
     return {
         "status": "cancelled", "recommendation_status": "no_qualified",
         "params": params, "recommended_params": None,
@@ -1059,32 +1508,7 @@ def _cancelled_selection(
         "candidates": [], "candidate_archive": public_rows,
         "search_candidate_archive": public_rows, "trial_archive": public_rows,
         "recommendation_regions": [],
-        "diagnostics": {
-            "status": "cancelled", "protocol_version": 5,
-            "strategy_id": "geometric_robust_j", "strategy_version": 5,
-            "training_window": window.diagnostic(),
-            "training_start": window.start.date().isoformat() if window.start is not None else None,
-            "training_end": window.end.date().isoformat() if window.end is not None else None,
-            "selection_history_days": window.days,
-            "training_only": True, "internal_validation_folds": 0,
-            "candidate_count": len(session.rows),
-            "training_unique_count": session.spent["training"],
-            "neighborhood_unique_count": session.spent["validation"],
-            "reporting_unique_count": session.spent["reporting"],
-            "ledger_evaluation_count": session.ledger_evaluations,
-            "budget_stopped": session.budget_stopped,
-            "budget_reason": session.budget_reason,
-            "reporting_stopped": session.reporting_stopped,
-            "reporting_reason": session.reporting_reason,
-            "score_complete": False, "local_peak_verified": False,
-            "global_exhaustive": False, "coverage_status": "cancelled",
-            "return_basis": "peak_principal", "ranking_baseline": "matched_funding_hold",
-            "risk_basis": "principal_profit_drawdown",
-            "statistics_applicability": {
-                "status": "not_applicable",
-                "reason": "本版本未提供峰值本金超额收益的显著性检验",
-            },
-        },
+        "diagnostics": diagnostics,
     }
 
 
@@ -1109,6 +1533,10 @@ def estimate_robust_search(
         mode=str(strategy.training_window_mode),
     )
     window = policy.window(data, asof)
+    prior_plan = (
+        _build_research_prior(normalized, space, data, window.end)
+        if normalized.prior_policy == "daily_state_v1" else None
+    )
     total = space.size()
     method = _method(normalized, total, space)
     edge = int(strategy.hypercube_edge)
@@ -1184,7 +1612,7 @@ def estimate_robust_search(
         )
     else:
         status = "ready"
-    return {
+    preview = {
         "status": status, "protocol_version": 5, "strategy_id": "geometric_robust_j",
         "strategy_version": 5, "geometry": "robust_j", "grid_mode": "geometric",
         "protocol": config.protocol_description(),
@@ -1212,3 +1640,6 @@ def estimate_robust_search(
         "effective_bounds": {name: {"low": space.value(name, dim.low), "high": space.value(name, dim.high), "low_ticks": dim.low, "high_ticks": dim.high, "fixed": dim.fixed} for name, dim in space.dimensions.items() if name in ROBUST_FIELDS},
         "slippage_mode": strategy.slippage_mode, "reasons": list(dict.fromkeys(reasons)),
     }
+    if prior_plan is not None:
+        preview["research_prior"] = deepcopy(prior_plan.diagnostics)
+    return preview

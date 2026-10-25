@@ -25,6 +25,7 @@ from . import rules
 from . import price_basis
 from .models import DataBundle
 from .etf_models import MIN_COMPLETE_DAY_RATIO
+from .market_state import METRIC_KEYS as MARKET_STATE_METRIC_KEYS, daily_market_state
 
 
 ANNUAL_TRADING_DAYS = 252.0
@@ -1367,6 +1368,7 @@ def _empty_grid_basis(
 def _empty_result(
     status: str, *, reason: str = "", diagnostics: dict[str, Any] | None = None,
     price_tick: float | None = None, current_raw: float | None = None,
+    market_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     metrics = {key: None for key in METRIC_KEYS}
     details = {
@@ -1376,10 +1378,32 @@ def _empty_result(
     return {
         "status": status, "metrics": metrics, "metric_details": details,
         "grid_basis": _empty_grid_basis(price_tick, current_raw),
+        "market_state": market_state or _empty_market_state(reason),
         "actions_applied": [], "eligible": False,
         "filter_reasons": [] if status == "completed" else [f"status_{status}"],
         "warnings": [reason] if reason else [], "diagnostics": diagnostics or {},
     }
+
+
+def _empty_market_state(reason: str = "市场状态未计算") -> dict[str, Any]:
+    return {
+        "method_version": "daily_state_v1", "as_of": None,
+        "status": "unavailable",
+        "metrics": {key: None for key in MARKET_STATE_METRIC_KEYS},
+        "metric_details": {},
+        "samples": {}, "warmup": {},
+        "price_basis": {"error": reason}, "input_fingerprint": None,
+        "message": reason,
+    }
+
+
+def _market_state_diagnostic(data: DataBundle, as_of: Any) -> dict[str, Any]:
+    try:
+        return daily_market_state(data, as_of)
+    except Exception as exc:
+        return _empty_market_state(
+            f"日线市场状态计算失败：{type(exc).__name__}: {exc}",
+        )
 
 
 def _safe_action(item: Mapping[str, Any]) -> dict[str, Any]:
@@ -1457,6 +1481,7 @@ def compute_etf_statistics(
     All returned numbers are finite JSON-safe values or ``None``. The
     corresponding ``metric_details`` entry explains every null result.
     """
+    market_state = _market_state_diagnostic(data, as_of)
     try:
         stamp = _timestamp(as_of)
         if not isinstance(window_days, (int, np.integer)) or isinstance(window_days, bool):
@@ -1745,6 +1770,7 @@ def compute_etf_statistics(
         return {
             "status": status, "metrics": metrics, "metric_details": details,
             "grid_basis": grid_basis,
+            "market_state": market_state,
             "actions_applied": [_safe_action(item) for item in context.factors],
             "eligible": bool(eligible), "filter_reasons": filter_reasons,
             "warnings": list(dict.fromkeys(context.warnings)), "diagnostics": diagnostics,
@@ -1754,7 +1780,9 @@ def compute_etf_statistics(
             tick = _price_tick(data)
         except Exception:
             tick = None
-        return _empty_result(exc.status, reason=exc.message, price_tick=tick)
+        return _empty_result(
+            exc.status, reason=exc.message, price_tick=tick, market_state=market_state,
+        )
     except Exception as exc:
         try:
             tick = _price_tick(data)
@@ -1762,7 +1790,7 @@ def compute_etf_statistics(
             tick = None
         return _empty_result(
             "unavailable", reason=f"ETF统计计算失败：{type(exc).__name__}: {exc}",
-            price_tick=tick,
+            price_tick=tick, market_state=market_state,
         )
 
 

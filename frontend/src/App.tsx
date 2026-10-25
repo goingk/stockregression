@@ -5,6 +5,8 @@ import { get, post } from './api'
 import { Button, defaultConfig, Loading } from './components'
 import { TaskButton, TaskProvider } from './TaskCenter'
 import { WorkbenchProvider, useWorkspaces } from './WorkbenchState'
+import { ResearchDraftProvider, useResearchDraft } from './ResearchDraftContext'
+import type { ResearchDraftBundle } from './researchDraft'
 import { etfResearchResultId, isEtfResearchJob, isResearchJob } from './taskState'
 import {
   navigationFromHistory, navigationFromUrl, navigationHistoryState, navigationUrl,
@@ -56,11 +58,12 @@ class PageErrorBoundary extends Component<{ children: ReactNode }, { failed: boo
 }
 
 export default function App() {
-  return <WorkbenchProvider><AppWindow /></WorkbenchProvider>
+  return <WorkbenchProvider><ResearchDraftProvider><AppWindow /></ResearchDraftProvider></WorkbenchProvider>
 }
 
 function AppWindow() {
   const workspace = useWorkspaces()
+  const researchDraft = useResearchDraft()
   const [navigation, setNavigation] = useState<NavigationState>(() => navigationFromUrl(
     typeof window === 'undefined' ? '' : window.location.search,
   ))
@@ -122,6 +125,7 @@ function AppWindow() {
     commitNavigation(previous => ({ ...previous, page: origin, report: null }))
   }, [commitNavigation, dataPreparation?.origin])
   const researchFromConfig = (config: BacktestConfig) => {
+    researchDraft.clearSource()
     workspace.transfer('research', config)
     setTransferNotice({ page: 'research', message: '已复制回测配置；可调整本页的评估区间与搜索设置后启动研究。' })
     go('research')
@@ -130,6 +134,12 @@ function AppWindow() {
     workspace.transfer('backtest', config)
     setTransferNotice({ page: 'backtest', message: message ?? `研究参数已载入回测。${config.selection_asof ? '选参截止日：' + config.selection_asof + '。' : ''}预览将自动更新。` })
     go('backtest')
+  }
+  const researchFromEtfSource = (draft: ResearchDraftBundle) => {
+    workspace.loadResearchDraft(draft.config, draft.settings)
+    researchDraft.replace(draft.context)
+    setTransferNotice({ page: 'research', message: '已从 ETF 结果建立参数研究草稿；来源、日期与执行参数已带入，搜索范围与预算沿用研究工作区设置。' })
+    commitNavigation(previous => ({ ...previous, page: 'research', research: null, researchDecision: null }))
   }
   const unsupportedRestartMessage = '当前后台仍是旧版本，无法通过网页重启。请关闭当前服务后重新运行 start.cmd；新版服务启动后，这个按钮即可直接重启项目。'
   const openRestartDialog = async () => {
@@ -210,9 +220,9 @@ function AppWindow() {
           <Suspense fallback={<div className="route-loading">载入工作区…</div>}>
             {page === 'data' && <DataCenterPage requestedReport={navigation.report} onReportHandled={clearRequestedReport} onOpenDataManagement={() => go('data-admin')} />}
             {page === 'data-admin' && <DataManagementPage requestedReport={navigation.report} onReportHandled={clearRequestedReport} preparation={dataPreparation} onPreparationJob={(jobId) => setDataPreparation(current => current ? { ...current, preparationJobId: jobId } : current)} onReturn={dataPreparation ? finishDataPreparation : undefined} />}
-            {page === 'etf' && <EtfResearchPage requestedResult={navigation.etfResult} onSelectedResultChange={(result) => commitNavigation(previous => ({ ...previous, etfResult: result }), { replace: true, scroll: false })} onLoadBacktest={backtestFromResearch} />}
+            {page === 'etf' && <EtfResearchPage requestedResult={navigation.etfResult} onSelectedResultChange={(result) => commitNavigation(previous => ({ ...previous, etfResult: result }), { replace: true, scroll: false })} onLoadBacktest={backtestFromResearch} onResearchSource={researchFromEtfSource} onOpenResearchResource={(resource) => commitNavigation(previous => ({ ...previous, page: 'research', research: resource, researchDecision: null }))} />}
             {page === 'backtest' && <BacktestPage onResearch={researchFromConfig} onPrepareData={(request) => prepareData(request, 'backtest')} />}
-            {page === 'research' && (workspace.research && workspace.researchSettings ? <ResearchPage base={workspace.research} settings={workspace.researchSettings} onBaseChange={workspace.updateResearch} onSettingsChange={workspace.updateResearchSettings} onLoadConfig={backtestFromResearch} requestedResource={navigation.research} onSelectedResourceChange={(resource) => commitNavigation(previous => ({ ...previous, research: resource }), { replace: true, scroll: false })} completionDecision={navigation.researchDecision} onCompletionDecisionChange={(decision) => commitNavigation(previous => ({ ...previous, researchDecision: decision }), { replace: true, scroll: false })} onFeeDefaultsEdit={workspace.rememberFees} onDefaultsEdit={workspace.rememberStrategy} onRestore={() => workspace.restore('research')} onPrepareData={(request) => prepareData(request, 'research')} /> : <Loading label="读取本机研究设置…" />)}
+            {page === 'research' && (workspace.research && workspace.researchSettings ? <ResearchPage base={workspace.research} settings={workspace.researchSettings} onBaseChange={workspace.updateResearch} onSettingsChange={workspace.updateResearchSettings} onLoadConfig={backtestFromResearch} requestedResource={navigation.research} onSelectedResourceChange={(resource) => commitNavigation(previous => ({ ...previous, research: resource }), { replace: true, scroll: false })} completionDecision={navigation.researchDecision} onCompletionDecisionChange={(decision) => commitNavigation(previous => ({ ...previous, researchDecision: decision }), { replace: true, scroll: false })} onFeeDefaultsEdit={workspace.rememberFees} onDefaultsEdit={workspace.rememberStrategy} onRestore={() => { workspace.restore('research'); researchDraft.clearSource() }} onOpenEtfSource={(resultId) => commitNavigation(previous => ({ ...previous, page: 'etf', etfResult: resultId }))} onPrepareData={(request) => prepareData(request, 'research')} /> : <Loading label="读取本机研究设置…" />)}
             {page === 'results' && <ResultsPage selectedResultId={navigation.result} selectedCompareId={navigation.compare} view={navigation.resultView} onSelectionChange={(result, compare) => commitNavigation(previous => ({ ...previous, result, compare }), { replace: true, scroll: false })} onViewChange={(resultView) => commitNavigation(previous => ({ ...previous, resultView }), { replace: true, scroll: false })} />}
           </Suspense>
         </PageErrorBoundary>

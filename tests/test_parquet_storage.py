@@ -174,7 +174,11 @@ def test_native_bundle_keeps_prior_close_for_share_accounting(tmp_path):
     calendar = tmp_path / "calendar.csv"
     pd.DataFrame({"date": days}).to_csv(calendar, index=False)
     path = tmp_path / "600000_daily.csv"
-    _daily(days).to_csv(path, index=False)
+    daily = _daily(days)
+    # This fixture has no corporate actions: each subsequent preclose must
+    # equal the preceding close, otherwise settlement correctly rejects it.
+    daily["preclose"] = daily["close"].shift().fillna(daily["preclose"])
+    daily.to_csv(path, index=False)
     service.import_file("600000.SH", "1day", path, calendar_path=calendar)
 
     manifest = service.store.snapshot("600000.SH")

@@ -13,6 +13,7 @@ from typing import Any, Callable
 import pandas as pd
 
 from .models import BacktestConfig, DataBundle, OptimizationConfig
+from .research_origin import prior_contract_hash
 from .research.robust import EvaluationBudget, estimate_robust_search, select_robust_at
 
 Progress = Callable[[float, str], None]
@@ -94,6 +95,7 @@ def _empty(config: OptimizationConfig, eval_start: pd.Timestamp, reason: str) ->
         "status": "insufficient_history",
         "protocol_version": 5,
         "result_schema_version": 2,
+        "research_origin": deepcopy(config.research_origin),
         "config": config.model_dump(mode="json"),
         "protocol": _protocol(config),
         "fixed": {"status": "insufficient_history", "test_result": None},
@@ -121,6 +123,12 @@ def optimize_v5(
         raise ValueError("新版研究需要 protocol_version=5 和 strategy_version=5")
     if config.base.schema_version != 3:
         raise ValueError("新版研究需要 schema_version=3 的股数配置")
+    if config.requested_data_version and config.requested_data_version != data.version:
+        raise ValueError("请求的行情数据版本与执行版本不一致，请重新提交研究")
+    contract = budget_contract if isinstance(budget_contract, dict) else None
+    frozen_prior_hash = (contract or {}).get("prior_policy_hash")
+    if frozen_prior_hash is not None and frozen_prior_hash != prior_contract_hash(config):
+        raise ValueError("提交时冻结的先验来源合同与执行配置不一致，请重新提交研究")
     dates = _calendar(data)
     start = _date_key(config.base.start_date)
     end = _date_key(config.base.end_date) if config.base.end_date else (dates[-1] if len(dates) else start)
@@ -131,7 +139,6 @@ def optimize_v5(
         return result
     base = _base_with(config.base, start=eval_dates[0], end=eval_dates[-1])
     estimate = estimate_robust_search(config, data)
-    contract = budget_contract if isinstance(budget_contract, dict) else None
     task_limit = int(estimate.get("effective_total_evaluation_budget") or 1)
     task_runtime = int(config.strategy.max_runtime_seconds)
     if contract is not None:
@@ -268,6 +275,18 @@ def optimize_v5(
             "oos_metrics": _metrics_pair(adaptive_result),
             "reasons": [] if adaptive_result is not None else [task_budget.reason or "任务总预算已用尽"],
         }
+        prior_diagnostics = [
+            {
+                **deepcopy((decision.get("diagnostics") or {}).get("research_prior") or {}),
+                "effective_date": decision.get("effective_date"),
+                "decision_date": decision.get("decision_date"),
+            }
+            for decision in decisions
+            if isinstance(decision.get("diagnostics"), dict)
+            and isinstance(decision["diagnostics"].get("research_prior"), dict)
+        ]
+        if prior_diagnostics:
+            adaptive["diagnostics"] = {"research_prior": prior_diagnostics}
     else:
         adaptive = {"status": "not_requested", "schedule": [], "test_result": None}
 
@@ -332,23 +351,27 @@ def optimize_v5(
     score_complete = bool(selection_diagnostics) and all(
         item.get("score_complete") is True for item in selection_diagnostics
     )
+    current_decision = {
+        "decision_date": current.get("as_of"), "status": current.get("status"),
+        "selected_params": current_recommended, "diagnostic_params": current.get("params"),
+        "score": current.get("score"), "candidate_count": current.get("diagnostics", {}).get("candidate_count", 0),
+        "eligible_count": current.get("diagnostics", {}).get("eligible_center_count", 0),
+        "selected_eligible": current.get("eligible", False), "reasons": current.get("reasons", []),
+        "recommendation_regions": current.get("recommendation_regions", []),
+    }
+    if isinstance(current.get("diagnostics"), dict) and current["diagnostics"].get("research_prior"):
+        current_decision["diagnostics"] = deepcopy(current["diagnostics"])
     result = {
         "status": status, "protocol_version": 5, "result_schema_version": 2,
         "symbol": config.base.symbol, "data_version": data.version,
+        "research_origin": deepcopy(config.research_origin),
         "config": config.model_dump(mode="json"), "protocol": _protocol(config),
         "data_issue": data_issue_reasons[0] if data_issue_reasons else None,
         "fixed": fixed, "adaptive": adaptive,
         "evidence": {
             "candidate_archives": archives, "trial_archives": trials,
             "search_candidate_archives": search_archives, "decisions": decisions,
-            "current_decision": {
-                "decision_date": current.get("as_of"), "status": current.get("status"),
-                "selected_params": current_recommended, "diagnostic_params": current.get("params"),
-                "score": current.get("score"), "candidate_count": current.get("diagnostics", {}).get("candidate_count", 0),
-                "eligible_count": current.get("diagnostics", {}).get("eligible_center_count", 0),
-                "selected_eligible": current.get("eligible", False), "reasons": current.get("reasons", []),
-                "recommendation_regions": current.get("recommendation_regions", []),
-            },
+            "current_decision": current_decision,
         },
         "outer_validation": {
             "status": "not_applicable", "reason": "本版本未提供显著性检验；以下为真实连续样本外账本",

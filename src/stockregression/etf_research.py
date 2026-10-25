@@ -623,6 +623,7 @@ def run_etf_research(
     result["rows"] = [{
         **item, "data_status": item["status"], "status": "pending" if item["status"] in {"ready", "limited"} else item["status"],
         "metrics": {}, "metric_details": {}, "grid_basis": {}, "diagnostics": {},
+        "market_state": None,
         "eligible": False, "filter_reasons": [], "gss_score": None,
         "rank": None, "score_cohort_size": 0, "score_contributions": {},
         "validation": {

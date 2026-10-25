@@ -153,6 +153,10 @@ def _assert_metric_contract(result: dict) -> None:
         "reference_price", "lower_price", "upper_price", "current_raw_price",
         "atr30_pct", "svr", "realized_skewness", "realized_kurtosis", "price_tick",
     } == set(result["grid_basis"])
+    assert result["market_state"]["method_version"] == "daily_state_v1"
+    assert set(result["market_state"]["metrics"]) == {
+        "natr14", "hv_ratio", "adx14", "plus_di14", "minus_di14", "amplitude_q75",
+    }
 
 
 def _use_complete_days(data, excluded):
@@ -336,6 +340,22 @@ def test_sampling_below_90_percent_is_not_accepted_by_statistics():
     data = _synthetic_bundle()
     _use_complete_days(data, data.calendar[-14:-1])
     assert compute_etf_statistics(data, data.calendar[-1], 120)["status"] == "data_not_ready"
+
+
+def test_market_state_diagnostic_unavailable_does_not_block_existing_statistics(monkeypatch):
+    data = _synthetic_bundle()
+    baseline = compute_etf_statistics(data, data.calendar[-1], 120)
+    unavailable = {
+        "method_version": "daily_state_v1", "as_of": data.calendar[-1].date().isoformat(),
+        "status": "insufficient_history",
+        "metrics": dict.fromkeys(statistics.MARKET_STATE_METRIC_KEYS), "metric_details": {},
+    }
+    monkeypatch.setattr(statistics, "daily_market_state", lambda *_args, **_kwargs: unavailable)
+    result = compute_etf_statistics(data, data.calendar[-1], 120)
+    assert result["status"] == baseline["status"] == "completed"
+    assert result["metrics"] == baseline["metrics"]
+    assert result["grid_basis"] == baseline["grid_basis"]
+    assert result["market_state"] == unavailable
 
 
 def test_incomparable_sampling_is_excluded_from_cross_section_scores():
