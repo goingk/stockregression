@@ -52,7 +52,7 @@ export default function EquityCurve({ result, height, stretch = false }: { resul
     legend: { top: 2, right: 4 },
     grid: { left: 57, right: 20, top: 42, bottom: 34 },
     xAxis: { type: 'time', axisLabel: { hideOverlap: true, color: '#64748b', fontSize: 11 } },
-    yAxis: { type: 'value', scale: false, name: '峰值本金收益率', axisLabel: { color: '#64748b', fontSize: 11, formatter: (value: number) => `${(value * 100).toFixed(0)}%` }, splitLine: { lineStyle: { color: '#e2e8f0', type: 'dashed' } } },
+    yAxis: { type: 'value', scale: false, name: '当前峰值本金收益率', axisLabel: { color: '#64748b', fontSize: 11, formatter: (value: number) => `${(value * 100).toFixed(0)}%` }, splitLine: { lineStyle: { color: '#e2e8f0', type: 'dashed' } } },
     dataZoom: [{ type: 'inside' }],
     series: curves.filter((curve) => result.strategies[curve.key]).map((curve) => {
       const strategy = result.strategies[curve.key]

@@ -157,11 +157,13 @@ def test_dca_initial_holdings_and_external_contributions_share_one_return_basis(
     for name in full["strategies"]:
         assert full["strategies"][name]["equity"] == preview["strategies"][name]["equity"]
     assert full["accounting_basis"] == "independent_contributions_v1"
-    dca_principal = dca["metrics"]["total_invested"]
+    running_dca_principal = 0.0
     for point in dca["equity"]:
+        running_dca_principal = max(running_dca_principal, point["total_invested"])
         assert point["principal_curve"] == pytest.approx(
-            1 + (point["equity"] - point["total_invested"]) / dca_principal
+            1 + (point["equity"] - point["total_invested"]) / running_dca_principal
         )
+    assert running_dca_principal == pytest.approx(dca["metrics"]["total_invested"])
     for name in ("grid", "buy_hold"):
         for point in full["strategies"][name]["equity"]:
             assert point["principal_curve"] == pytest.approx(
@@ -296,9 +298,8 @@ def test_initial_holding_receives_first_day_dividend_without_nav_jump():
     first_dca_trade = result["strategies"]["dca"]["trades"][0]
     first_invested = 2000 + first_dca_trade["quantity"] * first_dca_trade["price"] + first_dca_trade["fees"]
     assert result["strategies"]["dca"]["equity"][0]["total_invested"] == pytest.approx(first_invested)
-    dca_principal = result["strategies"]["dca"]["metrics"]["total_invested"]
     assert result["strategies"]["dca"]["equity"][0]["principal_curve"] == pytest.approx(
-        1 + (2940 - first_invested) / dca_principal
+        1 + (2940 - first_invested) / first_invested
     )
     assert result["strategies"]["dca"]["equity"][0]["cash"] == 0
     assert result["strategies"]["dca"]["equity"][1]["cash"] == 120
@@ -307,6 +308,38 @@ def test_initial_holding_receives_first_day_dividend_without_nav_jump():
     assert hold["metrics"]["initial_equity"] == 10000
     assert hold["equity"][0]["equity"] == pytest.approx(10000)
     assert hold["equity"][1]["cash"] == 600
+
+
+def test_fixed_grid_does_not_whipsaw_around_the_same_grid_line(monkeypatch):
+    config, bundle = fixture("512880.SH", days=6)
+    opens = np.array([1.031, 1.031, 1.081, 1.066, 1.068, 1.043, 1.084])
+    closes = np.array([1.031, 1.081, 1.066, 1.068, 1.043, 1.084, 1.084])
+    for name, values in (
+        ("open", opens), ("close", closes),
+        ("high", np.maximum(opens, closes) + .001),
+        ("low", np.minimum(opens, closes) - .001),
+        ("preclose", np.r_[closes[0], closes[:-1]]),
+        ("turnover", closes * 100000),
+    ):
+        bundle.daily[name] = values
+    bundle.bars = bundle.daily.iloc[1:].copy()
+    bundle.bars["timestamp"] = bundle.bars.date + pd.Timedelta(hours=15)
+    bundle.bars["frequency"], bundle.bars["tradable"], bundle.bars["is_synthetic"] = "1d", True, False
+    config = config.model_copy(update={
+        "schema_version": 3, "initial_shares": 20_000, "min_shares": 0,
+        "max_shares": None, "buy_shares": 2_500, "sell_shares": 2_500,
+        "grid_mode": "geometric", "buy_step": .035, "sell_step": .035,
+        "reference_price_mode": "manual", "reference_price": 1.031,
+    })
+
+    trades = engine.run_backtest(config, bundle)["strategies"]["grid"]["trades"]
+    monkeypatch.setattr(engine, "_NUMBA_FASTPATH_ENABLED", False)
+    assert engine.run_backtest(config, bundle)["strategies"]["grid"]["trades"] == trades
+    assert [(trade["side"], trade["price"]) for trade in trades] == [
+        ("sell", 1.081), ("buy", 1.043), ("sell", 1.084),
+    ]
+    assert trades[1]["price"] <= trades[0]["price"] * (1 - .035)
+    assert trades[2]["price"] >= trades[1]["price"] * (1 + .035)
 
 
 @pytest.mark.parametrize("bonus_ratio,expected_position,price_factor", [(1.0, 200, .5), (-.5, 50, 2.0)])

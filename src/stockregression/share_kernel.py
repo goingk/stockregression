@@ -68,7 +68,7 @@ def _nb_close_floor(active, anchor, high, sell_step, grids, count, squares):
 def _nb_grid_intent(close, position, reference, anchor, active_cell,
                     grid_mode, buy_step, sell_step, grid_step,
                     lower_price, upper_price, min_shares, max_shares,
-                    buy_shares, sell_shares, board_code):
+                    buy_shares, sell_shares, last_fill_price, board_code):
     """A close-only signal; never reads the next opening price or volume."""
     side, requested = 0, 0
     if grid_mode == 0:
@@ -84,6 +84,20 @@ def _nb_grid_intent(close, position, reference, anchor, active_cell,
             side, requested = 2, sell_shares
     if (side == 1 and lower_price > 0 and close < lower_price) or (side == 2 and upper_price > 0 and close > upper_price):
         side = 0
+    if side != 0 and grid_mode != 0 and last_fill_price > 0:
+        step = buy_step if side == 1 else sell_step
+        if grid_mode == 1:
+            width = max(anchor * step, 0.001)
+            if side == 1:
+                spacing_ok = close <= last_fill_price - width + 1e-10
+            else:
+                spacing_ok = close >= last_fill_price + width - 1e-10
+        elif side == 1:
+            spacing_ok = step < 1.0 and close <= last_fill_price * (1.0 - step) + 1e-10
+        else:
+            spacing_ok = close >= last_fill_price * (1.0 + step) - 1e-10
+        if not spacing_ok:
+            side = 0
     quantity = requested
     if side == 1:
         if math.isfinite(max_shares):
@@ -489,7 +503,7 @@ def simulate(
                         intent = _nb_grid_intent(prior_close, shares[0] + share_receivable[0],
                             reference[0], fixed_anchor[0], active_cell[0], grid_mode,
                             buy_step, sell_step, grid_step, lower_price, upper_price,
-                            min_shares, max_shares, buy_shares, sell_shares, board_code)
+                            min_shares, max_shares, buy_shares, sell_shares, last_grid_price, board_code)
                         if intent[0] != 0 and intent[1] > 0:
                             pending_side[0], pending_quantity[0], pending_reason[0] = intent[0], intent[1], intent[2]
                 parameter_index += 1
@@ -901,6 +915,20 @@ def simulate(
                 intent_side = 0
             if intent_side == 2 and upper_price > 0 and close > upper_price:
                 intent_side = 0
+            if intent_side != 0 and last_grid_price > 0:
+                step = buy_step if intent_side == 1 else sell_step
+                if grid_mode == 1:
+                    width = max(anchor * step, 0.001)
+                    if intent_side == 1:
+                        spacing_ok = close <= last_grid_price - width + 1e-10
+                    else:
+                        spacing_ok = close >= last_grid_price + width - 1e-10
+                elif intent_side == 1:
+                    spacing_ok = step < 1.0 and close <= last_grid_price * (1.0 - step) + 1e-10
+                else:
+                    spacing_ok = close >= last_grid_price * (1.0 + step) - 1e-10
+                if not spacing_ok:
+                    intent_side = 0
             if intent_side != 0:
                 if intent_side == 2 and position_close < intent_quantity:
                     if not stockout_signal_active:

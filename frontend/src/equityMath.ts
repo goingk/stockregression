@@ -3,7 +3,7 @@ export interface EquityMathPoint {
   equity: number
   normalized_equity?: number | null
   total_invested?: number | null
-  /** v5 peak-principal accounting: 1 + cumulative profit / peak principal. */
+  /** v5 peak-principal accounting: 1 + cumulative profit / current peak principal. */
   principal_curve?: number | null
   /** v5 peak-principal accounting: drawdown of the principal profit curve. */
   principal_drawdown?: number | null
@@ -28,13 +28,27 @@ export function assetInvestmentRatio(
   result: EquityMathResult,
   requireInvestmentData = false,
 ): number | null {
-  // v5 states the peak-principal ratio directly; only older results need the derived fallbacks.
-  if (typeof point.principal_curve === 'number' && Number.isFinite(point.principal_curve)) {
-    return point.principal_curve
-  }
   const invested = typeof point.total_invested === 'number' && Number.isFinite(point.total_invested)
     ? point.total_invested
     : null
+
+  // A peak-principal series is measured against the capital contributed by
+  // that point.  Derive it here as well so saved v5 results that used the old
+  // whole-period maximum display the corrected curve without a rerun.
+  if (strategy.return_basis === 'peak_principal' && invested != null) {
+    if (invested <= 0) return null
+    if (!Number.isFinite(point.equity)) return null
+    // External principal is cumulative and never withdrawn, so the value at
+    // this point is also the high-water mark reached by this point.
+    const ratio = 1 + (point.equity - invested) / invested
+    return Number.isFinite(ratio) ? ratio : null
+  }
+
+  // Other accounting bases state the normalized ratio directly.
+  if (typeof point.principal_curve === 'number' && Number.isFinite(point.principal_curve)) {
+    return point.principal_curve
+  }
+
   if (invested != null && invested <= 0) return null
 
   if (typeof point.normalized_equity === 'number' && Number.isFinite(point.normalized_equity)) {

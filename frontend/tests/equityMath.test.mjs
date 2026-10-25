@@ -34,6 +34,16 @@ test('the peak-principal curve wins over the legacy invested-capital fallback', 
   assert.equal(assetInvestmentRatio({ timestamp: '2024-01-02', equity: 0, total_invested: 0, principal_curve: 0.9 }, costStrategy, result), 0.9)
 })
 
+test('peak-principal returns use the capital reached by that point', () => {
+  const peakStrategy = { return_basis: 'peak_principal' }
+  const early = peakPoint('2024-01-01', 1.001, { equity: 110, total_invested: 100 })
+  const later = peakPoint('2024-01-02', 1.001, { equity: 1110, total_invested: 1100 })
+
+  // A later contribution must not dilute the return already earned.
+  assert.ok(Math.abs(assetInvestmentReturn(early, peakStrategy, result) - 0.1) < 1e-12)
+  assert.ok(Math.abs(assetInvestmentReturn(later, peakStrategy, result) - (1110 / 1100 - 1)) < 1e-12)
+})
+
 test('a missing peak-principal curve falls back to the legacy fields', () => {
   assert.equal(assetInvestmentRatio(point('2024-01-01', 1.1, 100, 110), costStrategy, result), 1.1)
   assert.equal(assetInvestmentRatio({ timestamp: '2024-01-01', equity: 110, total_invested: 100 }, costStrategy, result), 1.1)

@@ -377,7 +377,7 @@ export default function ResultsPage({ selectedResultId, selectedCompareId, view,
         <Card title='本次网格参数' className='result-parameters' subtitle='来自此结果保存的配置与资金口径'>
           <dl className='result-parameter-list'>{parameters.map((parameter) => <div className='result-parameter' key={parameter.key}><dt>{parameter.label}</dt><dd>{parameter.value}</dd>{parameter.note && <small className='result-parameter-note'>{parameter.note}</small>}</div>)}</dl>
         </Card>
-        <Card title='收益、回撤与网格持仓' className='results-curves-card' subtitle={(peakPrincipalBasis ? '收益率 = (资产总值 − 累计投入) ÷ 峰值本金 · 回撤 = 本金利润曲线回撤 · ' : result.accounting_basis ? '收益率 = 资产总值 ÷ 累计实际投入 − 1 · ' : '收益率 = 资产总值 ÷ 初始资产 − 1 · ') + curvePeriod + ' · 三图共享日期、缩放和悬浮值'} action={<Badge tone={result.accounting_basis ? 'blue' : 'amber'}>{peakPrincipalBasis ? '峰值本金' : result.accounting_basis ? '独立投入' : '历史口径'}</Badge>}>
+          <Card title='收益、回撤与网格持仓' className='results-curves-card' subtitle={(peakPrincipalBasis ? '收益率 = (资产总值 − 累计投入) ÷ 当前峰值本金 · 回撤 = 本金利润曲线回撤 · ' : result.accounting_basis ? '收益率 = 资产总值 ÷ 累计实际投入 − 1 · ' : '收益率 = 资产总值 ÷ 初始资产 − 1 · ') + curvePeriod + ' · 三图共享日期、缩放和悬浮值'} action={<Badge tone={result.accounting_basis ? 'blue' : 'amber'}>{peakPrincipalBasis ? '峰值本金' : result.accounting_basis ? '独立投入' : '历史口径'}</Badge>}>
           <ResultsCurves result={result} />
         </Card>
       </>}

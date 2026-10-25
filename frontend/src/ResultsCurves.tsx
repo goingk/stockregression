@@ -56,7 +56,7 @@ export default function ResultsCurves({ result }: { result: BacktestResult }) {
           const rows = model.strategies.map((strategy) => {
             const values = row.values[strategy.key]
             const marker = `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${strategy.color};margin-right:5px"></span>`
-            return `${marker}${escapeHtml(strategy.name)}　峰值本金收益 ${percent(values?.returnRate)}　回撤 ${percent(values?.drawdown)}<br/><span style="padding-left:13px;color:#94a3b8">资产 ${money(values?.asset)} 元　累计投入 ${money(values?.invested)} 元</span>`
+            return `${marker}${escapeHtml(strategy.name)}　当前峰值本金收益 ${percent(values?.returnRate)}　回撤 ${percent(values?.drawdown)}<br/><span style="padding-left:13px;color:#94a3b8">资产 ${money(values?.asset)} 元　累计投入 ${money(values?.invested)} 元</span>`
           })
           const position = model.positionMode === 'ratio' ? percent(row.position) : row.position == null ? '—' : `${money(row.position, 0)} ${model.shareUnit}`
           return [`<strong>${date}</strong>`, ...rows, `网格${model.positionMode === 'ratio' ? '仓位' : '持有'}　${position}`].join('<br/>')
@@ -69,7 +69,7 @@ export default function ResultsCurves({ result }: { result: BacktestResult }) {
         splitLine: { show: false }, axisPointer: { show: true, snap: true, label: { show: gridIndex === 2 } },
       })),
       yAxis: [
-        { name: '峰值本金收益率', gridIndex: 0, axisLabel: { formatter: (value: number) => `${(value * 100).toFixed(0)}%` } },
+        { name: '当前峰值本金收益率', gridIndex: 0, axisLabel: { formatter: (value: number) => `${(value * 100).toFixed(0)}%` } },
         { name: '回撤', gridIndex: 1, axisLabel: { formatter: (value: number) => `${(value * 100).toFixed(0)}%` } },
         { name: model.positionMode === 'ratio' ? '网格仓位' : `网格持有（${model.shareUnit}）`, gridIndex: 2, axisLabel: { formatter: (value: number) => model.positionMode === 'ratio' ? `${(value * 100).toFixed(0)}%` : value.toLocaleString('zh-CN') } },
       ].map((axis) => ({ ...axis, type: 'value' as const, nameGap: 12, nameLocation: 'end' as const, nameTextStyle: { align: 'left' as const, fontSize: 11 }, axisLabel: { ...axis.axisLabel, fontSize: 10, color: '#64748b' }, splitLine: { lineStyle: { color: '#e2e8f0', type: 'dashed' } } })),

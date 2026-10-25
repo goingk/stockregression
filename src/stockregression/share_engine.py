@@ -407,22 +407,27 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
             })
         equity = []
         if not summary_only:
-            principal_denominator = {
+            drawdown_denominator = {
                 0: peak_invested,
                 1: float(metrics[1, 10]),
                 2: initial_equities[2],
                 3: float(funding_stats[0, 23]),
             }[account]
+            current_peak_principal = 0.0
             for i in indices:
                 invested_at_point = float(invested[account, i])
+                # Use the high-water mark reached by this point.  Funding
+                # that arrives later must not dilute the return already
+                # earned before it was contributed.
+                current_peak_principal = max(current_peak_principal, invested_at_point)
                 profit = float(eq[account, i]) - invested_at_point
-                principal_curve = 1.0 + profit / principal_denominator if principal_denominator > 0 else None
+                principal_curve = 1.0 + profit / current_peak_principal if current_peak_principal > 0 else None
                 equity.append({
                     "timestamp": points[i].isoformat(), "equity": float(eq[account, i]),
                     "cash": float(cash[account, i]), "position": float(shares[account, i]),
-                    "total_invested": invested_at_point, "peak_principal": principal_denominator,
+                    "total_invested": invested_at_point, "peak_principal": current_peak_principal,
                     "cumulative_profit": profit, "principal_curve": principal_curve,
-                    "principal_drawdown": float(drawdown[account, i]) if principal_denominator > 0 else None,
+                    "principal_drawdown": float(drawdown[account, i]) if drawdown_denominator > 0 else None,
                 })
         trades = [{"timestamp": openings[int(tb[j])], "side": "buy" if ts[j] == 1 else "sell", "quantity": int(tq[j]), "price": float(tp[j]), "fees": float(tf[j]), "cash": float(tc[j]), "shares": int(th[j]), "reason": engine._TRADE_REASONS[int(tr[j])], "external_topup": float(ttop[j]) if account == 0 else 0.0} for j in range(len(tb)) if ta[j] == account]
         rejections = [{"timestamp": pd.Timestamp(rt[j]).isoformat(), "side": "buy" if rs[j] == 1 else "sell", "reason": "parameter_update" if int(rr[j]) == 12 else engine._REJECTION_REASONS[int(rr[j])], "requested_quantity": int(rq[j])} for j in range(len(rb)) if ra[j] == account]

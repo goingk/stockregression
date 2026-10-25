@@ -8,6 +8,7 @@ import pytest
 import stockregression.engine as engine
 from stockregression.engine import open_timestamp, run_backtest
 from stockregression.models import BacktestConfig, DataBundle
+from stockregression.share_kernel import _nb_grid_intent
 
 
 SYMBOL = "600000.SH"
@@ -122,6 +123,36 @@ def test_fixed_grid_uses_independent_buy_and_sell_spacing():
     assert engine._cell(10.25, 10.0, narrow_sell) > 0
     for price in (8.1, 9.0, 9.95, 10.0, 10.25, 12.0):
         assert engine._nb_cell(price, 10.0, 2, config.buy_step, config.sell_step) == engine._cell(price, 10.0, config)
+
+
+def test_fixed_grid_requires_a_full_interval_between_fills():
+    config = _config(
+        "2024-01-02", grid_mode="geometric", reference_price=1.031,
+        buy_step=.035, sell_step=.035, max_position=1.0, min_position=0.0,
+    )
+    ledger = engine._Ledger(
+        name="grid", cash=10_000.0, shares=17_500, started=True,
+        reference=1.031, fixed_anchor=1.031, active_cell=1,
+        last_trade_price=1.081,
+    )
+    equity = ledger.cash + ledger.shares * 1.066
+    # Crossing back into the cell below 1.067 is not enough after selling at
+    # 1.081; the next buy needs a full 3.5% move from the fill.
+    assert engine._grid_intent(ledger, 1.066, equity, config) is None
+    assert engine._grid_intent(ledger, 1.042, equity, config).side == "buy"
+
+    ledger.active_cell, ledger.last_trade_price = 0, 1.066
+    equity = ledger.cash + ledger.shares * 1.068
+    assert engine._grid_intent(ledger, 1.068, equity, config) is None
+    assert engine._grid_intent(ledger, 1.104, equity, config).side == "sell"
+
+    common = (17_500, 1.031, 1.031, .035, .035, .03, 0.0, 0.0, 0, 1e12, 2_500, 2_500)
+    sold = (*common[:3], 1, 2, *common[3:])
+    bought = (*common[:3], 0, 2, *common[3:])
+    assert _nb_grid_intent(1.066, *sold, 1.081, 0)[0] == 0
+    assert _nb_grid_intent(1.042, *sold, 1.081, 0)[0] == 1
+    assert _nb_grid_intent(1.068, *bought, 1.066, 0)[0] == 0
+    assert _nb_grid_intent(1.104, *bought, 1.066, 0)[0] == 2
 
 
 def test_pending_order_is_cancelled_on_real_suspension_and_daily_fallback_is_one_bar():

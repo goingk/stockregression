@@ -373,11 +373,11 @@ export interface EquityPoint {
   cash?: number
   position?: number
   total_invested?: number
-  /** v5 peak-principal accounting: the principal denominator the ratio is measured against. */
+  /** v5 peak-principal accounting: the principal high-water mark reached by this point. */
   peak_principal?: number | null
   /** v5 peak-principal accounting: profit accumulated since the run started. */
   cumulative_profit?: number | null
-  /** v5 peak-principal accounting: 1 + cumulative profit / peak principal. */
+  /** v5 peak-principal accounting: 1 + cumulative profit / current peak principal. */
   principal_curve?: number | null
   /** v5 peak-principal accounting: drawdown of the principal profit curve. */
   principal_drawdown?: number | null

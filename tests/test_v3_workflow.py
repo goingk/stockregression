@@ -52,10 +52,15 @@ def test_top_up_accounting_uses_peak_net_contributions():
         (grid["equity"][-1]["equity"] - expected_peak) / expected_peak)
     assert metrics["return_basis"] == "peak_principal"
     assert metrics["risk_basis"] == "principal_profit_drawdown"
-    # The principal curve divides the running profit by the same peak principal.
+    # Each point is measured against the principal high-water mark reached by
+    # that point; later contributions must not dilute earlier returns.
+    running_peak = 0.0
     for point in grid["equity"]:
+        running_peak = max(running_peak, point["total_invested"])
+        assert point["peak_principal"] == pytest.approx(running_peak)
         assert point["principal_curve"] == pytest.approx(
-            (point["equity"] - point["total_invested"]) / expected_peak + 1)
+            (point["equity"] - point["total_invested"]) / running_peak + 1)
+    assert running_peak == pytest.approx(expected_peak)
     # Only buys fund the account; a sell never asks for outside money.
     assert all(trade["external_topup"] == 0 for trade in grid["trades"] if trade["side"] == "sell")
 
@@ -92,7 +97,11 @@ def test_zero_initial_principal_is_funded_by_external_contributions():
     assert funding["peak_invested"] == funding["topups"]
     assert grid["metrics"]["peak_principal_return"] == pytest.approx(
         (grid["equity"][-1]["equity"] - funding["topups"]) / funding["topups"])
-    assert grid["equity"][0]["principal_curve"] is not None
+    # Before the first external contribution there is no current principal,
+    # so the return is undefined instead of borrowing a future peak.
+    assert grid["equity"][0]["principal_curve"] is None
+    first_funded = next(point for point in grid["equity"] if point["total_invested"] > 0)
+    assert first_funded["principal_curve"] is not None
     # With no principal of its own, the account only trades what an external
     # contribution pays for: the first fill is funded to its traded value.
     first = grid["trades"][0]

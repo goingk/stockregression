@@ -1259,11 +1259,31 @@ def _grid_intent(ledger: _Ledger, close: float, equity: float, config: BacktestC
         ledger.active_cell = _cell(ledger.reference or close, anchor, config)
     lower_ok = config.lower_price is None or close >= config.lower_price
     upper_ok = config.upper_price is None or close <= config.upper_price
+    last_fill = ledger.last_trade_price or anchor
     if index < ledger.active_cell and lower_ok and _position_shares(ledger) * close < config.max_position * equity:
+        if not _fixed_grid_spacing_ok("buy", close, last_fill, anchor, config):
+            return None
         return _Order("buy", _quantity_from_config(config.buy_quantity, equity, close), None, "grid_buy")
     if index > ledger.active_cell and upper_ok and _position_shares(ledger) * close > config.min_position * equity:
+        if not _fixed_grid_spacing_ok("sell", close, last_fill, anchor, config):
+            return None
         return _Order("sell", _quantity_from_config(config.sell_quantity, equity, close), None, "grid_sell")
     return None
+
+
+def _fixed_grid_spacing_ok(
+    side: str, close: float, last_fill: float, anchor: float, config: BacktestConfig,
+) -> bool:
+    """Require a full fixed-grid interval between consecutive fills."""
+    if last_fill <= 0:
+        return True
+    step = config.buy_step if side == "buy" else config.sell_step
+    if config.grid_mode == "arithmetic":
+        width = max(anchor * step, 0.01)
+        return close <= last_fill - width + 1e-10 if side == "buy" else close >= last_fill + width - 1e-10
+    if side == "buy":
+        return step < 1.0 and close <= last_fill * (1 - step) + 1e-10
+    return close >= last_fill * (1 + step) - 1e-10
 
 
 def _update_reference_after_fill(ledger: _Ledger, price: float, config: BacktestConfig) -> None:
