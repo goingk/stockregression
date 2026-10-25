@@ -76,6 +76,18 @@ def test_readiness_rejects_a_minute_gap_above_the_fallback_budget(tmp_path):
     assert any(gap["kind"] == "quality" for gap in readiness["gaps"])
 
 
+def test_preparation_marks_unpassed_validation_partial_and_reports_its_date(tmp_path):
+    service, config, gap_day = _gapped_minute_fixture(tmp_path, count=10)
+
+    result = MarketPreparationService(service).execute(config)
+
+    minute_step = next(step for step in result["steps"] if step.get("timeframe") == "1min")
+    assert minute_step["status"] == "partial"
+    assert "失败 1 日" in minute_step["reason"]
+    assert result["status"] == "partial"
+    assert any(str(gap_day.date()) in gap["message"] for gap in result["remaining_gaps"])
+
+
 def test_preparation_plan_lists_dependencies_without_network(tmp_path):
     service = MarketDataService(Store(tmp_path / "data"))
     plan = MarketPreparationService(service).plan(_config())

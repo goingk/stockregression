@@ -967,7 +967,9 @@ class CoverageArchive:
             day_text = _day_text(day)
             current_dependency = dependency_hashes.get(day_text)
             if current_dependency is None:
-                current_dependency = _dependency_hash(calendar_days, actions, day)
+                current_dependency = _dependency_hash(
+                    calendar_days, actions, day, timeframe=timeframe,
+                )
                 dependency_hashes[day_text] = current_dependency
             if row.get("dependency_hash") != current_dependency:
                 stale.add(day_text)

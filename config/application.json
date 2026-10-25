@@ -13,8 +13,8 @@
     "grid": {
       "link_spacing": true,
       "grid_mode": "geometric",
-      "buy_step": 0.065,
-      "sell_step": 0.065,
+      "buy_step": 0.047,
+      "sell_step": 0.047,
       "lower_price": null,
       "upper_price": null
     },
@@ -23,8 +23,8 @@
       "initial_shares": 10000,
       "min_shares": 0,
       "max_shares": null,
-      "buy_shares": 2000,
-      "sell_shares": 2000
+      "buy_shares": 1000,
+      "sell_shares": 1000
     },
     "dca": {
       "frequency": "monthly",
@@ -185,5 +185,5 @@
     "subprocess_timeout_seconds": 45,
     "lock_timeout_seconds": 30
   },
-  "config_revision": "58d1c319a017174f24df59bbae051e37da85f6b03827cc38484c76bec32c991e"
+  "config_revision": "d7ff97c2816c1b2e25baf276d65b2f7fc6447043cc15e4254a66871a0f913e27"
 }

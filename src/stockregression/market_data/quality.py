@@ -131,7 +131,7 @@ def validate_and_fill(
         expected = pd.DatetimeIndex(sorted(set(slots)))
         expected = expected[(expected >= lower) & (expected <= upper)]
         auction_rows = []
-        if timeframe == "1min" and symbol.endswith(".SZ"):
+        if timeframe == "1min":
             # Group the day once instead of re-filtering the whole frame for
             # every session; the auction check needs a per-day view only.
             by_day = {

@@ -60,6 +60,21 @@ SOURCE_TO_TARGETS = {
 }
 
 
+def _readiness_quality_message(timeframe: str, state: dict) -> str:
+    parts = []
+    for key, label in (("pending", "待核验"), ("failed", "校验失败")):
+        days = sorted(str(day)[:10] for day in state.get(key) or [])
+        count = max(int(state.get(f"{key}_count") or 0), len(days))
+        if count:
+            samples = "、".join(days[:3])
+            if len(days) > 3:
+                samples += f"等，至 {days[-1]}"
+            parts.append(f"{count} 个交易日{label}" + (f"（{samples}）" if samples else ""))
+    if parts:
+        return f"{timeframe} 在本次请求区间有" + "；".join(parts)
+    return f"{timeframe}：" + str(state.get("reason") or "本次请求区间尚无可用的质量核验结论")
+
+
 def _price_anomaly_rows(frame: pd.DataFrame, start=None, end=None) -> pd.DataFrame:
     anomalies = anomalies_in_range(frame, start, end)
     if anomalies.empty:
@@ -1607,7 +1622,10 @@ class MarketDataService:
             "status": status,
             "mode": mode,
             "checked_days": ledger.get("checked_days", 0),
-            "cached": int(ledger.get("checked_days") or 0) == 0,
+            "cached": (
+                int(ledger.get("checked_days") or 0) == 0
+                and int(ledger.get("scanned_months") or 0) == 0
+            ),
             "skipped_days": ledger.get("skipped_days", 0),
             "reused_days": ledger.get("reused_days", 0),
             "archive_hit": bool(ledger.get("archive_hit") or archive_head),
@@ -1617,6 +1635,8 @@ class MarketDataService:
             "verified_from": state.get("verified_from"),
             "verified_through": state.get("verified_through"),
             "failed": state.get("failed", []),
+            "pending_days": state.get("pending", []),
+            "stale_dates": ledger.get("stale_dates", []),
             "pending_validation": pending,
             "price_anomalies": anomaly_records(
                 existing_anomalies, symbol=symbol, timeframe=timeframe, limit=200
@@ -1985,8 +2005,14 @@ class MarketDataService:
                         daily_version=snapshot_daily_version,
                     )
                     if degradable is None:
+                        quality_state = self.repository.validation_state(
+                            symbol, source_timeframe,
+                            start=requested_start, end=requested_end,
+                            version=source_version, calendar_version=calendar_version,
+                            daily_version=snapshot_daily_version,
+                        )
                         gaps.append({"kind": "quality", "timeframe": target,
-                                     "message": minute.get("reason") or f"{target} 在本次请求区间尚未完成质量核验"})
+                                     "message": _readiness_quality_message(target, quality_state)})
                     else:
                         degraded_days.extend(degradable)
             if minute and minute.get("file_status") == "readable":
@@ -2036,7 +2062,13 @@ class MarketDataService:
                 daily_version=daily_version,
                 manifest=manifest if version else None,
             ):
-                gaps.append({"kind": "quality", "timeframe": "1day", "message": daily.get("reason") or "日线在本次请求区间尚未完成质量核验"})
+                quality_state = self.repository.validation_state(
+                    symbol, "1day", start=requested_start, end=requested_end,
+                    version=daily_version if version else None,
+                    calendar_version=calendar_version, daily_version=daily_version,
+                )
+                gaps.append({"kind": "quality", "timeframe": "1day",
+                             "message": _readiness_quality_message("1day", quality_state)})
             daily_rows = self.repository.bars(
                 symbol, "1day", version=daily_version,
                 start=requested_start - pd.Timedelta(days=30), end=requested_end,

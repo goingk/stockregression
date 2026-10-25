@@ -274,7 +274,7 @@ def _actions_dependency(actions: dict | None, day: pd.Timestamp) -> list[dict[st
 def _dependency_hash(
     calendar_days: pd.DatetimeIndex, actions: dict | None, day: pd.Timestamp,
     daily_row: pd.Series | None = None,
-    *, timeframe: str = "1day", rules_version: int | None = None,
+    *, timeframe: str, rules_version: int | None = None,
 ) -> str:
     payload = {
         "rules": rules_version if rules_version is not None else validation_rules_version(timeframe),
@@ -1073,7 +1073,12 @@ def validate_incremental(
                     calendar_part = pd.DataFrame({"date": [day]})
                     validation = validate_and_fill(
                         part, timeframe, calendar=calendar_part, fill=True,
-                        pending=pending, coverage_start=day, coverage_end=day, symbol=symbol,
+                        pending=pending, coverage_start=day,
+                        coverage_end=(
+                            day + pd.Timedelta(hours=15)
+                            if timeframe in MINUTE_TIMEFRAMES else day
+                        ),
+                        symbol=symbol,
                     )
                     report = validation.report
                     details = validation.details or details

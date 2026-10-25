@@ -223,7 +223,19 @@ class MarketPreparationService:
                     )
                 else:
                     raise MarketDataError("未知的数据准备步骤：" + str(step.get("kind")))
-                results.append({**step, "status": "completed", "result": result})
+                step_status = "completed"
+                reason = step["reason"]
+                if step["kind"] == "validate":
+                    report = result.get("report") or {}
+                    if result.get("status") != "complete":
+                        step_status = "partial"
+                    reason += (
+                        f"；结果：新检查 {int(report.get('checked_days') or 0)} 日，"
+                        f"复用 {int(report.get('reused_days') or 0)} 日，"
+                        f"待核验 {len(report.get('pending_days') or [])} 日，"
+                        f"失败 {len(report.get('failed') or [])} 日"
+                    )
+                results.append({**step, "reason": reason, "status": step_status, "result": result})
             except InterruptedError:
                 raise
             except Exception as exc:
@@ -233,7 +245,7 @@ class MarketPreparationService:
         failed = [row for row in results if row.get("status") == "failed"]
         remaining = readiness.get("gaps", [])
         status = "completed" if not failed and not remaining else "partial" if any(
-            row.get("status") in {"completed", "skipped"} for row in results
+            row.get("status") in {"completed", "partial", "skipped"} for row in results
         ) else "failed"
         progress(1.0, "数据准备结束")
         if not remaining:
