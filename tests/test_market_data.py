@@ -84,9 +84,9 @@ def test_recent_minute_incomplete_detects_a_partial_incremental_tail():
 
 @pytest.mark.parametrize("symbol,expected_status,expected_missing", [
     ("159611.SZ", "complete", 0),
-    ("510300.SH", "partial", 4),
+    ("510300.SH", "complete", 0),
 ])
-def test_read_only_revalidation_keeps_verified_sz_closing_auction_slots(symbol, expected_status, expected_missing):
+def test_read_only_revalidation_keeps_verified_closing_auction_slots(symbol, expected_status, expected_missing):
     days = _days(2)
     frame = _verified_minute_without_closing_placeholder_ticks(days)
     validation = validate_and_fill(
@@ -94,8 +94,7 @@ def test_read_only_revalidation_keeps_verified_sz_closing_auction_slots(symbol, 
     )
     assert validation.report["missing_rows"] == expected_missing
     assert validation.report["status"] == expected_status
-    if symbol.endswith(".SZ"):
-        assert validation.report["auction_placeholders"] == 4
+    assert validation.report["auction_placeholders"] == 4
 
 
 def _daily(days):

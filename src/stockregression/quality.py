@@ -6,7 +6,7 @@ import pandas as pd
 from .models import DataBundle
 from .price_validation import price_issue_details
 
-QUALITY_RULES_VERSION = 4
+QUALITY_RULES_VERSION = 5
 
 MINUTE_COLUMNS = ["timestamp", "open", "high", "low", "close", "volume", "turnover", "source"]
 
@@ -202,21 +202,44 @@ def _max_run(mask: np.ndarray) -> int:
     return longest
 
 
-def _closing_auction_placeholders(symbol: str, day, part: pd.DataFrame, missing_mask: np.ndarray) -> np.ndarray:
-    """Identify empty valuation slots inside a verified SZ closing auction.
+def _closing_auction_times(symbol: str, day) -> pd.DatetimeIndex | None:
+    """Return the four minute labels spanning an exchange's closing auction."""
+    day = pd.Timestamp(day).normalize()
+    exchange = str(symbol).upper().rsplit(".", 1)[-1]
+    start = {
+        "SH": pd.Timestamp("2018-08-20"),
+        "SZ": pd.Timestamp("2023-02-17"),
+    }.get(exchange)
+    if start is None or day < start:
+        return None
+    return pd.DatetimeIndex([
+        day + pd.Timedelta(hours=14, minutes=57),
+        day + pd.Timedelta(hours=14, minutes=58),
+        day + pd.Timedelta(hours=14, minutes=59),
+        day + pd.Timedelta(hours=15),
+    ])
 
-    SZSE rules (2023 and 2026), 2.3.2 / 3.4.1: continuous matching ends
-    at 14:57 and the closing auction matches once at 15:00. Trade-only
-    vendors can omit 14:58/14:59. Existing observations are never removed.
-    Earlier dates and other markets retain ordinary gap handling.
+
+def _closing_auction_placeholders(symbol: str, day, part: pd.DataFrame, missing_mask: np.ndarray) -> np.ndarray:
+    """Identify untraded 14:58/14:59 valuation slots in a verified closing auction.
+
+    Shanghai Stock Exchange rules effective 2018-08-20 and the supported
+    Shenzhen rules use continuous matching through 14:57 and a closing
+    auction matched at 15:00. Trade-only vendors can omit the two intervening
+    minute labels. Existing observations are never removed.
     """
     placeholders = np.zeros(len(missing_mask), dtype=bool)
-    if not symbol.endswith(".SZ") or pd.Timestamp(day) < pd.Timestamp("2023-02-17") or len(part) != 240:
+    auction_times = _closing_auction_times(symbol, day)
+    if auction_times is None or len(part) != 240:
         return placeholders
-    anchors = part.iloc[[236, 239]]  # End-labelled 14:57 and 15:00.
+    positions = minute_slots(day).get_indexer(auction_times)
+    if (positions < 0).any():
+        return placeholders
+    anchors = part.iloc[positions[[0, 3]]]
     if anchors.close.isna().any() or not anchors.get("source_verified", pd.Series(False, index=anchors.index)).eq(True).all():
         return placeholders
-    placeholders[237:239] = missing_mask[237:239]
+    auction_positions = positions[1:3]
+    placeholders[auction_positions] = missing_mask[auction_positions]
     return placeholders
 
 

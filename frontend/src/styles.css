@@ -140,6 +140,10 @@
 .pagination-row > div { display:flex; gap:6px; }
 .preparation-gaps { display:grid; gap:6px; margin:0 0 12px; }
 .preparation-gaps p { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:start; gap:8px; margin:0; padding:8px 10px; border:1px solid #f1dfbd; border-radius:8px; background:#fffbf2; color:#7b653f; font-size:10px; }
+.preparation-history { margin:0 0 12px; }
+.preparation-history p { margin:5px 0 0; }
+.preparation-history ul { margin:5px 0 0; padding-left:18px; }
+.preparation-history li { margin-top:3px; }
 .advanced-data { margin-top:12px; padding-top:10px; border-top:1px solid var(--line); }
 .advanced-data > summary { color:#607a9c; font-size:10px; cursor:pointer; }
 .advanced-data[open] > summary { margin-bottom:9px; }

@@ -12,7 +12,7 @@ from .coverage_index import (
 )
 from .models import MarketDataError
 from .quality import validate_and_fill
-from .repository import VALIDATION_RULES_VERSION, utc_now
+from .repository import VALIDATION_RULES_VERSION, validation_rules_version, utc_now
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe, timeframe_spec
 
 
@@ -274,9 +274,10 @@ def _actions_dependency(actions: dict | None, day: pd.Timestamp) -> list[dict[st
 def _dependency_hash(
     calendar_days: pd.DatetimeIndex, actions: dict | None, day: pd.Timestamp,
     daily_row: pd.Series | None = None,
+    *, timeframe: str = "1day", rules_version: int | None = None,
 ) -> str:
     payload = {
-        "rules": VALIDATION_RULES_VERSION,
+        "rules": rules_version if rules_version is not None else validation_rules_version(timeframe),
         "calendar": _calendar_hash(calendar_days, day),
         "actions": _actions_dependency(actions, day),
     }
@@ -488,14 +489,19 @@ def validation_targets(
         if requested_dates is not None and day not in requested_dates:
             continue
         row = rows.get(day)
-        expected_dependency = _dependency_hash(trading_days, actions, day)
+        row_rules_version = int(row.get("rules_version") or 0) if row else 0
+        current_rules_version = validation_rules_version(timeframe)
+        expected_dependency = _dependency_hash(
+            trading_days, actions, day, timeframe=timeframe,
+            rules_version=max(row_rules_version, current_rules_version),
+        )
         explicitly_requested = bool(requested_dates is not None and force_dates and day in requested_dates)
         dependency_mismatch = bool(
             row and row.get("dependency_hash")
             and str(row.get("dependency_hash")) != expected_dependency
         )
         rule_mismatch = bool(
-            row and int(row.get("rules_version") or 0) < VALIDATION_RULES_VERSION
+            row and row_rules_version < current_rules_version
         )
         invalid_months = set((head or {}).get("_invalid_months") or [])
         stale = bool(
@@ -771,7 +777,7 @@ def validate_incremental(
         daily_calendar_hashes = {}
         for calendar_fact in ("unknown", "trading", "non-trading"):
             calendar_hash = hashlib.sha256(calendar_fact.encode()).hexdigest()
-            payload = {"rules": VALIDATION_RULES_VERSION, "calendar": calendar_hash, "actions": []}
+            payload = {"rules": validation_rules_version(timeframe), "calendar": calendar_hash, "actions": []}
             daily_calendar_hashes[calendar_fact] = hashlib.sha256(str(payload).encode()).hexdigest()
         if len(trading_days):
             daily_calendar_span = (trading_days.min(), trading_days.max())
@@ -1097,7 +1103,9 @@ def validate_incremental(
                 calendar_fact = "trading" if day in daily_trading_day_set else "non-trading"
             dependency = daily_calendar_hashes[calendar_fact]
         else:
-            dependency = _dependency_hash(trading_days, actions, day, daily_row)
+            dependency = _dependency_hash(
+                trading_days, actions, day, daily_row, timeframe=timeframe,
+            )
         source_hash = (
             daily_hashes.get(key, {}).get(day)
             if fast_daily_day and day in daily_hashes.get(key, {})
@@ -1126,7 +1134,7 @@ def validate_incremental(
             "symbol": symbol, "timeframe": timeframe, "adjustment": adjustment,
             "trade_date": str(day.date()), "status": status, "row_count": row_count,
             "source_hash": source_hash, "dependency_hash": dependency,
-            "rules_version": VALIDATION_RULES_VERSION, "report": report,
+            "rules_version": validation_rules_version(timeframe), "report": report,
             "checked_at": checked_at,
         })
         coverage_days.append({
@@ -1141,7 +1149,7 @@ def validate_incremental(
             "gaps": gaps, "gap_count": len(gaps),
             "pending": [] if status in {"passed", "suspended"} else [reason or "未通过校验"],
             "source_hash": source_hash, "dependency_hash": dependency,
-            "rules_version": VALIDATION_RULES_VERSION, "dirty_reason": None,
+            "rules_version": validation_rules_version(timeframe), "dirty_reason": None,
             "report": report, "checked_at": checked_at,
             "_data_version": int(
                 source_frame.attrs.get("_coverage_data_version", base_data_version)

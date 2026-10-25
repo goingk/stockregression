@@ -160,7 +160,7 @@ def test_statistics_bundle_leaves_ordinary_small_gap_missing():
     assert not bundle.bars.is_synthetic.any()
 
 
-def test_statistics_bundle_only_fills_rule_validated_sz_closing_auction_slots():
+def test_statistics_bundle_fills_rule_validated_closing_auction_slots_for_both_markets():
     sz_manifest, sz_minute, sz_daily = _frames("159611.SZ", missing=(237, 238), minute_volume=1.0)
     sz = load_native_bundle(_service([(sz_manifest, sz_minute, sz_daily)]), _config(), statistics_only=True)
     filled = sz.bars[sz.bars.is_auction_placeholder]
@@ -171,8 +171,10 @@ def test_statistics_bundle_only_fills_rule_validated_sz_closing_auction_slots():
 
     sh_manifest, sh_minute, sh_daily = _frames("510210.SH", missing=(237, 238), minute_volume=1.0)
     sh = load_native_bundle(_service([(sh_manifest, sh_minute, sh_daily)]), _config("510210.SH"), statistics_only=True)
-    assert len(sh.bars) == 238
-    assert not sh.bars.is_auction_placeholder.any()
+    sh_filled = sh.bars[sh.bars.is_auction_placeholder]
+    assert len(sh.bars) == 240
+    assert set(sh_filled.timestamp) == {minute_slots(DAY)[237], minute_slots(DAY)[238]}
+    assert sh_filled.volume.eq(0).all() and sh_filled.turnover.eq(0).all()
 
 
 def test_statistics_bundle_reads_the_requested_frozen_market_version():

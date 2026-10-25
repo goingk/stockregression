@@ -62,15 +62,15 @@ def test_real_gap_and_unverified_sources_remain_visible():
     assert result.quality["days"][0]["auction_placeholders"] == 0
 
 
-def test_missing_closing_anchor_or_other_market_is_not_reclassified():
+def test_missing_closing_anchor_is_not_reclassified_and_sh_closing_auction_is():
     minute, daily, calendar = fixture(extra_missing=(239,))
     result = prepare(minute, daily, calendar)
     assert result.quality["days"][0]["auction_placeholders"] == 0
     assert result.quality["days"][0]["missing_data_minutes"] == 3
     minute, daily, calendar = fixture()
     result = prepare(minute, daily, calendar, symbol="510300.SH")
-    assert result.quality["days"][0]["auction_placeholders"] == 0
-    assert result.quality["days"][0]["missing_data_minutes"] == 2
+    assert result.quality["days"][0]["auction_placeholders"] == 2
+    assert result.quality["days"][0]["missing_data_minutes"] == 0
 
 
 def test_auction_omissions_do_not_disable_observed_five_minute_closing_bar():

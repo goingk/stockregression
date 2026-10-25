@@ -108,6 +108,14 @@ function periodText(item: DataPreparationRequest | null) {
   return `${item.symbol || '当前标的'} · ${item.frequency || '当前周期'} · ${item.checked_start || item.start || '最早'} → ${item.checked_end || item.end || '最新'}`
 }
 
+function historyGapText(range: NonNullable<DataPreparationPlan['history_coverage']>['daily_request_missing'], calendarAvailable: boolean) {
+  if (!range) return '未发现前段缺失'
+  const count = range.count == null
+    ? calendarAvailable ? '数量未知' : '缺少交易日历，无法统计缺失量'
+    : `${range.count} 个${range.unit || '交易日'}`
+  return `${range.start} 至 ${range.end}（${count}）`
+}
+
 function firstAvailableTimeframe(item: DataInventoryItem): DataTimeframe {
   const found = TIMEFRAMES.find(([name]) => item.periods[name])
   return found ? found[0] : '1day'
@@ -580,6 +588,8 @@ export default function DataManagementPage({
     false,
   )
 
+  const historyCoverage = preparationPlan?.history_coverage
+
   return <>
     <PageHeader eyebrow="DATA PACKAGE" title="数据管理" description="当前数据包是唯一正式行情来源；同步、导入、聚合、来源、路径与运行设置都集中在这里。" action={<div className="button-row"><Button variant="secondary" busy={busy === '刷新证券清单'} onClick={refreshInstrumentCatalog}><RefreshCw size={15} />刷新证券清单</Button><Button variant="secondary" busy={busy === '刷新'} onClick={() => void run('刷新', refreshAll, '数据包、来源与运行设置已刷新。')}><RefreshCw size={15} />刷新</Button><Button variant="quiet" onClick={tasks.showHistory}><Database size={15} />任务记录</Button></div>} />
     {error && <ErrorBox message={error} onClose={() => setError('')} />}
@@ -589,6 +599,18 @@ export default function DataManagementPage({
     {preparation && <Card title="本次请求的数据准备" subtitle={periodText(preparation.request)} action={preparationPlan ? <Badge tone={preparationPlan.ready ? 'green' : 'amber'}>{preparationPlan.ready ? '原请求已可用' : `${preparationPlan.gaps.length} 项缺口`}</Badge> : <Badge>检查中</Badge>}>
       <div className="result-meta"><span>来源：{preparation.origin === 'research' ? '参数研究' : '策略回测'}</span><span>请求指纹：{preparation.fingerprint}</span>{preparation.preparationJobId && <span>准备任务：{preparation.preparationJobId.slice(0, 12)} · {preparationJob?.status ?? '读取中'}</span>}</div>
       {preparationBusy ? <Loading label="读取本次请求所需数据…" /> : preparationPlan ? <>
+        {historyCoverage && <div className="inline-warning preparation-history" role="note">
+          <strong>历史范围与前置收盘价</strong>
+          <p>请求区间：{historyCoverage.request_start} 至 {historyCoverage.request_end}。日线准备从 {historyCoverage.preparation_start} 开始，比请求起点提前 {historyCoverage.preparation_lookback_calendar_days} 个自然日，用于查找起始日前最近的有效收盘价。</p>
+          <p>前置 10 天是日线核验窗口；启动计算至少需要一条请求起始日前有效交易日收盘价。下面分别列出前置窗口与请求区间的缺失量。</p>
+          <ul>
+            <li>日线本地最早日期：{historyCoverage.daily_first || '尚无本地日线'}；本次日线校验范围缺失：{historyGapText(historyCoverage.daily_validation_missing, historyCoverage.trading_calendar_available)}；其中请求区间内缺失：{historyGapText(historyCoverage.daily_request_missing, historyCoverage.trading_calendar_available)}。</li>
+            <li>开始日前置窗口：{historyCoverage.preparation_start} 至 {historyCoverage.preparation_end}；缺失：{historyGapText(historyCoverage.daily_prestart_missing, historyCoverage.trading_calendar_available)}。</li>
+            {preparationPlan.frequency !== '1d' && preparationPlan.frequency !== '1day' && <li>{preparationPlan.frequency} 本地最早日期：{historyCoverage.target_first || '尚无本地行情'}；请求内缺失：{historyGapText(historyCoverage.target_request_missing, historyCoverage.trading_calendar_available)}。</li>}
+          </ul>
+          {historyCoverage.previous_close_missing && <p><strong>当前缺少请求起点之前可用的日线收盘价，补齐这段前置日线后才能通过检查。</strong></p>}
+          {(preparationPlan.frequency === '1m' || preparationPlan.frequency === '1min') && <p>更早的 1 分钟历史只能从本地数据包或文件导入；在线修补只覆盖近期窗口。</p>}
+        </div>}
         {preparationPlan.gaps.length > 0 && <div className="preparation-gaps">{preparationPlan.gaps.map((gap, index) => <p key={`${gap.kind}-${index}`}><Badge tone="amber">{gap.timeframe || gap.kind || '数据'}</Badge><span>{gap.message}</span></p>)}</div>}
         {preparationPlan.ready && (preparationPlan.warnings?.length ?? 0) > 0 && <div className="notice"><span>{preparationPlan.warnings?.join('；')}</span></div>}
         <TableViewport className="table-wrap" owner='local' stickyKeyColumn={1}><table><thead><tr><th>顺序</th><th>处理事项</th><th>范围</th><th>说明</th></tr></thead><tbody>{preparationPlan.steps.map((step, index) => <tr key={`${step.kind}-${index}`}><td>{index + 1}</td><td>{step.kind === 'auxiliary' ? '日历与公司行动' : step.kind === 'validate' ? '校验并发布' : `${step.timeframe} 行情`}</td><td>{step.start ? `${step.start} → ${step.end}` : '当前数据包'}</td><td>{step.reason}</td></tr>)}</tbody></table></TableViewport>

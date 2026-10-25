@@ -77,7 +77,7 @@ def _state(repository, symbol, timeframe, manifest, start, end) -> dict:
 
 def build_data_resolution(market, symbol: str, manifest: dict, days) -> dict:
     """Choose daily fallbacks/skip independently, with no cohort ratio gate."""
-    from .market_data.repository import VALIDATION_RULES_VERSION
+    from .market_data.repository import VALIDATION_RULES_VERSION, validation_rules_version
 
     dates = sorted({_date(day) for day in days})
     if not dates:
@@ -103,8 +103,9 @@ def build_data_resolution(market, symbol: str, manifest: dict, days) -> dict:
                 or (reference.get("last") and day > _date(reference["last"]))):
             return None
         if row:
+            rules_version = validation_rules_version(timeframe)
             if (row.get("dirty_reason") or not row.get("scanned", True)
-                    or int(row.get("rules_version", VALIDATION_RULES_VERSION)) < VALIDATION_RULES_VERSION
+                    or int(row.get("rules_version", rules_version)) < rules_version
                     or row.get("pending") or day in failed
                     or row.get("status") not in {"passed", "suspended"}):
                 return None
@@ -115,7 +116,7 @@ def build_data_resolution(market, symbol: str, manifest: dict, days) -> dict:
                 and state.get("verified_from") and state.get("verified_through")
                 and _date(state["verified_from"]) <= day <= _date(state["verified_through"])):
             return {"status": "passed", "row_count": 240 if timeframe == "1min" else 1,
-                    "rules_version": VALIDATION_RULES_VERSION,
+                    "rules_version": validation_rules_version(timeframe),
                     "source_hash": _digest({"state": state, "day": day}),
                     "report": {}, "quality_source": state.get("quality_source", "range_certificate")}
         return None
@@ -153,8 +154,13 @@ def build_data_resolution(market, symbol: str, manifest: dict, days) -> dict:
                        "evidence": {"1day": evidence(daily), "1min": evidence(minute) if complete else None}})
     counts = Counter(item["mode"] for item in output)
     evaluated = [item["date"] for item in output if item["mode"] in {"minute", "daily"}]
+    validation_rules_versions = {
+        timeframe: validation_rules_version(timeframe)
+        for timeframe in ("1day", "1min")
+    }
     result = {"schema_version": 1, "policy": POLICY, "rules_version": 1,
-        "validation_rules_version": VALIDATION_RULES_VERSION, "symbol": symbol,
+        "validation_rules_version": VALIDATION_RULES_VERSION,
+        "validation_rules_versions": validation_rules_versions, "symbol": symbol,
         "start": dates[0], "end": dates[-1], "versions": _versions(manifest), "days": output,
         "counts": {mode: counts[mode] for mode in MODES},
         "prior_daily_days": [day for day in sorted(records["1day"])
@@ -172,14 +178,13 @@ def build_data_resolution(market, symbol: str, manifest: dict, days) -> dict:
 
 def validate_data_resolution(manifest: dict, start=None, end=None) -> dict:
     """Never rebuild a frozen plan from the mutable live quality ledger."""
-    from .market_data.repository import VALIDATION_RULES_VERSION
+    from .market_data.repository import VALIDATION_RULES_VERSION, validation_rules_version
 
     plan = manifest.get("data_resolution")
     if not isinstance(plan, dict):
         raise ValueError("DATA_RESOLUTION_MISSING: 冻结版本没有逐日数据策略")
     if (plan.get("schema_version") != 1 or plan.get("policy") != POLICY
             or plan.get("rules_version") != 1
-            or plan.get("validation_rules_version") != VALIDATION_RULES_VERSION
             or plan.get("symbol") != manifest.get("symbol")
             or plan.get("versions") != _versions(manifest)
             or plan.get("plan_hash") != _digest({key: value for key, value in plan.items() if key != "plan_hash"})):
@@ -188,6 +193,28 @@ def validate_data_resolution(manifest: dict, start=None, end=None) -> dict:
     if (not isinstance(days, list) or not days
             or any(not isinstance(day, dict) or day.get("mode") not in MODES for day in days)):
         raise ValueError("DATA_RESOLUTION_MISMATCH: 逐日数据模式无效")
+    try:
+        global_rules_version = int(plan.get("validation_rules_version", 0))
+        timeframe_versions = plan.get("validation_rules_versions") or {}
+        if not isinstance(timeframe_versions, dict):
+            raise ValueError
+        used_timeframes = set()
+        for day in days:
+            if day["mode"] == "minute":
+                used_timeframes.update(("1day", "1min"))
+            elif day["mode"] in {"daily", "suspended", "no_trades"}:
+                used_timeframes.add("1day")
+        if (global_rules_version < 1 or global_rules_version > VALIDATION_RULES_VERSION
+                or any(
+                    int(timeframe_versions.get(timeframe, global_rules_version))
+                    < validation_rules_version(timeframe)
+                    or int(timeframe_versions.get(timeframe, global_rules_version))
+                    > VALIDATION_RULES_VERSION
+                    for timeframe in used_timeframes
+                )):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("DATA_RESOLUTION_MISMATCH: 冻结方案使用了过期或未知的验证口径") from None
     dates = [_date(day.get("date")) for day in days]
     counts = Counter(day["mode"] for day in days)
     if (dates != sorted(set(dates)) or dates[0] != plan.get("start") or dates[-1] != plan.get("end")

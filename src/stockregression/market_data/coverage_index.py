@@ -656,12 +656,13 @@ class CoverageArchive:
         safe_adjustment = "".join(c for c in str(adjustment) if c.isalnum() or c in "-_")
         return f".stockregression/quality/archives/{normalize_timeframe(timeframe)}/{safe_symbol}/{safe_adjustment}"
 
-    def _summarize_month(self, dataset, month, entries, calendar_dates) -> dict[str, Any]:
-        from .repository import VALIDATION_RULES_VERSION
+    def _summarize_month(self, dataset, timeframe, month, entries, calendar_dates) -> dict[str, Any]:
+        from .repository import validation_rules_version
 
+        rules_version = validation_rules_version(timeframe)
         scanned = [row for row in entries if row.get("scanned")]
         clean = [row for row in scanned if not row.get("dirty_reason")
-                 and int(row.get("rules_version") or 0) >= VALIDATION_RULES_VERSION]
+                 and int(row.get("rules_version") or 0) >= rules_version]
         pending = {_day_text(row["trade_date"]): str(row.get("dirty_reason") or "待重新检查")
                    for row in entries if row not in clean
                    or row.get("status") not in {"passed", "failed", "suspended"}}
@@ -678,7 +679,7 @@ class CoverageArchive:
             values = [row[field] for row in scanned if row.get(field)]
             return operation(values) if values else None
         return {
-            "rules_version": VALIDATION_RULES_VERSION,
+            "rules_version": rules_version,
             "scanned_days": sum(1 << (pd.Timestamp(row["trade_date"]).day - 1) for row in scanned),
             "first_time": boundary("first_time", min), "last_time": boundary("last_time", max),
             "scanned_start": boundary("trade_date", min), "scanned_end": boundary("trade_date", max),
@@ -1023,9 +1024,10 @@ class CoverageArchive:
         _updates: Sequence[dict[str, Any]] = (),
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Write immutable month pages and a head without advancing its reference."""
-        from .repository import VALIDATION_RULES_VERSION, utc_now
+        from .repository import validation_rules_version, utc_now
 
         timeframe = normalize_timeframe(timeframe)
+        rules_version = validation_rules_version(timeframe)
         dataset = self._dataset(symbol, timeframe, adjustment)
         if not dataset:
             raise MarketDataError("没有可归档的本地行情")
@@ -1131,7 +1133,7 @@ class CoverageArchive:
                 "size": len(raw),
                 "days": len(entries),
                 "first_day": entries[0]["trade_date"], "last_day": entries[-1]["trade_date"],
-                "summary": self._summarize_month(dataset, month, entries, calendar_dates),
+                "summary": self._summarize_month(dataset, timeframe, month, entries, calendar_dates),
             })
         if changed is not None:
             previous_months = {
@@ -1149,7 +1151,7 @@ class CoverageArchive:
         for item in months:
             if (not isinstance(item.get("summary"), dict)
                     or "scanned_days" not in item["summary"]
-                    or int(item["summary"].get("rules_version") or 0) != VALIDATION_RULES_VERSION):
+                    or int(item["summary"].get("rules_version") or 0) != rules_version):
                 month = str(item["month"])
                 payload = self._month_payload(item)
                 entries = (payload or {}).get("days")
@@ -1157,7 +1159,7 @@ class CoverageArchive:
                     period = pd.Period(month, freq="M")
                     entries = self.rows(symbol, timeframe, adjustment,
                                         start=period.start_time, end=period.end_time)
-                item["summary"] = self._summarize_month(dataset, month, entries, calendar_dates)
+                item["summary"] = self._summarize_month(dataset, timeframe, month, entries, calendar_dates)
         summaries = [item["summary"] for item in months]
         unresolved: dict[str, str] = {}
         for update in (previous_head or {}).get("_pending_updates") or []:
@@ -1209,7 +1211,7 @@ class CoverageArchive:
                 entries = [overlay.get(_day_text(row["trade_date"]), row) for row in entries]
                 entries = [{**row, "dirty_reason": unresolved.get(_day_text(row["trade_date"]),
                            row.get("dirty_reason"))} for row in entries]
-                summary = self._summarize_month(dataset, month, entries, calendar_dates)
+                summary = self._summarize_month(dataset, timeframe, month, entries, calendar_dates)
             if summary.get("verified_through"):
                 verified_through = summary["verified_through"]
             if not summary.get("complete"):
@@ -1231,7 +1233,7 @@ class CoverageArchive:
             "generation": package["generation"],
             "symbol": symbol, "timeframe": timeframe, "adjustment": adjustment,
             "data_version": data_version, "revision": revision,
-            "rules_version": int(VALIDATION_RULES_VERSION),
+            "rules_version": int(rules_version),
             "data_start": dataset.get("first_time"),
             "data_end": dataset.get("last_time"),
             "first_time": aggregate["first_time"],
@@ -1264,7 +1266,7 @@ class CoverageArchive:
             "schema_version": COVERAGE_ARCHIVE_SCHEMA_VERSION,
             "path": relative, "sha256": head_digest,
             "data_version": data_version, "revision": revision,
-            "rules_version": int(VALIDATION_RULES_VERSION),
+            "rules_version": int(rules_version),
             "gap_count": gaps, "pending_count": pending, "failed_count": failed,
             "pending_updates": [
                 {"dates": sorted(days), "reason": reason}

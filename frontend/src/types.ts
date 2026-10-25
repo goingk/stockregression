@@ -173,6 +173,21 @@ export interface DataPreparationPlan {
   package_id: string
   package_version: number
   gaps: Array<{ kind?: string; timeframe?: string; message?: string }>
+  history_coverage?: {
+    request_start: string
+    request_end: string
+    daily_first?: string | null
+    target_first?: string | null
+    preparation_start: string
+    preparation_end: string
+    preparation_lookback_calendar_days: number
+    daily_validation_missing?: { start: string; end: string; count?: number | null; unit?: string } | null
+    daily_request_missing?: { start: string; end: string; count?: number | null; unit?: string } | null
+    daily_prestart_missing?: { start: string; end: string; count?: number | null; unit?: string } | null
+    target_request_missing?: { start: string; end: string; count?: number | null; unit?: string } | null
+    previous_close_missing: boolean
+    trading_calendar_available: boolean
+  }
   warnings?: string[]
   degraded_days?: Array<{ date: string; timeframe?: string; reason?: string }>
   steps: DataPreparationStep[]

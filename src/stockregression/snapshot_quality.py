@@ -11,14 +11,24 @@ def frozen_quality_state(manifest: dict | None, timeframe: str, start, end) -> d
     hashed into ETF snapshot versions. They do not certify newly appended bars
     and never replace actual price/field checks performed by readiness.
     """
-    from .market_data.repository import VALIDATION_RULES_VERSION
+    from .market_data.repository import validation_rules_version
+    from .market_data.timeframes import normalize_timeframe
 
     if not isinstance(manifest, dict):
         return None
     evidence = manifest.get("quality_evidence")
     if not isinstance(evidence, dict) or evidence.get("schema_version") != 1:
         return None
-    if evidence.get("rules_version") != VALIDATION_RULES_VERSION:
+    timeframe = normalize_timeframe(timeframe)
+    rules_version = validation_rules_version(timeframe)
+    rules_versions = evidence.get("rules_versions") or {}
+    if not isinstance(rules_versions, dict):
+        return None
+    evidence_version = rules_versions.get(timeframe, evidence.get("rules_version"))
+    try:
+        if evidence_version is None or int(evidence_version) < rules_version:
+            return None
+    except (TypeError, ValueError):
         return None
     try:
         versions = {
@@ -54,7 +64,7 @@ def frozen_quality_state(manifest: dict | None, timeframe: str, start, end) -> d
         if first <= lower <= upper <= last:
             return {
                 "symbol": manifest.get("symbol"), "timeframe": timeframe,
-                "version": versions.get(timeframe), "rules_version": VALIDATION_RULES_VERSION,
+                "version": versions.get(timeframe), "rules_version": rules_version,
                 "verified_from": first.date().isoformat(), "verified_through": last.date().isoformat(),
                 "expected_start": lower.date().isoformat(), "expected_end": upper.date().isoformat(),
                 "range_start": lower.date().isoformat(), "range_end": upper.date().isoformat(),

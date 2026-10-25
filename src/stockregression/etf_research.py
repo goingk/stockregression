@@ -154,7 +154,7 @@ def _align_sampling(rows, windows) -> None:
 
 def _freeze_quality(market, manifest, start, end, daily_start, *, sampling=None, window=None, data_resolution=None) -> None:
     """Bind successful ledger intervals to exact immutable data dependencies."""
-    from .market_data.repository import VALIDATION_RULES_VERSION
+    from .market_data.repository import VALIDATION_RULES_VERSION, validation_rules_version
 
     intervals = {
         timeframe: [{"start": start.date().isoformat(), "end": end.date().isoformat(), "status": "complete"}]
@@ -195,6 +195,10 @@ def _freeze_quality(market, manifest, start, end, daily_start, *, sampling=None,
         intervals["1day"][0]["start"] = daily_start.date().isoformat()
     manifest["quality_evidence"] = {
         "schema_version": 1, "rules_version": VALIDATION_RULES_VERSION,
+        "rules_versions": {
+            timeframe: validation_rules_version(timeframe)
+            for timeframe in ("1day", "1min")
+        },
         "market_versions": {key: int(value["version"]) for key, value in manifest["market_versions"].items()},
         "auxiliary_versions": dict(manifest.get("auxiliary_versions", {})),
         "intervals": intervals,

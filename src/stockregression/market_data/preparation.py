@@ -29,6 +29,70 @@ class MarketPreparationService:
         kinds = {str(gap.get("kind")) for gap in gaps}
         steps: list[dict] = []
 
+        datasets = {
+            timeframe: self.repository.dataset(config.symbol, timeframe)
+            for timeframe in dict.fromkeys(("1day", target))
+        }
+        calendar = self.repository.auxiliary(config.symbol, "calendar")
+        calendar_available = bool(calendar and calendar.get("payload"))
+        try:
+            session_dates = (
+                self.repository.trading_days(config.symbol, history_start, end)
+                if calendar_available else None
+            )
+        except (OSError, ValueError, TypeError):
+            session_dates = None
+
+        def first_local_date(timeframe: str) -> str | None:
+            dataset = datasets.get(timeframe)
+            value = dataset.get("first_time") if dataset else None
+            return pd.Timestamp(value).date().isoformat() if value is not None else None
+
+        def missing_leading_range(timeframe: str, lower, upper) -> dict | None:
+            first = first_local_date(timeframe)
+            missing_start = pd.Timestamp(lower).normalize()
+            missing_end = pd.Timestamp(upper).normalize()
+            if first:
+                first_day = pd.Timestamp(first)
+                missing_end = min(missing_end, first_day - pd.Timedelta(days=1))
+            if missing_start > missing_end:
+                return None
+            count = None
+            if session_dates is not None:
+                selected = session_dates[(session_dates >= missing_start) & (session_dates <= missing_end)]
+                if timeframe == "1week":
+                    count = int(selected.to_period("W-FRI").nunique())
+                elif timeframe == "1month":
+                    count = int(selected.to_period("M").nunique())
+                else:
+                    count = int(len(selected))
+            return {
+                "start": missing_start.date().isoformat(),
+                "end": missing_end.date().isoformat(),
+                "count": count,
+                "unit": "周线周期" if timeframe == "1week" else "月线周期" if timeframe == "1month" else "交易日",
+            }
+
+        history_coverage = {
+            "request_start": start.date().isoformat(),
+            "request_end": end.date().isoformat(),
+            "daily_first": first_local_date("1day"),
+            "target_first": first_local_date(target),
+            "preparation_start": history_start.date().isoformat(),
+            "preparation_end": (start - pd.Timedelta(days=1)).date().isoformat(),
+            "preparation_lookback_calendar_days": 10,
+            "daily_validation_missing": missing_leading_range("1day", history_start, end),
+            "daily_request_missing": missing_leading_range("1day", start, end),
+            "daily_prestart_missing": missing_leading_range(
+                "1day", history_start, start - pd.Timedelta(days=1),
+            ),
+            "target_request_missing": (
+                missing_leading_range(target, start, end) if target != "1day" else None
+            ),
+            "previous_close_missing": any(gap.get("kind") == "reference_price" for gap in gaps),
+            "trading_calendar_available": calendar_available,
+        }
+
         if "calendar" in kinds or "actions" in kinds:
             steps.append({
                 "kind": "auxiliary",
@@ -46,7 +110,11 @@ class MarketPreparationService:
             steps.append({
                 "kind": "bars", "timeframe": "1day", "mode": "history",
                 "symbol": config.symbol, "start": str(history_start.date()),
-                "end": str(end.date()), "reason": "补齐日线及开始日前置收盘",
+                "end": str(end.date()),
+                "reason": (
+                    f"补齐日线；校验从请求起点前 10 个自然日 {history_start.date()} 开始，"
+                    f"用于查找 {start.date()} 前最近的有效收盘价"
+                ),
             })
         target_gap = any(str(gap.get("timeframe") or "") == target and gap.get("kind") not in {"quality", "calendar", "actions"} for gap in gaps)
         if target != "1day" and target_gap:
@@ -61,7 +129,11 @@ class MarketPreparationService:
                     "kind": "bars", "timeframe": target,
                     "mode": "repair" if dataset else "history",
                     "symbol": config.symbol, "start": str(history_start.date()),
-                    "end": str(end.date()), "reason": f"准备 {target} 行情",
+                    "end": str(end.date()),
+                    "reason": (
+                        "修补近期 1min 行情；更早的分钟历史必须从本地数据包或文件导入"
+                        if target == "1min" else f"准备 {target} 行情"
+                    ),
                 })
         for timeframe in dict.fromkeys(("1day", target)):
             steps.append({
@@ -69,7 +141,11 @@ class MarketPreparationService:
                 "timeframe": timeframe,
                 "start": str(history_start.date()) if timeframe == "1day" else str(start.date()),
                 "end": str(end.date()),
-                "reason": "核验本次区间内的日线及前置收盘" if timeframe == "1day" else "核验本次区间内的包内行情",
+                "reason": (
+                    f"核验日线和前置收盘；检查范围从请求起点前 10 个自然日 "
+                    f"{history_start.date()} 开始"
+                    if timeframe == "1day" else "核验本次请求区间内的包内行情"
+                ),
             })
         return {
             "symbol": config.symbol,
@@ -81,6 +157,7 @@ class MarketPreparationService:
             "package_id": self.repository.package_id,
             "package_version": int(self.repository.package.manifest().get("package_version", 0)),
             "gaps": readiness.get("gaps", []),
+            "history_coverage": history_coverage,
             "warnings": readiness.get("warnings", []),
             "degraded_days": readiness.get("degraded_days", []),
             "steps": steps,

@@ -29,13 +29,13 @@ from ..settings import Settings
 from ..source_health import SourceFailure, SourceRouter, classify_source_error, fetch_auxiliary_routed, market_for_symbol
 from ..storage import Store
 from ..rules import instrument_terms
-from ..quality import minute_slots
+from ..quality import _closing_auction_times, minute_slots
 from .models import MarketDataError, MarketSyncCancelled
 from .coverage_index import CoverageArchive
 from .quality import validate_and_fill
 from .reader import normalize_frame
 from .service import MarketDataService
-from .repository import VALIDATION_RULES_VERSION
+from .repository import validation_rules_version
 from .timeframes import MINUTE_TIMEFRAMES, normalize_timeframe, timeframe_spec
 
 
@@ -103,15 +103,10 @@ def _recent_minute_incomplete(frame, symbol, start, end) -> str | None:
         missing = expected.difference(observed)
         if not len(missing):
             continue
-        if symbol.endswith(".SZ") and day >= pd.Timestamp("2023-02-17"):
-            placeholders = pd.DatetimeIndex([
-                day + pd.Timedelta(hours=14, minutes=58),
-                day + pd.Timedelta(hours=14, minutes=59),
-            ])
-            anchors = pd.DatetimeIndex([
-                day + pd.Timedelta(hours=14, minutes=57),
-                day + pd.Timedelta(hours=15),
-            ])
+        auction_times = _closing_auction_times(symbol, day)
+        if auction_times is not None:
+            placeholders = auction_times[1:3]
+            anchors = auction_times[[0, 3]]
             if missing.equals(placeholders) and anchors.isin(observed).all():
                 continue
         longest = _longest_true_run(expected.isin(missing))
@@ -1228,7 +1223,7 @@ class MarketDataSyncService:
         scanned = {
             pd.Timestamp(row["trade_date"]).normalize() for row in rows
             if row.get("scanned") and not row.get("dirty_reason")
-            and int(row.get("rules_version") or 0) >= VALIDATION_RULES_VERSION
+            and int(row.get("rules_version") or 0) >= validation_rules_version(timeframe)
             and not any(
                 start_value <= pd.Timestamp(row["trade_date"]).normalize() <= end_value
                 for start_value, end_value in invalid_ranges

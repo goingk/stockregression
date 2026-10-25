@@ -33,11 +33,14 @@ from .reader import (
     check_declared_adjustment, check_declared_identity, check_declared_timeframe, file_fingerprint,
     normalize_frame, read_file, scan_folder,
 )
-from .repository import MarketDataRepository, PARSER_VERSION
+from .repository import (
+    MarketDataRepository, PARSER_VERSION, VALIDATION_RULES_VERSION,
+    validation_rules_version,
+)
 from .timeframes import MINUTE_TIMEFRAMES, TIMEFRAMES, normalize_timeframe, timeframe_spec
 from .coverage_index import CoverageArchive
 from .validation import (
-    VALIDATION_RULES_VERSION, _read_daily_dependencies,
+    _read_daily_dependencies,
     finalize_validation_publication, validate_incremental, validation_targets,
 )
 
@@ -270,6 +273,7 @@ class MarketDataService:
             return output
 
         def price_quality(rows: list[dict[str, Any]], timeframe: str, item: dict | None) -> dict[str, Any]:
+            rules_version = validation_rules_version(timeframe)
             samples = []
             timestamps = []
             for row in rows:
@@ -295,7 +299,7 @@ class MarketDataService:
                 (head or {}).get("_invalid_months")
             ) or bool(pending_dates) or any(
                 not row.get("scanned") or row.get("dirty_reason")
-                or int(row.get("rules_version") or 0) < VALIDATION_RULES_VERSION
+                or int(row.get("rules_version") or 0) < rules_version
                 or str(row.get("status") or "unknown") == "unknown"
                 for row in rows
             )
@@ -324,7 +328,7 @@ class MarketDataService:
             auction = int(row.get("auction_placeholders") or 0)
             status = str(row.get("status") or "unknown")
             if (not row.get("scanned") or row.get("dirty_reason")
-                    or int(row.get("rules_version") or 0) < VALIDATION_RULES_VERSION
+                    or int(row.get("rules_version") or 0) < validation_rules_version(timeframe)
                     or status == "unknown"):
                 status = "pending"
             if pd.Timestamp(row["trade_date"]).normalize() in archive.pending_dates(archive_heads.get(timeframe)):
@@ -2154,6 +2158,10 @@ class MarketDataService:
         intervals["1day"] = [{"start": day, "end": day, "status": "complete"}
                                for day in plan.get("prior_daily_days", [])] + intervals["1day"]
         selected["quality_evidence"] = {"schema_version": 1, "rules_version": VALIDATION_RULES_VERSION,
+            "rules_versions": {
+                timeframe: validation_rules_version(timeframe)
+                for timeframe in ("1day", "1min")
+            },
             "market_versions": {key: int(item["version"]) for key, item in references.items()},
             "auxiliary_versions": dict(auxiliary), "intervals": intervals}
         selected["version"] = resolution_snapshot_version(selected)

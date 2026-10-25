@@ -30,8 +30,18 @@ from ..price_validation import details_to_rows, price_issue_details, split_inval
 
 
 PARSER_VERSION = "market-data-v3-price-validation"
-VALIDATION_RULES_VERSION = 5
+VALIDATION_RULES_VERSION = 6
+DEFAULT_VALIDATION_RULES_VERSION = 5
+VALIDATION_RULES_VERSION_BY_TIMEFRAME = {"1min": VALIDATION_RULES_VERSION}
 PRICE_FIELDS = ("open", "high", "low", "close", "volume", "turnover")
+
+
+def validation_rules_version(timeframe: str) -> int:
+    """Return the current validation version without staling unrelated timeframes."""
+    normalized = normalize_timeframe(timeframe)
+    return VALIDATION_RULES_VERSION_BY_TIMEFRAME.get(
+        normalized, DEFAULT_VALIDATION_RULES_VERSION,
+    )
 
 
 # Reconciliation walks every published dataset and stats each immutable
@@ -3331,7 +3341,7 @@ class MarketDataRepository:
                         str(row["trade_date"])[:10], row["status"],
                         int(row.get("row_count", 0)), row.get("source_hash"),
                         row.get("dependency_hash"), int(row.get(
-                            "rules_version", VALIDATION_RULES_VERSION
+                            "rules_version", validation_rules_version(row["timeframe"])
                         )), _json(row.get("report", {})), row.get("checked_at") or utc_now(),
                     )
                     for row in values
@@ -3493,6 +3503,7 @@ class MarketDataRepository:
         expected_dates: pd.DatetimeIndex | None = None, include_days: bool = True,
     ) -> dict:
         symbol, timeframe = dataset["symbol"], dataset["timeframe"]
+        rules_version = validation_rules_version(timeframe)
         first = pd.Timestamp(start or dataset["first_time"]).normalize()
         last = pd.Timestamp(end or dataset["last_time"]).normalize()
         by_day = {pd.Timestamp(row["trade_date"]).normalize(): row for row in records}
@@ -3530,7 +3541,7 @@ class MarketDataRepository:
                 stale = bool(
                     item.get("dirty_reason")
                     or not item.get("scanned", True)
-                    or int(item.get("rules_version") or 0) < VALIDATION_RULES_VERSION
+                    or int(item.get("rules_version") or 0) < rules_version
                 )
                 if stale:
                     continue
@@ -3552,7 +3563,7 @@ class MarketDataRepository:
                     row is None
                     or row.get("dirty_reason")
                     or not row.get("scanned", True)
-                    or int(row.get("rules_version") or 0) < VALIDATION_RULES_VERSION
+                    or int(row.get("rules_version") or 0) < rules_version
                 ):
                     pending.append(str(day.date()))
                 elif row["status"] == "failed":
@@ -3575,7 +3586,7 @@ class MarketDataRepository:
                     row and row["status"] in {"passed", "suspended"}
                     and row.get("scanned", True)
                     and not row.get("dirty_reason")
-                    and int(row.get("rules_version") or 0) >= VALIDATION_RULES_VERSION
+                    and int(row.get("rules_version") or 0) >= rules_version
                 )
                 if not started:
                     if index == 0 and not passed:
@@ -3589,14 +3600,14 @@ class MarketDataRepository:
                 verified_through = pd.Timestamp(day).normalize()
         return {
             "symbol": symbol, "timeframe": timeframe,
-            "rules_version": VALIDATION_RULES_VERSION,
+            "rules_version": rules_version,
             "verified_from": verified_from.date().isoformat() if verified_from is not None else None,
             "verified_through": verified_through.date().isoformat() if verified_through is not None else None,
             "validated_days": sum(
                 1 for row in records if row["status"] in {"passed", "suspended"}
                 and row.get("scanned", True)
                 and not row.get("dirty_reason")
-                and int(row.get("rules_version") or 0) >= VALIDATION_RULES_VERSION
+                and int(row.get("rules_version") or 0) >= rules_version
             ),
             "failed": failed, "pending": pending,
             "failed_count": failed_count, "pending_count": pending_count,
@@ -3623,6 +3634,7 @@ class MarketDataRepository:
         prevents a newly validated current dataset from blessing an old one.
         """
         timeframe = normalize_timeframe(timeframe)
+        rules_version = validation_rules_version(timeframe)
         with self._connect() as db:
             dataset_row = self._dataset_row(db, symbol, timeframe, adjustment)
             daily_row = self._dataset_row(db, symbol, "1day", "none")
@@ -3641,7 +3653,7 @@ class MarketDataRepository:
         if not selected:
             return {
                 "symbol": symbol, "timeframe": timeframe,
-                "rules_version": VALIDATION_RULES_VERSION,
+                "rules_version": rules_version,
                 "verified_from": None, "verified_through": None,
                 "validated_days": 0, "failed": [], "pending": [],
                 "calendar_available": False, "version": version,
@@ -3681,7 +3693,7 @@ class MarketDataRepository:
         if selected is None:
             return {
                 "symbol": symbol, "timeframe": timeframe,
-                "rules_version": VALIDATION_RULES_VERSION,
+                "rules_version": rules_version,
                 "verified_from": None, "verified_through": None,
                 "validated_days": 0, "failed": [], "pending": [],
                 "calendar_available": False, "version": version,
@@ -3701,7 +3713,7 @@ class MarketDataRepository:
             )
             return {
                 "symbol": symbol, "timeframe": timeframe,
-                "rules_version": VALIDATION_RULES_VERSION,
+                "rules_version": rules_version,
                 "verified_from": None, "verified_through": None,
                 "validated_days": 0, "failed": [], "pending": [],
                 "calendar_available": bool(len(calendar_dates)),
@@ -3802,7 +3814,7 @@ class MarketDataRepository:
             ]
             return {
                 "symbol": symbol, "timeframe": timeframe,
-                "rules_version": VALIDATION_RULES_VERSION,
+                "rules_version": rules_version,
                 "verified_from": first.date().isoformat(),
                 "verified_through": last.date().isoformat(),
                 "validated_days": int(len(requested_days)),
