@@ -194,6 +194,24 @@ export interface EtfValidation {
   constraints?: Record<string, unknown> | null
 }
 
+export interface EtfParameterGuidance {
+  method_version: string
+  as_of: string
+  data_version?: string | null
+  status: 'ready' | 'limited' | 'unavailable'
+  reason: string | null
+  ranges: Partial<Record<'buy_step' | 'sell_step', { low: number; high: number }>>
+  granularity: Partial<Record<'buy_step' | 'sell_step' | 'buy_shares' | 'sell_shares', number>>
+  tau: { value: number; sensitivity: number[]; reference_days: number; reason: string } | null
+  evidence: {
+    daily_return_samples?: number; daily_sample_start?: string | null; daily_sample_end?: string | null
+    daily_volatility?: number; natr14?: number; amplitude_q75?: number; atr30_pct?: number | null
+    raw_price?: number; price_tick?: number; tick_ratio?: number; round_trip_cost?: number
+    cost_order_shares?: number; spacing_points?: number
+  }
+  notes: string[]
+}
+
 export interface EtfRow {
   symbol: string
   symbol_name: string
@@ -209,6 +227,7 @@ export interface EtfRow {
   metric_details: Record<string, EtfMetricDetail>
   /** Added by daily-state-aware ETF results; historical rows legitimately omit it. */
   market_state?: EtfMarketState | null
+  parameter_guidance?: EtfParameterGuidance | null
   gaps: EtfGap[]
   eligible: boolean
   filter_reasons: string[]

@@ -1,4 +1,16 @@
 .etf-research-layout--stacked { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }
+.etf-guidance { margin: 16px 0; padding: 16px; border: 1px solid #cbddef; border-radius: 10px; background: #f7fbff; }
+.etf-guidance-heading, .etf-guidance-action { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.etf-guidance h3 { margin: 0; font-size: 15px; color: #27384f; }
+.etf-guidance p, .etf-guidance li, .etf-guidance-action span { font-size: 12px; line-height: 1.7; color: #526179; }
+.etf-guidance-heading p { margin: 5px 0 12px; }
+.etf-guidance-values { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.etf-guidance-values > div { display: flex; flex-direction: column; gap: 6px; padding: 12px; border-radius: 7px; border: 1px solid #dce6f1; background: #fff; }
+.etf-guidance-values small, .etf-guidance-values span { color: #607086; font-size: 11px; line-height: 1.5; }
+.etf-guidance-values strong { color: #285b99; font-size: 17px; }
+.etf-guidance-action { justify-content: flex-start; margin-top: 12px; }
+@media (max-width: 1100px) { .etf-guidance-values { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .etf-guidance-values { grid-template-columns: minmax(0, 1fr); } }
 .etf-research-layout--stacked > .etf-research-config { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; min-width: 0; }
 .etf-research-layout--stacked > .etf-research-main { min-width: 0; }
 .etf-research-steps { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 0 0 16px; padding: 0; list-style: none; }

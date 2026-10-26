@@ -362,10 +362,12 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
     mode = 0 if summary_only else 1 if preview else 3 if daily_details else 2
     options = _options(config, prepared, money, mode)
     change_days, change_values, schedule = _parameter_arrays(config, prepared, parameter_schedule)
+    from .smart_dca import smart_dca_signals
+    dca_budgets, dca_signals = smart_dca_signals(config, data, prepared["days"])
     runner = simulate if engine._NUMBA_FASTPATH_ENABLED else getattr(simulate, "py_func", simulate)
     output = runner(*prepared["arrays"], *options, change_days, change_values,
                     np.full(len(prepared["days"]), -1, dtype=np.int64), 0, False, passive_grid,
-                    ACCOUNT_MODE_FULL, cancel_flag if preview else None)
+                    ACCOUNT_MODE_FULL, cancel_flag if preview else None, dca_budgets)
     if cancelled and cancelled():
         raise InterruptedError("回测已取消")
     metrics, eq, cash, shares, drawdown, periods, tb, ta, ts, tq, tp, tf, tc, th, tr, ttop, rb, rt, ra, rs, rr, rq, invested, _, floor_episode_grids, funding_stats = output
@@ -477,7 +479,17 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
                     "principal_drawdown": float(drawdown[account, i]) if drawdown_denominator > 0 else None,
                 })
         trades = [{"timestamp": openings[int(tb[j])], "side": "buy" if ts[j] == 1 else "sell", "quantity": int(tq[j]), "price": float(tp[j]), "fees": float(tf[j]), "cash": float(tc[j]), "shares": int(th[j]), "reason": engine._TRADE_REASONS[int(tr[j])], "external_topup": float(ttop[j]) if account == 0 else 0.0} for j in range(len(tb)) if ta[j] == account]
-        rejections = [{"timestamp": pd.Timestamp(rt[j]).isoformat(), "side": "buy" if rs[j] == 1 else "sell", "reason": "parameter_update" if int(rr[j]) == 12 else "unavailable_day" if int(rr[j]) == 13 else engine._REJECTION_REASONS[int(rr[j])], "requested_quantity": int(rq[j])} for j in range(len(rb)) if ra[j] == account]
+        rejection_names = {12: "parameter_update", 13: "unavailable_day", 14: "dca_signal_unavailable", 15: "dca_amount_below_lot"}
+        rejections = [{"timestamp": pd.Timestamp(rt[j]).isoformat(), "side": "buy" if rs[j] == 1 else "sell", "reason": rejection_names.get(int(rr[j])) or engine._REJECTION_REASONS[int(rr[j])], "requested_quantity": int(rq[j])} for j in range(len(rb)) if ra[j] == account]
+        if account == 1 and dca_signals:
+            for row in [*trades, *rejections]:
+                signal = dca_signals.get(row["timestamp"][:10])
+                if signal:
+                    row["dca_signal"] = signal
+                    if row["reason"] == "dca_signal_unavailable":
+                        row["reason"] = signal.get("reason", row["reason"])
+                        row["message"] = signal.get("message")
+            metric["signal_unavailable_days"] = sum(item["status"] == "skipped" for item in dca_signals.values())
         if account == 1 and not summary_only and not preview:
             bought = {period_key(t["timestamp"], config.dca.frequency) for t in trades}
             for key in dict.fromkeys(prepared["period_keys"]):
@@ -490,6 +502,9 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
             "equity_frequency": "1d" if preview or daily_details else config.frequency,
             "trades": trades, "rejections": rejections, "return_basis": strategy_basis,
         }
+        if account == 1 and dca_signals:
+            strategy_result["dca_rule"] = "contrarian_linear_v1"
+            strategy_result["signals"] = list(dca_signals.values()) if not summary_only else []
         if account == 0 and config.floor_penalty_config is not None:
             strategy_result.update({
                 "floor_episode_count": int(round(funding_stats[0, 13])),
@@ -501,6 +516,9 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
     if progress:
         progress(1.0, "股数回测完成")
     warnings = list(dict.fromkeys([*data.warnings, *data.metadata.get("warnings", [])]))
+    missing_signals = sum(item["status"] == "skipped" for item in dca_signals.values())
+    if missing_signals:
+        warnings.append(f"智能定投有 {missing_signals} 个交易日缺少可用的此前参考信号；到期时跳过并记录原因，不替换参考标的。")
     selection_asof = getattr(config, "selection_asof", None)
     retrospective = bool(selection_asof and config.start_date <= selection_asof)
     if retrospective:

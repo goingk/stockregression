@@ -133,6 +133,12 @@ def test_real_package_local_validation_statistics_and_frozen_auxiliary(tmp_path,
     row = result["rows"][0]
     assert row["status"] == "completed", row
     assert row["metrics"]["rv_annualized"] > 0
+    guidance = row["parameter_guidance"]
+    assert guidance["status"] == "ready", guidance
+    assert guidance["data_version"] == row["version"]
+    assert guidance["as_of"] == row["window_end"]
+    assert guidance["tau"]["value"] > 0
+    assert guidance["evidence"]["daily_return_samples"] >= 60
     assert "path_redundancy" not in row["metrics"]
     for key in ("path_redundancy_daily_mean", "path_redundancy_5d_mean", "path_redundancy_20d_mean",
                 "path_redundancy_daily_mean_1m", "path_redundancy_5d_mean_1m", "path_redundancy_20d_mean_1m"):

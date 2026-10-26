@@ -258,6 +258,7 @@ def simulate(
     fold_ids: np.ndarray, fold_count: int,
     grid_only: bool, passive_grid: bool, account_mode: int,
     cancel_flag: np.ndarray | None = None,
+    dca_budgets_by_day: np.ndarray | None = None,
 ) -> tuple:
     keep_details = output_mode >= 2
     top_up_mode = funding_mode == 1
@@ -863,6 +864,34 @@ def simulate(
                 dca_last_day = day_id
                 if opening > 0:
                     quantity = _nb_buy_lot(dca_shares, board_code)
+                    if dca_budgets_by_day is not None:
+                        budget = dca_budgets_by_day[day_id]
+                        if not math.isfinite(budget):
+                            if keep_details:
+                                rejection_bar[rejection_n] = i
+                                rejection_ts[rejection_n] = open_timestamps_ns[i]
+                                rejection_strategy[rejection_n] = account
+                                rejection_side[rejection_n] = 1
+                                rejection_reason[rejection_n] = 14
+                                rejection_quantity[rejection_n] = 0
+                                rejection_n += 1
+                            continue
+                        execution = round(math.ceil(opening * (1.0 + slippage) / tick - 1e-10) * tick, 6)
+                        if math.isfinite(limit_ups[i]):
+                            execution = min(execution, limit_ups[i])
+                        if math.isfinite(limit_downs[i]):
+                            execution = max(execution, limit_downs[i])
+                        quantity = _nb_buy_lot(int(math.floor(budget / execution)), board_code)
+                        if quantity <= 0:
+                            if keep_details:
+                                rejection_bar[rejection_n] = i
+                                rejection_ts[rejection_n] = open_timestamps_ns[i]
+                                rejection_strategy[rejection_n] = account
+                                rejection_side[rejection_n] = 1
+                                rejection_reason[rejection_n] = 15
+                                rejection_quantity[rejection_n] = 0
+                                rejection_n += 1
+                            continue
                     result = _nb_attempt(
                         1, quantity, opening, volume, limit_ups[i], limit_downs[i],
                         stamp_rates[i], transfer_rates[i], transfer_is_face_value[i],

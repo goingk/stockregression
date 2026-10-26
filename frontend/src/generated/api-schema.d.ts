@@ -637,6 +637,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/dca/reference/prepare": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Dca Prepare Reference */
+        post: operations["dca_prepare_reference_api_v1_dca_reference_prepare_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/data/reference-price/{symbol}": {
         parameters: {
             query?: never;
@@ -1543,8 +1560,57 @@ export interface components {
              * @default 0
              */
             initial_shares: number;
+            /**
+             * Mode
+             * @default fixed_shares
+             * @enum {string}
+             */
+            mode: "fixed_shares" | "ma" | "price_change";
+            /**
+             * Base Amount
+             * @default 1000
+             */
+            base_amount: number;
+            /**
+             * Reference
+             * @default target
+             * @enum {string}
+             */
+            reference: "target" | "security" | "index";
+            /** Reference Symbol */
+            reference_symbol?: string | null;
+            /** Reference Version */
+            reference_version?: string | null;
+            /**
+             * Ma Window
+             * @default 250
+             */
+            ma_window: number;
+            /**
+             * Change Window
+             * @default 1
+             */
+            change_window: number;
+            /**
+             * Sensitivity
+             * @default 5
+             */
+            sensitivity: number;
+            /**
+             * Min Multiplier
+             * @default 0.5
+             */
+            min_multiplier: number;
+            /**
+             * Max Multiplier
+             * @default 2
+             */
+            max_multiplier: number;
         };
-        /** DcaDefaults */
+        /**
+         * DcaDefaults
+         * @description Use exactly the same validation for persisted and submitted DCA.
+         */
         DcaDefaults: {
             /**
              * Frequency
@@ -1562,6 +1628,52 @@ export interface components {
              * @default 0
              */
             initial_shares: number;
+            /**
+             * Mode
+             * @default fixed_shares
+             * @enum {string}
+             */
+            mode: "fixed_shares" | "ma" | "price_change";
+            /**
+             * Base Amount
+             * @default 1000
+             */
+            base_amount: number;
+            /**
+             * Reference
+             * @default target
+             * @enum {string}
+             */
+            reference: "target" | "security" | "index";
+            /** Reference Symbol */
+            reference_symbol?: string | null;
+            /** Reference Version */
+            reference_version?: string | null;
+            /**
+             * Ma Window
+             * @default 250
+             */
+            ma_window: number;
+            /**
+             * Change Window
+             * @default 1
+             */
+            change_window: number;
+            /**
+             * Sensitivity
+             * @default 5
+             */
+            sensitivity: number;
+            /**
+             * Min Multiplier
+             * @default 0.5
+             */
+            min_multiplier: number;
+            /**
+             * Max Multiplier
+             * @default 2
+             */
+            max_multiplier: number;
         };
         /** EtfExecutionTemplate */
         EtfExecutionTemplate: {
@@ -2829,6 +2941,11 @@ export interface components {
             result_id: string;
             /** Candidate Ids */
             candidate_ids?: number[] | null;
+            /**
+             * Apply Parameter Guidance
+             * @default false
+             */
+            apply_parameter_guidance: boolean;
         };
         /**
          * ResearchStrategySpec
@@ -4328,6 +4445,39 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    dca_prepare_reference_api_v1_dca_reference_prepare_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BacktestConfig"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

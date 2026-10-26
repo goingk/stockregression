@@ -1,4 +1,5 @@
 import type { BacktestConfig } from './types'
+import { defaultDca, dcaError, normalizeDca } from './smartDca.ts'
 
 export type GridDefaults = Pick<BacktestConfig, 'grid_mode' | 'buy_step' | 'sell_step' | 'lower_price' | 'upper_price'> & { link_spacing: boolean }
 export type PositionDefaults = Pick<BacktestConfig, 'initial_shares' | 'min_shares' | 'max_shares' | 'buy_shares' | 'sell_shares'> & { link_shares: boolean }
@@ -112,7 +113,7 @@ export function defaultWorkbenchDefaults(): WorkbenchDefaults {
   return {
     grid: { grid_mode: 'trailing', buy_step: .03, sell_step: .03, lower_price: null, upper_price: null, link_spacing: false },
     position: { initial_shares: 1000, min_shares: 0, max_shares: 2000, buy_shares: 100, sell_shares: 100, link_shares: false },
-    dca: { frequency: 'monthly', shares: 100, initial_shares: 0 },
+    dca: defaultDca(),
     research: {
       strategy_id: 'geometric_robust_j', protocol_version: 5, strategy_version: 5, ranking_mode: 'robust_j',
       selection_target: 'both', rebalance_days: 63, seed: 42, top_candidates: 20, max_principal_drawdown: .2,
@@ -322,6 +323,7 @@ export function validWorkbenchGroup<K extends WorkbenchGroup>(group: K, value: u
     && (item.link_shares === undefined || typeof item.link_shares === 'boolean')
     && (item.min_shares as number) <= (item.initial_shares as number) && (item.max_shares === null || (item.initial_shares as number) <= (item.max_shares as number))
   return ['daily', 'weekly', 'monthly'].includes(String(item.frequency)) && quantity(item.shares, 100) && quantity(item.initial_shares)
+    && !dcaError(item as unknown as BacktestConfig['dca'])
 }
 
 export function normalizeWorkbenchDefaults(value: unknown): WorkbenchDefaults {
@@ -330,7 +332,7 @@ export function normalizeWorkbenchDefaults(value: unknown): WorkbenchDefaults {
   return {
     grid: validWorkbenchGroup('grid', item?.grid) ? { ...defaults.grid, ...structuredClone(item.grid) } : defaults.grid,
     position: validWorkbenchGroup('position', item?.position) ? { ...defaults.position, ...structuredClone(item.position) } : defaults.position,
-    dca: validWorkbenchGroup('dca', item?.dca) ? structuredClone(item.dca) : defaults.dca,
+    dca: validWorkbenchGroup('dca', item?.dca) ? normalizeDca(structuredClone(item.dca)) : defaults.dca,
     research: structuredClone(normalizeResearchDefaults(item?.research)),
   }
 }

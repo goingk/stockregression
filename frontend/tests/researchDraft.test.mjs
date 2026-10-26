@@ -41,6 +41,42 @@ const candidate = (id, qualified) => ({
   grids_down_count: 10, grids_up_count: 7, asymmetric: false, metrics: {}, qualified, reasons: [], replay_config: current,
 })
 
+const guidance = {
+  method_version: 'etf_parameter_guidance_v1', as_of: '2026-02-28', data_version: 'mkt-source-version', status: 'ready',
+  ranges: { buy_step: { low: .01, high: .05 }, sell_step: { low: .01, high: .05 } },
+  granularity: { buy_step: .002, sell_step: .002, buy_shares: 100, sell_shares: 100 },
+  tau: { value: .016, sensitivity: [.008, .016, .024], reference_days: 250 },
+}
+
+test('applying historical hints carries ranges, granularity and tau into a future draft only', () => {
+  const { result, row } = sourceFixture()
+  row.parameter_guidance = guidance
+  const input = { result, row, current, settings, apply_guidance: true }
+  assert.match(researchDraftFromEtfSource(input).error, /截止日之后/)
+  const { draft } = researchDraftFromEtfSource({ ...input, range_mode: 'after_cutoff' })
+  assert.equal(draft.config.start_date, '2026-03-01')
+  assert.equal(draft.config.end_date, null)
+  assert.equal(draft.settings.tau, .016)
+  assert.deepEqual(draft.settings.ranges.buy_step, guidance.ranges.buy_step)
+  assert.deepEqual(draft.settings.granularity, guidance.granularity)
+  assert.deepEqual(draft.settings.ranges.buy_shares, settings.ranges.buy_shares)
+  assert.equal(draft.settings.training_budget, settings.training_budget)
+  assert.equal(draft.context.source_summary.applied_guidance.as_of, guidance.as_of)
+  assert.equal(researchSourceRequestFields(draft.context).source_etf.apply_parameter_guidance, true)
+  assert.equal(settings.tau, .01)
+  assert.deepEqual(settings.ranges.buy_step, { low: .006, high: .08 })
+})
+
+test('stale, missing and malformed historical guidance cannot be applied', () => {
+  for (const patch of [null, { status: 'unavailable' }, { data_version: 'other' }, { as_of: '2026-03-01' }, { tau: { value: NaN } }, { granularity: { ...guidance.granularity, buy_step: .00015 } }]) {
+    const { result, row } = sourceFixture()
+    row.parameter_guidance = patch === null ? null : { ...guidance, ...patch }
+    const converted = researchDraftFromEtfSource({ result, row, current, settings, apply_guidance: true, range_mode: 'after_cutoff' })
+    assert.ok(converted.error)
+    assert.equal(converted.draft, undefined)
+  }
+})
+
 function sourceFixture() {
   return {
     result: {

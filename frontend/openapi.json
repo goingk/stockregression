@@ -1682,6 +1682,42 @@
         }
       }
     },
+    "/api/v1/dca/reference/prepare": {
+      "post": {
+        "summary": "Dca Prepare Reference",
+        "operationId": "dca_prepare_reference_api_v1_dca_reference_prepare_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BacktestConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/data/reference-price/{symbol}": {
       "get": {
         "summary": "Reference Price",
@@ -4422,8 +4458,95 @@
             "minimum": 0.0,
             "title": "Initial Shares",
             "default": 0
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "fixed_shares",
+              "ma",
+              "price_change"
+            ],
+            "title": "Mode",
+            "default": "fixed_shares"
+          },
+          "base_amount": {
+            "type": "number",
+            "maximum": 1000000000.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Base Amount",
+            "default": 1000
+          },
+          "reference": {
+            "type": "string",
+            "enum": [
+              "target",
+              "security",
+              "index"
+            ],
+            "title": "Reference",
+            "default": "target"
+          },
+          "reference_symbol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Symbol"
+          },
+          "reference_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Version"
+          },
+          "ma_window": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 2.0,
+            "title": "Ma Window",
+            "default": 250
+          },
+          "change_window": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Change Window",
+            "default": 1
+          },
+          "sensitivity": {
+            "type": "number",
+            "maximum": 100.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Sensitivity",
+            "default": 5
+          },
+          "min_multiplier": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Min Multiplier",
+            "default": 0.5
+          },
+          "max_multiplier": {
+            "type": "number",
+            "maximum": 20.0,
+            "minimum": 1.0,
+            "title": "Max Multiplier",
+            "default": 2
           }
         },
+        "additionalProperties": false,
         "type": "object",
         "title": "DcaConfig"
       },
@@ -4452,11 +4575,98 @@
             "minimum": 0.0,
             "title": "Initial Shares",
             "default": 0
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "fixed_shares",
+              "ma",
+              "price_change"
+            ],
+            "title": "Mode",
+            "default": "fixed_shares"
+          },
+          "base_amount": {
+            "type": "number",
+            "maximum": 1000000000.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Base Amount",
+            "default": 1000
+          },
+          "reference": {
+            "type": "string",
+            "enum": [
+              "target",
+              "security",
+              "index"
+            ],
+            "title": "Reference",
+            "default": "target"
+          },
+          "reference_symbol": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Symbol"
+          },
+          "reference_version": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 256,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reference Version"
+          },
+          "ma_window": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 2.0,
+            "title": "Ma Window",
+            "default": 250
+          },
+          "change_window": {
+            "type": "integer",
+            "maximum": 1000.0,
+            "minimum": 1.0,
+            "title": "Change Window",
+            "default": 1
+          },
+          "sensitivity": {
+            "type": "number",
+            "maximum": 100.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Sensitivity",
+            "default": 5
+          },
+          "min_multiplier": {
+            "type": "number",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Min Multiplier",
+            "default": 0.5
+          },
+          "max_multiplier": {
+            "type": "number",
+            "maximum": 20.0,
+            "minimum": 1.0,
+            "title": "Max Multiplier",
+            "default": 2
           }
         },
         "additionalProperties": false,
         "type": "object",
-        "title": "DcaDefaults"
+        "title": "DcaDefaults",
+        "description": "Use exactly the same validation for persisted and submitted DCA."
       },
       "EtfExecutionTemplate": {
         "properties": {
@@ -7143,6 +7353,11 @@
               }
             ],
             "title": "Candidate Ids"
+          },
+          "apply_parameter_guidance": {
+            "type": "boolean",
+            "title": "Apply Parameter Guidance",
+            "default": false
           }
         },
         "additionalProperties": false,

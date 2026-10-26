@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { get } from './api'
 import Disclosure from './Disclosure'
+import SmartDcaFields from './SmartDcaFields'
+import { defaultDca, dcaError, dcaSummary, normalizeDca } from './smartDca'
 import type { ButtonHTMLAttributes, ChangeEvent, InputHTMLAttributes, ReactNode, SelectHTMLAttributes } from 'react'
 import { AlertCircle, Check, ChevronRight, LoaderCircle, X } from 'lucide-react'
 import type { BacktestConfig, FeeConfig, Instrument } from './types'
@@ -146,7 +148,7 @@ export function defaultConfig(feeDefaults: FeeDefaults = baseFeeDefaults): Backt
     parameter_links: { spacing: false, shares: false },
     grid_mode: 'trailing', buy_step: .03, sell_step: .03,
     reference_price: null, reference_price_mode: 'auto', lower_price: null, upper_price: null,
-    fees: { ...feeDefaults, slippage_bps: 5 }, dca: { frequency: 'monthly', shares: 100, initial_shares: 0 },
+    fees: { ...feeDefaults, slippage_bps: 5 }, dca: defaultDca(),
   }
 }
 
@@ -192,8 +194,9 @@ export function configError(value: BacktestConfig, options: { ignoreHiddenResear
     if (value.min_shares > value.initial_shares || (value.max_shares != null && value.initial_shares > value.max_shares)) return '最低持股 ≤ 初始持股 ≤ 最高持股'
   }
   const minDcaShares = isStarBoard ? 200 : lotSize
-  if (!Number.isInteger(value.dca.shares) || value.dca.shares < minDcaShares || value.dca.shares % lotSize !== 0) return `定投数量应为 ${lotSize} 的正整数倍，至少 ${minDcaShares}`
+  if ((value.dca.mode ?? 'fixed_shares') === 'fixed_shares' && (!Number.isInteger(value.dca.shares) || value.dca.shares < minDcaShares || value.dca.shares % lotSize !== 0)) return `定投数量应为 ${lotSize} 的正整数倍，至少 ${minDcaShares}`
   if (!Number.isInteger(value.dca.initial_shares) || value.dca.initial_shares < 0 || value.dca.initial_shares % lotSize !== 0) return `定投初始持仓应为 ${lotSize} 的整数倍`
+  if (dcaError(value.dca)) return dcaError(value.dca)
   if (!validWorkbenchGroup('grid', strategyDefaults(value).grid)) return '请填写有效的买入、卖出间距，价格下限必须小于上限'
   if (!validFeeDefaults(value.fees) || !Number.isFinite(value.fees.slippage_bps) || value.fees.slippage_bps < 0 || value.fees.slippage_bps > 1000) return '请填写有效的费用与滑点'
   return ''
@@ -482,9 +485,11 @@ export function ConfigFeesFields({ model, extraBeforeSlippage }: { model: Config
 
 export function ConfigDcaFields({ model }: { model: ConfigFormModel }) {
   const { value, set, unit, isStarBoard } = model
+  const dca = normalizeDca(value.dca)
   return <div className="form-grid two">
+    <Field label="定投模式"><SelectInput value={dca.mode} onChange={event => set('dca', { ...dca, mode: event.target.value as typeof dca.mode })}><option value="fixed_shares">普通定投 · 固定股数</option><option value="ma">智能定投 · 均线模式</option><option value="price_change">智能定投 · 涨跌幅模式</option></SelectInput></Field>
     <Field label="定投频率"><SelectInput value={value.dca.frequency} onChange={event => set('dca', { ...value.dca, frequency: event.target.value as BacktestConfig['dca']['frequency'] })}><option value="daily">每天</option><option value="weekly">每周</option><option value="monthly">每月</option></SelectInput></Field>
-    <NumField label="每期定投" value={value.dca.shares} onChange={next => next != null && set('dca', { ...value.dca, shares: next })} suffix={unit} min={isStarBoard ? 200 : 100} step="100" />
+    {dca.mode === 'fixed_shares' ? <NumField label="每期定投" value={value.dca.shares} onChange={next => next != null && set('dca', { ...value.dca, shares: next })} suffix={unit} min={isStarBoard ? 200 : 100} step="100" /> : <SmartDcaFields config={value} onChange={next => set('dca', next)} />}
     <NumField label="定投初始持仓" value={value.dca.initial_shares} onChange={next => next != null && set('dca', { ...value.dca, initial_shares: next })} suffix={unit} min={0} step="100" hint="回测开始前已持有，不收取开仓手续费" />
   </div>
 }
@@ -508,7 +513,7 @@ export function ConfigForm({ value, onChange, onFeeDefaultsEdit, onDefaultsEdit,
       {purpose === 'backtest' && <>{share('min_shares', '最低持股')}{maxShares}{share('buy_shares', sharesLinked ? '每次买卖' : '每次买入')}{!sharesLinked && share('sell_shares', '每次卖出')}</>}
       <div className="field full-width"><span className="field-label">交易量参数联动</span><label className="link-toggle"><input type="checkbox" checked={sharesLinked} onChange={event => setLink('shares', event.target.checked)} /><span>统一买卖份额</span></label>{sharesLinked && <small>已采用当前买入值，双向共用</small>}</div>
     </div>{purpose === 'research' && researchProtocol !== 5 && <Disclosure id="config-research-baseline-position" title="对照策略仓位与交易量" summary={`${current.min_shares}～${current.max_shares ?? '不限'} ${unit}`} className="form-disclosure"><div className="form-grid two">{share('min_shares', '最低持股')}{maxShares}{share('buy_shares', sharesLinked ? '每次买卖' : '每次买入')}{!sharesLinked && share('sell_shares', '每次卖出')}</div></Disclosure>}</div>
-    <div data-validation-group="dca"><Disclosure id={`config-${purpose}-dca`} title="定投设置" summary={`${{daily: '每天', weekly: '每周', monthly: '每月'}[current.dca.frequency]} ${current.dca.shares} ${unit}`} className="form-disclosure"><ConfigDcaFields model={model} /></Disclosure></div>
+    <div data-validation-group="dca"><Disclosure id={`config-${purpose}-dca`} title="定投设置" summary={dcaSummary(current.dca, unit)} className="form-disclosure"><ConfigDcaFields model={model} /></Disclosure></div>
     <div data-validation-group="fees"><Disclosure id={`config-${purpose}-fees`} title="费用与滑点" summary={`${percent(fees.commission_rate, 3)} · 最低 ${money(fees.min_commission)} 元`} className="form-disclosure"><ConfigFeesFields model={model} /></Disclosure></div>
   </div>
 }

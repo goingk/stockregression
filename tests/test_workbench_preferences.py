@@ -53,7 +53,8 @@ def test_workbench_defaults_match_frontend_defaults_and_merge_partial_updates(se
         "initial_shares": 1000, "min_shares": 0, "max_shares": 2000,
         "buy_shares": 100, "sell_shares": 100,
     }
-    assert defaults["dca"] == {"frequency": "monthly", "shares": 100, "initial_shares": 0}
+    from stockregression.models import DcaConfig
+    assert defaults["dca"] == DcaConfig().model_dump()
     assert defaults["research"]["protocol_version"] == 5
     assert defaults["research"]["strategy_version"] == 5
     assert defaults["research"]["ranking_mode"] == "robust_j"

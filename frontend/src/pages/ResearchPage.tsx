@@ -24,6 +24,7 @@ import {
 import { flushConfiguration, useWorkbenchDefaults } from '../useWorkbenchDefaults'
 import { researchEstimateKey, useResearchEstimate } from '../researchEstimate'
 import { canSubmitResearchEstimate } from '../researchEstimateFreshness'
+import { dcaSummary as describeDca } from '../smartDca'
 import { linkResearchRanges } from '../parameterLinks'
 import type { BacktestConfig, BacktestResult, DataDiagnostics, DataPreparationRequest, DataSourceEvent, Job } from '../types'
 import { defaultSearchRanges, percentageRanges as pctRange, researchConfigForSubmission, researchRangesForSymbol, validResearchDefaults } from '../workbenchDefaults'
@@ -513,6 +514,9 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
   })
   const researchValidationError = () => {
     const researchBase = researchConfigForSubmission(base)
+    if (sourceSummary?.applied_guidance && researchBase.start_date <= sourceSummary.applied_guidance.as_of) {
+      return '已应用 ETF 历史参数建议，研究开始日必须晚于建议截止日，以免将未来信息带入历史验证。'
+    }
     const baseError = configError(researchBase, { ignoreHiddenResearchQuantities: true })
     if (baseError) return baseError
     if (researchBase.initial_shares <= 0) return '稳健 J 研究要求初始持股大于零。'
@@ -767,8 +771,7 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
   const basicsSummary = `${base.symbol || '未选标的'} · ${base.start_date || '未设开始'} 至 ${base.end_date || '未设结束'} · ${base.frequency}`
   const priceBoundsSummary = `${base.lower_price == null ? '不限' : money(base.lower_price, 3)} ～ ${base.upper_price == null ? '不限' : money(base.upper_price, 3)} 元`
   const feesSummary = `佣金 ${percent(configModel.fees.commission_rate, 3)} · 最低 ${money(configModel.fees.min_commission)} 元 · 滑点 ${configModel.fees.slippage_bps} 基点`
-  const dcaFrequency = { daily: '每天', weekly: '每周', monthly: '每月' }[base.dca.frequency]
-  const dcaSummary = `${dcaFrequency} ${base.dca.shares} ${configModel.unit} · 初始 ${base.dca.initial_shares} ${configModel.unit}`
+  const dcaSummary = `${describeDca(base.dca, configModel.unit)} · 初始 ${base.dca.initial_shares} ${configModel.unit}`
   const planSummary = `${schemeLabel(selectionTarget, rebalanceDays)} · ${rebalanceDays} 日换参 · 种子 ${seed} · 训练/核验 ${trainingBudget}/${validationBudget} · 展示 ${topCandidates} 组`
   const preflightTone = preflightReady ? 'green' : preflight.status === 'loading' ? 'blue' : preflight.status === 'idle' ? 'neutral' : 'amber'
   const preflightStatusLabel = preflightReady ? '可以启动' : preflight.status === 'loading' ? '预检中' : preflight.status === 'idle' ? '等待预检' : '存在阻断项'
@@ -977,6 +980,7 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
         <div><small>来源数据版本（仅追溯）</small><strong className='source-version'>{displayedDraftSummary?.data_version || '—'}</strong><span>提交目标版本：{requestedDataVersionFromPreview(preflight.preview) || '等待预检确认'}</span></div>
       </div>
       <div className='research-prior-control'><div><strong>研究先验</strong><span>来源候选仅在来源截止日不晚于该次决策日时使用；历史研究按当时日线重算。样本内 ETF 核验收益与稳健 J 不合并为一个分数，评估开始日前选参建议是训练候选，基于当时可见历史，不计作样本外结果。</span></div><div className='research-prior-toggle' role='group' aria-label='研究先验策略'><button type='button' className={researchDraft.state.prior_policy === 'off' ? 'selected' : ''} aria-pressed={researchDraft.state.prior_policy === 'off'} onClick={() => researchDraft.setPriorPolicy('off')}>关闭</button><button type='button' className={researchDraft.state.prior_policy === 'daily_state_v1' ? 'selected' : ''} aria-pressed={researchDraft.state.prior_policy === 'daily_state_v1'} onClick={() => researchDraft.setPriorPolicy('daily_state_v1')}>日线状态先验</button></div></div>
+      {sourceSummary?.applied_guidance && <p className='field-hint'>已应用截止 {sourceSummary.applied_guidance.as_of} 的历史建议：间距上下限、四轴细粒度与 τ。当前 τ 为 {percent(settings.tau)}；建议以 250 日为参考跨度，可继续调整并对照敏感性值。</p>}
       <div className='research-source-actions'><Button variant='quiet' onClick={() => onOpenEtfSource?.(sourceEtf.result_id)}><ArrowLeft size={14} />返回 ETF 研究</Button><Button variant='quiet' onClick={removeSource}><Unlink size={14} />解除来源并保留数值草稿</Button><span><Link2 size={13} /> 换标的、恢复默认或从回测转入研究会清除来源；切换页面保留。</span></div>
       {sourceError && <div className='notice error research-source-error' role='alert'><span>{sourceError}</span><Button variant='secondary' onClick={removeSource}>解除来源并继续</Button></div>}
     </Card>}

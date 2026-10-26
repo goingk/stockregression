@@ -29,6 +29,7 @@ import type {
 } from '../etfResearch.ts'
 import { isEtfResearchResult, isEtfValidationResult } from '../etfResearch.ts'
 import TableViewport from '../TableViewport'
+import EtfGuidance from '../EtfGuidance'
 import './EtfResearchPage.css'
 
 type Props = {
@@ -492,7 +493,7 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
     onLoadBacktest?.(next, 'ETF 候选参数已载入回测草稿，未自动提交。尚无选参截止日后的本地行情时，仅保留草稿。')
   }
 
-  const enterResearchDraft = (row: EtfRow, rangeMode: 'prior_year' | 'after_cutoff' = 'prior_year') => {
+  const enterResearchDraft = (row: EtfRow, rangeMode: 'prior_year' | 'after_cutoff' = 'prior_year', applyGuidance = false) => {
     if (!researchResult) { setError('请先打开一条已保存的 ETF 研究排名。'); return }
     if (!workspace.research || !workspace.researchSettings) { setError('当前研究工作区尚未载入。'); return }
     if (!onResearchSource) { setError('参数研究导航尚未初始化。'); return }
@@ -502,6 +503,7 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
       current: workspace.research,
       settings: workspace.researchSettings,
       range_mode: rangeMode,
+      apply_guidance: applyGuidance,
     })
     if (converted.error || !converted.draft) { setError(converted.error || '无法建立参数研究草稿。'); return }
     setError(''); setNotice('')
@@ -670,6 +672,7 @@ export default function EtfResearchPage({ requestedResult, onSelectedResultChang
               <div className='etf-detail-heading'><div><h2>{detail.symbol_name || detail.symbol}</h2><span>{detail.symbol} · {dateText(detail.window_start)} 至 {dateText(detail.window_end)}</span></div><div><Badge tone={dataStatusTone(detail.data_status)}>{dataStatusLabel(detail.data_status)}</Badge><Badge tone={detail.eligible ? 'green' : 'red'}>{detail.eligible ? '满足网格筛选' : '未满足网格筛选'}</Badge><Badge tone='blue'>样本内</Badge>{detailMarketState && <Badge tone={marketStateStatusTone(detailMarketState.status)}>日线状态 · {marketStateStatusLabel(detailMarketState.status)}</Badge>}</div></div>
               <div className='etf-user-conclusion'><div><small>当前结论</small><strong>{detail.status !== 'completed' ? '暂不能判断网格特征' : detail.eligible ? '符合网格特征筛选' : '未满足网格特征筛选'}</strong><span>{detailFilterReasons.length ? filterReasonsText(detailFilterReasons) : '特征筛选通过；这不代表未来收益预测。'}</span></div><div><small>历史参数试算</small><ValidationBadge status={detailValidation?.status ?? 'not_selected'} /><span>{validationSummary(detailValidation)}</span></div><div><small>网格参考区间</small><strong>{money(gridBasis?.lower_price, 4)} – {money(gridBasis?.upper_price, 4)} 元</strong><span>比较价格 {money(gridBasis?.current_raw_price, 4)} 元 · 参考价 {money(gridBasis?.reference_price, 4)} 元</span>{gridBasis?.current_price_date && <span>价格来自 {dateText(gridBasis.current_price_date)} {gridBasis.current_price_source === 'daily' ? '日线' : '分钟线'}收盘，已统一到本次研究的价格口径。</span>}</div></div>
               <section className='etf-parameter-summary' aria-label='参数试算结论'><div><h3>参数试算</h3><ValidationBadge status={detailValidation?.status ?? 'not_selected'} /></div><p>{validationSummary(detailValidation)}</p>{detailValidation?.recommendation && <p>推荐候选 #{String(detailValidation.recommendation.id)} · 基准步长 {percent(detailValidation.recommendation.base_step)} · 历史峰值本金收益 {percent(detailValidation.recommendation.metrics.peak_principal_return)} · 最大回撤 {percent(detailValidation.recommendation.metrics.max_principal_drawdown)}</p>}</section>
+              <EtfGuidance guidance={detail.parameter_guidance} onApply={() => enterResearchDraft(detail, 'after_cutoff', true)} />
               <Disclosure id={`etf-data-resolution-${detail.symbol}`} title='数据使用情况' summary={dataResolutionSummary(detail.data_resolution)}>
                 <p>{minuteAndGssSampleText(detail.sampling)} · 可进入参数试算：{detail.replay_allowed ? '是' : '否'}</p>
                 {detail.data_resolution && <><p>策略 {detail.data_resolution.policy} · 计划校验码 {detail.data_resolution.plan_hash}</p><p>可评价区间 {dateText(detail.data_resolution.first_evaluable_date)} 至 {dateText(detail.data_resolution.last_evaluable_date)}</p><ul className='etf-resolution-days'>{detail.data_resolution.days.filter(day => day.mode !== 'minute').map(day => <li key={day.date}><b>{day.date}</b> · {({ daily: '日线降级', skip: '跳过', suspended: '停牌', no_trades: '全天无成交' } as Record<string, string>)[day.mode]} · {day.reason || day.reason_code || '—'}</li>)}</ul></>}

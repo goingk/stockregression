@@ -13,7 +13,7 @@ from typing import Any, Literal
 from filelock import FileLock
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .models import GRANULARITY_DEFAULTS, GRANULARITY_MINIMUMS, ROBUST_RANGE_DEFAULTS
+from .models import DcaConfig, GRANULARITY_DEFAULTS, GRANULARITY_MINIMUMS, ROBUST_RANGE_DEFAULTS
 
 PROJECT_ROOT = Path(os.environ.get("STOCKREGRESSION_HOME", Path(__file__).resolve().parents[2])).resolve()
 PROJECT_CONFIG_FILE = PROJECT_ROOT / "config" / "application.json"
@@ -101,10 +101,8 @@ class PositionDefaults(_WorkbenchPreference):
         return self
 
 
-class DcaDefaults(_WorkbenchPreference):
-    frequency: Literal["daily", "weekly", "monthly"] = "monthly"
-    shares: int = Field(default=100, ge=100, multiple_of=100)
-    initial_shares: int = Field(default=0, ge=0, multiple_of=100)
+class DcaDefaults(DcaConfig):
+    """Use exactly the same validation for persisted and submitted DCA."""
 
 
 class ResearchRangeDefaults(_WorkbenchPreference):

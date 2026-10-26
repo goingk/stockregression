@@ -138,7 +138,9 @@ function AppWindow() {
   const researchFromEtfSource = (draft: ResearchDraftBundle) => {
     workspace.loadResearchDraft(draft.config, draft.settings)
     researchDraft.replace(draft.context)
-    setTransferNotice({ page: 'research', message: '已从 ETF 结果建立参数研究草稿；来源、日期与执行参数已带入，搜索范围与预算沿用研究工作区设置。' })
+    setTransferNotice({ page: 'research', message: draft.context.source_summary?.applied_guidance
+      ? '已按 ETF 历史建议建立截止日后研究草稿：买卖间距范围、四轴细粒度和安全垫 τ 已带入；预算与数量范围沿用研究设置。'
+      : '已从 ETF 结果建立参数研究草稿；来源、日期与执行参数已带入，搜索范围与预算沿用研究工作区设置。' })
     commitNavigation(previous => ({ ...previous, page: 'research', research: null, researchDecision: null }))
   }
   const unsupportedRestartMessage = '当前后台仍是旧版本，无法通过网页重启。请关闭当前服务后重新运行 start.cmd；新版服务启动后，这个按钮即可直接重启项目。'

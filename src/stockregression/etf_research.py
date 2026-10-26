@@ -15,6 +15,7 @@ from typing import Callable
 import pandas as pd
 
 from .etf_models import EtfResearchRequest, METHOD_VERSION, RESULT_SCHEMA_VERSION, MIN_COMPLETE_DAY_RATIO
+from .etf_guidance import GUIDANCE_VERSION, parameter_guidance
 from .market_data import MarketDataService
 from .market_data.models import MarketDataError
 from .models import BacktestConfig, DataBundle
@@ -705,7 +706,7 @@ def run_etf_research(
     result["rows"] = [{
         **item, "data_status": item["status"], "status": "pending" if item["status"] in {"ready", "limited"} else item["status"],
         "metrics": {}, "metric_details": {}, "grid_basis": {}, "diagnostics": {},
-        "market_state": None,
+        "market_state": None, "parameter_guidance": None,
         "eligible": False, "filter_reasons": [], "gss_score": None,
         "rank": None, "score_cohort_size": 0, "score_contributions": {},
         "replay_allowed": bool(item.get(
@@ -733,6 +734,7 @@ def run_etf_research(
                     *row["warnings"], *getattr(data, "warnings", []), *statistics.get("warnings", []),
                 ]))
                 row.update(statistics)
+                row["parameter_guidance"] = parameter_guidance(row, request)
                 if row["status"] != "completed":
                     row["data_status"] = row["status"]
                     row["replay_allowed"] = False
@@ -886,6 +888,7 @@ def run_local_validation(store, request, plan, *, market=None, progress=None, ca
 
 def request_fingerprint(request, plan) -> str:
     return hashlib.sha256(json.dumps(
-        {"method_version": plan.get("method_version", METHOD_VERSION), "request": request.model_dump(mode="json"), "universe": plan["universe"]},
+        {"method_version": plan.get("method_version", METHOD_VERSION), "guidance_version": GUIDANCE_VERSION,
+         "request": request.model_dump(mode="json"), "universe": plan["universe"]},
         sort_keys=True, ensure_ascii=False, default=str,
     ).encode()).hexdigest()

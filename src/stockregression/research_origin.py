@@ -38,6 +38,14 @@ def resolve_research_origin(store, config) -> dict | None:
         as_of = date.fromisoformat(str(row.get("window_end") or original.get("as_of"))).isoformat()
     except ValueError as exc:
         raise ResearchOriginError("来源 ETF 研究缺少有效截止日") from exc
+    guidance = row.get("parameter_guidance") or {}
+    if reference.apply_parameter_guidance:
+        if (guidance.get("status") not in {"ready", "limited"}
+                or guidance.get("as_of") != as_of
+                or guidance.get("data_version") != row.get("version")):
+            raise ResearchOriginError("来源 ETF 缺少同一数据版本的有效历史参数建议，请重新运行 ETF 研究")
+        if config.base.start_date <= date.fromisoformat(as_of):
+            raise ResearchOriginError("应用 ETF 历史参数建议时，研究开始日必须晚于建议截止日，避免未来信息泄漏")
     available = (row.get("validation") or {}).get("candidates") or []
     by_id = {item.get("id"): item for item in available if isinstance(item, dict)}
     if reference.candidate_ids is None:
@@ -70,6 +78,10 @@ def resolve_research_origin(store, config) -> dict | None:
         "gss_score": row.get("gss_score"), "source_metrics": row.get("metrics") or {},
         "market_state": row.get("market_state"), "seeds": seeds,
     }
+    if row.get("parameter_guidance"):
+        origin["parameter_guidance"] = row["parameter_guidance"]
+    if reference.apply_parameter_guidance:
+        origin["applied_parameter_guidance"] = True
     origin["source_hash"] = origin_fingerprint(origin)
     return origin
 

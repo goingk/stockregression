@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildResultCurveModel, resultCurveRowAt, savedGridParameters } from '../src/resultPresentation.ts'
+import { buildResultCurveModel, resultCurveRowAt, resultStrategyEntries, savedGridParameters } from '../src/resultPresentation.ts'
 
 const parameterMap = (result) => Object.fromEntries(savedGridParameters(result).map((row) => [row.key, row]))
 const strategy = (equity, values = {}) => ({ metrics: {}, equity, trades: [], rejections: [], ...values })
@@ -94,14 +94,50 @@ test('peak-principal curves drive the curve model returns and drawdowns', () => 
     symbol: '600000.SH', accounting_basis: 'peak_principal_v2', config: {},
     strategies: {
       grid: strategy([{ timestamp: '2024-01-02', equity: 110, total_invested: 100, principal_curve: 1.1, principal_drawdown: .02, position: 10 }]),
-      matched_funding_hold: strategy([{ timestamp: '2024-01-02', equity: 105, total_invested: 100, principal_curve: 1.05, principal_drawdown: .01 }]),
+      same_account_passive: strategy([{ timestamp: '2024-01-02', equity: 105, total_invested: 100, principal_curve: 1.05, principal_drawdown: .01 }]),
     },
   })
   assert.ok(Math.abs(model.rows[0].values.grid.returnRate - .1) < 1e-12)
   assert.equal(model.rows[0].values.grid.drawdown, .02)
-  assert.ok(Math.abs(model.rows[0].values.matched_funding_hold.returnRate - .05) < 1e-12)
-  assert.equal(model.rows[0].values.matched_funding_hold.drawdown, .01)
-  assert.equal(model.strategies.find((style) => style.key === 'matched_funding_hold').name, '同资金被动持有')
+  assert.ok(Math.abs(model.rows[0].values.same_account_passive.returnRate - .05) < 1e-12)
+  assert.equal(model.rows[0].values.same_account_passive.drawdown, .01)
+  assert.equal(model.strategies.find((style) => style.key === 'same_account_passive').name, '同账户被动持有')
+})
+
+test('results hide the matched-funding baseline without changing saved research data or other strategies', () => {
+  const result = {
+    symbol: '600000.SH', accounting_basis: 'peak_principal_v2', config: {},
+    funding: { matched_funding_hold_invested: 100 },
+    strategies: {
+      matched_funding_hold: strategy([
+        { timestamp: '2023-01-01', equity: 100, total_invested: 100, principal_curve: 1 },
+        { timestamp: '2024-01-03', equity: 105, total_invested: 100, principal_curve: 1.05 },
+      ], { metrics: { peak_principal_return: .05, total_invested: 100 } }),
+      grid: strategy([{ timestamp: '2024-01-02', equity: 110, total_invested: 100, principal_curve: 1.1 }], { metrics: { matched_funding_hold_return: .05, matched_funding_hold_invested: 100 } }),
+      same_account_passive: strategy([{ timestamp: '2024-01-02', equity: 105, total_invested: 100, principal_curve: 1.05 }]),
+      historical_strategy: strategy([{ timestamp: '2024-01-04', equity: 108, total_invested: 100, principal_curve: 1.08 }]),
+      dca: null,
+    },
+  }
+  const saved = structuredClone(result)
+  const entries = resultStrategyEntries(result)
+  assert.deepEqual(entries.map(([key]) => key), ['grid', 'same_account_passive', 'historical_strategy'])
+  assert.equal(entries[0][1], result.strategies.grid)
+  const model = buildResultCurveModel(result)
+  assert.deepEqual(model.strategies.map(({ key }) => key), ['grid', 'same_account_passive', 'historical_strategy'])
+  assert.deepEqual(model.rows.map(({ timestamp }) => timestamp), ['2024-01-02', '2024-01-04'])
+  assert.ok(model.rows.every((row) => !Object.hasOwn(row.values, 'matched_funding_hold')))
+  assert.equal(resultCurveRowAt(model, '2024-01-03'), undefined)
+  assert.deepEqual(result, saved)
+})
+
+test('missing strategies and historical results containing only the hidden baseline stay empty', () => {
+  assert.deepEqual(resultStrategyEntries(null), [])
+  assert.deepEqual(resultStrategyEntries(undefined), [])
+  assert.deepEqual(resultStrategyEntries({}), [])
+  const model = buildResultCurveModel({ strategies: { matched_funding_hold: strategy([{ timestamp: '2024-01-01', equity: 100 }]) } })
+  assert.deepEqual(model.strategies, [])
+  assert.deepEqual(model.rows, [])
 })
 
 test('legacy results keep their own drawdown when no principal drawdown is reported', () => {

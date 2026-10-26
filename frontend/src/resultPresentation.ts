@@ -82,10 +82,14 @@ export function savedGridParameters(value: unknown): ResultParameter[] {
 export const resultCurveStyles = [
   { key: 'grid', name: '网格策略', color: '#2563eb' },
   { key: 'same_account_passive', name: '同账户被动持有', color: '#0d9488' },
-  { key: 'matched_funding_hold', name: '同资金被动持有', color: '#7c3aed' },
   { key: 'dca', name: '定投', color: '#d97706' },
   { key: 'buy_hold', name: '买入并持有', color: '#64748b' },
 ] as const
+
+/** Results-only presentation filter; keep the saved research baseline and other historical strategies intact. */
+export function resultStrategyEntries(result: BacktestResult | null | undefined): Array<[string, StrategyResult]> {
+  return Object.entries(result?.strategies ?? {}).filter(([key, strategy]) => key !== 'matched_funding_hold' && strategy != null)
+}
 
 export type ResultCurveValues = { returnRate: number | null; drawdown: number | null; asset: number | null; invested: number | null }
 export type ResultCurveRow = { timestamp: string; time: number; values: Record<string, ResultCurveValues>; position: number | null }
@@ -112,7 +116,7 @@ function investmentAmount(point: EquityPoint, strategy: StrategyResult, result: 
 
 /** A shared timestamp union prevents one strategy's nearest observation from being shown as another date. */
 export function buildResultCurveModel(result: BacktestResult): ResultCurveModel {
-  const available = Object.entries(result.strategies ?? {}).filter(([, strategy]) => strategy != null)
+  const available = resultStrategyEntries(result)
   const known = resultCurveStyles.filter((style) => available.some(([key]) => style.key === key))
   const extra = available.filter(([key]) => !resultCurveStyles.some((style) => style.key === key))
   const strategies = [

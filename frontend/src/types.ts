@@ -193,6 +193,22 @@ export interface DataPreparationPlan {
   steps: DataPreparationStep[]
   config: BacktestConfig
 }
+export interface DcaConfig {
+  frequency: 'daily' | 'weekly' | 'monthly'
+  shares: number
+  initial_shares: number
+  mode?: 'fixed_shares' | 'ma' | 'price_change'
+  base_amount?: number
+  reference?: 'target' | 'security' | 'index'
+  reference_symbol?: string | null
+  reference_version?: string | null
+  ma_window?: number
+  change_window?: number
+  sensitivity?: number
+  min_multiplier?: number
+  max_multiplier?: number
+}
+
 export type QuantityMode = 'shares' | 'cash' | 'equity_ratio'
 export interface ParameterLinks { spacing: boolean; shares: boolean }
 export interface TradingCalendar {
@@ -237,7 +253,7 @@ export interface BacktestConfig {
   buy_shares: number
   sell_shares: number
   parameter_links: ParameterLinks
-  dca: { frequency: 'daily' | 'weekly' | 'monthly'; shares: number; initial_shares: number }
+  dca: DcaConfig
   reference_price_mode: 'auto' | 'manual'
   initial_cash?: number
   /** Legacy v1/v2 only; new v3 configs do not send this field. */

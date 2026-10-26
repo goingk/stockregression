@@ -61,6 +61,28 @@ def test_invalid_reference_and_empty_candidate_list(tmp_path):
     assert resolve_research_origin(store, config)["seeds"] == []
 
 
+def test_applied_guidance_is_frozen_and_cannot_look_ahead(tmp_path):
+    store = Store(tmp_path)
+    original = store.result(_source(store))
+    original["rows"][0]["parameter_guidance"] = {
+        "status": "ready", "as_of": "2025-01-03", "data_version": "source-retired",
+        "method_version": "etf_parameter_guidance_v1", "tau": {"value": .016},
+    }
+    source = store.save_result("etf_research", original, "", "with guidance")
+    config = _config(source)
+    config.source_etf.apply_parameter_guidance = True
+    with pytest.raises(ResearchOriginError, match="必须晚于"):
+        resolve_research_origin(store, config)
+    config.base.start_date = pd.Timestamp("2025-01-04").date()
+    origin = resolve_research_origin(store, config)
+    assert origin["applied_parameter_guidance"] is True
+    assert origin["parameter_guidance"]["tau"]["value"] == .016
+    missing = _config(_source(store))
+    missing.source_etf.apply_parameter_guidance = True
+    with pytest.raises(ResearchOriginError, match="缺少"):
+        resolve_research_origin(store, missing)
+
+
 @pytest.mark.parametrize("standalone", [False, True])
 def test_api_freezes_target_version_and_source_and_indexes_submission(tmp_path, monkeypatch, standalone):
     app = create_app(str(tmp_path), start_jobs=False)

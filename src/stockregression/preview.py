@@ -94,7 +94,8 @@ class PreviewManager:
 
     @staticmethod
     def _data_key(config):
-        return (config.symbol, str(config.start_date), str(config.end_date), config.frequency, config.schema_version)
+        reference = (config.dca.reference, config.dca.reference_symbol, config.dca.reference_version) if config.dca.mode != "fixed_shares" else None
+        return (config.symbol, str(config.start_date), str(config.end_date), config.frequency, config.schema_version, reference)
 
     @staticmethod
     def _bundle_key(version, config):

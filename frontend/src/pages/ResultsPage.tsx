@@ -7,7 +7,8 @@ import ChartView from '../ChartView'
 import Disclosure from '../Disclosure'
 import ResultsCurves from '../ResultsCurves'
 import { RESULT_PAGE_SIZE, barTimestampRange, bucketTradeMarkers, earliestBarTimestamp, groupTradeMarkers, mapTradesToBars, markerLabel, mergeBars, naiveStamp, periodReturnBaseline, periodReturns, resultsPageQuery } from '../resultsReview'
-import { resultShareUnit, savedGridParameters } from '../resultPresentation'
+import { resultShareUnit, resultStrategyEntries, savedGridParameters } from '../resultPresentation'
+import { dcaSummary, dcaIndexes } from '../smartDca'
 import { Badge, Button, Card, Empty, ErrorBox, Loading, PageHeader, SelectInput, money, percent, useErrorMessage } from '../components'
 import { chartValue } from '../marketValues'
 import type { BacktestResult, ResultSummary, StrategyResult, Trade } from '../types'
@@ -21,10 +22,14 @@ type Props = {
   onSelectionChange: (result: string | null, compare: string | null) => void
   onViewChange: (view: ResultView) => void
 }
-const names: Record<string, string> = { grid: '网格策略', dca: '定期定额', buy_hold: '买入并持有', same_account_passive: '同账户被动持有', matched_funding_hold: '同资金被动持有' }
-const colors: Record<string, string> = { grid: '#2563eb', dca: '#d97706', buy_hold: '#64748b', same_account_passive: '#0d9488', matched_funding_hold: '#7c3aed' }
+const names: Record<string, string> = { grid: '网格策略', dca: '定期定额', buy_hold: '买入并持有', same_account_passive: '同账户被动持有' }
+const colors: Record<string, string> = { grid: '#2563eb', dca: '#d97706', buy_hold: '#64748b', same_account_passive: '#0d9488' }
 const reasonNames: Record<string, string> = {
   initial_position: '初始建仓', dca: '定期购买', buy_hold: '初始全仓', grid_buy: '网格买入', grid_sell: '网格卖出',
+  dca_signal_unavailable: '此前参考信号不可用', dca_amount_below_lot: '本期金额不足一个交易单位或本期投入为零',
+  dca_reference_stale: '参考数据缺少执行日前一交易日收盘', dca_insufficient_history: '参考历史不足',
+  dca_reference_invalid: '参考窗口含无效价格或停牌', dca_reference_gap: '参考窗口有交易日缺口',
+  dca_reference_action: '参考公司行动数据不足，无法校正除权价格',
   dca_period_skipped: '该期无可成交时点，未投入资金', non_tradable_bar: '不可交易行情', suspended_day: '当日停牌', invalid_open: '开盘价无效', zero_volume: '无成交量',
   limit_up_locked: '开盘封涨停', limit_down_locked: '开盘封跌停', invalid_execution_price: '成交价格无效',
   below_lot: '不足最小申报数量', position_limit: '仓位限制', position_limit_or_below_lot: '仓位限制或不足最小数量',
@@ -32,8 +37,8 @@ const reasonNames: Record<string, string> = {
 }
 const reasonText = (value: unknown) => reasonNames[String(value)] ?? String(value ?? '—')
 const sideText = (value: unknown) => value === 'buy' ? '买入' : value === 'sell' ? '卖出' : String(value ?? '—')
-const metricLabels: Record<string, string> = { peak_principal_return: '峰值本金收益', max_principal_drawdown: '最大本金回撤', matched_funding_hold_return: '同资金被动持有', trade_count: '成交笔数', total_fees: '总手续费', buy_count: '买入次数', sell_count: '卖出次数', turnover: '换手率' }
-const percentMetrics = ['peak_principal_return', 'max_principal_drawdown', 'matched_funding_hold_return']
+const metricLabels: Record<string, string> = { peak_principal_return: '峰值本金收益', max_principal_drawdown: '最大本金回撤', trade_count: '成交笔数', total_fees: '总手续费', buy_count: '买入次数', sell_count: '卖出次数', turnover: '换手率' }
+const percentMetrics = ['peak_principal_return', 'max_principal_drawdown']
 const countMetrics = ['trade_count', 'buy_count', 'sell_count']
 type Strategy = { key: string; name: string; value: StrategyResult }
 const BAR_PAGE_LIMIT = 1500
@@ -123,11 +128,11 @@ export default function ResultsPage({ selectedResultId, selectedCompareId, view,
     if (before) params.set('before', before)
     return '/data/bars/' + encodeURIComponent(result.symbol) + '?' + params.toString()
   }, [result])
-  const strategies: Strategy[] = useMemo(() => result ? Object.entries(result.strategies ?? {}).filter(([, value]) => value != null).map(([key, value]) => ({ key, name: value.return_basis === 'cost' ? '定投（成本收益）' : names[key] ?? key, value })) : [], [result])
+  const strategies: Strategy[] = useMemo(() => resultStrategyEntries(result).map(([key, value]) => ({ key, name: value.return_basis === 'cost' ? '定投（成本收益）' : names[key] ?? key, value })), [result])
   const [tradeStrategy, setTradeStrategy] = useState('grid')
   const reference = strategies.find((x) => x.key === tradeStrategy) ?? strategies[0]
   const isDemoResult = result?.is_demo === true || result?.quality?.is_demo === true || Boolean(result?.warnings?.some((warning) => warning.includes('演示数据')))
-  const equityFrequency = result?.equity_frequency ?? Object.values(result?.strategies ?? {}).find((strategy) => strategy?.equity_frequency)?.equity_frequency
+  const equityFrequency = result?.equity_frequency ?? strategies.find((strategy) => strategy.value.equity_frequency)?.value.equity_frequency
   const curvePeriod = equityFrequency === '1d' ? '每日收盘' : '回测时间点'
   const shareUnit = resultShareUnit(result?.symbol)
   const parameters = useMemo(() => savedGridParameters(result), [result])
@@ -172,7 +177,6 @@ export default function ResultsPage({ selectedResultId, selectedCompareId, view,
   }, [result, compareResult])
   const peakPrincipalBasis = result?.accounting_basis === 'peak_principal_v2' || (result?.accounting_basis == null && (result?.result_schema_version === 2 || result?.schema_version === 3))
   const externalTopups = result?.funding?.external_topups ?? result?.strategies?.grid?.metrics?.external_topups ?? result?.funding?.topups
-  const matchedHoldInvested = result?.funding?.matched_funding_hold_invested ?? result?.strategies?.grid?.metrics?.matched_funding_hold_invested ?? result?.strategies?.matched_funding_hold?.metrics?.total_invested
   const periodBaseline = useMemo(() => periodReturnBaseline(result), [result])
   const unit = view
   const periodData = useMemo(() => periodReturns(strategies.map((strategy) => ({ key: strategy.key, equity: strategy.value.equity ?? [] })), unit, { baseline: periodBaseline }), [strategies, unit, periodBaseline])
@@ -336,23 +340,21 @@ export default function ResultsPage({ selectedResultId, selectedCompareId, view,
           <div className='strategy-metrics results-metrics'>{strategies.map((strategy) => {
             const metrics = strategy.value.metrics
             const peakReturn = metrics?.peak_principal_return
-            const matchedHoldReturn = metrics?.matched_funding_hold_return
-            const excess = peakReturn != null && matchedHoldReturn != null && Number.isFinite(peakReturn) && Number.isFinite(matchedHoldReturn) ? peakReturn - matchedHoldReturn : null
             return <div className={'strategy-card ' + strategy.key} key={strategy.key}>
               <div className='strategy-top'><div><span className='strategy-swatch' style={{ background: colors[strategy.key] ?? '#69758b' }} /><strong>{strategy.name}</strong></div><Badge tone={peakReturn == null || !Number.isFinite(peakReturn) ? 'neutral' : peakReturn >= 0 ? 'red' : 'green'}>{percent(peakReturn)}</Badge></div>
               <div className='strategy-detail-grid'>
                 <div><small>最大本金回撤</small><strong className='loss'>{percent(metrics?.max_principal_drawdown)}</strong></div>
                 <div><small>成交笔数</small><strong>{metrics?.trade_count ?? '—'}</strong></div>
                 <div><small>总手续费</small><strong>{money(metrics?.total_fees)} 元</strong></div>
-                {strategy.key === 'grid' && <>
-                  <div><small>同资金被动持有</small><strong>{percent(matchedHoldReturn)}</strong></div>
-                  <div><small>超额（同资金被动持有）</small><strong className={excess == null ? '' : excess >= 0 ? 'gain' : 'loss'}>{excess == null ? '—' : percent(excess)}</strong></div>
-                </>}
                 {strategy.key === 'dca' && <>
                   <div><small>累计投入</small><strong>{money(metrics?.total_invested)} 元</strong></div>
                   <div><small>跳过期数</small><strong>{metrics?.skipped_periods ?? '—'}</strong></div>
                 </>}
               </div>
+              {strategy.key === 'dca' && result.config?.dca?.mode && result.config.dca.mode !== 'fixed_shares' && <p className='field-hint'>
+                {dcaSummary(result.config.dca, shareUnit)} · 参考 {result.config.dca.reference === 'target' ? result.symbol : dcaIndexes[result.config.dca.reference_symbol ?? ''] ?? result.config.dca.reference_symbol}
+                {' · '}{result.config.dca.mode === 'ma' ? `均线 ${result.config.dca.ma_window} 日` : `涨跌幅 ${result.config.dca.change_window} 日`}
+              </p>}
               {strategy.value.floor_penalty_basis && <p className='field-hint'>底仓惩罚 {percent(strategy.value.floor_penalty, 4)} · {strategy.value.floor_episode_count ?? 0} 段 · 各段上涨格数 {strategy.value.floor_episode_grids?.length ? strategy.value.floor_episode_grids.join(' / ') : '无'}</p>}
             </div>
           })}</div>
@@ -388,27 +390,21 @@ export default function ResultsPage({ selectedResultId, selectedCompareId, view,
         <div className='result-details-grid'>
           <Card title={result.funding ? '股数回测口径' : '历史回测口径'}>
             {result.funding ? <>
-              <p>估值日 {result.funding.reference_date ?? '—'} · 峰值本金 {money(result.funding.peak_invested)} 元 · 外部补款 {money(externalTopups)} 元 · 同资金被动持有投入 {money(matchedHoldInvested)} 元 · 实际截至 {result.effective_end_date ?? '—'}</p>
+              <p>估值日 {result.funding.reference_date ?? '—'} · 峰值本金 {money(result.funding.peak_invested)} 元 · 外部补款 {money(externalTopups)} 元 · 实际截至 {result.effective_end_date ?? '—'}</p>
               <p>期初持有：网格 {result.config?.initial_shares ?? '—'} {shareUnit} · 全仓 {result.funding.buy_hold_initial_shares ?? '—'} {shareUnit} · 定投 {result.config?.dca?.initial_shares ?? '—'} {shareUnit}。初始资产：全仓 {money(result.funding.buy_hold_initial_equity)} 元 · 定投 {money(result.funding.dca_initial_equity)} 元；定投累计实际投入 {money(result.strategies?.dca?.metrics?.total_invested)} 元，各策略使用独立资产账户。</p>
-              <pre className='json-preview'>{JSON.stringify(result.funding, null, 2)}</pre>
+              <pre className='json-preview'>{JSON.stringify(result.funding, (key, value) => key.startsWith('matched_funding_hold') ? undefined : value, 2)}</pre>
             </> : <p>本结果按保存记录中的历史资金口径展示。缺失的参数与投入数据以“—”表示。</p>}
           </Card>
           <Card title='保存的完整配置'><pre className='json-preview'>{JSON.stringify(result.config ?? {}, null, 2)}</pre></Card>
         </div>
       </Disclosure>
-      <Disclosure id='results-metrics' title='完整收益指标' summary={strategies.length + ' 类策略 · 收益、风险、费用与超额'}>
+      <Disclosure id='results-metrics' title='完整收益指标' summary={strategies.length + ' 类策略 · 收益、风险与费用'}>
         <TableViewport className='table-wrap' owner='local' stickyKeyColumn={1}><table><thead><tr><th>指标</th>{strategies.map((strategy) => <th key={strategy.key}>{strategy.name}</th>)}</tr></thead><tbody>
           {Object.entries(metricLabels).map(([key, label]) => <tr key={key}><td>{label}</td>{strategies.map((strategy) => {
             const value = strategy.value.metrics?.[key]
             const shown = percentMetrics.includes(key) ? percent(value) : countMetrics.includes(key) ? value == null || !Number.isFinite(value) ? '—' : String(value) : key === 'total_fees' ? money(value) : value == null || !Number.isFinite(value) ? '—' : value.toFixed(2)
             return <td key={strategy.key} className={tone(key, value)}>{shown}</td>
           })}</tr>)}
-          <tr><td>相对同资金被动持有超额（百分点）</td>{strategies.map((strategy) => {
-            const strategyReturn = strategy.value.metrics?.peak_principal_return
-            const baselineReturn = result.strategies?.matched_funding_hold?.metrics?.peak_principal_return
-            const excess = strategy.key === 'matched_funding_hold' || strategyReturn == null || baselineReturn == null || !Number.isFinite(strategyReturn) || !Number.isFinite(baselineReturn) ? null : strategyReturn - baselineReturn
-            return <td key={strategy.key} className={excess == null ? '' : excess >= 0 ? 'gain' : 'loss'}>{excess == null ? '—' : (excess * 100).toFixed(2)}</td>
-          })}</tr>
         </tbody></table></TableViewport>
       </Disclosure>
       <Disclosure id='results-candles' title='K 线与成交标记' summary={(result.config?.frequency ?? '频率未知') + ' · ' + (reference?.name ?? '策略')}>

@@ -52,9 +52,37 @@ class FeeConfig(BaseModel):
 
 
 class DcaConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     frequency: Literal["daily", "weekly", "monthly"] = "monthly"
     shares: int = Field(default=100, ge=100, multiple_of=100)
     initial_shares: int = Field(default=0, ge=0, multiple_of=100)
+    mode: Literal["fixed_shares", "ma", "price_change"] = "fixed_shares"
+    base_amount: float = Field(default=1000, gt=0, le=1_000_000_000)
+    reference: Literal["target", "security", "index"] = "target"
+    reference_symbol: str | None = None
+    reference_version: str | None = Field(default=None, min_length=1, max_length=256)
+    ma_window: int = Field(default=250, ge=2, le=1000)
+    change_window: int = Field(default=1, ge=1, le=1000)
+    sensitivity: float = Field(default=5, gt=0, le=100)
+    min_multiplier: float = Field(default=0.5, ge=0, le=1)
+    max_multiplier: float = Field(default=2, ge=1, le=20)
+
+    @model_validator(mode="after")
+    def valid_smart_dca(self):
+        if self.reference == "target":
+            self.reference_symbol = None
+            self.reference_version = None
+        elif self.reference_symbol:
+            if self.reference == "security":
+                self.reference_symbol = normalize_symbol(self.reference_symbol)
+            else:
+                from .dca_reference import INDEX_REFERENCES
+                self.reference_symbol = self.reference_symbol.strip().upper()
+                if self.reference_symbol not in INDEX_REFERENCES:
+                    raise ValueError("智能定投参考指数不受支持，请选择列表中的指数（含交易所）")
+        elif self.mode != "fixed_shares":
+            raise ValueError("智能定投必须指定参考证券或指数")
+        return self
 
 
 class FloorPenaltyConfig(BaseModel):
@@ -175,7 +203,9 @@ class BacktestConfig(BaseModel):
             raise ValueError("持股数量必须满足：最低持股 ≤ 初始持股 ≤ 最高持股")
         if self.schema_version in (2, 3) and self.max_shares is not None and self.initial_shares > self.max_shares:
             raise ValueError("持股数量必须满足：最低持股 ≤ 初始持股 ≤ 最高持股")
-        if self.schema_version in (2, 3) and self.symbol.startswith(("688", "689")) and (self.buy_shares < 200 or self.dca.shares < 200):
+        if self.schema_version == 1 and self.dca.mode != "fixed_shares":
+            raise ValueError("智能定投需要 schema_version=2 或 3 的股数账户")
+        if self.schema_version in (2, 3) and self.symbol.startswith(("688", "689")) and (self.buy_shares < 200 or (self.dca.mode == "fixed_shares" and self.dca.shares < 200)):
             raise ValueError("科创板每次买入及定投至少为 200 股")
         if self.schema_version == 3 and self.reserve_cash is not None:
             raise ValueError("schema_version=3 已取消固定可用现金；请删除 reserve_cash 后重新提交")
@@ -450,6 +480,7 @@ class ResearchSourceRef(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     result_id: str = Field(min_length=1)
     candidate_ids: list[int] | None = None
+    apply_parameter_guidance: bool = False
 
 
 class ResearchRequestV5(BaseModel):
@@ -753,3 +784,5 @@ class DataBundle:
     version: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # A locked daily reference for smart DCA; never substitutes another symbol.
+    dca_reference: dict[str, Any] | None = None

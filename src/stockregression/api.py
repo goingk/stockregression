@@ -1277,6 +1277,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
 
     def submit(kind, payload, dedupe_key=None, *, include_created=False):
         frozen = dict(payload)
+        if kind == "backtest":
+            frozen["config"] = freeze_reference(BacktestConfig.model_validate(frozen["config"])).model_dump(mode="json")
         snapshot = task_configuration_snapshot(
             active_data_dir=root,
             active_package_dir=package_dir,
@@ -1322,6 +1324,20 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             "package_id": identity.get("package_id"),
             "package_generation": identity.get("generation"),
         }
+
+    def freeze_reference(config):
+        from .dca_reference import freeze_dca_reference
+        try:
+            return freeze_dca_reference(store, config)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(409, {"code": "DCA_REFERENCE_NOT_READY", "message": str(exc)}) from exc
+
+    def freeze_research_reference(config):
+        from .dca_reference import freeze_research_dca_reference
+        try:
+            return freeze_research_dca_reference(store, config)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(409, {"code": "DCA_REFERENCE_NOT_READY", "message": str(exc)}) from exc
 
     def require_ready(config, version=None):
         manifest = store.snapshot(config.symbol, version)
@@ -1369,6 +1385,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             if cancelled():
                 raise InterruptedError("研究预估已取消")
         checkpoint()
+        config = freeze_research_reference(config)
         if config.protocol_version != 5:
             raise HTTPException(422, "旧研究协议已移除；请使用 protocol_version=5")
         manifest = store.snapshot(config.base.symbol, config.requested_data_version)
@@ -1383,7 +1400,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         checkpoint()
         version = require_ready(prepared, version)
         checkpoint()
-        data_key = (version, prepared.symbol, str(prepared.start_date), str(prepared.end_date), prepared.frequency)
+        data_key = (version, prepared.symbol, str(prepared.start_date), str(prepared.end_date), prepared.frequency, prepared.dca.model_dump_json())
         with preflight_cache_lock:
             bundle = preflight_cache.get(data_key)
         if bundle is None:
@@ -2035,6 +2052,16 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             rows = [row for row in rows if row.get("symbol") == normalized]
         return {"items": rows[offset:offset + limit], "total": len(rows), "offset": offset, "limit": limit}
 
+    @app.post("/api/v1/dca/reference/prepare")
+    def dca_prepare_reference(config: BacktestConfig):
+        from .dca_reference import prepare_index_reference
+        try:
+            return prepare_index_reference(store, config)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(502, f"智能定投指数参考数据准备失败：{exc}") from exc
+
     @app.get("/api/v1/data/reference-price/{symbol}")
     def reference_price(symbol: str, start_date: str):
         try:
@@ -2075,7 +2102,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             raise HTTPException(409, "预览只接受 schema_version=3 的当前股数配置")
         # Preview is deliberately submitted without a synchronous coverage scan;
         # the worker reports preparation progress and pins the result version.
-        return json_safe(previews.submit(payload.session_id, payload.revision, payload.config, version))
+        return json_safe(previews.submit(payload.session_id, payload.revision, freeze_reference(payload.config), version))
 
     @app.get("/api/v1/backtests/preview/{session_id}")
     def preview_status(session_id: str):
@@ -2128,6 +2155,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         if isinstance(config, ResearchRequestV5):
             config = config.to_optimization()
         config = resolve_optimization_source(config)
+        config = freeze_research_reference(config)
         preview, version = _research_preflight(config)
         config = config.model_copy(update={"requested_data_version": version})
         if preview.get("status") == "budget_exceeded":

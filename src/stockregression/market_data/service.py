@@ -2389,7 +2389,9 @@ class MarketDataService:
                 config.symbol, target, start=config.start_date, end=config.end_date,
             )
         from .consumer import load_native_bundle
-        return load_native_bundle(self, config, version, summary_only=summary_only)
+        from ..dca_reference import attach_dca_reference
+        bundle = load_native_bundle(self, config, version, summary_only=summary_only)
+        return attach_dca_reference(self, config, bundle)
 
     def refresh_snapshot(self, symbol: str) -> dict | None:
         market = self.repository.active_manifest(symbol)

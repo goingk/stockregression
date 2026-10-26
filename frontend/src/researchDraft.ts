@@ -9,6 +9,7 @@ export type ResearchPriorPolicy = 'off' | 'daily_state_v1'
 export interface ResearchSourceEtf {
   result_id: string
   candidate_ids?: number[]
+  apply_parameter_guidance?: boolean
 }
 
 /** Display-only metadata. It is never sent back as source or target identity. */
@@ -29,6 +30,7 @@ export interface ResearchSourceSummary {
   eligible: boolean
   validation_status: string
   validation_reason: string | null
+  applied_guidance?: { method_version: string; as_of: string }
   archived?: boolean
 }
 
@@ -80,9 +82,8 @@ export function normalizeSourceEtf(source: ResearchSourceEtf): ResearchSourceEtf
       .filter(value => Number.isSafeInteger(value) && value >= 0)
       .filter((value, index, values) => values.indexOf(value) === index)
     : []
-  return candidateIds.length
-    ? { result_id: source.result_id, candidate_ids: candidateIds }
-    : { result_id: source.result_id }
+  return { result_id: source.result_id, ...(candidateIds.length ? { candidate_ids: candidateIds } : {}),
+    ...(source.apply_parameter_guidance ? { apply_parameter_guidance: true } : {}) }
 }
 
 export function researchPriorPolicyLabel(policy: ResearchPriorPolicy): string {
@@ -220,7 +221,8 @@ export function archivedResearchSource(result: unknown): ResearchDraftContextSta
     .map(seed => objectValue(seed)?.candidate_id)
     .map(value => typeof value === 'number' ? value : typeof value === 'string' ? Number(value.trim()) : Number.NaN)
     .filter(Number.isSafeInteger)
-  const sourceEtf = normalizeSourceEtf({ result_id: resultId, candidate_ids: candidateIds })
+  const sourceEtf = normalizeSourceEtf({ result_id: resultId, candidate_ids: candidateIds,
+    apply_parameter_guidance: origin.applied_parameter_guidance === true })
   const candidateCount = sourceEtf.candidate_ids?.length ?? 0
   const symbol = typeof origin.symbol === 'string' ? origin.symbol.trim() : ''
   const sourceAsOf = typeof origin.source_as_of === 'string' ? origin.source_as_of.trim() : ''
@@ -256,6 +258,8 @@ export function archivedResearchSource(result: unknown): ResearchDraftContextSta
         ? '归档快照只保存入选候选，原始逐候选核验明细未随来源快照保存。'
         : '归档来源快照没有入选候选。',
       archived: true,
+      ...(origin.applied_parameter_guidance === true && objectValue(origin.parameter_guidance)
+        ? { applied_guidance: { as_of: sourceAsOf, method_version: String(objectValue(origin.parameter_guidance)!.method_version ?? '') } } : {}),
     },
     prior_policy: priorPolicy,
   }
@@ -271,12 +275,18 @@ export function researchDraftFromEtfSource(input: {
   current: BacktestConfig
   settings: ResearchDefaults
   range_mode?: 'prior_year' | 'after_cutoff'
+  apply_guidance?: boolean
   shanghai_today?: string
 }): { draft?: ResearchDraftBundle; error?: string } {
   const { result, row, current, settings } = input
   if (!isValidResearchSymbol(row.symbol)) return { error: 'ETF 行没有有效的证券代码，无法建立参数研究草稿。' }
   const cutoff = (row.window_end || result.as_of || '').trim()
   const afterCutoff = input.range_mode === 'after_cutoff'
+  const guidance = row.parameter_guidance
+  if (input.apply_guidance && (!afterCutoff || !guidance || !['ready', 'limited'].includes(guidance.status)
+    || guidance.as_of !== cutoff || (guidance.data_version && guidance.data_version !== row.version))) {
+    return { error: '参数建议只能用于同一数据版本、同一截止日之后的研究；请重新运行 ETF 研究以生成有效建议。' }
+  }
   const start = afterCutoff ? dateNextDay(cutoff) : dateYearsAgo(cutoff)
   if (!start) return { error: afterCutoff ? 'ETF 结果没有有效的截止日，无法确定截止日后的研究起点。' : 'ETF 结果没有有效的截止日，无法确定默认研究区间。' }
   // The after-cutoff end is resolved asynchronously from the target ETF's
@@ -315,12 +325,37 @@ export function researchDraftFromEtfSource(input: {
     min_trades: minTrades,
     max_principal_drawdown: maxDrawdown,
   }
-  const source = normalizeSourceEtf({ result_id: result.id, candidate_ids: etfSourceCandidateIds(row) })
+  if (input.apply_guidance && guidance) {
+    for (const name of ['buy_step', 'sell_step'] as const) {
+      const range = guidance.ranges[name]
+      const step = guidance.granularity[name]
+      if (!range || !finite(range.low) || !finite(range.high) || range.low <= 0 || range.high <= range.low
+        || !finite(step) || step <= 0 || Math.abs(step / .0001 - Math.round(step / .0001)) > 1e-7
+        || Math.ceil(range.low / step - 1e-9) > Math.floor(range.high / step + 1e-9)) {
+        return { error: '历史建议缺少有效的间距范围或研究细粒度，请重新运行 ETF 研究。' }
+      }
+      nextSettings.ranges[name] = { ...range }
+      nextSettings.granularity[name] = step
+    }
+    for (const name of ['buy_shares', 'sell_shares'] as const) {
+      const step = guidance.granularity[name]
+      if (!finite(step) || step < 100 || step % 100 !== 0) return { error: '历史建议的数量细粒度无效。' }
+      nextSettings.granularity[name] = step
+    }
+    if (!guidance.tau || !finite(guidance.tau.value) || guidance.tau.value < 0 || guidance.tau.value > .1) {
+      return { error: '历史建议的安全垫阈值无效。' }
+    }
+    nextSettings.tau = guidance.tau.value
+  }
+  const source = normalizeSourceEtf({ result_id: result.id, candidate_ids: etfSourceCandidateIds(row),
+    apply_parameter_guidance: input.apply_guidance })
+  const summary = etfSourceSummary(result, row)
+  if (input.apply_guidance && guidance) summary.applied_guidance = { method_version: guidance.method_version, as_of: guidance.as_of }
   return {
     draft: {
       config,
       settings: nextSettings,
-      context: withResearchDraftSource(source, etfSourceSummary(result, row)),
+      context: withResearchDraftSource(source, summary),
     },
   }
 }
