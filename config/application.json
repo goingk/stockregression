@@ -20,16 +20,26 @@
     },
     "position": {
       "link_shares": true,
-      "initial_shares": 10000,
+      "initial_shares": 20000,
       "min_shares": 0,
       "max_shares": null,
       "buy_shares": 1000,
       "sell_shares": 1000
     },
     "dca": {
-      "frequency": "monthly",
+      "frequency": "weekly",
       "shares": 1000,
-      "initial_shares": 0
+      "initial_shares": 0,
+      "mode": "ma",
+      "base_amount": 1000.0,
+      "reference": "target",
+      "reference_symbol": null,
+      "reference_version": null,
+      "ma_window": 250,
+      "change_window": 1,
+      "sensitivity": 10.0,
+      "min_multiplier": 0.1,
+      "max_multiplier": 3.0
     },
     "fees": {
       "commission_rate": 5e-05,
@@ -52,8 +62,8 @@
       "strategy_version": 5,
       "hypercube_edge": 3,
       "granularity": {
-        "buy_step": 0.005,
-        "sell_step": 0.005,
+        "buy_step": 0.002,
+        "sell_step": 0.002,
         "sell_shares": 100.0,
         "buy_shares": 100.0
       },
@@ -80,30 +90,30 @@
       },
       "ranges": {
         "buy_step": {
-          "low": 0.005,
-          "high": 0.08,
+          "low": 0.001,
+          "high": 0.035,
           "step": null
         },
         "sell_step": {
-          "low": 0.005,
-          "high": 0.08,
+          "low": 0.001,
+          "high": 0.035,
           "step": null
         },
         "buy_shares": {
-          "low": 500.0,
-          "high": 1500.0,
+          "low": 1000.0,
+          "high": 3000.0,
           "step": null
         },
         "sell_shares": {
-          "low": 500.0,
-          "high": 1500.0,
+          "low": 1000.0,
+          "high": 3000.0,
           "step": null
         }
       },
       "sigma": 1.0,
       "alpha": 0.3,
       "beta": 1.0,
-      "tau": 0.05,
+      "tau": 0.015,
       "eta_limit": 1.8,
       "eta_hard_cap": 3.5,
       "gamma_max": 1.0,
@@ -185,5 +195,5 @@
     "subprocess_timeout_seconds": 45,
     "lock_timeout_seconds": 30
   },
-  "config_revision": "d7ff97c2816c1b2e25baf276d65b2f7fc6447043cc15e4254a66871a0f913e27"
+  "config_revision": "816fcd0ba4a10bc818eae415b40ddbc41d09d22b30991e3d1f94a073fd2874e4"
 }
