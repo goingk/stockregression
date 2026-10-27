@@ -2204,6 +2204,125 @@
         }
       }
     },
+    "/api/v1/research-validations/preview": {
+      "post": {
+        "summary": "Validation Preview",
+        "operationId": "validation_preview_api_v1_research_validations_preview_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResearchValidationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/research-validations": {
+      "post": {
+        "summary": "Validation Submit",
+        "operationId": "validation_submit_api_v1_research_validations_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResearchValidationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/results/{result_id}/evidence-views": {
+      "post": {
+        "summary": "Validation View",
+        "operationId": "validation_view_api_v1_results__result_id__evidence_views_post",
+        "parameters": [
+          {
+            "name": "result_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Result Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ValidationViewEvent"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/optimizations": {
       "post": {
         "summary": "Optimization",
@@ -2799,6 +2918,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ValidationResumeRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Extension"
+              }
+            }
+          }
+        },
         "responses": {
           "202": {
             "description": "Successful Response",
@@ -4432,6 +4568,27 @@
           "patch"
         ],
         "title": "ConfigurationValidationRequest"
+      },
+      "Contribution": {
+        "properties": {
+          "available_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Available At"
+          },
+          "amount": {
+            "type": "number",
+            "exclusiveMinimum": 0.0,
+            "title": "Amount"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "available_at",
+          "amount"
+        ],
+        "title": "Contribution"
       },
       "DcaConfig": {
         "properties": {
@@ -6561,6 +6718,56 @@
         ],
         "title": "PreviewRequest"
       },
+      "QualificationAccount": {
+        "properties": {
+          "total_budget": {
+            "type": "number",
+            "exclusiveMinimum": 0.0,
+            "title": "Total Budget"
+          },
+          "max_shares": {
+            "type": "integer",
+            "multipleOf": 100.0,
+            "minimum": 100.0,
+            "title": "Max Shares"
+          },
+          "contributions": {
+            "items": {
+              "$ref": "#/components/schemas/Contribution"
+            },
+            "type": "array",
+            "title": "Contributions"
+          },
+          "participation_rate": {
+            "type": "number",
+            "maximum": 1.0,
+            "exclusiveMinimum": 0.0,
+            "title": "Participation Rate",
+            "default": 0.01
+          },
+          "ttl_bars": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 1.0,
+            "title": "Ttl Bars",
+            "default": 3
+          },
+          "extra_delay_bars": {
+            "type": "integer",
+            "maximum": 100.0,
+            "minimum": 0.0,
+            "title": "Extra Delay Bars",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "total_budget",
+          "max_shares"
+        ],
+        "title": "QualificationAccount"
+      },
       "QuantityConfig": {
         "properties": {
           "mode": {
@@ -7685,6 +7892,117 @@
         "title": "ResearchStrategySpec",
         "description": "Versioned research algorithm configuration."
       },
+      "ResearchValidationRequest": {
+        "properties": {
+          "research": {
+            "$ref": "#/components/schemas/ResearchRequestV5"
+          },
+          "symbols": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 100,
+            "title": "Symbols"
+          },
+          "history_policy": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "explicit"
+            ],
+            "title": "History Policy",
+            "default": "auto"
+          },
+          "accounts": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/QualificationAccount"
+            },
+            "type": "object",
+            "title": "Accounts"
+          },
+          "requested_data_versions": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Requested Data Versions"
+          },
+          "suite_version": {
+            "type": "string",
+            "const": "research_validation_v1",
+            "title": "Suite Version",
+            "default": "research_validation_v1"
+          },
+          "primary_branch": {
+            "type": "string",
+            "const": "adaptive",
+            "title": "Primary Branch",
+            "default": "adaptive"
+          },
+          "family_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Family Id"
+          },
+          "parent_result_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Result Id"
+          },
+          "plan_hash": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Plan Hash"
+          },
+          "max_runtime_seconds": {
+            "type": "integer",
+            "maximum": 2592000.0,
+            "minimum": 1.0,
+            "title": "Max Runtime Seconds",
+            "default": 86400
+          },
+          "total_evaluation_budget": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 1000000000.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Evaluation Budget"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "research",
+          "accounts"
+        ],
+        "title": "ResearchValidationRequest"
+      },
       "RestartRequest": {
         "properties": {
           "force": {
@@ -7897,6 +8215,53 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "ValidationResumeRequest": {
+        "properties": {
+          "max_runtime_seconds": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 2592000.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Runtime Seconds"
+          },
+          "total_evaluation_budget": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 1000000000.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Total Evaluation Budget"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ValidationResumeRequest"
+      },
+      "ValidationViewEvent": {
+        "properties": {
+          "section": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Section",
+            "default": "overview"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ValidationViewEvent"
       }
     }
   }

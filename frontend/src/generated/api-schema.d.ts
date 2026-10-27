@@ -774,6 +774,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/research-validations/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Validation Preview */
+        post: operations["validation_preview_api_v1_research_validations_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/research-validations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Validation Submit */
+        post: operations["validation_submit_api_v1_research_validations_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/results/{result_id}/evidence-views": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Validation View */
+        post: operations["validation_view_api_v1_results__result_id__evidence_views_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/optimizations": {
         parameters: {
             query?: never;
@@ -1541,6 +1592,16 @@ export interface components {
             patch: {
                 [key: string]: unknown;
             };
+        };
+        /** Contribution */
+        Contribution: {
+            /**
+             * Available At
+             * Format: date-time
+             */
+            available_at: string;
+            /** Amount */
+            amount: number;
         };
         /** DcaConfig */
         DcaConfig: {
@@ -2499,6 +2560,30 @@ export interface components {
             revision: number;
             config: components["schemas"]["BacktestConfig"];
         };
+        /** QualificationAccount */
+        QualificationAccount: {
+            /** Total Budget */
+            total_budget: number;
+            /** Max Shares */
+            max_shares: number;
+            /** Contributions */
+            contributions?: components["schemas"]["Contribution"][];
+            /**
+             * Participation Rate
+             * @default 0.01
+             */
+            participation_rate: number;
+            /**
+             * Ttl Bars
+             * @default 3
+             */
+            ttl_bars: number;
+            /**
+             * Extra Delay Bars
+             * @default 0
+             */
+            extra_delay_bars: number;
+        };
         /** QuantityConfig */
         QuantityConfig: {
             /**
@@ -3154,6 +3239,51 @@ export interface components {
              */
             stress_region_count: number;
         };
+        /** ResearchValidationRequest */
+        ResearchValidationRequest: {
+            research: components["schemas"]["ResearchRequestV5"];
+            /** Symbols */
+            symbols?: string[];
+            /**
+             * History Policy
+             * @default auto
+             * @enum {string}
+             */
+            history_policy: "auto" | "explicit";
+            /** Accounts */
+            accounts: {
+                [key: string]: components["schemas"]["QualificationAccount"];
+            };
+            /** Requested Data Versions */
+            requested_data_versions?: {
+                [key: string]: string;
+            };
+            /**
+             * Suite Version
+             * @default research_validation_v1
+             * @constant
+             */
+            suite_version: "research_validation_v1";
+            /**
+             * Primary Branch
+             * @default adaptive
+             * @constant
+             */
+            primary_branch: "adaptive";
+            /** Family Id */
+            family_id?: string | null;
+            /** Parent Result Id */
+            parent_result_id?: string | null;
+            /** Plan Hash */
+            plan_hash?: string | null;
+            /**
+             * Max Runtime Seconds
+             * @default 86400
+             */
+            max_runtime_seconds: number;
+            /** Total Evaluation Budget */
+            total_evaluation_budget?: number | null;
+        };
         /** RestartRequest */
         RestartRequest: {
             /**
@@ -3276,6 +3406,21 @@ export interface components {
             input?: unknown;
             /** Context */
             ctx?: Record<string, never>;
+        };
+        /** ValidationResumeRequest */
+        ValidationResumeRequest: {
+            /** Max Runtime Seconds */
+            max_runtime_seconds?: number | null;
+            /** Total Evaluation Budget */
+            total_evaluation_budget?: number | null;
+        };
+        /** ValidationViewEvent */
+        ValidationViewEvent: {
+            /**
+             * Section
+             * @default overview
+             */
+            section: string;
         };
     };
     responses: never;
@@ -4771,6 +4916,107 @@ export interface operations {
             };
         };
     };
+    validation_preview_api_v1_research_validations_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResearchValidationRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    validation_submit_api_v1_research_validations_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResearchValidationRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    validation_view_api_v1_results__result_id__evidence_views_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                result_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ValidationViewEvent"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     optimization_api_v1_optimizations_post: {
         parameters: {
             query?: never;
@@ -5175,7 +5421,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ValidationResumeRequest"] | null;
+            };
+        };
         responses: {
             /** @description Successful Response */
             202: {

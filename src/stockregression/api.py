@@ -40,6 +40,7 @@ from .data_diagnostics import derive_source_spans, project_data_diagnostics
 from .quality import QUALITY_RULES_VERSION, _closing_auction_placeholders, minute_slots
 from .jobs import JobManager
 from .models import BacktestConfig, OptimizationConfig, ResearchRequestV5, normalize_symbol
+from .validation_models import ResearchValidationRequest, ValidationViewEvent, ValidationResumeRequest
 from .etf_models import EtfResearchRequest
 from .market_data import MarketDataService
 from .market_data.aggregation import AggregationService
@@ -938,6 +939,8 @@ def public_result(result: dict, full: bool = False, data_metadata: dict | None =
     """Send UI-sized results by default, preserving raw data for full requests."""
     if full:
         return result
+    if result.get("kind") == "research_validation":
+        return _compact_validation_result(result)
     if result.get("kind") in {"etf_research", "etf_validation"}:
         return {key: value for key, value in result.items() if key != "rows"}
     result = dict(result)
@@ -972,8 +975,30 @@ def public_result(result: dict, full: bool = False, data_metadata: dict | None =
     return result
 
 
+def _compact_validation_result(value):
+    """Keep reports small without recomputing any validation or market data."""
+    if isinstance(value, list):
+        return [_compact_validation_result(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key in {"trades", "rejections", "contributions", "candidate_archive", "trial_archive", "search_candidate_archive"}:
+            result[key + "_count"] = len(item) if isinstance(item, list) else None
+        elif key == "equity" and isinstance(item, list):
+            daily = {str(row.get("timestamp", ""))[:10]: row for row in item if isinstance(row, dict)}
+            result[key] = list(daily.values())
+        else:
+            result[key] = _compact_validation_result(item)
+    return result
+
+
 def _stream_json_value(value: Any, store: Store):
     """Serialize a result while streaming candidate archives from SQLite."""
+    if isinstance(value, dict) and isinstance(value.get("__validation_ledger__"), str):
+        from .validation_store import ValidationStore
+        yield from ValidationStore(store).iter_ledger_json(value)
+        return
     if isinstance(value, dict) and isinstance(value.get("__candidate_archive__"), str):
         yield "["
         first = True
@@ -992,7 +1017,10 @@ def _stream_json_value(value: Any, store: Store):
                 yield ","
             yield json.dumps(str(key), ensure_ascii=False)
             yield ":"
-            yield from _stream_json_value(item, store)
+            if key == "ledger_refs":
+                yield dumps(item)
+            else:
+                yield from _stream_json_value(item, store)
             first = False
         yield "}"
         return
@@ -1005,6 +1033,26 @@ def _stream_json_value(value: Any, store: Store):
         yield "]"
         return
     yield dumps(value)
+
+
+def _validate_validation_ledgers(value, store):
+    """Reject missing immutable artifacts before sending download headers."""
+    from .validation_store import ValidationStore
+    validations, checked = ValidationStore(store), set()
+    def visit(item):
+        if isinstance(item, dict):
+            path = item.get("__validation_ledger__")
+            if isinstance(path, str):
+                if path not in checked:
+                    validations.iter_ledger_json(item)  # verifies compressed bytes before returning its iterator
+                    checked.add(path)
+                return
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+    visit(value)
 
 
 def _with_data_availability(store: Store, result: dict) -> dict:
@@ -1299,7 +1347,7 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             })
         frozen.setdefault("configuration_revision", snapshot.get("revision"))
         frozen.setdefault("configuration_snapshot", snapshot)
-        if kind in {"optimization", "etf_research", "etf_validation"} and "submission_provenance" not in frozen:
+        if kind in {"optimization", "etf_research", "etf_validation", "research_validation"} and "submission_provenance" not in frozen:
             from .reproducibility import computation_provenance
             from .settings import PROJECT_ROOT
             frozen["submission_provenance"] = computation_provenance(
@@ -2150,6 +2198,51 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
             raise HTTPException(404, "该 ETF 不在原始候选池中")
         return json_safe(store.research_links(result_id, symbol, offset=offset, limit=limit))
 
+    def frozen_validation_request(config: ResearchValidationRequest):
+        resolved = freeze_research_reference(resolve_optimization_source(config.research.to_optimization()))
+        if resolved.source_etf is not None and len(config.symbols) > 1:
+            raise HTTPException(422, "绑定单标的ETF来源时，请分别验证标的或先解除来源绑定")
+        research = config.research.model_copy(update={
+            "research_origin": resolved.research_origin,
+            "source_etf": resolved.source_etf,
+            "research_context": config.research.research_context.model_copy(update={"dca": resolved.base.dca}),
+        })
+        return config.model_copy(update={"research": research})
+
+    @app.post("/api/v1/research-validations/preview")
+    def validation_preview(config: ResearchValidationRequest):
+        from .validation_planner import plan_validation
+        return json_safe(plan_validation(store, frozen_validation_request(config), settings=configured))
+
+    @app.post("/api/v1/research-validations", status_code=202)
+    def validation_submit(config: ResearchValidationRequest):
+        from .validation_planner import plan_validation
+        from .validation_store import ValidationStore
+        config = frozen_validation_request(config)
+        if not config.plan_hash:
+            raise HTTPException(409, {"code": "VALIDATION_PLAN_REQUIRED", "message": "请先预检并确认完整验证方案"})
+        plan = plan_validation(store, config, settings=configured)
+        if plan["plan_hash"] != config.plan_hash:
+            raise HTTPException(409, {"code": "VALIDATION_PLAN_CHANGED", "message": "数据或设置已变化，请重新预检", "plan": plan})
+        if plan["status"] != "ready":
+            raise HTTPException(409, {"code": "VALIDATION_NOT_READY", "message": "完整验证所需数据或预算不足", "plan": plan})
+        submitted = submit("research_validation", {
+            "config": config.model_dump(mode="json"), "plan": plan,
+            "run_id": uuid.uuid4().hex,
+        }, dedupe_key="research-validation:" + plan["plan_hash"], include_created=True)
+        job = store.job(submitted["job_id"])
+        frozen = job["payload"]
+        audit = ValidationStore(store).register_plan(frozen["run_id"], frozen["config"], frozen["plan"], frozen["submission_provenance"])
+        return {**submitted, "plan": frozen["plan"], "run_id": frozen["run_id"], "audit": audit}
+
+    @app.post("/api/v1/results/{result_id}/evidence-views")
+    def validation_view(result_id: str, event: ValidationViewEvent):
+        from .validation_store import ValidationStore
+        result = store.result(result_id)
+        if not result or result.get("kind") != "research_validation":
+            raise HTTPException(404, "完整验证结果不存在")
+        return ValidationStore(store).record_view(result_id, run_id=result.get("run_id"), section=event.section)
+
     @app.post("/api/v1/optimizations")
     def optimization(config: OptimizationConfig | ResearchRequestV5):
         if isinstance(config, ResearchRequestV5):
@@ -2289,6 +2382,8 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         if result is None:
             raise HTTPException(404, "结果不存在")
         _require_supported_result(result)
+        if result.get("kind") == "research_validation":
+            return get_result(result_id)
         revisions = store.completion_revisions(result_id)
         payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
         requested_revision = payload.get("completion_revision")
@@ -2315,9 +2410,52 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         )
         return _with_data_availability(store, public)
 
-    @app.post("/api/v1/jobs/{job_id}/resume", status_code=202)
-    def resume_job(job_id: str):
+    def _resume_job_unlocked(job_id: str, extension: ValidationResumeRequest | None = None):
         job = get_job(job_id)
+        if job.get("kind") == "research_validation":
+            from .validation_store import ValidationStore
+            from .validation_planner import plan_hash
+            from .reproducibility import computation_provenance, reproducibility_mismatches
+            from .settings import PROJECT_ROOT
+            if job.get("status") not in {"failed", "cancelled", "partial"}:
+                raise HTTPException(409, "任务当前不需要恢复")
+            payload = dict(job.get("payload") or {})
+            current = computation_provenance(PROJECT_ROOT, configuration=payload.get("config"))
+            mismatches = reproducibility_mismatches(payload.get("submission_provenance"), current)
+            if mismatches:
+                raise HTTPException(409, {"code": "VALIDATION_PROVENANCE_CHANGED", "message": "源码、依赖或配置已变化，不能混合旧验证", "mismatches": mismatches})
+            for symbol, version in payload["plan"]["data_versions"].items():
+                if store.snapshot(symbol, version, persist=False) is None:
+                    raise HTTPException(409, "原冻结数据版本已不可用，不能恢复")
+            audit_store = ValidationStore(store)
+            request = ResearchValidationRequest.model_validate(payload["config"])
+            updates = extension.model_dump(exclude_none=True) if extension else {}
+            for key, value in updates.items():
+                old = getattr(request, key) or payload["plan"]["estimated_work"].get(key, 0)
+                if value < old:
+                    raise HTTPException(422, "恢复时只能增加任务预算")
+            for active in store.active_jobs():
+                active_payload = active.get("payload") or {}
+                if active.get("kind") == "research_validation" and active_payload.get("run_id") == payload["run_id"]:
+                    active_config = active_payload.get("config") or {}
+                    if updates and any(active_config.get(key) != value for key, value in updates.items()):
+                        raise HTTPException(409, "已有同一验证的继续任务排队或运行，不能同时修改预算")
+                    return {"job_id": active["id"], "resumed_from": job_id, "created": False}
+            if updates:
+                request = request.model_copy(update=updates)
+                plan = json.loads(json.dumps(payload["plan"]))
+                plan["estimated_work"].update(updates)
+                plan["plan_hash"] = plan_hash(request, plan)
+                request = request.model_copy(update={"plan_hash": plan["plan_hash"]})
+                audit_store.register_revision(payload["run_id"], {"previous_plan_hash": payload["plan"]["plan_hash"], "plan_hash": plan["plan_hash"], "updates": updates})
+                checkpoint = audit_store.load_checkpoint(payload["run_id"])
+                if checkpoint:
+                    checkpoint["plan_hash"] = plan["plan_hash"]
+                    audit_store.save_checkpoint(payload["run_id"], checkpoint)
+                payload.update(config=request.model_dump(mode="json"), plan=plan)
+            payload.pop("submission_provenance", None)
+            payload["resume_from_job"] = job_id
+            return {**submit("research_validation", payload, dedupe_key="research-validation-resume:" + payload["run_id"]), "resumed_from": job_id}
         if job.get("kind") == "market_sync":
             if job.get("status") not in {"failed", "cancelled", "partial"}:
                 raise HTTPException(409, "只有失败、取消或部分完成的同步任务支持继续")
@@ -2434,6 +2572,20 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         payload["checkpoint_id"] = payload.get("checkpoint_id") or job_id
         return {**submit("research_completion", payload), "resumed_from": job_id}
 
+    @app.post("/api/v1/jobs/{job_id}/resume", status_code=202)
+    def resume_job(job_id: str, extension: ValidationResumeRequest | None = None):
+        job = get_job(job_id)
+        if job.get("kind") != "research_validation":
+            return _resume_job_unlocked(job_id, extension)
+        from filelock import FileLock, Timeout
+        run_id = str((job.get("payload") or {}).get("run_id") or job_id)
+        lock_path = store.root / ("validation-resume-" + hashlib.sha256(run_id.encode()).hexdigest() + ".lock")
+        try:
+            with FileLock(str(lock_path), timeout=5):
+                return _resume_job_unlocked(job_id, extension)
+        except Timeout as exc:
+            raise HTTPException(409, "验证恢复正在处理，请稍后重试") from exc
+
     @app.get("/api/v1/jobs/{job_id}/items")
     def job_items(job_id: str, section: str = "all", offset: int = Query(0, ge=0), limit: int = Query(100, ge=1, le=1000)):
         job = get_job(job_id)
@@ -2471,9 +2623,20 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         if result is None:
             raise HTTPException(404, "结果不存在")
         _require_supported_result(result)
+        if full and result.get("kind") == "research_validation":
+            from .validation_runner import materialize_stored_validation_result
+            try:
+                result = materialize_stored_validation_result(store, result, resolve=False)
+                _validate_validation_ledgers(result, store)
+            except (OSError, ValueError) as exc:
+                raise HTTPException(409, {"code": "VALIDATION_LEDGER_UNAVAILABLE", "message": str(exc)}) from exc
         public = public_result(
             result, full=full, data_metadata=None,
         )
+        if result.get("kind") == "research_validation":
+            from .validation_store import ValidationStore
+            public = {**public, "audit": ValidationStore(store).audit_summary(result["run_id"])}
+            return StreamingResponse(_stream_json_value(public, store), media_type="application/json") if full else public
         revisions = store.completion_revisions(result_id)
         selected_revision = revisions[-1] if revisions else None
         if revision is not None:
@@ -2685,7 +2848,16 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
 
     @app.get("/api/v1/results/{result_id}/export")
     def export(result_id: str, kind: str = "json", revision: int | None = Query(None, ge=1)):
-        result = get_result(result_id, full=True, revision=revision)
+        original = store.result(result_id)
+        if original and original.get("kind") == "research_validation":
+            from .validation_runner import materialize_stored_validation_result
+            try:
+                result = materialize_stored_validation_result(store, original, resolve=False)
+                _validate_validation_ledgers(result, store)
+            except (OSError, ValueError) as exc:
+                raise HTTPException(409, {"code": "VALIDATION_LEDGER_UNAVAILABLE", "message": str(exc)}) from exc
+        else:
+            result = get_result(result_id, full=True, revision=revision)
         if kind == "json":
             revision_record = store.completion_revision(result_id, revision) if revision is not None else None
             try:
@@ -2696,6 +2868,36 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
                 _stream_json_value(payload, store), media_type="application/json",
                 headers={"Content-Disposition": f'attachment; filename="{result_id}-{kind}.json"'},
             )
+        elif result.get("kind") == "research_validation" and kind in {"validation", "equity", "trades"}:
+            def validation_records():
+                for cell in result.get("cells", []):
+                    common = {"unit_id": cell.get("unit_id"), "symbol": cell.get("symbol"),
+                              "arm_group": cell.get("arm_group"), "scheme": cell.get("scheme"),
+                              "kind": cell.get("kind"), "status": cell.get("status")}
+                    if kind == "validation":
+                        yield {**common, "result": json.dumps(cell.get("result", {}), ensure_ascii=False)}
+                    else:
+                        ledgers = cell.get("ledger") or {}
+                        if "__validation_ledger__" in ledgers:
+                            from .validation_store import ValidationStore
+                            ledgers = ValidationStore(store).load_ledger(ledgers)
+                        for strategy, ledger in ledgers.items():
+                            if isinstance(ledger, dict):
+                                for row in ledger.get(kind, []):
+                                    yield {**common, "strategy": strategy, **row}
+            columns = list(dict.fromkeys(key for row in validation_records() for key in row))
+            def validation_csv():
+                stream = io.StringIO(newline="")
+                writer = csv.writer(stream, lineterminator="\n")
+                writer.writerow(columns)
+                yield "\ufeff" + stream.getvalue()
+                for row in validation_records():
+                    stream.seek(0)
+                    stream.truncate(0)
+                    writer.writerow([_csv_value(row.get(key)) for key in columns])
+                    yield stream.getvalue()
+            return StreamingResponse(validation_csv(), media_type="text/csv",
+                headers={"Content-Disposition": f'attachment; filename="{result_id}-{kind}.csv"'})
         elif kind in ("equity", "trades"):
             def ledger_records():
                 """Yield the equity or trade ledger rows one at a time."""

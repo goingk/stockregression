@@ -228,6 +228,53 @@ def _nb_attempt(
     return True, cash_after, shares - quantity, sellable - quantity, quantity, price, fee, notional, normalized_request, 0, 0.0
 
 
+@_jit(cache=True)
+def _nb_qualification_bar_lots(volume, participation_rate, board_code):
+    """Whole-lot capacity one account may consume at a bar."""
+    if not math.isfinite(volume) or volume <= 0 or not math.isfinite(participation_rate) or participation_rate <= 0:
+        return 0
+    raw = volume * participation_rate
+    return _nb_buy_lot(raw, board_code)
+
+
+@_jit(cache=True)
+def _nb_qualification_buy_total(
+    quantity, price, commission_rate, min_commission, transfer_rate,
+    transfer_is_face_value, transfer_minimum, stamp_rate, stamp_bilateral,
+    face_value,
+):
+    """Cash needed by one independent fill, including all per-fill fees."""
+    normalized = _nb_buy_lot(min(max(0, quantity), 2147483647), 0)
+    if normalized <= 0 or price <= 0 or not math.isfinite(price):
+        return np.inf
+    notional = _nb_round_money(normalized * price)
+    commission = _nb_round_money(max(min_commission, notional * commission_rate))
+    stamp = _nb_round_money(notional * stamp_rate) if stamp_bilateral else 0.0
+    transfer_basis = normalized * face_value if transfer_is_face_value else notional
+    transfer = _nb_round_money(max(transfer_minimum, transfer_basis * transfer_rate))
+    return _nb_round_money(notional + commission + stamp + transfer)
+
+
+@_jit(cache=True)
+def _nb_qualification_affordable_quantity(
+    quantity, cash, price, commission_rate, min_commission, transfer_rate,
+    transfer_is_face_value, transfer_minimum, stamp_rate, stamp_bilateral,
+    face_value, board_code,
+):
+    """Size a new order once; active remainders are never resized by cash."""
+    candidate = _nb_buy_lot(min(max(0, quantity), 2147483647), board_code)
+    while candidate > 0:
+        total = _nb_qualification_buy_total(
+            candidate, price, commission_rate, min_commission, transfer_rate,
+            transfer_is_face_value, transfer_minimum, stamp_rate,
+            stamp_bilateral, face_value,
+        )
+        if total <= cash + 0.005:
+            return candidate
+        candidate -= 200 if board_code == 2 and candidate >= 200 else 100
+    return 0
+
+
 @_jit(cache=True, nogil=True)
 def simulate(
     opens: np.ndarray, closes: np.ndarray, volumes: np.ndarray,
@@ -259,6 +306,14 @@ def simulate(
     grid_only: bool, passive_grid: bool, account_mode: int,
     cancel_flag: np.ndarray | None = None,
     dca_budgets_by_day: np.ndarray | None = None,
+    qualification_mode: bool = False,
+    qualification_initial_cash: float = 0.0,
+    qualification_participation_rate: float = 0.01,
+    qualification_ttl_bars: int = 3,
+    qualification_extra_delay_bars: int = 0,
+    qualification_contribution_bars: np.ndarray | None = None,
+    qualification_contribution_amounts: np.ndarray | None = None,
+    qualification_volume_unavailable: np.ndarray | None = None,
 ) -> tuple:
     keep_details = output_mode >= 2
     top_up_mode = funding_mode == 1
@@ -275,10 +330,19 @@ def simulate(
     # The surviving ledgers keep their original account index, so every output
     # array stays four rows wide and row 3 is still the matched funding hold.
     mode = int(account_mode)
+    qualification = bool(qualification_mode)
     if grid_only:
         mode = ACCOUNT_MODE_GRID
     active_accounts = np.zeros(4, dtype=np.int64)
-    if mode == ACCOUNT_MODE_RESEARCH:
+    if qualification:
+        # Qualification compares two independent implementations of one
+        # funding policy: an active grid and a scheduled-funding hold.  Both
+        # ledgers receive the same initial cash and external contributions, but
+        # do not share each other's bar participation capacity.
+        active_accounts[0] = 0
+        active_accounts[1] = 3
+        active_count = 2
+    elif mode == ACCOUNT_MODE_RESEARCH:
         active_accounts[0] = 0
         active_accounts[1] = 3
         active_count = 2
@@ -294,13 +358,17 @@ def simulate(
     account_active = np.zeros(4, dtype=np.bool_)
     for slot in range(active_count):
         account_active[active_accounts[slot]] = True
-    matched_enabled = bool(account_active[3])
+    matched_enabled = bool(account_active[3]) and not qualification
     n = len(opens)
     day_count = 0
     for flag in last_bar_day:
         if flag:
             day_count += 1
     initial_equities = np.array([grid_initial_equity, dca_initial_equity, buy_hold_initial_equity, grid_initial_equity], dtype=np.float64)
+    if qualification:
+        qualification_start_equity = _nb_round_money(qualification_initial_cash + float(seed_shares) * float(valuation_price))
+        initial_equities[0] = qualification_start_equity
+        initial_equities[3] = qualification_start_equity
     cash = initial_equities.copy()
     shares = np.zeros(4, dtype=np.int64)
     sellable = np.zeros(4, dtype=np.int64)
@@ -315,6 +383,13 @@ def simulate(
     pending_side = np.zeros(4, dtype=np.int64)
     pending_quantity = np.zeros(4, dtype=np.int64)
     pending_reason = np.zeros(4, dtype=np.int64)
+    qualification_pending_created = np.full(4, -1, dtype=np.int64)
+    qualification_pending_due = np.zeros(4, dtype=np.int64)
+    qualification_pending_attempts = np.zeros(4, dtype=np.int64)
+    qualification_pending_was_filled = np.zeros(4, dtype=np.bool_)
+    qualification_capacity_remaining = np.zeros(4, dtype=np.int64)
+    qualification_block_new_order = np.zeros(4, dtype=np.bool_)
+    qualification_contribution_index = 0
     dca_due = False
     dca_last_day = -1
     action_count = len(action_record_day)
@@ -358,12 +433,12 @@ def simulate(
     fold_snapshots = np.zeros((fold_count, 5), dtype=np.float64)
     fold_start_assets = np.zeros(fold_count, dtype=np.float64)
     fold_topups = np.zeros(fold_count, dtype=np.float64)
-    grid_invested = float(grid_initial_equity)
+    grid_invested = float(initial_equities[0])
     grid_topups = 0.0
-    grid_peak_invested = float(grid_initial_equity)
+    grid_peak_invested = float(initial_equities[0])
     grid_peak_day = -1
-    matched_invested = float(grid_initial_equity)
-    matched_peak_invested = float(grid_initial_equity)
+    matched_invested = float(initial_equities[3])
+    matched_peak_invested = float(initial_equities[3])
     matched_pending_cash = 0.0
     peak_profit = np.zeros(4, dtype=np.float64)
     day_external_flow = 0.0
@@ -372,8 +447,10 @@ def simulate(
     buy_shares_exact = float(buy_shares)
     sell_shares_exact = float(sell_shares)
     dca_shares_exact = float(dca_shares)
+    qualification_max_shares = float(max_shares)
     last_grid_price = reference_price
     prior_signal_allowed = False
+    rejection_capacity = 12 * n if qualification else 5 * n
     if keep_details:
         period_values = np.zeros((0, 0), dtype=np.float64)
         trade_bar = np.zeros(5 * n, dtype=np.int64)
@@ -387,12 +464,12 @@ def simulate(
         trade_reason = np.zeros(5 * n, dtype=np.int8)
         trade_topup = np.zeros(5 * n, dtype=np.float64)
         trade_n = 0
-        rejection_bar = np.zeros(5 * n, dtype=np.int64)
-        rejection_ts = np.zeros(5 * n, dtype=np.int64)
-        rejection_strategy = np.zeros(5 * n, dtype=np.int8)
-        rejection_side = np.zeros(5 * n, dtype=np.int8)
-        rejection_reason = np.zeros(5 * n, dtype=np.int8)
-        rejection_quantity = np.zeros(5 * n, dtype=np.int64)
+        rejection_bar = np.zeros(rejection_capacity, dtype=np.int64)
+        rejection_ts = np.zeros(rejection_capacity, dtype=np.int64)
+        rejection_strategy = np.zeros(rejection_capacity, dtype=np.int8)
+        rejection_side = np.zeros(rejection_capacity, dtype=np.int8)
+        rejection_reason = np.zeros(rejection_capacity, dtype=np.int8)
+        rejection_quantity = np.zeros(rejection_capacity, dtype=np.int64)
         rejection_n = 0
     else:
         period_values = np.zeros((0, 0), dtype=np.float64)
@@ -415,7 +492,7 @@ def simulate(
         rejection_quantity = np.zeros(0, dtype=np.int64)
         rejection_n = 0
 
-    cash[0] = reserve_cash
+    cash[0] = qualification_initial_cash if qualification else reserve_cash
     shares[0] = seed_shares
     sellable[0] = seed_shares
     started[0] = True
@@ -429,10 +506,22 @@ def simulate(
     shares[2] = buy_hold_initial_shares
     sellable[2] = buy_hold_initial_shares
     started[2] = True
-    cash[3] = reserve_cash
+    cash[3] = qualification_initial_cash if qualification else reserve_cash
     shares[3] = seed_shares
     sellable[3] = seed_shares
     started[3] = True
+    if qualification and qualification_initial_cash > 0:
+        # The baseline knows its opening cash before the first market bar.  Its
+        # first eligible execution is therefore that bar's close (next_bar_end
+        # for a pre-open funding decision).
+        max_holding = max(0.0, max_shares - float(seed_shares))
+        initial_quantity = _nb_buy_lot(max_holding, board_code) if math.isfinite(max_shares) else _nb_buy_lot(qualification_initial_cash, board_code)
+        if initial_quantity > 0:
+            pending_side[3] = 1
+            pending_quantity[3] = initial_quantity
+            pending_reason[3] = 16
+            qualification_pending_created[3] = -1
+            qualification_pending_due[3] = 0
     dca_invested = dca_initial_equity
     prior_close = valuation_price
     initial_holdings = (seed_shares, dca_initial_shares, buy_hold_initial_shares, seed_shares)
@@ -485,6 +574,8 @@ def simulate(
                            or grid_step != values[4] or buy_shares != int(values[5])
                            or sell_shares != int(values[6]) or params_paused != next_paused)
                 min_shares, max_shares = values[0], values[1]
+                if qualification:
+                    max_shares = min(max_shares, qualification_max_shares)
                 buy_step, sell_step, grid_step = values[2], values[3], values[4]
                 buy_shares_exact, sell_shares_exact = float(values[5]), float(values[6])
                 buy_shares, sell_shares = int(values[5]), int(values[6])
@@ -492,16 +583,17 @@ def simulate(
                 if changed and not passive_grid:
                     if pending_side[0] and keep_details:
                         rejection_bar[rejection_n] = i
-                        rejection_ts[rejection_n] = open_timestamps_ns[i]
+                        rejection_ts[rejection_n] = timestamps_ns[i] if qualification else open_timestamps_ns[i]
                         rejection_strategy[rejection_n] = 0
                         rejection_side[rejection_n] = pending_side[0]
                         rejection_reason[rejection_n] = 12
                         rejection_quantity[rejection_n] = pending_quantity[0]
                         rejection_n += 1
                     pending_side[0], pending_quantity[0], pending_reason[0] = 0, 0, 0
+                    qualification_pending_attempts[0] = 0
                     if grid_mode != 0:
                         active_cell[0] = _nb_cell(last_grid_price, fixed_anchor[0], grid_mode, buy_step, sell_step)
-                    if i > 0 and prior_signal_allowed and not params_paused:
+                    if not qualification and i > 0 and prior_signal_allowed and not params_paused:
                         intent = _nb_grid_intent(prior_close, shares[0] + share_receivable[0],
                             reference[0], fixed_anchor[0], active_cell[0], grid_mode,
                             buy_step, sell_step, grid_step, lower_price, upper_price,
@@ -555,6 +647,8 @@ def simulate(
                     min_shares *= ratio
                     if math.isfinite(max_shares):
                         max_shares *= ratio
+                    if qualification and math.isfinite(qualification_max_shares):
+                        qualification_max_shares *= ratio
                     floor_limit *= ratio
                     buy_shares_exact *= ratio
                     sell_shares_exact *= ratio
@@ -585,6 +679,10 @@ def simulate(
                     if not floor_active and floor_anchor > 0:
                         floor_anchor *= factor
                         floor_high *= factor
+                elif qualification and account == 3 and pending_side[3] != 0:
+                    pending_quantity[3] = int(math.floor(pending_quantity[3] * bonus_multiplier + 1e-10))
+                    if pending_quantity[3] <= 0:
+                        pending_side[3], pending_reason[3] = 0, 0
                 for action in range(action_count):
                     if action_ex_day[action] == day_id:
                         first_same_ex_date = True
@@ -667,6 +765,24 @@ def simulate(
                     actual_min_position = min(actual_min_position, current_position)
                     actual_max_position = max(actual_max_position, current_position)
                     floor_position_changed = True
+        fold_id = fold_ids[day_id]
+        if qualification and qualification_contribution_bars is not None and qualification_contribution_amounts is not None:
+            while (qualification_contribution_index < len(qualification_contribution_bars)
+                   and qualification_contribution_bars[qualification_contribution_index] <= i):
+                contribution = _nb_round_money(qualification_contribution_amounts[qualification_contribution_index])
+                if contribution > 0:
+                    cash[0] = _nb_round_money(cash[0] + contribution)
+                    cash[3] = _nb_round_money(cash[3] + contribution)
+                    grid_invested = _nb_round_money(grid_invested + contribution)
+                    grid_topups = _nb_round_money(grid_topups + contribution)
+                    grid_peak_invested = max(grid_peak_invested, grid_invested)
+                    grid_peak_day = day_id
+                    matched_invested = _nb_round_money(matched_invested + contribution)
+                    matched_peak_invested = max(matched_peak_invested, matched_invested)
+                    day_external_flow = _nb_round_money(day_external_flow + contribution)
+                    if fold_id >= 0:
+                        fold_topups[fold_id] = _nb_round_money(fold_topups[fold_id] + contribution)
+                qualification_contribution_index += 1
         if first_dca_day[i]:
             dca_due = True
 
@@ -677,7 +793,7 @@ def simulate(
             prior_signal_allowed = False
             for slot in range(active_count):
                 account = active_accounts[slot]
-                if pending_side[account] != 0:
+                if pending_side[account] != 0 and not qualification:
                     if keep_details:
                         rejection_bar[rejection_n] = i
                         rejection_ts[rejection_n] = open_timestamps_ns[i]
@@ -701,7 +817,7 @@ def simulate(
             prior_signal_allowed = False
             for slot in range(active_count):
                 account = active_accounts[slot]
-                if pending_side[account] != 0:
+                if pending_side[account] != 0 and not qualification:
                     if keep_details:
                         rejection_bar[rejection_n] = i
                         rejection_ts[rejection_n] = open_timestamps_ns[i]
@@ -718,6 +834,15 @@ def simulate(
         opening = opens[i]
         close = closes[i]
         volume = volumes[i]
+        if qualification:
+            policy_volume = volume
+            if qualification_volume_unavailable is not None and qualification_volume_unavailable[i]:
+                policy_volume = 0.0
+            capacity = _nb_qualification_bar_lots(policy_volume, qualification_participation_rate, board_code)
+            qualification_capacity_remaining[0] = capacity
+            qualification_capacity_remaining[3] = capacity
+            qualification_block_new_order[0] = False
+            qualification_block_new_order[3] = False
         if floor_active:
             floor_high = max(floor_high, opening)
         if floor_position_changed and floor_enabled:
@@ -732,7 +857,196 @@ def simulate(
         for slot in range(active_count):
             account = active_accounts[slot]
             traded = False
-            if pending_side[account] != 0:
+            if qualification and (account == 0 or account == 3):
+                if pending_side[account] != 0 and i >= qualification_pending_due[account]:
+                    side = pending_side[account]
+                    requested = pending_quantity[account]
+                    reason_code = pending_reason[account]
+                    capacity = qualification_capacity_remaining[account]
+                    executable = min(requested, capacity)
+                    if side == 1:
+                        position = shares[account] + share_receivable[account]
+                        position_limit = qualification_max_shares if account == 3 else max_shares
+                        executable = min(executable, _nb_buy_lot(max(0.0, position_limit - position), board_code)) if math.isfinite(position_limit) else _nb_buy_lot(executable, board_code)
+                    elif side == 2:
+                        position = shares[account] + share_receivable[account]
+                        executable = min(executable, min(sellable[account], int(max(0.0, position - min_shares)) // 100 * 100))
+                    executable = _nb_buy_lot(executable, board_code) if side == 1 else max(0, executable // 100 * 100)
+
+                    execution = 0.0
+                    if executable > 0:
+                        price = close * (1.0 + slippage if side == 1 else 1.0 - slippage)
+                        if side == 1:
+                            price = math.ceil(price / tick - 1e-10) * tick
+                        else:
+                            price = math.floor(price / tick + 1e-10) * tick
+                        price = round(price, 6)
+                        if math.isfinite(limit_ups[i]):
+                            price = min(price, limit_ups[i])
+                        if math.isfinite(limit_downs[i]):
+                            price = max(price, limit_downs[i])
+                        execution = price
+
+                    if (side == 1 and reason_code == 16
+                            and qualification_pending_created[account] == -1
+                            and qualification_pending_attempts[account] == 0):
+                        initial_request = requested
+                        requested = _nb_qualification_affordable_quantity(
+                            requested, cash[account], execution, commission_rate,
+                            min_commission, transfer_rates[i], transfer_is_face_value[i],
+                            transfer_minimums[i], stamp_rates[i], stamp_bilateral[i],
+                            face_value, board_code,
+                        ) if execution > 0 else 0
+                        pending_quantity[account] = requested
+                        executable = min(executable, requested)
+                        if requested <= 0:
+                            if keep_details:
+                                rejection_bar[rejection_n] = i
+                                rejection_ts[rejection_n] = timestamps_ns[i]
+                                rejection_strategy[rejection_n] = account
+                                rejection_side[rejection_n] = 1
+                                rejection_reason[rejection_n] = 5
+                                rejection_quantity[rejection_n] = initial_request
+                                rejection_n += 1
+                            pending_side[account], pending_quantity[account], pending_reason[account] = 0, 0, 0
+                            qualification_pending_attempts[account] = 0
+                            qualification_block_new_order[account] = True
+                            executable = 0
+
+                    if side == 1 and execution > 0:
+                        required_cash = _nb_qualification_buy_total(
+                            executable, execution, commission_rate, min_commission,
+                            transfer_rates[i], transfer_is_face_value[i], transfer_minimums[i],
+                            stamp_rates[i], stamp_bilateral[i], face_value,
+                        )
+                        if required_cash > cash[account] + 0.005:
+                            if keep_details:
+                                rejection_bar[rejection_n] = i
+                                rejection_ts[rejection_n] = timestamps_ns[i]
+                                rejection_strategy[rejection_n] = account
+                                rejection_side[rejection_n] = side
+                                rejection_reason[rejection_n] = 5
+                                rejection_quantity[rejection_n] = requested
+                                rejection_n += 1
+                            pending_side[account], pending_quantity[account], pending_reason[account] = 0, 0, 0
+                            qualification_pending_attempts[account] = 0
+                            qualification_block_new_order[account] = True
+                            executable = 0
+
+                    attempt_max_shares = qualification_max_shares if account == 3 else max_shares
+                    result = _nb_attempt(
+                        side, executable, close, policy_volume, limit_ups[i], limit_downs[i],
+                        stamp_rates[i], transfer_rates[i], transfer_is_face_value[i],
+                        transfer_minimums[i], stamp_bilateral[i], day_id, cash[account],
+                        cash_receivable[account], share_receivable[account],
+                        shares[account], sellable[account], attempt_max_shares, min_shares,
+                        commission_rate, min_commission, slippage, board_code, face_value, tick, t0,
+                        False, allow_odd_lot_exit,
+                    ) if executable > 0 else (
+                        False, cash[account], shares[account], sellable[account], 0, 0.0, 0.0, 0.0, requested,
+                        (4 if (side == 1 and shares[account] + share_receivable[account] >= max_shares) else
+                         6 if (side == 2 and sellable[account] <= 0 and shares[account] > 0) else
+                         7 if side == 2 else 8),
+                        0.0,
+                    )
+                    filled = result[0]
+                    if filled:
+                        cash[account], shares[account], sellable[account] = result[1], result[2], result[3]
+                        qualification_capacity_remaining[account] = max(0, capacity - result[4])
+                        pending_quantity[account] = max(0, requested - result[4])
+                        qualification_pending_was_filled[account] = pending_quantity[account] > 0
+                        if pending_quantity[account] <= 0:
+                            pending_side[account], pending_quantity[account], pending_reason[account] = 0, 0, 0
+                        if account == 0:
+                            current_position = float(shares[0] + share_receivable[0])
+                            actual_min_position = min(actual_min_position, current_position)
+                            actual_max_position = max(actual_max_position, current_position)
+                            if floor_enabled:
+                                if floor_active and current_position > floor_limit + 1e-9:
+                                    floor_active, floor_anchor, floor_high, floor_episode_grids, floor_episode_count, floor_grid_squares = _nb_close_floor(
+                                        floor_active, floor_anchor, floor_high, floor_sell_step,
+                                        floor_episode_grids, floor_episode_count, floor_grid_squares,
+                                    )
+                                elif not floor_active and current_position <= floor_limit + 1e-9:
+                                    floor_active, floor_anchor, floor_high, floor_sell_step = True, result[5], result[5], sell_step
+                        trade_count[account] += 1
+                        buy_count[account] += side == 1
+                        sell_count[account] += side == 2
+                        total_fees[account] += result[6]
+                        gross_turnover[account] += result[7]
+                        if keep_details:
+                            trade_bar[trade_n] = i
+                            trade_strategy[trade_n] = account
+                            trade_side[trade_n] = side
+                            trade_quantity[trade_n] = result[4]
+                            trade_price[trade_n] = result[5]
+                            trade_fees[trade_n] = result[6]
+                            trade_cash[trade_n] = cash[account]
+                            trade_shares[trade_n] = shares[account]
+                            trade_reason[trade_n] = reason_code
+                            trade_topup[trade_n] = 0.0
+                            trade_n += 1
+                        traded = True
+                        if account == 0:
+                            last_grid_price = result[5]
+                            if grid_mode == 0:
+                                reference[account] = result[5]
+                            else:
+                                if fixed_anchor[account] == 0:
+                                    fixed_anchor[account] = reference_price if reference_price > 0 else result[5]
+                                if reference[account] == 0:
+                                    reference[account] = fixed_anchor[account]
+                                active_cell[account] = _nb_cell(result[5], fixed_anchor[account], grid_mode, buy_step, sell_step)
+                                has_active_cell[account] = True
+                    elif pending_side[account] != 0:
+                        if keep_details:
+                            rejection_bar[rejection_n] = i
+                            rejection_ts[rejection_n] = timestamps_ns[i]
+                            rejection_strategy[rejection_n] = account
+                            rejection_side[rejection_n] = side
+                            rejection_reason[rejection_n] = result[9]
+                            rejection_quantity[rejection_n] = requested
+                            rejection_n += 1
+                        if result[9] in (4, 5):
+                            pending_side[account], pending_quantity[account], pending_reason[account] = 0, 0, 0
+                            qualification_block_new_order[account] = True
+                    if pending_side[account] != 0:
+                        qualification_pending_attempts[account] += 1
+                        if qualification_pending_attempts[account] >= qualification_ttl_bars:
+                            if keep_details:
+                                rejection_bar[rejection_n] = i
+                                rejection_ts[rejection_n] = timestamps_ns[i]
+                                rejection_strategy[rejection_n] = account
+                                rejection_side[rejection_n] = pending_side[account]
+                                rejection_reason[rejection_n] = 18
+                                rejection_quantity[rejection_n] = pending_quantity[account]
+                                rejection_n += 1
+                            pending_side[account], pending_quantity[account], pending_reason[account] = 0, 0, 0
+                            qualification_block_new_order[account] = True
+
+                # A passive grid still has a valued ledger, but never submits
+                # a grid order.  The baseline deploys settled cash on the first
+                # eligible bar and retries any day-end remainder next session.
+                if account == 3 and pending_side[3] == 0 and not qualification_block_new_order[3] and cash[3] > 0 and close > 0:
+                    position = shares[3] + share_receivable[3]
+                    maximum = _nb_buy_lot(max(0.0, qualification_max_shares - position), board_code) if math.isfinite(qualification_max_shares) else 2147483600
+                    price = close * (1.0 + slippage)
+                    price = math.ceil(price / tick - 1e-10) * tick
+                    if math.isfinite(limit_ups[i]):
+                        price = min(price, limit_ups[i])
+                    quantity = min(maximum, _nb_buy_lot(cash[3] / price, board_code)) if price > 0 else 0
+                    quantity = _nb_qualification_affordable_quantity(
+                        quantity, cash[3], price, commission_rate, min_commission,
+                        transfer_rates[i], transfer_is_face_value[i], transfer_minimums[i],
+                        stamp_rates[i], stamp_bilateral[i], face_value, board_code,
+                    )
+                    if quantity > 0:
+                        pending_side[3], pending_quantity[3], pending_reason[3] = 1, quantity, 17
+                        qualification_pending_created[3] = i
+                        qualification_pending_due[3] = i + 1 + qualification_extra_delay_bars
+                        qualification_pending_attempts[3] = 0
+                        qualification_pending_was_filled[3] = False
+            elif pending_side[account] != 0:
                 side = pending_side[account]
                 quantity = pending_quantity[account]
                 reason_code = pending_reason[account]
@@ -815,7 +1129,7 @@ def simulate(
                             active_cell[account] = _nb_cell(result[5], fixed_anchor[account], grid_mode, buy_step, sell_step)
                             has_active_cell[account] = True
 
-            if matched_enabled and account == 0 and matched_pending_cash > 0 and opening > 0:
+            if not qualification and matched_enabled and account == 0 and matched_pending_cash > 0 and opening > 0:
                 available_pool = min(matched_pending_cash, cash[3])
                 matched_quantity = _nb_buy_lot(available_pool / opening, board_code)
                 if matched_quantity > 0:
@@ -934,7 +1248,8 @@ def simulate(
 
         # Submit at most one grid order from the real close; it becomes eligible
         # at the next real bar's open.  Position sizing is frozen at this close.
-        if started[0] and volumes[i] > 0 and not passive_grid and not params_paused:
+        if (started[0] and volumes[i] > 0 and not passive_grid and not params_paused
+                and (not qualification or not qualification_block_new_order[0])):
             position_close = shares[0] + share_receivable[0]
             equity_close = cash[0] + cash_receivable[0] + position_close * close
             intent_side = 0
@@ -983,6 +1298,19 @@ def simulate(
                     spacing_ok = close >= last_grid_price * (1.0 + step) - 1e-10
                 if not spacing_ok:
                     intent_side = 0
+            if qualification and pending_side[0] != 0 and intent_side != 0 and intent_side != pending_side[0]:
+                if keep_details:
+                    rejection_bar[rejection_n] = i
+                    rejection_ts[rejection_n] = timestamps_ns[i]
+                    rejection_strategy[rejection_n] = 0
+                    rejection_side[rejection_n] = pending_side[0]
+                    rejection_reason[rejection_n] = 16
+                    rejection_quantity[rejection_n] = pending_quantity[0]
+                    rejection_n += 1
+                pending_side[0], pending_quantity[0], pending_reason[0] = 0, 0, 0
+                qualification_pending_attempts[0] = 0
+            if qualification and pending_side[0] != 0:
+                intent_side = 0
             if intent_side != 0:
                 if intent_side == 2 and position_close < intent_quantity:
                     if not stockout_signal_active:
@@ -1025,6 +1353,27 @@ def simulate(
                     pending_side[0] = intent_side
                     pending_quantity[0] = clipped_quantity
                     pending_reason[0] = intent_reason
+                    if qualification:
+                        qualification_pending_created[0] = i
+                        qualification_pending_due[0] = i + 1 + qualification_extra_delay_bars
+                        qualification_pending_attempts[0] = 0
+                        qualification_pending_was_filled[0] = False
+
+        if qualification and last_bar_day[i]:
+            for slot in range(active_count):
+                account = active_accounts[slot]
+                if (pending_side[account] != 0 and qualification_pending_was_filled[account]
+                        and qualification_pending_created[account] != i):
+                    if keep_details:
+                        rejection_bar[rejection_n] = i
+                        rejection_ts[rejection_n] = timestamps_ns[i]
+                        rejection_strategy[rejection_n] = account
+                        rejection_side[rejection_n] = pending_side[account]
+                        rejection_reason[rejection_n] = 19
+                        rejection_quantity[rejection_n] = pending_quantity[account]
+                        rejection_n += 1
+                    pending_side[account], pending_quantity[account], pending_reason[account] = 0, 0, 0
+                    qualification_pending_attempts[account] = 0
 
         for slot in range(active_count):
             account = active_accounts[slot]
@@ -1056,10 +1405,10 @@ def simulate(
 
         if output_mode == 2 or (output_mode in (1, 3) and last_bar_day[i]):
             out = i if output_mode == 2 else dca_day_index
-            invested_values[0, out] = grid_invested if top_up_mode else initial_equities[0]
+            invested_values[0, out] = grid_invested if top_up_mode or qualification else initial_equities[0]
             invested_values[1, out] = dca_invested
             invested_values[2, out] = initial_equities[2]
-            invested_values[3, out] = matched_invested if matched_enabled else initial_equities[3]
+            invested_values[3, out] = matched_invested if matched_enabled or qualification else initial_equities[3]
 
         if floor_active:
             floor_high = max(floor_high, close)

@@ -9,7 +9,7 @@ from .storage import Store, now_iso
 
 CPU_JOB_KINDS = (
     "backtest", "optimization", "optimize", "batch", "batch_backtest", "research_completion",
-    "etf_research", "etf_validation",
+    "etf_research", "etf_validation", "research_validation",
     "market_validate", "market_prepare", "market_sync", "market_aggregate",
     "market_import", "market_import_batch", "market_import_package",
 )

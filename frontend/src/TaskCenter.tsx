@@ -2,18 +2,26 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef, use
 import type { ReactNode } from 'react'
 import { AlertCircle, ArrowLeft, Bell, CheckCircle2, ChevronRight, ExternalLink, LoaderCircle, RefreshCw, X } from 'lucide-react'
 import { get, post } from './api'
-import { Badge, Button, Empty, JobProgress, money, percent } from './components'
+import { Badge, Button, Empty, JobProgress, money, NumField, percent } from './components'
 import { DataTaskReport } from './DataTaskReport'
-import { isActiveJob, isEtfResearchJob, mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds, taskLabel, taskStatusLabel, taskNoticeMessage } from './taskState'
+import {
+  canResumeResearchValidation, isActiveJob, isEtfResearchJob, isResearchValidationJob, mergeJobSnapshots,
+  newlyNotifiableJobs, submissionJobIds, taskLabel, taskStatusLabel, taskNoticeMessage,
+  validationResumeExtension, validationResumeLimits, validationResumeNeedsIncrease, validationResumeReason,
+} from './taskState'
+import type { ValidationResumeExtension } from './taskState'
 import { canResumeMarketSync, syncProgressLines } from './types'
 import type { Job } from './types'
 import { useWorkbenchDefaults } from './useWorkbenchDefaults'
 import { LatestRequest } from './requestState'
+import { validationOverviewItems } from './researchValidationModel.ts'
 
 type Notice = { id: string; label: string; job?: Job; error?: string; submitting?: boolean; expiresAt?: number }
 type Tasks = {
   jobs: Job[]; loading: boolean; error: string; refresh: () => Promise<void>; cancel: (id: string) => Promise<void>
-  run: <T>(label: string, action: () => Promise<T>) => Promise<T>; openResult: (job: Job) => void; showHistory: () => void
+  run: <T>(label: string, action: () => Promise<T>) => Promise<T>
+  resume: (id: string, extension?: ValidationResumeExtension) => Promise<void>
+  openResult: (job: Job) => void; showHistory: () => void
 }
 type JobHistory = {
   items: Job[]
@@ -71,6 +79,12 @@ function taskRequestFacts(job: Job): TaskFact[] {
   const config = isRecord(payload.config) ? payload.config : {}
   const base = isRecord(config.base) ? config.base : {}
   const plan = isRecord(payload.plan) ? payload.plan : {}
+  const research = isRecord(payload.research) ? payload.research : {}
+  const context = isRecord(research.research_context) ? research.research_context : {}
+  const planSymbols = Array.isArray(plan.symbols)
+    ? plan.symbols.map(item => typeof item === 'string' ? item : isRecord(item) ? textValue(item.symbol) : '').filter(Boolean)
+    : []
+  const accounts = isRecord(payload.accounts) ? payload.accounts : {}
   const first = (...keys: string[]) => {
     for (const source of [config, base, plan, payload]) {
       for (const key of keys) {
@@ -80,15 +94,16 @@ function taskRequestFacts(job: Job): TaskFact[] {
     }
     return undefined
   }
-  const symbol = textValue(config.symbol) || textValue(base.symbol) || textValue(payload.symbol)
-  const symbols = compactList(plan.symbols) || compactList(config.symbols) || compactList(payload.symbols)
+  const symbol = textValue(config.symbol) || textValue(base.symbol) || textValue(context.symbol) || textValue(payload.symbol)
+  const symbols = planSymbols.join('、') || compactList(plan.symbols) || compactList(config.symbols) || compactList(payload.symbols)
   const timeframes = compactList(payload.timeframes) || textValue(payload.timeframe) || textValue(first('frequency'))
   const asOf = textValue(plan.as_of) || textValue(first('as_of'))
   const facts: TaskFact[] = []
   const add = (label: string, value: string, title?: string) => { if (value) facts.push({ label, value, title }) }
   add('范围', textValue(first('scope')))
   add('模式', textValue(first('mode')))
-  add('标的', symbol || symbols, symbol || symbols)
+  const symbolSummary = isResearchValidationJob(job) && symbols ? symbols : symbol || symbols
+  add('标的', symbolSummary, symbolSummary)
   add('周期', timeframes)
   add('开始日期', textValue(first('start_date')))
   add('结束日期', textValue(first('end_date')))
@@ -98,6 +113,9 @@ function taskRequestFacts(job: Job): TaskFact[] {
   const validationTopK = first('validation_top_k')
   add('自动核验', validationTopK == null ? '' : `前 ${textValue(validationTopK)} 名`)
   add('并发数', textValue(first('workers', 'download_workers', 'validation_workers')))
+  add('历史区间', textValue(payload.history_policy) === 'explicit' ? '严格使用当前日期' : textValue(payload.history_policy) === 'auto' ? '按数据自动规划' : '')
+  add('完整验证方案', textValue(plan.plan_hash), textValue(plan.plan_hash))
+  add('预算账户', Object.keys(accounts).length ? `${Object.keys(accounts).length} 个标的` : '')
   return facts
 }
 
@@ -132,6 +150,13 @@ function taskResultFacts(job: Job, result: TaskResult): TaskFact[] {
   const completion = isRecord(result.completion) ? result.completion : {}
   add('本次修订', completion.selected_revision ?? completion.revision_number)
   add('修订范围', completion.revision_scope)
+  if (isResearchValidationJob(job)) {
+    const validation = validationOverviewItems(result)
+    add('完成情况', validation.completion.label)
+    add('候选结果', validation.candidate.label)
+    add('预算资格', validation.qualification.label)
+    add('证据', validation.evidence.label)
+  }
   if (job.kind === 'backtest' || job.kind === 'batch_backtest') {
     const config = isRecord(result.config) ? result.config : {}
     add('回测标的', config.symbol)
@@ -171,7 +196,7 @@ function TaskDetail({ job, cancelling, resuming, onBack, onCancel, onResume, onO
   resuming: boolean
   onBack: () => void
   onCancel: (id: string) => void
-  onResume: (id: string) => void
+  onResume: (id: string, extension?: ValidationResumeExtension) => Promise<void> | void
   onOpenResult: (job: Job) => void
 }) {
   const facts = useMemo(() => taskRequestFacts(job), [job.payload])
@@ -179,12 +204,25 @@ function TaskDetail({ job, cancelling, resuming, onBack, onCancel, onResume, onO
   const [resultLoading, setResultLoading] = useState(false)
   const [resultError, setResultError] = useState('')
   const [resultRetry, setResultRetry] = useState(0)
+  const [resumeFormError, setResumeFormError] = useState('')
   const errorText = taskErrorText(job.error)
-  const resultLabel = isEtfResearchJob(job) ? '打开 ETF 研究' : ['sync', 'market_sync'].includes(job.kind) ? '打开完整报告' : '打开完整结果'
+  const resultLabel = isResearchValidationJob(job) ? '打开完整验证' : isEtfResearchJob(job) ? '打开 ETF 研究' : ['sync', 'market_sync'].includes(job.kind) ? '打开完整报告' : '打开完整结果'
   const dataReport = DATA_REPORT_KINDS.has(job.kind)
   const resultFacts = useMemo(() => result ? taskResultFacts(job, result) : [], [job, result])
   const resultCounts = result && isRecord(result.counts) ? result.counts : null
   const resultWarnings = result && Array.isArray(result.warnings) ? result.warnings.map(item => textValue(item)).filter(Boolean) : []
+  const validationResume = canResumeResearchValidation(job)
+  const resumeOriginal = useMemo(() => validationResumeLimits(job), [job.id, job.payload])
+  const resumeReason = useMemo(() => validationResumeReason(job, result), [job, result])
+  const resumeNeedsIncrease = validationResumeNeedsIncrease(resumeReason) || ['budget_exhausted', 'timeout'].includes(job.status)
+  const [resumeRuntime, setResumeRuntime] = useState<number | null>(resumeOriginal.max_runtime_seconds)
+  const [resumeBudget, setResumeBudget] = useState<number | null>(resumeOriginal.total_evaluation_budget)
+
+  useEffect(() => {
+    setResumeRuntime(resumeOriginal.max_runtime_seconds)
+    setResumeBudget(resumeOriginal.total_evaluation_budget)
+    setResumeFormError('')
+  }, [job.id, resumeOriginal.max_runtime_seconds, resumeOriginal.total_evaluation_budget])
 
   useEffect(() => {
     if (!job.result_id || isActiveJob(job)) {
@@ -202,6 +240,16 @@ function TaskDetail({ job, cancelling, resuming, onBack, onCancel, onResume, onO
       .finally(() => { if (active) setResultLoading(false) })
     return () => { active = false }
   }, [job.id, job.result_id, job.status, resultRetry])
+
+  const resumeValidation = async () => {
+    const extension = validationResumeExtension(resumeOriginal, {
+      max_runtime_seconds: resumeRuntime ?? undefined,
+      total_evaluation_budget: resumeBudget ?? undefined,
+    }, resumeNeedsIncrease)
+    if (extension.error) { setResumeFormError(extension.error); return }
+    setResumeFormError('')
+    await onResume(job.id, extension.body)
+  }
 
   return <div className="task-detail-panel">
     <div className="task-detail-top"><Button variant="quiet" onClick={onBack}><ArrowLeft size={14} />返回任务列表</Button><Badge tone={job.status === 'failed' ? 'red' : job.status === 'partial' ? 'amber' : job.status === 'completed' ? 'green' : isActiveJob(job) ? 'blue' : 'neutral'}>{taskStatusLabel(job.status)}</Badge></div>
@@ -239,7 +287,18 @@ function TaskDetail({ job, cancelling, resuming, onBack, onCancel, onResume, onO
       </> : <p className="task-detail-empty">该任务没有保存结果{job.status === 'failed' ? '，请根据错误详情处理后重试。' : '。'}</p>}
     </section>
     {isActiveJob(job) && <div className="task-detail-actions"><Button variant="quiet" busy={cancelling} disabled={job.cancel_requested} onClick={() => onCancel(job.id)}>{job.cancel_requested ? '取消中…' : '取消任务'}</Button><span>任务状态会自动刷新。</span></div>}
-    {canResumeMarketSync(job) && <div className="task-detail-actions"><Button variant="secondary" busy={resuming} onClick={() => onResume(job.id)}>继续同步</Button><span>继续会沿用原任务冻结的范围和截止日；原任务记录保持终态。</span></div>}
+    {validationResume && <section className="task-detail-section task-resume-validation" aria-labelledby="task-resume-validation-title">
+      <h3 id="task-resume-validation-title">继续完整验证</h3>
+      <p className="task-detail-empty">继续会核对已完成的方案单元，沿用原冻结计划、数据版本和已选参数。提高上限只允许更多执行时间或评价次数，不会重新选择参数，也不会改写历史检查点。</p>
+      {resumeNeedsIncrease && <p className="inline-warning">{resumeReason === 'runtime_limit' ? '上次因运行时间耗尽而停止。' : '上次因评价预算耗尽而停止。'}按原上限继续会再次立即停止，请至少提高一项上限。</p>}
+      <div className="form-grid two task-resume-limits">
+        <NumField label="最长运行时间（秒）" value={resumeRuntime} min={resumeOriginal.max_runtime_seconds} max={2_592_000} step="60" onChange={setResumeRuntime} hint={`原上限 ${resumeOriginal.max_runtime_seconds.toLocaleString('zh-CN')} 秒；只能增加。`} />
+        <NumField label="评价点预算" value={resumeBudget} min={resumeOriginal.total_evaluation_budget ?? 1} max={1_000_000_000} step="1" onChange={setResumeBudget} hint={resumeOriginal.total_evaluation_budget != null ? `原上限 ${resumeOriginal.total_evaluation_budget.toLocaleString('zh-CN')} 点；只能增加。` : '原任务未单独记录评价点上限。'} />
+      </div>
+      {resumeFormError && <div className="notice error" role="alert"><span>{resumeFormError}</span></div>}
+      <div className="task-detail-actions"><Button variant="secondary" busy={resuming} disabled={resultLoading} onClick={() => void resumeValidation()}>{resumeNeedsIncrease ? '提高上限并继续' : '按当前上限继续'}</Button><span>{resultLoading ? '正在核对保存的停止原因与完成单元…' : '恢复成功后会自动打开新任务，原任务记录保持终态。'}</span></div>
+    </section>}
+    {canResumeMarketSync(job) && <div className="task-detail-actions"><Button variant="secondary" busy={resuming} onClick={() => void onResume(job.id)}>继续同步</Button><span>继续会沿用原任务冻结的范围和截止日；原任务记录保持终态。</span></div>}
   </div>
 }
 
@@ -445,26 +504,29 @@ export function TaskProvider({ children, onOpenResult, filter, kind, onFilterCha
       setNotices(current => [...current.filter(notice => notice.id !== 'cancel-' + id), { id: 'cancel-' + id, label: '取消任务失败', error: cause instanceof Error ? cause.message : String(cause) }])
     } finally { setCancelling(current => { const next = new Set(current); next.delete(id); return next }) }
   }, [accept, refresh, loadHistory, historyOffset, historyOpen])
-  const resume = useCallback(async (id: string) => {
+  const resume = useCallback(async (id: string, extension?: ValidationResumeExtension) => {
     setResuming(current => new Set(current).add(id))
+    const original = jobsRef.current.find(job => job.id === id)
+    const validationResume = original ? canResumeResearchValidation(original) : false
+    const label = validationResume ? '完整研究验证' : '行情同步'
     try {
-      const response = await post<{ job_id: string; resumed_from: string }>(`/jobs/${encodeURIComponent(id)}/resume`)
+      const response = await post<{ job_id: string; resumed_from: string }>(`/jobs/${encodeURIComponent(id)}/resume`, extension)
       const resumedJob = await get<Job>(`/jobs/${encodeURIComponent(response.job_id)}`).catch(() => ({
-        id: response.job_id, kind: 'market_sync', status: 'queued' as const, progress: 0,
-        message: '继续任务已创建，正在读取进度', created_at: new Date().toISOString(),
+        id: response.job_id, kind: original?.kind ?? 'market_sync', status: 'queued' as const, progress: 0,
+        message: '继续任务已创建，正在读取进度', created_at: new Date().toISOString(), payload: original?.payload,
       }))
       accept([resumedJob])
       await refresh()
       if (historyOpen) await loadHistory(historyOffset, false)
       setSelectedJobId(response.job_id)
-      setNotices(current => [...current, { id: 'resume-' + response.job_id, label: '继续同步', expiresAt: Date.now() + 6000 }])
+      setNotices(current => [...current, { id: 'resume-' + response.job_id, label: '继续' + label, expiresAt: Date.now() + 6000 }])
     } catch (cause) {
-      setNotices(current => [...current.filter(notice => notice.id !== 'resume-' + id), { id: 'resume-' + id, label: '继续同步失败', error: cause instanceof Error ? cause.message : String(cause) }])
+      setNotices(current => [...current.filter(notice => notice.id !== 'resume-' + id), { id: 'resume-' + id, label: '继续' + label + '失败', error: cause instanceof Error ? cause.message : String(cause) }])
     } finally { setResuming(current => { const next = new Set(current); next.delete(id); return next }) }
   }, [accept, refresh, loadHistory, historyOffset, historyOpen])
   const openResult = useCallback((job: Job) => { setSelectedJobId(''); setHistoryOpen(false); onOpenResult(job) }, [onOpenResult])
   const showHistory = useCallback(() => { setSelectedJobId(''); setHistoryOpen(true) }, [])
-  const value = useMemo(() => ({ jobs, loading, error, refresh, cancel, run, openResult, showHistory }), [jobs, loading, error, refresh, cancel, run, openResult, showHistory])
+  const value = useMemo(() => ({ jobs, loading, error, refresh, cancel, run, resume, openResult, showHistory }), [jobs, loading, error, refresh, cancel, run, resume, openResult, showHistory])
   const selectedJob = selectedJobId ? jobs.find(job => job.id === selectedJobId) ?? history.items.find(job => job.id === selectedJobId) : undefined
   const removeNotice = (id: string) => setNotices(current => current.filter(notice => notice.id !== id))
   const jobActions = (job: Job) => <div className="task-actions">
@@ -483,7 +545,7 @@ export function TaskProvider({ children, onOpenResult, filter, kind, onFilterCha
     {historyOpen && <div className="task-drawer-overlay" onMouseDown={event => { if (event.target === event.currentTarget) setHistoryOpen(false) }}>
       <section ref={drawer} className={`task-drawer ${selectedJobId ? 'task-drawer-detail' : ''}`} role="dialog" aria-modal="true" aria-labelledby="task-center-title">
         <div className="task-drawer-head"><div><h2 id="task-center-title">任务中心</h2><p>{selectedJobId ? '请求、错误与结果入口' : '进度、历史记录与结果入口'}</p></div><button className="icon-button" onClick={() => setHistoryOpen(false)} aria-label="关闭任务中心"><X size={20} /></button></div>
-        {selectedJobId ? (selectedJob ? <TaskDetail job={selectedJob} cancelling={cancelling.has(selectedJob.id)} resuming={resuming.has(selectedJob.id)} onBack={() => setSelectedJobId('')} onCancel={id => void cancel(id)} onResume={id => void resume(id)} onOpenResult={openResult} /> : <div className="task-detail-panel"><Button variant="quiet" onClick={() => setSelectedJobId('')}><ArrowLeft size={14} />返回任务列表</Button><Empty title="任务不存在" detail="该任务可能已从当前筛选或分页中移除。" /></div>) : <>
+        {selectedJobId ? (selectedJob ? <TaskDetail job={selectedJob} cancelling={cancelling.has(selectedJob.id)} resuming={resuming.has(selectedJob.id)} onBack={() => setSelectedJobId('')} onCancel={id => void cancel(id)} onResume={(id, extension) => resume(id, extension)} onOpenResult={openResult} /> : <div className="task-detail-panel"><Button variant="quiet" onClick={() => setSelectedJobId('')}><ArrowLeft size={14} />返回任务列表</Button><Empty title="任务不存在" detail="该任务可能已从当前筛选或分页中移除。" /></div>) : <>
           <div className="task-drawer-tools"><select className="input" aria-label="筛选任务状态" value={filter} onChange={event => onFilterChange(event.target.value, kind)}><option value="all">全部任务</option><option value="active">正在运行</option><option value="completed">已完成</option><option value="partial">部分完成</option><option value="failed">失败</option><option value="cancelled">已取消</option></select><select className="input" aria-label="筛选任务类型" value={kind} onChange={event => onFilterChange(filter, event.target.value)}><option value="">全部类型</option>{history.kinds.map(item => <option key={item.kind} value={item.kind}>{taskLabel({ id: '', kind: item.kind, status: '', progress: 0, message: '', created_at: '' })}（{item.count}）</option>)}</select><Button variant="quiet" busy={historyLoading} onClick={() => void Promise.all([refresh(), loadHistory(historyOffset, false)])}><RefreshCw size={14} />刷新</Button></div>
           {error && <p className="task-connection-note" role="status">{error}</p>}
           {historyError && <p className="task-connection-note" role="alert">{historyError} <button className="text-link" onClick={() => void loadHistory(historyOffset, false)}>重试</button></p>}
@@ -491,7 +553,7 @@ export function TaskProvider({ children, onOpenResult, filter, kind, onFilterCha
             <div className="task-history-heading"><strong>{taskLabel(job)}</strong><Badge tone={job.status === 'failed' ? 'red' : job.status === 'partial' ? 'amber' : job.status === 'completed' ? 'green' : isActiveJob(job) ? 'blue' : 'neutral'}>{taskStatusLabel(job.status)}</Badge></div>
             <small>{job.created_at ? new Date(job.created_at).toLocaleString('zh-CN', { hour12: false }) : ''} · {job.id.slice(0, 12)}</small>
             <JobProgress progress={job.progress} status={job.status} /><p>{job.message || '等待处理'}</p><SyncProgress job={job} />
-            <div className="task-actions"><button className="text-link" onClick={() => setSelectedJobId(job.id)}>查看详情<ChevronRight size={13} /></button>{isActiveJob(job) && <button className="text-link danger-text" disabled={cancelling.has(job.id) || job.cancel_requested} onClick={() => void cancel(job.id)}>{cancelling.has(job.id) || job.cancel_requested ? '取消中…' : '取消任务'}</button>}{canResumeMarketSync(job) && <button className="text-link" disabled={resuming.has(job.id)} onClick={() => void resume(job.id)}>{resuming.has(job.id) ? '提交中…' : '继续同步'}</button>}</div>
+            <div className="task-actions"><button className="text-link" onClick={() => setSelectedJobId(job.id)}>查看详情<ChevronRight size={13} /></button>{isActiveJob(job) && <button className="text-link danger-text" disabled={cancelling.has(job.id) || job.cancel_requested} onClick={() => void cancel(job.id)}>{cancelling.has(job.id) || job.cancel_requested ? '取消中…' : '取消任务'}</button>}{canResumeResearchValidation(job) && <button className="text-link" onClick={() => setSelectedJobId(job.id)}>设置继续验证</button>}{canResumeMarketSync(job) && <button className="text-link" disabled={resuming.has(job.id)} onClick={() => void resume(job.id)}>{resuming.has(job.id) ? '提交中…' : '继续同步'}</button>}</div>
           </article>)}</div>
           {filter !== 'active' && history.total > 0 && <div className="pagination-row"><span>第 {Math.floor(historyOffset / 50) + 1} / {Math.max(1, Math.ceil(history.total / 50))} 页 · 共 {history.total} 条</span><div><Button variant="quiet" disabled={historyLoading || historyOffset <= 0} onClick={() => void loadHistory(Math.max(0, historyOffset - 50), false)}>上一页</Button><Button variant="quiet" disabled={historyLoading || historyOffset + 50 >= history.total} onClick={() => void loadHistory(historyOffset + 50, false)}>下一页</Button></div></div>}
         </>}

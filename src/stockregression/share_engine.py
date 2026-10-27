@@ -11,6 +11,7 @@ from .performance import (
     blas_thread_limit, current_workspace_bytes, rebalance_cpu_budget,
     record_count, record_details,
 )
+from .validation_models import QualificationAccount
 
 _CACHE = OrderedDict()
 BUY_HOLD_INITIAL_SHARES = 1000
@@ -21,6 +22,32 @@ BUY_HOLD_INITIAL_SHARES = 1000
 _FREQUENCY_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "60m": 60}
 _NS_PER_MINUTE = 60_000_000_000
 _NS_PER_DAY = 86_400_000_000_000
+
+_QUALIFICATION_TRADE_REASONS = {
+    4: "grid_buy",
+    5: "grid_sell",
+    16: "qualification_initial_cash",
+    17: "qualification_scheduled_funding",
+}
+
+_QUALIFICATION_REJECTION_REASONS = {
+    1: "limit_up_locked",
+    2: "limit_down_locked",
+    3: "below_lot",
+    4: "position_limit",
+    5: "insufficient_cash",
+    6: "t_plus_1",
+    7: "insufficient_sellable_shares",
+    8: "participation_capacity_unavailable",
+    9: "invalid_execution_price",
+    10: "position_limit_or_below_lot",
+    11: "non_tradable_bar",
+    12: "parameter_update",
+    13: "unavailable_day",
+    16: "reverse_signal",
+    18: "ttl_expired",
+    19: "day_end_cancel",
+}
 
 
 def _open_timestamps_ns(stamps: pd.DatetimeIndex, frequencies: np.ndarray) -> np.ndarray:
@@ -251,11 +278,15 @@ def _inputs(config, data):
         np.full(n, str(config.frequency), dtype=object) if frequency_column is None
         else frequency_column.astype(str).to_numpy()
     )
+    policy_volume = pd.to_numeric(frame.volume, errors="coerce").to_numpy(dtype=np.float64)
+    volume_unavailable = np.isnan(policy_volume)
+    filled_volume = policy_volume.copy()
+    filled_volume[volume_unavailable] = 0.0
     # Extend the array tuple at its end: existing research/preview consumers
     # use the stable price-band, opening-time and corporate-action positions.
-    arrays = (opens, closes, pd.to_numeric(frame.volume, errors="coerce").fillna(0).to_numpy(dtype=np.float64), tradable, ups, downs, stamps.asi8, _open_timestamps_ns(stamps, frequencies), codes, first & new_period[codes], last, stamp[codes], transfer[codes], face[codes], minimum[codes], bilateral[codes], preclose,
+    arrays = (opens, closes, filled_volume, tradable, ups, downs, stamps.asi8, _open_timestamps_ns(stamps, frequencies), codes, first & new_period[codes], last, stamp[codes], transfer[codes], face[codes], minimum[codes], bilateral[codes], preclose,
               np.asarray([-1 if a.record_date < config.start_date else day_ids.get(a.record_date, -2) for a in actions], dtype=np.int64), np.asarray([day_ids.get(a.ex_date, -2) for a in actions], dtype=np.int64), np.asarray([day_ids.get(a.pay_date, -2) for a in actions], dtype=np.int64), np.asarray([day_ids.get(a.stock_date, -2) for a in actions], dtype=np.int64), np.asarray([a.cash_per_share for a in actions], dtype=np.float64), np.asarray([a.bonus_ratio for a in actions], dtype=np.float64), skip)
-    result = {"arrays": arrays, "days": days, "stamps": stamps, "tradable": tradable, "skip": skip, "opens": arrays[7], "period_keys": keys, "terms": terms, "data": data, "end": str(end.date())}
+    result = {"arrays": arrays, "days": days, "stamps": stamps, "tradable": tradable, "skip": skip, "opens": arrays[7], "period_keys": keys, "terms": terms, "data": data, "end": str(end.date()), "volume_unavailable": volume_unavailable}
     _CACHE[key] = result
     while len(_CACHE) > 2:
         _CACHE.popitem(last=False)
@@ -542,6 +573,359 @@ def run_share_backtest(config, data, progress=None, cancelled=None, summary_only
     if passive_grid:
         result["strategies"]["grid"]["label"] = "同资金同初始持股被动持有"
     return result
+
+
+def run_qualification(
+    config: BacktestConfig,
+    data: DataBundle,
+    account: QualificationAccount | dict,
+    parameter_schedule: list | None = None,
+    passive_grid: bool = False,
+    cancelled=None,
+    cost_multiplier: float = 1.0,
+    volume_multiplier: float = 1.0,
+    extra_delay_bars: int = 0,
+    omitted_contribution_index: int | None = None,
+    max_principal_drawdown: float | None = None,
+) -> dict:
+    """Run the qualification policy on the shared share-account kernel.
+
+    The grid and the scheduled-funding hold are two independent ledgers inside
+    the same native simulation.  They receive the same initial cash and the
+    same dated contributions, while each has its own per-bar participation
+    capacity.  Orders evaluate a close and execute at the next eligible bar's
+    close with adverse slippage and tick rounding.
+    """
+    import threading
+
+    from . import engine
+    from .share_kernel import ACCOUNT_MODE_RESEARCH, simulate
+
+    profile = account if isinstance(account, QualificationAccount) else QualificationAccount.model_validate(account)
+    cost_multiplier = float(cost_multiplier)
+    volume_multiplier = float(volume_multiplier)
+    extra_delay_bars = int(extra_delay_bars)
+    if not math.isfinite(cost_multiplier) or cost_multiplier <= 0:
+        raise ValueError("成本倍率必须为正数")
+    if not math.isfinite(volume_multiplier) or volume_multiplier <= 0:
+        raise ValueError("成交量倍率必须为正数")
+    if extra_delay_bars < 0:
+        raise ValueError("额外延迟 bar 数不能为负")
+    risk_limit = float(max_principal_drawdown if max_principal_drawdown is not None else getattr(config, "max_principal_drawdown", 0.2))
+    if not math.isfinite(risk_limit) or not 0 < risk_limit <= 1:
+        raise ValueError("资格回撤门槛必须大于0且不超过1")
+    if cancelled and cancelled():
+        raise InterruptedError("资格回测已取消")
+
+    prepared = _inputs(config, data)
+    money = funding(config, data)
+    terms = prepared["terms"]
+    initial_holdings_value = round_money(float(config.initial_shares) * float(money["valuation_price"]))
+    all_contributions = list(profile.contributions)
+    scheduled_total = round_money(math.fsum(item.amount for item in all_contributions))
+    contributions = list(all_contributions)
+    contribution_indices = list(range(len(all_contributions)))
+    omitted_contribution_amount = 0.0
+    if omitted_contribution_index is not None:
+        if (isinstance(omitted_contribution_index, bool)
+                or not isinstance(omitted_contribution_index, (int, np.integer))
+                or not 0 <= int(omitted_contribution_index) < len(contributions)):
+            raise ValueError("待忽略补款序号超出计划补款范围")
+        omitted_contribution_index = int(omitted_contribution_index)
+        omitted_contribution_amount = round_money(all_contributions[omitted_contribution_index].amount)
+        contributions.pop(omitted_contribution_index)
+        contribution_indices.pop(omitted_contribution_index)
+    eligible_scheduled_total = round_money(scheduled_total - omitted_contribution_amount)
+    initial_cash = round_money(profile.total_budget - initial_holdings_value - scheduled_total)
+    if initial_cash < -0.005:
+        raise ValueError("总预算不足以覆盖初始持仓和全部计划补款")
+    initial_cash = max(0.0, initial_cash)
+
+    stamps_ns = prepared["stamps"].asi8
+    contribution_bars = []
+    contribution_amounts = []
+    for item in contributions:
+        available_ns = pd.Timestamp(item.available_at).value
+        bar = int(np.searchsorted(stamps_ns, available_ns, side="left"))
+        contribution_bars.append(bar if bar < len(stamps_ns) else len(stamps_ns))
+        contribution_amounts.append(float(item.amount))
+
+    arrays = list(prepared["arrays"])
+    arrays[2] = np.ascontiguousarray(arrays[2] * volume_multiplier, dtype=np.float64)
+    volume_unavailable = np.ascontiguousarray(prepared.get("volume_unavailable", np.zeros(len(arrays[2]), dtype=np.bool_)), dtype=np.bool_)
+    policy_config = config.model_copy(update={"max_shares": profile.max_shares})
+    change_days, change_values, schedule = _parameter_arrays(policy_config, prepared, parameter_schedule)
+    options = list(_options(config, prepared, money, 2, cost_multiplier=cost_multiplier))
+    options[4] = float(profile.max_shares)
+    fold_ids = np.full(len(prepared["days"]), -1, dtype=np.int64)
+    effective_delay = int(profile.extra_delay_bars) + extra_delay_bars
+    runner = simulate if engine._NUMBA_FASTPATH_ENABLED else getattr(simulate, "py_func", simulate)
+    cancel_flag = np.zeros(1, dtype=np.int8) if cancelled else None
+    stop_monitor = threading.Event() if cancelled else None
+    monitor = None
+    if cancelled:
+        def watch_cancellation():
+            while not stop_monitor.wait(.05):
+                if cancelled():
+                    cancel_flag[0] = 1
+                    return
+        monitor = threading.Thread(target=watch_cancellation, daemon=True)
+        monitor.start()
+    try:
+        output = runner(
+            *tuple(arrays), *tuple(options), change_days, change_values,
+            fold_ids, 0, False, bool(passive_grid), ACCOUNT_MODE_RESEARCH,
+            cancel_flag, None, True, float(initial_cash), float(profile.participation_rate),
+            int(profile.ttl_bars), effective_delay,
+            np.ascontiguousarray(contribution_bars, dtype=np.int64),
+            np.ascontiguousarray(contribution_amounts, dtype=np.float64),
+            volume_unavailable,
+        )
+    finally:
+        if stop_monitor is not None:
+            stop_monitor.set()
+        if monitor is not None:
+            monitor.join(timeout=1.0)
+    if cancelled and (cancel_flag[0] or cancelled()):
+        raise InterruptedError("资格回测已取消")
+    (metrics, eq, cash_values, share_values, drawdown, _periods, trade_bar,
+     trade_strategy, trade_side, trade_quantity, trade_price, trade_fees,
+     trade_cash, trade_shares, trade_reason, _trade_topup, rejection_bar,
+     rejection_ts, rejection_strategy, rejection_side, rejection_reason,
+     rejection_quantity, invested_values, _folds, _episodes, _funding_stats) = output
+
+    tradable = np.asarray(prepared["tradable"], dtype=np.bool_)
+    skip = np.asarray(prepared["skip"], dtype=np.bool_)
+    visible = np.flatnonzero(tradable & ~skip)
+    bar_timestamps = prepared["stamps"]
+    contribution_rows = []
+    for index, item, bar, amount in zip(contribution_indices, contributions, contribution_bars, contribution_amounts):
+        credited = bar < len(bar_timestamps)
+        contribution_rows.append({
+            "index": index,
+            "available_at": pd.Timestamp(item.available_at).isoformat(),
+            "amount": float(amount),
+            "status": "credited" if credited else "outside_backtest",
+            "credited_at": bar_timestamps[bar].isoformat() if credited else None,
+            "bar": int(bar) if credited else None,
+        })
+    received_total = round_money(math.fsum(
+        float(item["amount"]) for item in contribution_rows if item["status"] == "credited"
+    ))
+    start_equity = round_money(initial_holdings_value + initial_cash)
+    volume_nan_count = int(np.count_nonzero(volume_unavailable))
+
+    strategies = {}
+    for account_id, name in ((0, "grid"), (3, "scheduled_funding_hold")):
+        account_trades = []
+        for offset in np.flatnonzero(trade_strategy == account_id):
+            bar = int(trade_bar[offset])
+            side = "buy" if int(trade_side[offset]) == 1 else "sell"
+            account_trades.append({
+                "timestamp": bar_timestamps[bar].isoformat(),
+                "side": side,
+                "quantity": int(trade_quantity[offset]),
+                "price": float(trade_price[offset]),
+                "fees": float(trade_fees[offset]),
+                "notional": round_money(float(trade_quantity[offset]) * float(trade_price[offset])),
+                "cash": float(trade_cash[offset]),
+                "shares": int(trade_shares[offset]),
+                "reason": _QUALIFICATION_TRADE_REASONS.get(int(trade_reason[offset]), "qualification_trade"),
+                "execution": "next_bar_end",
+            })
+        account_rejections = []
+        for offset in np.flatnonzero(rejection_strategy == account_id):
+            reason = int(rejection_reason[offset])
+            account_rejections.append({
+                "timestamp": pd.Timestamp(int(rejection_ts[offset])).isoformat(),
+                "side": "buy" if int(rejection_side[offset]) == 1 else "sell",
+                "reason": _QUALIFICATION_REJECTION_REASONS.get(reason, f"qualification_rejection_{reason}"),
+                "requested_quantity": int(rejection_quantity[offset]),
+            })
+
+        equity = []
+        peak_principal = 0.0
+        for bar in visible:
+            invested = float(invested_values[account_id, bar])
+            peak_principal = max(peak_principal, invested)
+            profit = float(eq[account_id, bar]) - invested
+            equity.append({
+                "timestamp": bar_timestamps[bar].isoformat(),
+                "equity": float(eq[account_id, bar]),
+                "cash": float(cash_values[account_id, bar]),
+                "position": float(share_values[account_id, bar]),
+                "total_invested": invested,
+                "peak_principal": peak_principal,
+                "cumulative_profit": profit,
+                "principal_curve": 1.0 + profit / peak_principal if peak_principal > 0 else None,
+                "principal_drawdown": float(drawdown[account_id, bar]) if math.isfinite(drawdown[account_id, bar]) else None,
+            })
+        final_equity = float(eq[account_id, visible[-1]]) if len(visible) else start_equity
+        final_invested = round_money(start_equity + received_total)
+        total_profit = round_money(final_equity - final_invested)
+        peak_metric = float(metrics[account_id, 0]) if math.isfinite(metrics[account_id, 0]) else None
+        drawdown_metric = float(metrics[account_id, 2]) if math.isfinite(metrics[account_id, 2]) else None
+        reason_counts = {}
+        for item in account_rejections:
+            reason_counts[item["reason"]] = reason_counts.get(item["reason"], 0) + 1
+        metric = {
+            "peak_principal_return": peak_metric,
+            "max_principal_drawdown": drawdown_metric,
+            "total_profit": total_profit,
+            "trade_count": int(metrics[account_id, 5]),
+            "external_topups": received_total,
+            "return_on_committed_budget": total_profit / profile.total_budget if profile.total_budget > 0 else None,
+            "total_budget": float(profile.total_budget),
+            "initial_equity": start_equity,
+            "initial_holdings_value": initial_holdings_value,
+            "initial_cash": initial_cash,
+            "scheduled_contributions": scheduled_total,
+            "eligible_scheduled_contributions": eligible_scheduled_total,
+            "omitted_contribution_amount": omitted_contribution_amount,
+            "unreceived_contributions": round_money(eligible_scheduled_total - received_total),
+            "total_invested": final_invested,
+            "peak_invested": round_money(peak_principal),
+            "final_equity": final_equity,
+            "final_cash": float(cash_values[account_id, visible[-1]]) if len(visible) else initial_cash,
+            "final_position": float(share_values[account_id, visible[-1]]) if len(visible) else float(config.initial_shares),
+            "total_fees": float(metrics[account_id, 6]) if math.isfinite(metrics[account_id, 6]) else None,
+            "turnover": float(metrics[account_id, 7]) if math.isfinite(metrics[account_id, 7]) else None,
+            "buy_count": int(metrics[account_id, 8]),
+            "sell_count": int(metrics[account_id, 9]),
+            "return_basis": "peak_principal",
+            "risk_basis": "principal_profit_drawdown",
+            "funding_diagnostics": {
+                "policy": "budget_includes_initial_holdings",
+                "initial_cash_formula": "total_budget - initial_holdings_value - all_scheduled_contributions",
+                "scheduled_receipts_linked_to_grid_fills": False,
+                "omitted_contribution_index": omitted_contribution_index,
+                "initial_shares_sellable_at_start": True,
+                "cash_shortfall_action": "cancel_remainder",
+                "automatic_top_up_on_fill": False,
+                "unspent_cash": float(cash_values[account_id, visible[-1]]) if len(visible) else initial_cash,
+            },
+            "execution_diagnostics": {
+                "model": "next_bar_end_close_participation_ttl_v1",
+                "capacity_scope": "account_per_bar",
+                "participation_rate": float(profile.participation_rate),
+                "volume_multiplier": volume_multiplier,
+                "effective_extra_delay_bars": effective_delay,
+                "ttl_bars": int(profile.ttl_bars),
+                "partial_fill_remainder_ttl_bars": int(profile.ttl_bars),
+                "day_end_cancel": True,
+                "fees_charged_per_independent_fill": True,
+                "trade_fill_count": len(account_trades),
+                "rejection_count": len(account_rejections),
+                "rejections_by_reason": reason_counts,
+                "volume_nan_bars": volume_nan_count,
+            },
+        }
+        strategies[name] = {
+            "metrics": metric,
+            "equity": equity,
+            "equity_frequency": config.frequency,
+            "trades": account_trades,
+            "rejections": account_rejections,
+            "contributions": [dict(item) for item in contribution_rows],
+        }
+
+    grid_drawdown = strategies["grid"]["metrics"]["max_principal_drawdown"]
+    funding_rejections_by_strategy = {
+        name: int(strategy["metrics"]["execution_diagnostics"]
+                  ["rejections_by_reason"].get("insufficient_cash", 0))
+        for name, strategy in strategies.items()
+    }
+    grid_funding_rejections = funding_rejections_by_strategy["grid"]
+    risk_breached = grid_drawdown is not None and grid_drawdown > risk_limit
+    unevaluable_reasons = []
+    if volume_nan_count:
+        unevaluable_reasons.append(
+            "存在成交量为 NaN 的行情 bar；保留原始成交量掩码，不能按零成交量推断资格"
+        )
+    if grid_drawdown is None:
+        unevaluable_reasons.append("grid 最大本金回撤不可评价")
+    unevaluable_reason = "；".join(unevaluable_reasons) or None
+    if unevaluable_reason:
+        qualification_status = "unevaluable"
+    elif risk_breached:
+        qualification_status = "risk_breached"
+    elif grid_funding_rejections:
+        qualification_status = "execution_limited"
+    else:
+        qualification_status = "qualified"
+    qualification_basis = {
+        "priority": ["unevaluable", "risk_breached", "execution_limited", "qualified"],
+        "risk_limit": risk_limit,
+        "grid_max_principal_drawdown": grid_drawdown,
+        "risk_breached": risk_breached,
+        "grid_insufficient_cash_rejections": grid_funding_rejections,
+        "funding_rejections_by_strategy": funding_rejections_by_strategy,
+        "volume_nan_bars": volume_nan_count,
+    }
+    if unevaluable_reason:
+        for strategy in strategies.values():
+            strategy["metrics"]["unevaluable_reason"] = unevaluable_reason
+
+    execution_profile = {
+        "version": "qualification_execution_v1",
+        "decision_price": "bar_close",
+        "execution": "next_bar_end",
+        "execution_price": "next_bar_close",
+        "slippage": "adverse",
+        "price_tick": float(terms["price_tick"]),
+        "participation_rate": float(profile.participation_rate),
+        "volume_multiplier": volume_multiplier,
+        "cost_multiplier": cost_multiplier,
+        "ttl_bars": int(profile.ttl_bars),
+        "extra_delay_bars": effective_delay,
+        "partial_fill_remainder": "ttl_then_day_end_cancel_v1",
+        "day_end_cancel": True,
+        "same_account_capacity_shared": True,
+        "independent_strategy_capacity": True,
+        "insufficient_funds": "cancel_remainder_without_cash_resize",
+        "automatic_top_up_on_fill": False,
+        "fees_per_independent_fill": True,
+        "passive_grid": bool(passive_grid),
+        "funding_policy": "budget_includes_initial_holdings",
+        "scheduled_receipts_independent_of_grid_fills": True,
+    }
+    funding_summary = {
+        "policy": "budget_includes_initial_holdings",
+        "total_budget": float(profile.total_budget),
+        "initial_holdings_value": initial_holdings_value,
+        "initial_cash": initial_cash,
+        "scheduled_contributions": scheduled_total,
+        "eligible_scheduled_contributions": eligible_scheduled_total,
+        "omitted_contribution_amount": omitted_contribution_amount,
+        "received_contributions": received_total,
+        "external_topups": received_total,
+        "valuation_price": float(money["valuation_price"]),
+        "valuation_date": str(money.get("reference_date")),
+        "initial_shares": int(config.initial_shares),
+        "initial_cash_formula": "total_budget - initial_holdings_value - all_scheduled_contributions",
+        "automatic_top_up_on_fill": False,
+    }
+    return {
+        "status": "completed",
+        "qualification_status": qualification_status,
+        "unevaluable_reason": unevaluable_reason,
+        "risk_limit": risk_limit,
+        "qualification_basis": qualification_basis,
+        "execution_profile": execution_profile,
+        "config": config.model_dump(mode="json"),
+        "account": profile.model_dump(mode="json"),
+        "initial_cash": initial_cash,
+        "initial_holdings_value": initial_holdings_value,
+        "external_topups": received_total,
+        "funding": funding_summary,
+        "contributions": [dict(item) for item in contribution_rows],
+        "volume_unavailable_bars": [
+            bar_timestamps[index].isoformat()
+            for index in np.flatnonzero(volume_unavailable)
+        ],
+        "parameter_schedule": schedule,
+        "strategies": strategies,
+    }
 
 
 def research_batch(base, data, params, fold_ranges, cost_multiplier=1.0,

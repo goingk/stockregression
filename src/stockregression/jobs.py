@@ -48,6 +48,8 @@ def _runtime_limit_seconds(job: dict) -> int:
         return int(config.get("max_runtime_seconds", 3600))
     if job.get("kind") == "research_completion":
         return int(payload.get("max_runtime_seconds", 0) or 0)
+    if job.get("kind") == "research_validation":
+        return int((payload.get("config") or {}).get("max_runtime_seconds", 86400))
     config = payload.get("config")
     strategy = config.get("strategy") if isinstance(config, dict) else None
     if not isinstance(strategy, dict):
@@ -373,7 +375,7 @@ def execute_job(root: str, job_id: str, observer=None):
         tick = time.monotonic()
         if tick - last_progress > progress_update_seconds or fraction <= 0 or fraction >= 1:
             rendered = str(message)
-            if job.get("kind") in {"backtest", "optimization", "batch", "batch_backtest", "etf_research", "etf_validation"} and 0 < fraction < 1:
+            if job.get("kind") in {"backtest", "optimization", "batch", "batch_backtest", "etf_research", "etf_validation", "research_validation"} and 0 < fraction < 1:
                 rendered += f" · {max(1, lease.units)} 线程"
             normalized_fraction = max(0, min(1, float(fraction)))
             with progress_detail_lock:
@@ -399,7 +401,7 @@ def execute_job(root: str, job_id: str, observer=None):
         payload, kind = job["payload"], job["kind"]
         computation_started = None
         submission_provenance = None
-        if kind in {"optimization", "etf_research", "etf_validation"}:
+        if kind in {"optimization", "etf_research", "etf_validation", "research_validation"}:
             from .reproducibility import computation_provenance, reproducibility_mismatches
             from .settings import PROJECT_ROOT
             submission_provenance = payload.get("submission_provenance")
@@ -423,6 +425,45 @@ def execute_job(root: str, job_id: str, observer=None):
             with trace.measure("backtest"):
                 result = run_backtest(config, bundle, lambda fraction, message: progress(0.33 + 0.67 * fraction, message), cancelled)
             symbol, title = config.symbol, "现金补足网格 / 定投 / 买入持有" if config.schema_version == 3 else "股数网格 / 定投 / 买入持有" if config.schema_version == 2 else "网格 / 定投 / 初始全仓"
+        elif kind == "research_validation":
+            from .validation_models import ResearchValidationRequest
+            from .validation_planner import load_validation_bundles
+            from .validation_runner import run_validation
+            from .validation_store import ValidationStore
+            request = ResearchValidationRequest.model_validate(payload["config"])
+            audit_store = ValidationStore(store)
+            run_id = payload["run_id"]
+            if not payload.get("resume_from_job"):
+                audit_store.register_plan(run_id, payload["config"], payload["plan"], submission_provenance)
+            progress(.01, "读取完整验证的冻结数据与检查点")
+            bundles = load_validation_bundles(store, request, payload["plan"], settings=configured, cancelled=cancelled)
+
+            def save_inner(inner, inner_symbol, arm_group):
+                identity = uuid.uuid5(uuid.NAMESPACE_URL, f"{run_id}:{inner_symbol}:{arm_group}").hex
+                inner = {**inner, "validation_run_id": run_id, "computation_provenance": {
+                    "submission": submission_provenance, "started": computation_started,
+                    "reproducible": None, "completion_allowed": False,
+                    "reason": "内部单元的计算来源以所属完整验证最终审计为准",
+                }}
+                return store.save_result("optimization", inner, inner_symbol, "完整验证内部研究 · " + arm_group, result_id=identity)
+
+            result = run_validation(
+                request, payload["plan"], bundles,
+                progress=lambda fraction, message: progress(.05 + .94 * fraction, message),
+                cancelled=cancelled, runtime=configured.performance,
+                checkpoint=audit_store.load_checkpoint(run_id),
+                save_checkpoint=lambda value: audit_store.save_checkpoint(run_id, value),
+                audit_event=lambda unit, event, value=None: audit_store.append_event(run_id, unit, event, value),
+                save_inner_result=save_inner,
+                save_unit_ledger=lambda unit, value: audit_store.save_ledger(run_id, unit, value),
+                load_unit_ledger=audit_store.load_ledger,
+            )
+            result.update(kind="research_validation", run_id=run_id,
+                          validation_protocol_version=1, result_schema_version=1,
+                          config=request.model_dump(mode="json"), plan=payload["plan"],
+                          checkpoint_snapshot=audit_store.freeze_checkpoint(run_id),
+                          audit=audit_store.audit_summary(run_id))
+            symbol, title = ",".join(request.symbols), "完整研究验证 · 自适应主方案"
         elif kind in {"etf_research", "etf_validation"}:
             from .etf_models import EtfResearchRequest
             from .etf_research import run_etf_research, run_local_validation
@@ -780,13 +821,13 @@ def execute_job(root: str, job_id: str, observer=None):
             symbol, title = "", "证券清单更新"
         else:
             raise ValueError("未知任务类型：" + kind)
-        if cancelled() and kind not in {"optimization", "etf_research", "etf_validation"} \
+        if cancelled() and kind not in {"optimization", "etf_research", "etf_validation", "research_validation"} \
                 and not (kind == "market_sync" and result.get("status") == "cancelled"):
             raise InterruptedError("任务已取消")
         was_cancelled = cancelled()
         failed_sync = kind in {"market_sync", "market_source_probe", "market_import", "market_import_batch", "market_import_package", "market_index_package", "market_aggregate", "market_prepare", "market_archive"} and result.get("status") == "failed"
-        failed_research = kind == "optimization" and payload.get("config", {}).get("protocol_version") == 5 and _research_failed(result)
-        result_cancelled = kind in {"optimization", "etf_research", "etf_validation"} and result.get("status") == "cancelled"
+        failed_research = (kind == "optimization" and payload.get("config", {}).get("protocol_version") == 5 and _research_failed(result)) or (kind == "research_validation" and result.get("status") == "failed")
+        result_cancelled = kind in {"optimization", "etf_research", "etf_validation", "research_validation"} and result.get("status") == "cancelled"
         cancelled_job = was_cancelled or result_cancelled or (
             kind == "market_sync" and result.get("status") == "cancelled"
         )
@@ -800,7 +841,7 @@ def execute_job(root: str, job_id: str, observer=None):
         if isinstance(result, dict):
             result["performance"] = trace.snapshot()
             result["configuration_snapshot"] = frozen if isinstance(frozen, dict) else None
-            if kind in {"optimization", "etf_research", "etf_validation"}:
+            if kind in {"optimization", "etf_research", "etf_validation", "research_validation"}:
                 from .reproducibility import computation_provenance, reproducibility_mismatches
                 from .settings import PROJECT_ROOT
                 computation_finished = computation_provenance(
@@ -824,6 +865,9 @@ def execute_job(root: str, job_id: str, observer=None):
                 }
                 if finish_mismatches:
                     result["status"] = "failed"
+                    if kind == "research_validation":
+                        result["completion_status"] = "incomplete"
+                        result["qualification_status"] = "unevaluable"
                     result["reproducibility_error"] = (
                         "任务运行期间计算源码、配置或依赖发生变化，结果不可复现，请重新提交"
                     )
@@ -862,7 +906,7 @@ def execute_job(root: str, job_id: str, observer=None):
             message = "参数研究部分完成；已保留已完成的候选与结果"
         else:
             message = result.get("message", "完成")
-        partial = result.get("status") == "partial"
+        partial = result.get("status") == "partial" or (kind == "research_validation" and result.get("completion_status") == "incomplete")
         if kind == "research_completion" and partial:
             message = "补算部分完成，已保存可追踪修订与检查点"
         terminal_error = sync_error or (result.get("reason") if failed_research else None)
@@ -979,7 +1023,7 @@ class JobManager:
                     continue
                 job = store.job(job_id) or {}
                 limit = _runtime_limit_seconds(job)
-                if job.get("kind") in {"optimization", "research_completion", "etf_research", "etf_validation"} and limit > 0:
+                if job.get("kind") in {"optimization", "research_completion", "etf_research", "etf_validation", "research_validation"} and limit > 0:
                     elapsed = _elapsed_seconds(job)
                     stage = timeout_stage(elapsed, limit)
                     if stage == "stop":
