@@ -2,7 +2,7 @@ import TableViewport from '../TableViewport'
 import { researchQuantityUnit } from '../workbenchDefaults'
 import { ETF_MARKET_STATE_METRICS, dataStatusLabel, etfMarketStateMetricText, resultStatusLabel, scoreDisplay, validationStatusLabel } from '../etfResearch'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowLeft, Download, FlaskConical, Link2, RefreshCw, RotateCcw, Unlink } from 'lucide-react'
+import { ArrowLeft, Download, FlaskConical, Link2, RefreshCw, RotateCcw, ShieldCheck, Unlink } from 'lucide-react'
 import { ApiError, download, get, post } from '../api'
 import { LatestRequest, PromiseCache } from '../requestState'
 import { resultsPageQuery } from '../resultsReview'
@@ -12,6 +12,8 @@ import Disclosure from '../Disclosure'
 import ResearchSectionStack, { type ResearchSection } from '../ResearchSectionStack'
 import { useTasks } from '../TaskCenter'
 import { useResearchDraft } from '../ResearchDraftContext'
+import { LegacyValidationStatus, ResearchValidationLauncher, ResearchValidationReport } from '../ResearchValidation'
+import { isResearchValidationResult, researchResultHistoryLabel } from '../researchValidationModel.ts'
 import {
   archivedResearchSource, isMissingResearchSourceError, requestedDataVersionFromPreview, researchPriorPolicyLabel,
   researchSourceErrorFromPreview, researchSourceRequestFields,
@@ -48,6 +50,7 @@ type OptimizationResult = {
   evidence?: Dict & { decisions?: Array<Dict> }
   completion?: CompletionState
 }
+type ResearchResult = OptimizationResult & Record<string, unknown>
 export type Props = {
   base: BacktestConfig
   settings: ResearchDefaults
@@ -68,6 +71,7 @@ export type Props = {
 }
 
 const robustFields = ['buy_step', 'sell_step', 'buy_shares', 'sell_shares'] as const
+const RESEARCH_RESULT_PAGE_SIZE = 25
 const labels: Record<string, string> = { buy_step: '买入间距', sell_step: '卖出间距', buy_shares: '每次买入股数', sell_shares: '每次卖出股数' }
 const candidateLabels: Record<string, string> = {
   peak_principal_return: '峰值本金收益', principal_drawdown: '本金回撤', max_principal_drawdown: '本金回撤',
@@ -128,11 +132,22 @@ function hasDemoFlag(value: unknown) {
 }
 function isOptimizationJob(job: Job) {
   const config = record(job.payload?.config)
-  return job.kind === 'optimization' || job.kind === 'optimize' || record(config?.base) != null
+  return job.kind === 'optimization' || job.kind === 'optimize' || job.kind === 'research_validation' || record(config?.base) != null
 }
 function isCompletionJob(job: Job) { return job.kind === 'research_completion' }
+function isValidationJob(job: Job) { return job.kind === 'research_validation' }
 function taskLabelForResearch(job: Job) {
   const config = searchConfigOf(job.payload?.config)
+  const validationResearch = record(job.payload?.research)
+  const validationContext = record(validationResearch?.research_context)
+  const plan = record(job.payload?.plan)
+  const plannedSymbols = Array.isArray(plan?.symbols)
+    ? plan.symbols.map(item => typeof item === 'string' ? item : record(item)?.symbol).filter((item): item is string => typeof item === 'string')
+    : []
+  if (isValidationJob(job)) {
+    const symbols = plannedSymbols.length > 1 ? `${plannedSymbols[0]} 等 ${plannedSymbols.length} 只` : String(plannedSymbols[0] ?? validationContext?.symbol ?? '完整验证')
+    return `${symbols} · ${job.created_at?.slice(0, 10) ?? job.id.slice(0, 12)} · ${statusText(job.status)}`
+  }
   return `${config?.base?.symbol ?? '研究任务'} · ${job.created_at?.slice(0, 10) ?? job.id.slice(0, 12)} · ${statusText(job.status)}`
 }
 function rangeValue(key: string, value: unknown) {
@@ -282,7 +297,7 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
   const researchDraft = useResearchDraft()
   const sourceEtf = researchDraft.state.source_etf
   const sourceSummary = researchDraft.state.source_summary
-  const researchJobs = useMemo(() => tasks.jobs.filter(isOptimizationJob), [tasks.jobs])
+  const researchJobs = useMemo(() => tasks.jobs.filter(job => isOptimizationJob(job) || isCompletionJob(job) || isValidationJob(job)), [tasks.jobs])
   const ranges = useMemo(() => researchRangesForSymbol(settings.ranges, base.symbol), [base.symbol, settings.ranges])
   const updateSettings = (patch: Partial<ResearchDefaults>) => onSettingsChange(normalizeSettings({ ...settings, ...patch }))
   const [selectedJobId, setSelectedJobId] = useState('')
@@ -293,7 +308,7 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
   const [researchResultsMore, setResearchResultsMore] = useState(false)
   const [researchResultsOffset, setResearchResultsOffset] = useState(0)
   const [fallbackJob, setFallbackJob] = useState<Job | null>(null)
-  const [loadedResult, setLoadedResult] = useState<{ key: string; value: OptimizationResult } | null>(null)
+  const [loadedResult, setLoadedResult] = useState<{ key: string; value: ResearchResult } | null>(null)
   const [resultLoading, setResultLoading] = useState(false)
   const [busy, setBusy] = useState(false)
   const [preflight, setPreflight] = useState<PreflightState>({ status: 'idle', preview: null, message: '' })
@@ -308,7 +323,7 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
   const [completionNote, setCompletionNote] = useState('')
   const [completionToken, setCompletionToken] = useState(0)
   const jobRequests = useRef(new PromiseCache<string, Job>())
-  const resultRequests = useRef(new PromiseCache<string, OptimizationResult>())
+  const resultRequests = useRef(new PromiseCache<string, ResearchResult>())
   const resultsRequest = useRef(new LatestRequest<string>())
   const err = useErrorMessage()
   // Errors that are not a failed job or result read cannot be retried by reloading the task.
@@ -346,15 +361,28 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
     const ticket = resultsRequest.current.begin(`optimization:${offset}:${append}`)
     setResearchResultsLoading(true); setResearchResultsError('')
     try {
-      const page = await get<Array<{ id: string; symbol: string; created_at: string; title: string; kind: string }>>(
-        resultsPageQuery(offset, 50, 'optimization'),
-      )
+      const pageSize = RESEARCH_RESULT_PAGE_SIZE
+      const [legacyPage, validationPage] = await Promise.all([
+        get<Array<{ id: string; symbol: string; created_at: string; title: string; kind: string }>>(
+          resultsPageQuery(offset, pageSize, 'optimization'),
+        ),
+        get<Array<{ id: string; symbol: string; created_at: string; title: string; kind: string }>>(
+          resultsPageQuery(offset, pageSize, 'research_validation'),
+        ),
+      ])
+      const page = [...validationPage, ...legacyPage].sort((left, right) => {
+        if (left.kind !== right.kind) return left.kind === 'research_validation' ? -1 : 1
+        return String(right.created_at ?? '').localeCompare(String(left.created_at ?? ''))
+      })
       if (!resultsRequest.current.isCurrent(ticket)) return
-      setResearchResults(current => append
+      setResearchResults(current => (append
         ? [...current, ...page.filter(item => !current.some(existing => existing.id === item.id))]
-        : page)
+        : page).sort((left, right) => {
+          if (left.kind !== right.kind) return left.kind === 'research_validation' ? -1 : 1
+          return String(right.created_at ?? '').localeCompare(String(left.created_at ?? ''))
+        }))
       setResearchResultsOffset(offset)
-      setResearchResultsMore(page.length >= 50)
+      setResearchResultsMore(legacyPage.length >= pageSize || validationPage.length >= pageSize)
       if (!requestedResource && !selectedResultId && !selectedJobId && page[0]) selectResult(page[0].id)
     } catch (cause) {
       if (resultsRequest.current.isCurrent(ticket)) setResearchResultsError(err(cause))
@@ -375,7 +403,7 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
     if (!requestedResource) return
     if (requestedResource === selectedResultId || requestedResource === selectedJobId) return
     let active = true
-    const resultRequest = get<OptimizationResult>('/results/' + encodeURIComponent(requestedResource))
+    const resultRequest = get<ResearchResult>('/results/' + encodeURIComponent(requestedResource))
     void resultRequest.then(value => {
       if (!active) return
       const key = 'result:' + requestedResource
@@ -394,7 +422,7 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
       void jobRequest.then(job => {
         if (!active) return
         if (!isOptimizationJob(job) && !isCompletionJob(job)) {
-          setRetryable(false); setError('链接中的任务不是参数研究。')
+          setRetryable(false); setError('链接中的任务不是参数研究或完整验证。')
           return
         }
         setSelectedJobId(requestedResource); setSelectedResultId(''); setFallbackJob(job); setError('')
@@ -420,7 +448,7 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
     )
     void request.then(job => {
       if (!active) return
-      if (!isOptimizationJob(job) && !isCompletionJob(job)) { reportError('所选任务不是参数研究。'); return }
+      if (!isOptimizationJob(job) && !isCompletionJob(job)) { reportError('所选任务不是参数研究或完整验证。'); return }
       setFallbackJob(job)
     }).catch(cause => {
       // A rejected request is dropped so a retry reads the task again. A newer request
@@ -439,8 +467,10 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
     const request = resultRequests.current.getOrCreate(
       selectedResultKey,
       () => selectedResultId
-        ? get<OptimizationResult>('/results/' + encodeURIComponent(selectedResultId))
-        : get<OptimizationResult>('/jobs/' + encodeURIComponent(selectedJobId) + '/result'),
+        ? get<ResearchResult>('/results/' + encodeURIComponent(selectedResultId))
+        : selectedJob && isValidationJob(selectedJob) && selectedJob.result_id
+          ? get<ResearchResult>('/results/' + encodeURIComponent(selectedJob.result_id))
+          : get<ResearchResult>('/jobs/' + encodeURIComponent(selectedJobId) + '/result'),
     )
     void request.then(value => { if (active) setLoadedResult({ key: selectedResultKey, value }) })
       .catch(cause => {
@@ -564,10 +594,10 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
       ...(requestedDataVersion ? { requested_data_version: requestedDataVersion } : {}),
     }
   }, [base, settings, ranges, sourceEtf, researchDraft.state.prior_policy])
-
   const estimateRequest = buildResearchRequest()
   const estimateKey = researchEstimateKey(estimateRequest, record(configuration.document.runtime)?.workspace_mb)
   const validation = researchValidationError()
+  const validationEnabled = Boolean(base.symbol) && !validation && dateReady
   const estimate = useResearchEstimate(estimateRequest, estimateKey, {
     enabled: Boolean(base.symbol) && !validation && dateReady,
     delayMs: Number(uiSettings.preview_debounce_ms) || 1500,
@@ -944,7 +974,7 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
   ]
 
   return <>
-    <PageHeader eyebrow='PARAMETER RESEARCH' title='参数研究' description='用历史训练选择参数，在所选日期内检验固定与自适应方案。' action={<Button busy={busy} disabled={!base.symbol || !preflightReady} onClick={() => void submit()}><FlaskConical size={15} />启动参数研究</Button>} />
+    <PageHeader eyebrow='RESEARCH VALIDATION' title='研究验证' description='正式结论来自完整研究验证；参数研究只用于发现候选，不等同于完整验证。' action={<div className='button-row'><Button onClick={() => document.querySelector('.research-validation-launch-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' })}><ShieldCheck size={15} />设置完整验证</Button><Button variant='quiet' busy={busy} disabled={!base.symbol || !preflightReady} onClick={() => void submit()}><FlaskConical size={15} />参数探索（仅选参）</Button></div>} />
     <section className={`research-preflight-bar ${preflightReady ? 'ready' : preflight.status === 'loading' ? 'loading' : preflight.status === 'idle' ? 'idle' : 'blocked'}`} aria-live='polite'>
       <div className='research-preflight-bar-main'>
         <div className='research-preflight-status'><Badge tone={preflightTone}>{preflightStatusLabel}</Badge><small>只读搜索预检</small></div>
@@ -971,6 +1001,15 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
     </div>
     {error && <ErrorBox message={error} onClose={() => setError('')} onRetry={retryable ? () => { setError(''); setRetryToken(token => token + 1) } : undefined} />}
     {dataIssue && <div className='notice'><span>本次研究缺少本地行情或质量依据。请在数据管理中显式准备所需周期和前置历史。</span><Button variant='secondary' onClick={() => onPrepareData?.(dataIssue)}>去准备数据</Button></div>}
+    <ResearchValidationLauncher
+      buildResearch={buildResearchRequest}
+      initialSymbol={base.symbol}
+      initialShares={base.initial_shares}
+      datesExplicit={datesExplicit}
+      enabled={validationEnabled}
+      disabledReason={validation || (!dateReady && base.symbol ? '正在读取标的数据日期，请稍后再检查完整验证方案。' : undefined)}
+      onSubmitted={jobId => { selectJob(jobId); void loadResearchResults(0, false); void tasks.refresh() }}
+    />
     {sourceEtf && <Card className='research-source-card' title='ETF 来源草稿' subtitle='来源只用于先验与追溯；本次提交的数据版本来自最新预检，不使用来源结果的历史版本。' action={<Badge tone={researchDraft.state.prior_policy === 'daily_state_v1' ? 'blue' : 'neutral'}>{researchPriorPolicyLabel(researchDraft.state.prior_policy)}</Badge>}>
       <div className='research-source-summary'>
         <div><small>来源 ETF</small><strong>{displayedDraftSummary?.symbol_name || displayedDraftSummary?.symbol || base.symbol || '—'}</strong><span>{displayedDraftSummary?.symbol || base.symbol} · 截止 {displayedDraftSummary?.as_of || base.end_date || '—'}</span></div>
@@ -1012,19 +1051,25 @@ export default function ResearchPage({ base, datesExplicit = false, onDateIntent
           }}>
             {selectedJob && <option value={'job:' + selectedJob.id}>{taskLabelForResearch(selectedJob)}</option>}
             {selectedResultId && !researchResults.some(item => item.id === selectedResultId) && <option value={'result:' + selectedResultId}>链接中的研究结果</option>}
-            {researchResults.map(item => <option key={item.id} value={'result:' + item.id}>{item.symbol || '未识别标的'} · {item.created_at?.slice(0, 10) ?? ''} · {item.title || '等比网格 v5 · 稳健 J'}</option>)}
+            {researchResults.map(item => <option key={item.id} value={'result:' + item.id}>{item.symbol || '未识别标的'} · {item.created_at?.slice(0, 10) ?? ''} · {researchResultHistoryLabel(item)}</option>)}
           </SelectInput></Field>}
           <Button variant='quiet' busy={researchResultsLoading} onClick={() => { void tasks.refresh(); void loadResearchResults(0, false) }} aria-label='刷新研究结果列表'><RefreshCw size={14} />刷新</Button>
         </div>
         {researchResultsError && <ErrorBox message={'研究结果历史读取失败：' + researchResultsError} onRetry={() => void loadResearchResults(0, false)} />}
-        {researchResultsMore && <div className='button-row'><Button variant='quiet' busy={researchResultsLoading} onClick={() => void loadResearchResults(researchResultsOffset + 50, true)}>加载更早研究结果</Button></div>}
+        {researchResultsMore && <div className='button-row'><Button variant='quiet' busy={researchResultsLoading} onClick={() => void loadResearchResults(researchResultsOffset + RESEARCH_RESULT_PAGE_SIZE, true)}>加载更早研究结果</Button></div>}
         {resultLoading && result && <p className='inline-warning'>正在刷新研究结果，当前显示上次成功读取的内容。</p>}
-        {resultLoading && !result ? <Card><Loading label='正在读取研究结果…' /></Card> : !result ? <Card>{selectedJob && ['queued', 'running'].includes(selectedJob.status) ? <><div className='result-meta'><Badge tone='blue'>{statusText(selectedJob.status)}</Badge><span>{selectedJob.message || '任务正在执行'}</span></div><p className='field-hint'>任务完成并保存结果后，这里会自动刷新研究结果历史。</p></> : <Empty title='研究结果将在这里展示' detail='在左侧启动研究，或从任务中心打开已有研究结果。' />}</Card> : !isSupportedResult ? <Card title='不支持的历史版本' subtitle='这条结果产生于已移除的研究协议版本。'>
+        {resultLoading && !result ? <Card><Loading label='正在读取研究结果…' /></Card> : !result ? <Card>{selectedJob && ['queued', 'running'].includes(selectedJob.status) ? <><div className='result-meta'><Badge tone='blue'>{statusText(selectedJob.status)}</Badge><span>{selectedJob.message || '任务正在执行'}</span></div><p className='field-hint'>任务完成并保存结果后，这里会自动刷新研究结果历史。</p></> : <Empty title='研究结果将在这里展示' detail='在上方检查完整验证方案，或从任务中心打开已有研究结果。' />}</Card> : isResearchValidationResult(result) ? <ResearchValidationReport key={resultId || String(result.id ?? 'validation-result')} result={result} resultId={resultId} onRefresh={() => {
+          const cached = resultRequests.current.get(selectedResultKey)
+          if (cached) resultRequests.current.forget(selectedResultKey, cached)
+          setRetryToken(token => token + 1)
+          void tasks.refresh()
+        }} /> : !isSupportedResult ? <Card title='不支持的历史版本' subtitle='这条结果产生于已移除的研究协议版本。'>
           <div className='research-legacy-banner'>该历史结果产生于协议版本 {resultProtocolVersion || '未知'}（结果结构版本 {resultSchemaVersion || '未知'}）。本工作台只支持协议 v5 的结果，旧版本不再提供详情、参数分布与导出适配。</div>
           <div className='result-meta'><Badge tone='amber'>不支持的历史版本</Badge><span>请重新运行一次 v5 参数研究以获得可查看、可补算的结果。</span></div>
         </Card> : <>
           <Card title={originalBase?.symbol ?? '研究样本'} subtitle={(evalStart ?? '开始日期不详') + ' 至 ' + (evalEnd ?? '最新可用日期') + ' · ' + (originalBase?.frequency ?? '频率不详')}>
             <div className='result-meta'><Badge tone='blue'>等比网格 v5 · 稳健 J</Badge>{isDemoResearch && <Badge tone='amber'>演示数据</Badge>}{selectedJob?.status === 'cancelled' && <Badge tone='amber'>已保留的部分结果</Badge>}<span>所选日期为样本外评估；训练时段为评估日前的单一区间，内部验证窗为 0。</span></div>
+            <LegacyValidationStatus />
             {isDemoResearch && <div className='demo-callout'>此研究使用演示行情生成，不能代表真实历史数据或投资结论。</div>}
             <div className='research-summary-states'>
               <div><small>训练时段</small><strong>{trainStart && trainEnd ? trainStart + ' 至 ' + trainEnd : `评估日前 ${trainingMinDays}–${trainingMaxDays} 个交易日`}</strong></div>

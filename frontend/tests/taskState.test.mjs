@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { etfResearchResultId, isEtfResearchJob, isResearchJob, mergeJobSnapshots, newlyNotifiableJobs, submissionJobIds, taskLabel, taskNoticeMessage } from '../src/taskState.ts'
+import {
+  canResumeResearchValidation, etfResearchResultId, isEtfResearchJob, isResearchJob, mergeJobSnapshots,
+  newlyNotifiableJobs, submissionJobIds, taskLabel, taskNoticeMessage, validationResumeExtension,
+  validationResumeLimits, validationResumeNeedsIncrease, validationResumeReason,
+} from '../src/taskState.ts'
 
 const job = (id, status, values = {}) => ({ id, kind: 'backtest', status, progress: 0, message: '', ...values })
 const ids = (jobs) => jobs.map((entry) => entry.id)
@@ -26,6 +30,58 @@ test('research completion jobs are treated as research tasks and labelled as suc
   assert.equal(isResearchJob({ kind: 'optimization' }), true)
   assert.equal(isResearchJob({ kind: 'optimize' }), true)
   assert.equal(isResearchJob({ kind: 'backtest' }), false)
+})
+
+test('complete validation is a research task with its frozen primary symbol and a resumable terminal state', () => {
+  const validation = {
+    id: '', kind: 'research_validation', status: 'partial', progress: .8, message: '', created_at: '',
+    payload: {
+      research: { research_context: { symbol: '600000.SH' } },
+      plan: { symbols: [{ symbol: '600000.SH' }, { symbol: '510300.SH' }] },
+    },
+  }
+  assert.equal(isResearchJob(validation), true)
+  assert.equal(taskLabel(validation), '完整研究验证 · 600000.SH · 2 个标的')
+  assert.equal(canResumeResearchValidation(validation), true)
+  assert.equal(canResumeResearchValidation({ ...validation, status: 'running' }), false)
+  assert.equal(canResumeResearchValidation({ ...validation, kind: 'optimization' }), false)
+})
+
+test('validation resume shows frozen limits and accepts only increased exhausted budgets', () => {
+  const partial = {
+    ...job('validation-limited', 'partial', {
+      payload: {
+        config: { max_runtime_seconds: 3600, total_evaluation_budget: 1000 },
+        plan: { estimated_work: { max_runtime_seconds: 7200, total_evaluation_budget: 1200 } },
+      },
+    }),
+  }
+  const limits = validationResumeLimits(partial)
+  assert.deepEqual(limits, { max_runtime_seconds: 3600, total_evaluation_budget: 1000 })
+  assert.equal(validationResumeReason(partial, { stop_reason: 'runtime_limit' }), 'runtime_limit')
+  assert.equal(validationResumeNeedsIncrease('runtime_limit'), true)
+  assert.match(validationResumeExtension(limits, limits, true).error, /至少提高一项/)
+  assert.deepEqual(validationResumeExtension(limits, { max_runtime_seconds: 4800, total_evaluation_budget: 1000 }, true), {
+    body: { max_runtime_seconds: 4800 },
+  })
+  assert.deepEqual(validationResumeExtension(limits, { max_runtime_seconds: 3600, total_evaluation_budget: 1500 }, true), {
+    body: { total_evaluation_budget: 1500 },
+  })
+  assert.match(validationResumeExtension(limits, { max_runtime_seconds: 3000, total_evaluation_budget: 1500 }, true).error, /运行时间只能增加/)
+  assert.match(validationResumeExtension(limits, { max_runtime_seconds: 3600, total_evaluation_budget: 999 }, true).error, /评价预算只能增加/)
+})
+
+test('cancelled validation can resume on the original limits while exhaustion is detected from plan or message', () => {
+  const cancelled = job('validation-cancelled', 'cancelled', {
+    payload: { config: { max_runtime_seconds: 7200, total_evaluation_budget: null }, plan: { estimated_work: { total_evaluation_budget: 4321 } } },
+  })
+  const limits = validationResumeLimits(cancelled)
+  assert.deepEqual(limits, { max_runtime_seconds: 7200, total_evaluation_budget: 4321 })
+  assert.equal(validationResumeReason(cancelled), 'cancelled')
+  assert.deepEqual(validationResumeExtension(limits, limits, false), { body: undefined })
+  assert.equal(validationResumeReason({ ...cancelled, status: 'partial', message: '评价预算耗尽，等待恢复' }), 'evaluation_budget')
+  assert.equal(validationResumeReason({ ...cancelled, status: 'failed', message: '运行时间耗尽' }), 'runtime_limit')
+  assert.equal(validationResumeReason({ ...cancelled, status: 'failed', message: '进程异常退出' }, { stop_reason: 'workflow_crash' }), 'failed')
 })
 
 test('ETF research and data-validation jobs open the ETF workspace', () => {
