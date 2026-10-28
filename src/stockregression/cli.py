@@ -10,7 +10,7 @@ import shutil
 
 import typer
 
-from .jobs import execute_job
+from .jobs import execute_job, normalize_sync_scope
 from .schedule import configure_schedule
 from .settings import PROJECT_ROOT, load_settings
 from .storage import Store
@@ -81,10 +81,12 @@ def sync(mode: str = "daily", symbol: list[str] = typer.Option(None), scope: str
     """无网页时独立补数；mode 为 history/daily/repair。"""
     if mode not in ("history", "daily", "repair"):
         raise typer.BadParameter("mode 为 history/daily/repair")
-    if scope not in (None, "market", "watchlist", "selected") or workers not in range(1, 5):
+    if workers not in range(1, 5):
         raise typer.BadParameter("scope 为 market/watchlist/selected，workers 为 1–4")
-    if scope == "market" and symbol:
-        raise typer.BadParameter("全市场范围不能同时指定代码")
+    try:
+        scope, symbols = normalize_sync_scope(scope, symbol or [])
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     settings = load_settings()
     root = Path(settings.data_dir)
     existing = root
@@ -107,14 +109,14 @@ def sync(mode: str = "daily", symbol: list[str] = typer.Option(None), scope: str
             except Exception as exc:
                 raise typer.BadParameter(f"无法预检完整证券清单：{exc}") from exc
         else:
-            symbols = [normalize_symbol(code) for code in symbol] if symbol else [item["symbol"] for item in Store(root).watches()]
+            symbols = [normalize_symbol(code) for code in symbols] if symbols else [item["symbol"] for item in Store(root).watches()]
             typer.echo(f"目标：{len(set(symbols))} 个标的")
         typer.echo("预检结束，未下载行情或创建同步任务。目录元数据可能写入来源缓存。")
         return
     timeframes = ["1day"] if mode == "history" else ["1day", "1min"]
     _run("market_sync", {
         "mode": "incremental" if mode == "daily" else mode,
-        "symbols": symbol or [], "scope": scope, "resume": resume,
+        "symbols": symbols, "scope": scope, "resume": resume,
         "retry_failed": retry_failed, "workers": workers,
         "timeframe": "1day", "timeframes": timeframes,
     })
@@ -297,6 +299,10 @@ def data_sync(
     workers: int = typer.Option(4, "--workers", min=1, max=4),
 ):
     """更新日线或 1 分钟基础行情；粗周期按需生成。"""
+    try:
+        scope, symbols = normalize_sync_scope(scope, symbol or [])
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     timeframes = frequency or ["1day", "1min"]
     if any(value not in {"1day", "1min"} for value in timeframes):
         raise typer.BadParameter("线上更新只支持 1day 和 1min；粗周期来自基础行情聚合")
@@ -305,7 +311,7 @@ def data_sync(
     if "1min" in timeframes and scope == "market" and initialize:
         raise typer.BadParameter("1 分钟行情不支持全市场在线初始化；请登记数据包或导入文件。")
     _run("market_sync", {
-        "symbols": symbol or [], "timeframe": timeframes[0], "timeframes": timeframes,
+        "symbols": symbols, "timeframe": timeframes[0], "timeframes": timeframes,
         "mode": mode, "scope": scope,
         "start_date": start, "end_date": end, "resume": resume,
         "retry_failed": retry_failed,

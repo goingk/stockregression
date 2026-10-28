@@ -315,7 +315,13 @@ def task_configuration_snapshot(
     active_port: int | None = None,
 ) -> dict[str, Any]:
     document = current_configuration()
-    settings = load_settings()
+    settings = settings_from_document(document)
+    # ``settings_from_document`` validates the grouped document but deliberately
+    # leaves paths portable.  Tasks need the same absolute paths as
+    # ``load_settings`` without a second read that could observe a newer autosave.
+    settings.data_dir = str(settings_module.resolve_project_path(settings.data_dir))
+    if settings.package_dir:
+        settings.package_dir = str(settings_module.resolve_project_path(settings.package_dir))
     # Restart-only paths and listeners are frozen from the values actually held
     # by the running application, not from a newer saved value that is still
     # waiting for restart.  The saved document and its revision remain attached

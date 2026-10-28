@@ -38,6 +38,23 @@ TIMEOUT_GRACE_SECONDS = 30
 """Extra seconds a compute job may use to stop cleanly after its limit."""
 
 
+def normalize_sync_scope(scope: str | None, symbols, *, frozen_market: bool = False) -> tuple[str, list]:
+    """Resolve the legacy empty sync request without widening its scope."""
+    if isinstance(symbols, str):
+        symbols = [symbols]
+    else:
+        symbols = list(symbols or [])
+    if scope is None:
+        scope = "selected" if symbols else "watchlist"
+    if scope not in {"market", "watchlist", "selected"}:
+        raise ValueError("同步范围应为 market/watchlist/selected")
+    if scope == "market" and symbols and not frozen_market:
+        raise ValueError("全市场范围不能同时指定代码")
+    if scope == "selected" and not symbols:
+        raise ValueError("显式选择范围 selected 时必须指定至少一个标的")
+    return scope, symbols
+
+
 def _runtime_limit_seconds(job: dict) -> int:
     """Wall-clock limit of a running compute job (0 means unlimited)."""
     payload = job.get("payload") or {}
@@ -602,8 +619,21 @@ def execute_job(root: str, job_id: str, observer=None):
             symbol, title = "", "登记 ETF 原始 Parquet 数据包"
         elif kind == "market_sync":
             timeframes = payload.get("timeframes") or [payload["timeframe"]]
-            symbols = payload.get("symbols", [])
-            scope = payload.get("scope")
+            frozen_by_timeframe = payload.get("sync_symbols_by_timeframe")
+            if "sync_symbols_by_timeframe" in payload:
+                if (
+                    not isinstance(frozen_by_timeframe, dict)
+                    or any(
+                        timeframe not in frozen_by_timeframe
+                        or not isinstance(frozen_by_timeframe[timeframe], list)
+                        for timeframe in set(timeframes)
+                    )
+                ):
+                    raise ValueError("任务冻结的逐周期同步范围缺失或损坏，不能改用当前范围")
+            scope, symbols = normalize_sync_scope(
+                payload.get("scope"), payload.get("symbols") or [],
+                frozen_market=isinstance(frozen_by_timeframe, dict) and bool(frozen_by_timeframe),
+            )
             if "1min" in timeframes and payload.get("mode") == "history":
                 raise ValueError("1 分钟历史行情只从本地数据包读取；请先登记数据包或导入文件，近期缺口使用缺口修补。")
             if "1min" in timeframes and scope == "market" and payload.get("initialize"):
@@ -636,7 +666,6 @@ def execute_job(root: str, job_id: str, observer=None):
                 span = 1 / len(ordered)
                 progress(base + span * max(0.0, min(1.0, float(fraction))), message)
 
-            frozen_by_timeframe = payload.get("sync_symbols_by_timeframe")
             if not isinstance(frozen_by_timeframe, dict):
                 frozen_by_timeframe = {}
             if not frozen_by_timeframe:
@@ -666,7 +695,7 @@ def execute_job(root: str, job_id: str, observer=None):
                 symbol for timeframe in ordered for symbol in frozen_by_timeframe[timeframe]
             ))
             payload.update({
-                "symbols": symbols,
+                "symbols": symbols, "scope": scope,
                 "sync_symbols_by_timeframe": frozen_by_timeframe,
                 "package_id": package_id,
                 "package_generation": package_generation,
@@ -715,6 +744,13 @@ def execute_job(root: str, job_id: str, observer=None):
                     progress(base + span * max(0.0, min(1.0, float(fraction))), message)
 
                 selected = list(frozen_by_timeframe[timeframe])
+                if not selected:
+                    combined.append({
+                        "status": "completed", "timeframe": timeframe,
+                        "symbols": [], "failures": [], "skipped": [],
+                        "message": f"{timeframe} 没有待更新标的，已跳过",
+                    })
+                    continue
                 sync_progress = period_progress
                 if scope == "market" and payload.get("initialize") and index == 0:
                     sync_progress = lambda fraction, message: period_progress(
