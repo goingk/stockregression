@@ -34,11 +34,7 @@ export default function ResultsCurves({ result }: { result: BacktestResult }) {
     return {
       animation: false,
       legend: { data: model.strategies.map((strategy) => strategy.name), top: 0, left: 'center', itemWidth: 18, itemHeight: 9, textStyle: { fontSize: 11 } },
-      grid: [
-        { left: 62, right: 25, top: 58, height: '30%' },
-        { left: 62, right: 25, top: '45%', height: '19%' },
-        { left: 62, right: 25, top: '73%', bottom: 65 },
-      ],
+      grid: [9, 39, 69].map((top) => ({ left: 62, right: 25, top: `${top}%`, height: '23%' })),
       axisPointer: { link: [{ xAxisIndex: [0, 1, 2] }], label: { backgroundColor: '#65758d' } },
       tooltip: {
         trigger: 'axis', confine: true, axisPointer: { type: 'line', snap: true },
@@ -76,7 +72,7 @@ export default function ResultsCurves({ result }: { result: BacktestResult }) {
       dataZoom: [
         { type: 'inside', xAxisIndex: [0, 1, 2], filterMode: 'none' },
         {
-          type: 'slider', xAxisIndex: [0, 1, 2], filterMode: 'none', height: 20, bottom: 7, left: 62, right: 25, brushSelect: false,
+          type: 'slider', xAxisIndex: [0, 1, 2], filterMode: 'none', height: 18, bottom: 4, left: 62, right: 25, brushSelect: false,
           borderColor: '#e2e8f0', fillerColor: 'rgba(37, 99, 235, 0.10)', backgroundColor: '#f8fafc',
           handleStyle: { color: '#ffffff', borderColor: '#2563eb' },
         },
@@ -85,5 +81,5 @@ export default function ResultsCurves({ result }: { result: BacktestResult }) {
     }
   }, [model])
 
-  return <div className='results-curves' aria-label='收益、回撤与网格持仓共享日期轴，拖动底部滑块同时缩放三条曲线'><ChartView option={option} height={620} /></div>
+  return <div className='results-curves' aria-label='收益、回撤与网格持仓共享日期轴，拖动底部滑块同时缩放三条曲线'><ChartView option={option} height={620} stretch /></div>
 }

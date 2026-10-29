@@ -1,9 +1,50 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildResultCurveModel, resultCurveRowAt, resultStrategyEntries, savedGridParameters } from '../src/resultPresentation.ts'
+import { buildResultCurveModel, formatResultExcessReturn, resultCurveRowAt, resultExcessReturn, resultStrategyEntries, savedGridParameters } from '../src/resultPresentation.ts'
 
 const parameterMap = (result) => Object.fromEntries(savedGridParameters(result).map((row) => [row.key, row]))
 const strategy = (equity, values = {}) => ({ metrics: {}, equity, trades: [], rejections: [], ...values })
+
+test('excess returns compare each saved strategy to buy-and-hold even when both lose money', () => {
+  const result = { strategies: {
+    grid: { metrics: { peak_principal_return: -.1519, matched_funding_hold_return: -.2 } },
+    dca: { metrics: { peak_principal_return: -.2115 } },
+    buy_hold: { metrics: { peak_principal_return: -.2922 } },
+  } }
+  const saved = structuredClone(result)
+  assert.ok(Math.abs(resultExcessReturn(result, 'grid') - .1403) < 1e-12)
+  assert.ok(Math.abs(resultExcessReturn(result, 'dca') - .0807) < 1e-12)
+  assert.equal(resultExcessReturn(result, 'buy_hold'), 0)
+  assert.deepEqual(result, saved)
+})
+
+test('excess return preserves zero, negative differences and returns above 100 percent', () => {
+  for (const [strategyReturn, benchmarkReturn, expected] of [[0, 0, 0], [.1, .2, -.1], [2, .5, 1.5]]) {
+    const result = { strategies: { grid: { metrics: { peak_principal_return: strategyReturn } }, buy_hold: { metrics: { peak_principal_return: benchmarkReturn } } } }
+    assert.ok(Math.abs(resultExcessReturn(result, 'grid') - expected) < 1e-12)
+  }
+})
+
+test('excess-return labels round positive and negative boundaries symmetrically without signed zero', () => {
+  assert.equal(formatResultExcessReturn(.00005), '+0.01 个百分点')
+  assert.equal(formatResultExcessReturn(-.00005), '-0.01 个百分点')
+  assert.equal(formatResultExcessReturn(.1403), '+14.03 个百分点')
+  for (const value of [0, -0, .000001, -.000001]) assert.equal(formatResultExcessReturn(value), '0.00 个百分点')
+  for (const value of [null, undefined, NaN, Infinity]) assert.equal(formatResultExcessReturn(value), '—')
+})
+
+test('incomplete historical returns never invent an excess-return benchmark', () => {
+  for (const missing of [undefined, null, NaN, Infinity, -Infinity, '0.1']) {
+    const result = { strategies: { grid: { metrics: { peak_principal_return: .1 } }, buy_hold: { metrics: { peak_principal_return: missing } } } }
+    assert.equal(resultExcessReturn(result, 'grid'), null)
+    result.strategies.buy_hold.metrics.peak_principal_return = .1
+    result.strategies.grid.metrics.peak_principal_return = missing
+    assert.equal(resultExcessReturn(result, 'grid'), null)
+  }
+  for (const result of [null, undefined, {}, { strategies: { grid: { metrics: { peak_principal_return: .1 } } } }]) {
+    assert.equal(resultExcessReturn(result, 'grid'), null)
+  }
+})
 
 test('saved trailing grid parameters show only active steps and the actual saved funding', () => {
   const rows = parameterMap({

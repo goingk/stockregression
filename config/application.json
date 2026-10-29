@@ -13,29 +13,29 @@
     "grid": {
       "link_spacing": true,
       "grid_mode": "geometric",
-      "buy_step": 0.047,
-      "sell_step": 0.047,
+      "buy_step": 0.01,
+      "sell_step": 0.01,
       "lower_price": null,
       "upper_price": null
     },
     "position": {
-      "link_shares": true,
-      "initial_shares": 20000,
+      "link_shares": false,
+      "initial_shares": 5000,
       "min_shares": 0,
-      "max_shares": null,
-      "buy_shares": 1000,
-      "sell_shares": 1000
+      "max_shares": 8000,
+      "buy_shares": 400,
+      "sell_shares": 500
     },
     "dca": {
-      "frequency": "weekly",
+      "frequency": "daily",
       "shares": 1000,
       "initial_shares": 0,
-      "mode": "ma",
+      "mode": "price_change",
       "base_amount": 1000.0,
       "reference": "target",
       "reference_symbol": null,
       "reference_version": null,
-      "ma_window": 250,
+      "ma_window": 243,
       "change_window": 1,
       "sensitivity": 10.0,
       "min_multiplier": 0.1,
@@ -90,13 +90,13 @@
       },
       "ranges": {
         "buy_step": {
-          "low": 0.001,
-          "high": 0.035,
+          "low": 0.002,
+          "high": 0.05,
           "step": null
         },
         "sell_step": {
-          "low": 0.001,
-          "high": 0.035,
+          "low": 0.002,
+          "high": 0.05,
           "step": null
         },
         "buy_shares": {
@@ -195,5 +195,5 @@
     "subprocess_timeout_seconds": 45,
     "lock_timeout_seconds": 30
   },
-  "config_revision": "816fcd0ba4a10bc818eae415b40ddbc41d09d22b30991e3d1f94a073fd2874e4"
+  "config_revision": "e001c7f27e3021d38201426547d8f8ed49515ef9800c6910b0243adcb07caa65"
 }
