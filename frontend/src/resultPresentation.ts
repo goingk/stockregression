@@ -14,6 +14,21 @@ export function resultShareUnit(symbol: unknown) {
   return /^[15]/.test(String(symbol ?? '')) ? '份' : '股'
 }
 
+/** Compare saved returns against buy-and-hold using the same reported basis. */
+export function resultExcessReturn(value: unknown, strategyKey: string): number | null {
+  const strategies = record(record(value).strategies)
+  const strategyReturn = record(record(strategies[strategyKey]).metrics).peak_principal_return
+  const benchmarkReturn = record(record(strategies.buy_hold).metrics).peak_principal_return
+  return finite(strategyReturn) && finite(benchmarkReturn) ? strategyReturn - benchmarkReturn : null
+}
+
+export function formatResultExcessReturn(value: number | null | undefined): string {
+  if (!finite(value)) return '—'
+  const points = (Math.abs(value) * 100).toFixed(2)
+  const sign = Number(points) === 0 ? '' : value < 0 ? '-' : '+'
+  return `${sign}${points} 个百分点`
+}
+
 function quantityText(value: unknown, unit: string) {
   const quantity = record(value)
   if (!finite(quantity.value)) return '—'

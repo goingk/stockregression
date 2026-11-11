@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
+from stockregression import configuration as configuration_module
 from stockregression import settings as settings_module
 from stockregression.api import create_app
 from stockregression.configuration import (
     configuration_schema,
     current_configuration,
     patch_configuration,
+    task_configuration_snapshot,
     validate_configuration_patch,
 )
 from stockregression.settings import CONFIG_SCHEMA_VERSION, load_settings
@@ -22,6 +25,78 @@ def config_file(tmp_path, monkeypatch):
     target = tmp_path / "config" / "application.json"
     monkeypatch.setattr(settings_module, "SETTINGS_FILE", target)
     return target
+
+
+def test_task_snapshot_derives_settings_from_its_document(config_file, tmp_path, monkeypatch):
+    load_settings()
+    original_read = settings_module.read_configuration_document
+    autosaved = False
+    saved_revision = None
+
+    def read_then_autosave(path=None):
+        nonlocal autosaved, saved_revision
+        document, revision = original_read(path)
+        if not autosaved:
+            autosaved = True
+            changed = deepcopy(document)
+            changed["ui"]["polling_interval_ms"] = 9876
+            changed["research"]["defaults"]["alpha"] = 0.91
+            saved_document, _ = settings_module.save_configuration_document(
+                changed, base_revision=revision,
+            )
+            saved_revision = saved_document["config_revision"]
+        return document, revision
+
+    monkeypatch.setattr(configuration_module, "read_configuration_document", read_then_autosave)
+    active_data_dir = tmp_path / "active-data"
+    active_package_dir = tmp_path / "active-package"
+
+    snapshot = task_configuration_snapshot(
+        active_data_dir=str(active_data_dir),
+        active_package_dir=str(active_package_dir),
+        active_host="0.0.0.0",
+        active_port=8765,
+    )
+
+    assert snapshot["revision"] == snapshot["document"]["config_revision"]
+    assert autosaved is True
+    assert snapshot["revision"] != saved_revision
+    assert snapshot["settings"]["ui"] == snapshot["document"]["ui"]
+    assert snapshot["settings"]["workbench_defaults"]["research"]["alpha"] == (
+        snapshot["document"]["research"]["defaults"]["alpha"]
+    )
+    assert snapshot["active"] == {
+        "data_dir": str(active_data_dir),
+        "package_dir": str(active_package_dir),
+        "host": "0.0.0.0",
+        "port": 8765,
+    }
+    assert snapshot["settings"]["data_dir"] == str(active_data_dir)
+    assert snapshot["settings"]["package_dir"] == str(active_package_dir)
+    assert snapshot["settings"]["host"] == "0.0.0.0"
+    assert snapshot["settings"]["port"] == 8765
+
+
+def test_task_snapshot_resolves_relative_paths_from_the_same_document(config_file):
+    config_file.parent.mkdir(parents=True)
+    document = settings_module.configuration_document(settings_module.Settings(
+        data_dir="task-data",
+        package_dir="task-packages",
+    ))
+    config_file.write_text(json.dumps(document), encoding="utf-8")
+
+    snapshot = task_configuration_snapshot()
+
+    assert snapshot["document"]["paths"] == {
+        "data_dir": "task-data",
+        "package_dir": "task-packages",
+    }
+    assert snapshot["settings"]["data_dir"] == str(
+        (settings_module.PROJECT_ROOT / "task-data").resolve()
+    )
+    assert snapshot["settings"]["package_dir"] == str(
+        (settings_module.PROJECT_ROOT / "task-packages").resolve()
+    )
 
 
 def test_only_the_current_grouped_configuration_is_materialised(config_file):

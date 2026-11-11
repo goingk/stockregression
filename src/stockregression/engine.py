@@ -212,7 +212,7 @@ def _prepare_actions(data: DataBundle, start: date, end: date) -> list[_Action]:
     for i, row in enumerate(actions.to_dict("records")):
         record_date = _date_or_none(_value(row, "record_date"))
         ex_date = _date_or_none(_value(row, "ex_date"))
-        if record_date is not None and ex_date is not None and (record_date > end or ex_date < start):
+        if (ex_date is not None and ex_date < start) or (record_date is not None and record_date > end):
             continue
         reason = str(_value(row, "unsupported_reason", "") or "").strip()
         if reason:

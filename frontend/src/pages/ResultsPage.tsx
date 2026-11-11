@@ -7,7 +7,7 @@ import ChartView from '../ChartView'
 import Disclosure from '../Disclosure'
 import ResultsCurves from '../ResultsCurves'
 import { RESULT_PAGE_SIZE, barTimestampRange, bucketTradeMarkers, earliestBarTimestamp, groupTradeMarkers, mapTradesToBars, markerLabel, mergeBars, naiveStamp, periodReturnBaseline, periodReturns, resultsPageQuery } from '../resultsReview'
-import { resultShareUnit, resultStrategyEntries, savedGridParameters } from '../resultPresentation'
+import { formatResultExcessReturn, resultExcessReturn, resultShareUnit, resultStrategyEntries, savedGridParameters } from '../resultPresentation'
 import { dcaSummary, dcaIndexes } from '../smartDca'
 import { Badge, Button, Card, Empty, ErrorBox, Loading, PageHeader, SelectInput, money, percent, useErrorMessage } from '../components'
 import { chartValue } from '../marketValues'
@@ -37,9 +37,12 @@ const reasonNames: Record<string, string> = {
 }
 const reasonText = (value: unknown) => reasonNames[String(value)] ?? String(value ?? '—')
 const sideText = (value: unknown) => value === 'buy' ? '买入' : value === 'sell' ? '卖出' : String(value ?? '—')
-const metricLabels: Record<string, string> = { peak_principal_return: '峰值本金收益', max_principal_drawdown: '最大本金回撤', trade_count: '成交笔数', total_fees: '总手续费', buy_count: '买入次数', sell_count: '卖出次数', turnover: '换手率' }
-const percentMetrics = ['peak_principal_return', 'max_principal_drawdown']
+const metricLabels: Record<string, string> = { peak_principal_return: '峰值本金收益', excess_return: '超额收益（较买入持有）', max_principal_drawdown: '最大本金回撤', trade_count: '成交笔数', total_fees: '总手续费', buy_count: '买入次数', sell_count: '卖出次数', turnover: '换手率' }
+const percentMetrics = ['peak_principal_return', 'excess_return', 'max_principal_drawdown']
 const countMetrics = ['trade_count', 'buy_count', 'sell_count']
+const metricValue = (result: BacktestResult, strategy: string, key: string) => key === 'excess_return' ? resultExcessReturn(result, strategy) : result.strategies?.[strategy]?.metrics?.[key]
+const excessText = formatResultExcessReturn
+const metricText = (key: string, value: number | null | undefined) => key === 'excess_return' ? excessText(value) : percentMetrics.includes(key) ? percent(value) : key === 'total_fees' ? money(value) : value == null || !Number.isFinite(value) ? '—' : countMetrics.includes(key) ? String(value) : value.toFixed(2)
 type Strategy = { key: string; name: string; value: StrategyResult }
 const BAR_PAGE_LIMIT = 1500
 const MAX_MARKERS = 240
@@ -343,6 +346,7 @@ export default function ResultsPage({ selectedResultId, selectedCompareId, view,
             return <div className={'strategy-card ' + strategy.key} key={strategy.key}>
               <div className='strategy-top'><div><span className='strategy-swatch' style={{ background: colors[strategy.key] ?? '#69758b' }} /><strong>{strategy.name}</strong></div><Badge tone={peakReturn == null || !Number.isFinite(peakReturn) ? 'neutral' : peakReturn >= 0 ? 'red' : 'green'}>{percent(peakReturn)}</Badge></div>
               <div className='strategy-detail-grid'>
+                <div><small>超额收益（较买入持有）</small><strong className={tone('excess_return', resultExcessReturn(result, strategy.key))}>{excessText(resultExcessReturn(result, strategy.key))}</strong></div>
                 <div><small>最大本金回撤</small><strong className='loss'>{percent(metrics?.max_principal_drawdown)}</strong></div>
                 <div><small>成交笔数</small><strong>{metrics?.trade_count ?? '—'}</strong></div>
                 <div><small>总手续费</small><strong>{money(metrics?.total_fees)} 元</strong></div>
@@ -367,22 +371,36 @@ export default function ResultsPage({ selectedResultId, selectedCompareId, view,
           <p className={comparisonDifferences.length ? 'inline-warning' : 'field-hint'}>{comparisonDifferences.length ? '两侧以下口径不同：' + comparisonDifferences.join('、') + '。数值并列展示，不据此排名。' : '两侧标的、区间、费用口径与数据版本一致，可按同一口径逐项核对。'}</p>
           <TableViewport className='table-wrap' owner='local' stickyKeyColumn={1}><table><thead><tr><th>项目</th><th>A · 当前</th><th>B · 对照</th></tr></thead><tbody>{comparisonRows.map(row => <tr key={row.label}><td>{row.label}</td><td>{row.left}</td><td>{row.right}</td></tr>)}</tbody></table></TableViewport>
           <TableViewport className='table-wrap results-compare-metrics' owner='local' stickyKeyColumn={1}><table><thead><tr><th>网格指标</th><th>A</th><th>B</th><th>差值（A − B）</th></tr></thead><tbody>{Object.entries(metricLabels).map(([key, label]) => {
-            const left = result.strategies?.grid?.metrics?.[key]
-            const right = compareResult.strategies?.grid?.metrics?.[key]
+            const left = metricValue(result, 'grid', key)
+            const right = metricValue(compareResult, 'grid', key)
             const difference = left == null || right == null || !Number.isFinite(left) || !Number.isFinite(right) ? null : left - right
-            const display = (value: number | null | undefined) => percentMetrics.includes(key) ? percent(value) : key === 'total_fees' ? money(value) : value == null || !Number.isFinite(value) ? '—' : String(value)
-            return <tr key={key}><td>{label}</td><td>{display(left)}</td><td>{display(right)}</td><td className={difference == null ? '' : difference >= 0 ? 'gain' : 'loss'}>{percentMetrics.includes(key) ? percent(difference) : difference == null ? '—' : String(difference)}</td></tr>
+            return <tr key={key}><td>{label}</td><td>{metricText(key, left)}</td><td>{metricText(key, right)}</td><td className={difference == null ? '' : difference >= 0 ? 'gain' : 'loss'}>{metricText(key, difference)}</td></tr>
           })}</tbody></table></TableViewport>
           {comparisonDifferences.length > 0 && <p className='field-hint'>差值仅供核对，不表示更优：口径不一致时，收益率、回撤和费用不能直接排名。</p>}
         </> : <Empty title='对照结果不可用' detail='可移除对照后重新选择。' />}
       </Card>}
       {result && <>
-        <Card title='本次网格参数' className='result-parameters' subtitle='来自此结果保存的配置与资金口径'>
-          <dl className='result-parameter-list'>{parameters.map((parameter) => <div className='result-parameter' key={parameter.key}><dt>{parameter.label}</dt><dd>{parameter.value}</dd>{parameter.note && <small className='result-parameter-note'>{parameter.note}</small>}</div>)}</dl>
-        </Card>
+        <div className='results-performance-grid'>
           <Card title='收益、回撤与网格持仓' className='results-curves-card' subtitle={(peakPrincipalBasis ? '收益率 = (资产总值 − 累计投入) ÷ 当前峰值本金 · 回撤 = 本金利润曲线回撤 · ' : result.accounting_basis ? '收益率 = 资产总值 ÷ 累计实际投入 − 1 · ' : '收益率 = 资产总值 ÷ 初始资产 − 1 · ') + curvePeriod + ' · 三图共享日期、缩放和悬浮值'} action={<Badge tone={result.accounting_basis ? 'blue' : 'amber'}>{peakPrincipalBasis ? '峰值本金' : result.accounting_basis ? '独立投入' : '历史口径'}</Badge>}>
-          <ResultsCurves result={result} />
-        </Card>
+            <ResultsCurves result={result} />
+          </Card>
+          <div className='results-performance-details'>
+            <Card title='完整收益指标' className='results-full-metrics' subtitle={strategies.length + ' 类策略 · 超额收益 = 策略收益率 − 买入并持有收益率，单位为百分点'}>
+            <TableViewport className='table-wrap results-full-metrics-table' owner='local' stickyKeyColumn={1} label='完整收益指标'>
+              <table style={strategies.length > 4 ? { minWidth: 100 + strategies.length * 118 + 'px' } : undefined}><thead><tr><th>指标</th>{strategies.map((strategy) => <th key={strategy.key}>{strategy.name}</th>)}</tr></thead><tbody>
+                {Object.entries(metricLabels).map(([key, label]) => <tr key={key}><td>{label}</td>{strategies.map((strategy) => {
+                  const value = metricValue(result, strategy.key, key)
+                  const shown = metricText(key, value)
+                  return <td key={strategy.key} className={tone(key, value)}>{shown}</td>
+                })}</tr>)}
+              </tbody></table>
+            </TableViewport>
+            </Card>
+            <Card title='本次网格参数' className='result-parameters' subtitle='来自此结果保存的配置与资金口径'>
+              <dl className='result-parameter-list'>{parameters.map((parameter) => <div className='result-parameter' key={parameter.key}><dt>{parameter.label}</dt><dd>{parameter.value}</dd>{parameter.note && <small className='result-parameter-note'>{parameter.note}</small>}</div>)}</dl>
+            </Card>
+          </div>
+        </div>
       </>}
     </div>
     {result && <div className='result-disclosures'>
@@ -397,15 +415,6 @@ export default function ResultsPage({ selectedResultId, selectedCompareId, view,
           </Card>
           <Card title='保存的完整配置'><pre className='json-preview'>{JSON.stringify(result.config ?? {}, null, 2)}</pre></Card>
         </div>
-      </Disclosure>
-      <Disclosure id='results-metrics' title='完整收益指标' summary={strategies.length + ' 类策略 · 收益、风险与费用'}>
-        <TableViewport className='table-wrap' owner='local' stickyKeyColumn={1}><table><thead><tr><th>指标</th>{strategies.map((strategy) => <th key={strategy.key}>{strategy.name}</th>)}</tr></thead><tbody>
-          {Object.entries(metricLabels).map(([key, label]) => <tr key={key}><td>{label}</td>{strategies.map((strategy) => {
-            const value = strategy.value.metrics?.[key]
-            const shown = percentMetrics.includes(key) ? percent(value) : countMetrics.includes(key) ? value == null || !Number.isFinite(value) ? '—' : String(value) : key === 'total_fees' ? money(value) : value == null || !Number.isFinite(value) ? '—' : value.toFixed(2)
-            return <td key={strategy.key} className={tone(key, value)}>{shown}</td>
-          })}</tr>)}
-        </tbody></table></TableViewport>
       </Disclosure>
       <Disclosure id='results-candles' title='K 线与成交标记' summary={(result.config?.frequency ?? '频率未知') + ' · ' + (reference?.name ?? '策略')}>
         <Card title={result.symbol + ' K 线与交易'} subtitle={'每根 K 线覆盖自身开盘到下一根 bar 开盘；窗口外或缺口内的成交不画标记。标记取自 ' + (reference?.name ?? '策略') + ' 成交记录。'} action={<div className='button-row'><span className='field-hint'>{barsRange}</span><Button variant='quiet' busy={earlierLoading} disabled={!earlierBefore || barsLoading} onClick={loadEarlier}>加载更早</Button></div>}>

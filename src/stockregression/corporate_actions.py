@@ -142,6 +142,9 @@ def action_issues(actions: pd.DataFrame, daily: pd.DataFrame, start, end, *, set
         if ex is not None and ((lower is not None and ex < lower) or (upper is not None and ex > upper)):
             continue
         if ex is None:
+            record = day(row.get("record_date"))
+            if record is not None and upper is not None and record > upper:
+                continue
             issues.append("公司行动缺少除权日，无法计算相关区间")
             continue
         action_days.add(ex)

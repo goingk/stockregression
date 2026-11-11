@@ -3,10 +3,11 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from stockregression import engine
 from stockregression.corporate_actions import (
-    LEGACY_SPLIT_REASON, action_issues, resolve_actions, split_record,
+    LEGACY_SPLIT_REASON, UNRESOLVED_SPLIT, action_issues, resolve_actions, split_record,
 )
-from stockregression.models import DataBundle
+from stockregression.models import BacktestConfig, DataBundle, FeeConfig
 from stockregression.price_basis import action_factors, adjust_frame
 from stockregression.providers import normalize_actions
 
@@ -17,6 +18,174 @@ def prices(ratio=2.0):
         "close": [10., 10., 10. / ratio, 10. / ratio],
         "preclose": [10., 10., 10. / ratio, 10. / ratio],
     })
+
+
+def backtest_bundle(actions=None):
+    dates = pd.bdate_range("2026-07-27", periods=5)
+    prices = [1.0, 1.0, 1.01, 1.0, 1.01]
+    daily = pd.DataFrame({
+        "date": dates,
+        "open": prices,
+        "high": [price + .01 for price in prices],
+        "low": [price - .01 for price in prices],
+        "close": prices,
+        "preclose": [prices[0], *prices[:-1]],
+        "volume": 100_000,
+        "turnover": [price * 100_000 for price in prices],
+        "tradestatus": 1,
+        "is_st": False,
+        "limit_up": 100.0,
+        "limit_down": .01,
+    })
+    bars = daily.iloc[1:].copy()
+    bars["timestamp"] = bars.date + pd.Timedelta(hours=15)
+    bars["frequency"] = "1d"
+    bars["tradable"] = True
+    bars["is_synthetic"] = False
+    config = BacktestConfig(
+        schema_version=3, symbol="159516.SZ",
+        start_date=dates[2].date(), end_date=dates[-1].date(), frequency="1d",
+        initial_shares=1000, min_shares=0, max_shares=None,
+        buy_shares=100, sell_shares=100, reference_price_mode="manual",
+        reference_price=1.0,
+        fees=FeeConfig(commission_rate=0, min_commission=0, slippage_bps=0),
+    )
+    bundle = DataBundle(
+        symbol=config.symbol, bars=bars, daily=daily, calendar=dates[1:],
+        actions=normalize_actions(pd.DataFrame(actions or [])),
+        version="corporate-action-boundary",
+        metadata={"asset_type": "etf", "price_tick": .001},
+    )
+    return config, bundle
+
+
+def test_unresolved_historical_split_without_record_date_does_not_block_backtest():
+    config, bundle = backtest_bundle([
+        {
+            "record_date": None, "ex_date": ex_date,
+            "stock_date": None, "cash_per_share": 0.0, "bonus_ratio": 1.0,
+            "action_type": "split", "split_date": ex_date,
+            "date_unresolved": True, "implemented": True,
+            "unsupported_reason": UNRESOLVED_SPLIT,
+        }
+        for ex_date in ("2026-03-27", "2026-07-09")
+    ])
+
+    assert engine._prepare_actions(bundle, config.start_date, config.end_date) == []
+    for preview in (False, True):
+        result = engine.run_backtest(config, bundle, preview=preview)
+        assert result["strategies"]["grid"]["equity"]
+
+
+def test_prepare_actions_still_rejects_unsupported_action_inside_window():
+    config, bundle = backtest_bundle([{
+        "record_date": "2026-07-28", "ex_date": "2026-07-29",
+        "stock_date": "2026-07-29", "cash_per_share": 0.0, "bonus_ratio": 0.0,
+        "implemented": True, "unsupported_reason": "配股缺少认购结算模型",
+    }])
+
+    with pytest.raises(ValueError, match="配股缺少认购结算模型"):
+        engine._prepare_actions(bundle, config.start_date, config.end_date)
+
+
+@pytest.mark.parametrize(
+    ("action", "message"),
+    [
+        (
+            {"record_date": None, "ex_date": "2026-08-03", "cash_per_share": .1, "bonus_ratio": 0.0},
+            "缺少登记日或除权除息日",
+        ),
+        (
+            {"record_date": "2026-07-29", "ex_date": None, "cash_per_share": .1, "bonus_ratio": 0.0},
+            "公司行动缺少除权日",
+        ),
+    ],
+)
+def test_prepare_actions_does_not_skip_an_action_with_a_missing_date(action, message):
+    config, bundle = backtest_bundle([action])
+
+    with pytest.raises(ValueError, match=message):
+        engine._prepare_actions(bundle, config.start_date, config.end_date)
+
+
+def test_prepare_actions_skips_action_whose_known_record_date_is_after_window():
+    config, bundle = backtest_bundle([{
+        "record_date": "2026-08-03", "ex_date": "2026-08-04",
+        "stock_date": "2026-08-04", "cash_per_share": 0.0, "bonus_ratio": 0.0,
+        "implemented": True, "unsupported_reason": "配股缺少认购结算模型",
+    }])
+
+    assert engine._prepare_actions(bundle, config.start_date, config.end_date) == []
+
+
+@pytest.mark.parametrize("check", ["prices", "settlement", "engine"])
+def test_future_record_without_ex_date_does_not_block_current_window(check):
+    config, bundle = backtest_bundle([{
+        "record_date": "2026-08-03", "ex_date": None,
+        "cash_per_share": .1, "bonus_ratio": 0.0,
+    }])
+
+    if check == "engine":
+        assert engine._prepare_actions(bundle, config.start_date, config.end_date) == []
+    else:
+        assert action_issues(
+            bundle.actions, bundle.daily, config.start_date, config.end_date,
+            settlement=check == "settlement",
+        ) == []
+
+
+@pytest.mark.parametrize("settlement", [False, True])
+def test_action_without_record_or_ex_date_still_fails(settlement):
+    config, bundle = backtest_bundle([{
+        "record_date": None, "ex_date": None,
+        "cash_per_share": .1, "bonus_ratio": 0.0,
+    }])
+
+    assert "公司行动缺少除权日" in action_issues(
+        bundle.actions, bundle.daily, config.start_date, config.end_date,
+        settlement=settlement,
+    )[0]
+    with pytest.raises(ValueError, match="公司行动缺少除权日"):
+        engine._prepare_actions(bundle, config.start_date, config.end_date)
+
+
+@pytest.mark.parametrize("settlement", [False, True])
+def test_in_window_ex_date_is_checked_even_when_record_date_is_after_window(settlement):
+    config, bundle = backtest_bundle([
+        {
+            "record_date": "2026-08-03", "ex_date": "2026-07-29",
+            "stock_date": "2026-07-29", "cash_per_share": 0.0, "bonus_ratio": -.6,
+        },
+        {
+            "record_date": "2026-07-28", "ex_date": "2026-07-29",
+            "stock_date": "2026-07-29", "cash_per_share": 0.0, "bonus_ratio": -.6,
+        },
+    ])
+
+    issues = action_issues(
+        bundle.actions, bundle.daily, config.start_date, config.end_date,
+        settlement=settlement,
+    )
+    assert any("同日合计份额倍率必须大于零" in issue for issue in issues)
+    if settlement:
+        assert any("缺少有效的除权前登记日" in issue for issue in issues)
+
+
+def test_cross_window_record_date_keeps_the_action_for_settlement():
+    config, bundle = backtest_bundle([{
+        "record_date": "2026-07-27", "ex_date": "2026-07-29",
+        "pay_date": "2026-07-29", "stock_date": "2026-07-29",
+        "cash_per_share": .1, "bonus_ratio": 0.0,
+    }])
+
+    actions = engine._prepare_actions(bundle, config.start_date, config.end_date)
+    assert [(action.record_date, action.ex_date) for action in actions] == [
+        (pd.Timestamp("2026-07-27").date(), pd.Timestamp("2026-07-29").date()),
+    ]
+    result = engine.run_backtest(config, bundle, preview=True)
+    first = result["strategies"]["grid"]["equity"][0]
+    assert first["timestamp"] == "2026-07-29T15:00:00"
+    assert first["cash"] == 100.0
 
 
 @pytest.mark.parametrize("ratio", [2.0, 0.5, 2.5])
