@@ -1205,6 +1205,78 @@ td small.table-sub, .muted-cell { color:#64748b; }
   *, *::before, *::after { animation-duration:.01ms !important; animation-iteration-count:1 !important; transition-duration:.01ms !important; scroll-behavior:auto !important; }
 }
 
+/* Interval amplitude: one shared numeric x-axis and three stacked histograms. */
+.amplitude-card { min-width:0; margin-top:20px; }
+.amplitude-card > .card-head { align-items:flex-start; }
+.amplitude-card > .empty-state { min-height:220px; }
+.amplitude-toolbar { display:flex; flex-wrap:wrap; align-items:flex-end; gap:12px 24px; padding:14px; border:1px solid #e5ebf3; border-radius:10px; background:#f8fafc; }
+.amplitude-quick { display:flex; flex-wrap:wrap; align-items:center; gap:7px; }
+.amplitude-toolbar-label { flex:0 0 auto; color:#64748b; font-size:11px; font-weight:600; }
+.amplitude-range-button { min-height:34px; padding:0 12px; border:1px solid #dbe4ef; border-radius:8px; color:#526179; background:#fff; font-size:11px; font-weight:600; transition:.16s ease; }
+.amplitude-range-button:hover:not(:disabled) { border-color:#adc4e8; color:var(--blue); background:#f8fbff; }
+.amplitude-range-button.active { border-color:#bfd5f7; color:var(--blue-dark); background:#eef4ff; box-shadow:inset 0 0 0 1px #dbe8ff; }
+.amplitude-custom-range { display:flex; flex:1 1 510px; align-items:flex-end; gap:8px; min-width:0; }
+.amplitude-custom-range .field { flex:1 1 150px; min-width:128px; }
+.amplitude-custom-range .input { width:100%; }
+.amplitude-date-separator { padding-bottom:11px; color:#94a3b8; font-size:11px; }
+.amplitude-compute { min-height:40px; flex:0 0 auto; }
+.amplitude-query-note { display:flex; flex-wrap:wrap; align-items:center; gap:5px 16px; min-height:24px; padding:7px 2px 0; color:#7b8799; font-size:11px; }
+.amplitude-query-note strong { color:#b45309; font-size:11px; font-weight:600; }
+.amplitude-loading { display:flex; align-items:center; min-height:180px; padding:18px 4px; }
+.amplitude-loading .loading { width:100%; justify-content:center; }
+.amplitude-range-summary { display:grid; grid-template-columns:minmax(250px,1.4fr) repeat(3,minmax(110px,.6fr)); gap:10px; margin-top:13px; padding:12px 14px; border:1px solid #e5ebf3; border-radius:10px; background:#fbfcfe; }
+.amplitude-range-summary > div { min-width:0; padding-right:12px; border-right:1px solid #edf1f6; }
+.amplitude-range-summary > div:last-child { padding-right:0; border-right:0; }
+.amplitude-range-summary small { display:block; margin-bottom:3px; color:#7b8799; font-size:10px; }
+.amplitude-range-summary strong { display:block; color:#334155; font-size:12px; font-weight:600; overflow-wrap:anywhere; }
+.amplitude-stat-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin-top:14px; }
+.amplitude-stat { min-width:0; padding:14px 15px; border:1px solid #e2e8f0; border-radius:10px; background:#f8fafc; }
+.amplitude-stat.total { border-color:#d6e4fa; background:#f3f7fe; }
+.amplitude-stat.upside { border-color:#f6d9e1; background:#fff6f8; }
+.amplitude-stat.downside { border-color:#d5ede8; background:#f3fbf9; }
+.amplitude-stat-label { display:flex; align-items:center; gap:7px; color:#475569; font-size:12px; font-weight:600; }
+.amplitude-stat-label i { width:7px; height:7px; flex:0 0 auto; border-radius:50%; }
+.amplitude-stat-values { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:11px; }
+.amplitude-stat-values > div { min-width:0; }
+.amplitude-stat-values small { display:block; margin-bottom:2px; color:#7b8799; font-size:10px; }
+.amplitude-stat-values strong { display:block; color:#24344c; font-size:22px; font-weight:650; line-height:1.25; letter-spacing:-.4px; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+.amplitude-stat-values .median strong { color:#475569; font-size:17px; letter-spacing:-.2px; }
+.amplitude-warnings { margin-top:12px; padding:11px 13px; border:1px solid #efdcae; border-radius:9px; background:#fffbf2; color:#7b653f; font-size:11px; line-height:1.7; }
+.amplitude-warnings > strong { display:block; margin-bottom:3px; color:#93671d; font-size:11px; }
+.amplitude-warnings ul { margin:0; padding-left:18px; }
+.amplitude-warnings li + li { margin-top:2px; }
+.amplitude-chart { min-width:0; margin-top:13px; padding-top:3px; border:1px solid #e5ebf3; border-radius:10px; overflow:hidden; background:#fff; }
+.amplitude-card > .notice { margin-top:12px; }
+
+@media (max-width:1100px) {
+  .amplitude-custom-range { flex-basis:100%; }
+  .amplitude-stat-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .amplitude-stat:last-child { grid-column:1 / -1; }
+  .amplitude-range-summary { grid-template-columns:minmax(220px,1.4fr) repeat(3,minmax(95px,.6fr)); }
+}
+@media (max-width:720px) {
+  .amplitude-card { margin-top:16px; }
+  .amplitude-toolbar { padding:12px; gap:12px; }
+  .amplitude-quick { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); width:100%; }
+  .amplitude-toolbar-label { grid-column:1 / -1; }
+  .amplitude-custom-range { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); align-items:end; }
+  .amplitude-date-separator { display:none; }
+  .amplitude-compute { grid-column:1 / -1; width:100%; }
+  .amplitude-range-summary { grid-template-columns:1fr 1fr; }
+  .amplitude-range-summary > div { padding-right:10px; }
+  .amplitude-range-summary > div:nth-child(2) { border-right:0; }
+  .amplitude-range-summary > div:nth-child(n+3) { padding-top:8px; border-top:1px solid #edf1f6; }
+  .amplitude-stat-grid { grid-template-columns:1fr; }
+  .amplitude-stat:last-child { grid-column:auto; }
+}
+@media (max-width:450px) {
+  .amplitude-custom-range { grid-template-columns:1fr; }
+  .amplitude-compute { grid-column:auto; }
+  .amplitude-range-summary { grid-template-columns:1fr; }
+  .amplitude-range-summary > div { padding:0 0 8px; border-right:0; border-bottom:1px solid #edf1f6; }
+  .amplitude-range-summary > div:last-child { padding-top:0; border-top:0; border-bottom:0; }
+}
+
 /* ETF research keeps preflight, cross-sectional ranking and one-symbol diagnosis in one workspace. */
 .etf-sample-banner { display:flex; align-items:flex-start; gap:10px; margin:0 0 16px; padding:11px 14px; border:1px solid #d7e4f6; border-radius:9px; background:#f5f9ff; color:#526179; font-size:12px; line-height:1.7; }
 .etf-sample-banner .badge { flex:0 0 auto; margin-top:1px; }

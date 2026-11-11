@@ -2143,6 +2143,24 @@ def create_app(data_dir: str | None = None, start_jobs: bool = True, *, openapi_
         except (ValueError, TypeError) as exc:
             raise HTTPException(422, str(exc)) from exc
 
+    @app.get("/api/v1/market/amplitude/{symbol}")
+    def market_amplitude(
+        symbol: str,
+        lookback: int = Query(60, ge=1, le=5000),
+        start_date: str | None = None,
+        end_date: str | None = None,
+        adjustment: Literal["none", "qfq"] = "none",
+    ):
+        try:
+            return json_safe(MarketDataService(store).market_amplitude(
+                symbol, lookback=lookback, start_date=start_date, end_date=end_date,
+                adjustment=adjustment,
+            ))
+        except MarketDataError as exc:
+            raise HTTPException(409, {"code": "MARKET_DATA_UNAVAILABLE", "message": str(exc)}) from exc
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+
     @app.post("/api/v1/backtests/preview")
     def preview(payload: PreviewRequest):
         version = require_ready(payload.config)

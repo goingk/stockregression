@@ -28,6 +28,7 @@ from ..rules import instrument_terms
 from ..snapshot_quality import frozen_quality_state
 from ..storage import Store
 from .models import DataNotReady, FileImportResult, MarketDataError
+from .amplitude import calculate_daily_amplitude, summarize_amplitude
 from .quality import validate_and_fill
 from .reader import (
     check_declared_adjustment, check_declared_identity, check_declared_timeframe, file_fingerprint,
@@ -88,6 +89,29 @@ def _summary_from_anomalies(
     holder = pd.DataFrame()
     holder.attrs["price_anomaly_rows"] = details_to_rows(anomalies)
     return anomaly_summary(holder, symbol=symbol, timeframe=timeframe, version=version)
+
+
+class _AmplitudeAdjustmentRepository:
+    """Give chart adjustment a complete reference series without mutating storage."""
+
+    def __init__(self, repository, daily: pd.DataFrame):
+        self._repository = repository
+        self._daily = daily
+
+    def dataset(self, *args, **kwargs):
+        return self._repository.dataset(*args, **kwargs)
+
+    def active_rows(self, *args, **kwargs):
+        return self._daily.copy()
+
+    def auxiliary(self, *args, **kwargs):
+        return self._repository.auxiliary(*args, **kwargs)
+
+
+class _AmplitudeAdjustmentService:
+    def __init__(self, service, repository):
+        self.repository = repository
+        self.store = service.store
 
 
 def _raise_price_not_ready(
@@ -740,6 +764,226 @@ class MarketDataService:
             "adjustment_version": adjustment_version,
             "diagnostics": {}, "source_events": [], "storage": dataset.get("storage", "parquet"),
             "instrument": self.store.instrument(symbol) or instrument_terms(symbol, {"name": symbol}),
+        }
+
+    @staticmethod
+    def _amplitude_window(
+        analysis: dict, *, lookback: int, start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> tuple[list[dict], list[dict]]:
+        """Select valid samples and excluded rows from the same daily window."""
+        records = analysis.get("records") or []
+        if start_date is not None and end_date is not None:
+            window = [
+                record for record in records
+                if record.get("date") is not None
+                and start_date <= str(record["date"]) <= end_date
+            ]
+        else:
+            valid_positions = [
+                index for index, record in enumerate(records)
+                if record.get("sample") is not None
+            ]
+            if not valid_positions:
+                return [], []
+            first = 0 if len(valid_positions) <= lookback else valid_positions[-lookback]
+            window = records[first:]
+        samples = [record["sample"] for record in window if record.get("sample") is not None]
+        excluded = [record for record in window if record.get("sample") is None]
+        return samples, excluded
+
+    @staticmethod
+    def _amplitude_date(value: str | None, label: str) -> pd.Timestamp | None:
+        if value is None or str(value).strip() == "":
+            return None
+        try:
+            parsed = pd.to_datetime(str(value).strip(), format="%Y-%m-%d", errors="raise")
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} 格式应为 YYYY-MM-DD") from exc
+        return pd.Timestamp(parsed).normalize()
+
+    def market_amplitude(
+        self, symbol: str, *, lookback: int = 60,
+        start_date: str | None = None, end_date: str | None = None,
+        adjustment: str = "none",
+    ) -> dict:
+        """Return daily amplitude statistics over a lookback or inclusive range."""
+        symbol = normalize_symbol(symbol)
+        if isinstance(lookback, bool):
+            raise TypeError("lookback 应为 1 到 5000 的整数")
+        try:
+            lookback = int(lookback)
+        except (TypeError, ValueError) as exc:
+            raise TypeError("lookback 应为 1 到 5000 的整数") from exc
+        if not 1 <= lookback <= 5000:
+            raise ValueError("lookback 应为 1 到 5000 的整数")
+        if adjustment not in {"none", "qfq"}:
+            raise ValueError("adjustment 应为 none 或 qfq")
+
+        start = self._amplitude_date(start_date, "start_date")
+        end = self._amplitude_date(end_date, "end_date")
+        if (start is None) != (end is None):
+            raise ValueError("start_date 与 end_date 必须同时提供")
+        if start is not None and end is not None and start > end:
+            raise ValueError("start_date 不能晚于 end_date")
+
+        dataset = self.repository.dataset(symbol, "1day")
+        if not dataset:
+            raise MarketDataError(f"{symbol} 尚无 1day 数据")
+
+        from ..providers import latest_closed_date
+
+        closed = pd.Timestamp(latest_closed_date()).normalize()
+        cutoff = min(end, closed) if end is not None else closed
+        frame = self.repository.active_rows(symbol, "1day", end=cutoff)
+        if frame.empty:
+            raise MarketDataError(f"{symbol} 在请求区间内没有可用的日线数据")
+        timestamps = pd.to_datetime(frame["timestamp"], errors="coerce")
+        frame = frame[timestamps.notna() & (timestamps < cutoff + pd.Timedelta(days=1))].copy()
+        if frame.empty:
+            raise MarketDataError(f"{symbol} 在请求区间内没有可用的日线数据")
+
+        start_text = start.date().isoformat() if start is not None else None
+        end_text = end.date().isoformat() if end is not None else None
+        analysis = calculate_daily_amplitude(frame)
+        samples, excluded = self._amplitude_window(
+            analysis, lookback=lookback,
+            start_date=start_text, end_date=end_text,
+        )
+        if not samples:
+            raise MarketDataError(f"{symbol} 在请求区间内没有可用的日线振幅样本")
+
+        actual_end = str(samples[-1]["date"])
+        adjustment_anchor = None
+        adjustment_version = None
+        if adjustment == "qfq":
+            from .chart_adjustment import apply_chart_adjustment
+
+            anchor = min(pd.Timestamp(actual_end).normalize(), closed)
+            unadjusted = frame.copy()
+            source = frame[pd.to_datetime(frame["timestamp"]).dt.normalize() <= anchor].copy()
+            if "preclose" in source:
+                original_preclose = pd.to_numeric(source["preclose"], errors="coerce")
+            else:
+                original_preclose = pd.Series(np.nan, index=source.index)
+            missing_preclose = ~np.isfinite(original_preclose) | (original_preclose <= 0)
+            adjustment_service = self
+            if missing_preclose.any():
+                adjustment_daily = source.copy()
+                adjustment_daily.loc[missing_preclose, "preclose"] = pd.to_numeric(
+                    adjustment_daily["close"], errors="coerce"
+                ).shift(1).loc[missing_preclose]
+                adjustment_service = _AmplitudeAdjustmentService(
+                    self, _AmplitudeAdjustmentRepository(self.repository, adjustment_daily),
+                )
+            frame, adjustment_error, adjustment_version = apply_chart_adjustment(
+                adjustment_service, symbol, "1day", source, anchor=anchor,
+            )
+            if adjustment_error:
+                raise MarketDataError(adjustment_error)
+            frame = frame[
+                pd.to_datetime(frame["timestamp"]).dt.normalize() <= anchor
+            ].copy()
+            if missing_preclose.any():
+                missing_days = pd.to_datetime(
+                    source.loc[missing_preclose, "timestamp"], errors="coerce"
+                ).dt.normalize()
+                adjusted_days = pd.to_datetime(frame["timestamp"], errors="coerce").dt.normalize()
+                frame.loc[adjusted_days.isin(missing_days), "preclose"] = np.nan
+            # The factor anchor is the last valid sample, but the requested
+            # window may contain later suspended/invalid rows. Preserve those
+            # rows so exclusion counts and warnings remain comparable between
+            # qfq and unadjusted requests. They cannot form a sample because
+            # the last valid sample defines the anchor.
+            tail = unadjusted[
+                pd.to_datetime(unadjusted["timestamp"], errors="coerce").dt.normalize() > anchor
+            ].copy()
+            if not tail.empty:
+                frame = pd.concat([frame, tail], ignore_index=True, sort=False)
+                frame = frame.sort_values("timestamp", kind="stable").reset_index(drop=True)
+            analysis = calculate_daily_amplitude(frame)
+            samples, excluded = self._amplitude_window(
+                analysis, lookback=lookback,
+                start_date=start_text, end_date=end_text,
+            )
+            if not samples:
+                raise MarketDataError(f"{symbol} 在请求区间内没有可用的日线振幅样本")
+            adjustment_anchor = anchor.date().isoformat()
+
+        warnings = []
+        if dataset.get("status") != "ready":
+            warnings.append(
+                dataset.get("reason")
+                or f"1day 数据集状态为 {dataset.get('status') or 'unknown'}，结果仅供复核"
+            )
+
+        try:
+            dataset_latest = pd.Timestamp(dataset.get("last_time")).normalize()
+        except (TypeError, ValueError):
+            dataset_latest = None
+        if dataset_latest is not None and pd.isna(dataset_latest):
+            dataset_latest = None
+        if dataset_latest is not None and dataset_latest > closed:
+            warnings.append(
+                f"本地日线含最近收盘日 {closed.date().isoformat()} 之后的数据，已截断至该日"
+            )
+        observed_dates = [
+            record["date"] for record in analysis.get("records") or []
+            if record.get("date")
+        ]
+        observed_latest = (
+            pd.Timestamp(max(observed_dates)).normalize()
+            if observed_dates else dataset_latest
+        )
+        if end is not None:
+            if end > closed:
+                warnings.append(
+                    f"end_date {end_text} 晚于最近收盘日 {closed.date().isoformat()}，"
+                    "已截断至最近收盘日"
+                )
+            elif observed_latest is not None and end > observed_latest:
+                warnings.append(
+                    f"end_date {end_text} 晚于本地日线最新日期 {observed_latest.date().isoformat()}，"
+                    "已按本地可用数据截断"
+                )
+
+        if excluded:
+            dates = [str(record.get("date") or "日期无效") for record in excluded]
+            reasons: dict[str, int] = {}
+            for record in excluded:
+                reason = str(record.get("reason") or "无效记录")
+                reasons[reason] = reasons.get(reason, 0) + 1
+            reason_text = "、".join(
+                f"{reason} {count} 条" for reason, count in reasons.items()
+            )
+            sample_text = "、".join(dates[:3])
+            if len(dates) > 3:
+                sample_text += " 等"
+            warnings.append(
+                f"已排除 {len(excluded)} 条日线记录（{reason_text}；{sample_text}），"
+                "仅使用形成有效振幅的同一组样本计算均值和中位数"
+            )
+
+        return {
+            "symbol": symbol,
+            "frequency": "1day",
+            "adjustment": adjustment,
+            "adjustment_anchor": adjustment_anchor,
+            "adjustment_version": adjustment_version,
+            "requested": {
+                "lookback": lookback,
+                "start_date": start_text,
+                "end_date": end_text,
+            },
+            "actual": {
+                "start_date": str(samples[0]["date"]),
+                "end_date": str(samples[-1]["date"]),
+            },
+            "sample_count": len(samples),
+            "excluded_count": len(excluded),
+            "metrics": summarize_amplitude(samples),
+            "samples": samples,
+            "warnings": warnings,
         }
 
     def import_file(

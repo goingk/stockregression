@@ -289,6 +289,50 @@ export interface WatchItem extends Instrument {
   has_data?: boolean
 }
 
+export type AmplitudeAdjustment = 'none' | 'qfq'
+export type AmplitudeMetricKey = 'amplitude' | 'upside' | 'downside'
+
+export interface AmplitudeMetricSummary {
+  mean: number
+  median: number
+}
+
+export interface AmplitudeSample {
+  date: string
+  previous_close: number
+  high: number
+  low: number
+  amplitude: number
+  upside: number
+  downside: number
+}
+
+export interface AmplitudeRequestedRange {
+  lookback: number | null
+  start_date: string | null
+  end_date: string | null
+}
+
+export interface AmplitudeActualRange {
+  start_date: string
+  end_date: string
+}
+
+export interface AmplitudeResponse {
+  symbol: string
+  frequency: '1day'
+  adjustment: AmplitudeAdjustment
+  adjustment_anchor: string | null
+  adjustment_version: string | null
+  requested: AmplitudeRequestedRange
+  actual: AmplitudeActualRange
+  sample_count: number
+  excluded_count: number
+  metrics: Record<AmplitudeMetricKey, AmplitudeMetricSummary>
+  samples: AmplitudeSample[]
+  warnings: string[]
+}
+
 export interface DataSourceSpan {
   source?: string | null
   source_kind?: string | null

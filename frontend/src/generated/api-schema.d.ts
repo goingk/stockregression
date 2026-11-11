@@ -705,6 +705,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/market/amplitude/{symbol}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Market Amplitude */
+        get: operations["market_amplitude_api_v1_market_amplitude__symbol__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/backtests/preview": {
         parameters: {
             query?: never;
@@ -4722,6 +4739,42 @@ export interface operations {
                 ma?: string;
                 adjustment?: "none" | "qfq";
                 adjustment_anchor?: string | null;
+            };
+            header?: never;
+            path: {
+                symbol: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    market_amplitude_api_v1_market_amplitude__symbol__get: {
+        parameters: {
+            query?: {
+                lookback?: number;
+                start_date?: string | null;
+                end_date?: string | null;
+                adjustment?: "none" | "qfq";
             };
             header?: never;
             path: {

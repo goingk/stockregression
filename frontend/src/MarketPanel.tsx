@@ -11,6 +11,7 @@ import { useTasks } from './TaskCenter'
 import { chartValue, priceText, validPrice, validVolume } from './marketValues'
 import { adjustmentPageParams, appendMarketPage } from './marketPagination'
 import { useWorkbenchDefaults } from './useWorkbenchDefaults'
+import AmplitudePanel from './AmplitudePanel'
 
 type Bar = { timestamp: string; open: number; close: number; high: number; low: number; volume: number; [key: string]: unknown }
 type MarketFrequency = Frequency | '1week' | '1month'
@@ -162,6 +163,7 @@ export default function MarketPanel({ onSelect, requestedReport, onReportHandled
       {market?.quality_flags?.map((flag, index) => <p className="inline-warning" key={index}>{flag}</p>)}
       {market?.warnings?.length ? <Disclosure id="market-sources" title="来源与覆盖说明" summary={`${market.warnings.length} 条`}>{market.warnings.map((warning, index) => <p key={index}>{warning}</p>)}</Disclosure> : null}
     </Card></div>
+    <AmplitudePanel symbol={active?.symbol ?? null} adjustment={adjustment} taskRevision={`${finished}:${refreshToken}`} />
     {report && <div className="task-drawer-overlay" onMouseDown={event => { if (event.target === event.currentTarget) setReport(null) }}><section className="task-drawer report-drawer" role="dialog" aria-modal="true" aria-label="数据任务报告"><Card title="数据任务报告" subtitle={report.message} action={<Button variant="quiet" onClick={() => setReport(null)}><X size={14} />关闭报告</Button>}>{report.warnings?.map((warning, index) => <p key={index} className="inline-warning">{warning}</p>)}<TableViewport className="table-wrap scroll-table" owner='parent' label='市场任务报告'><table><thead><tr><th>标的</th><th>日线截止</th><th>分钟末条</th><th>覆盖 / 来源说明</th></tr></thead><tbody>{report.symbols?.map(item => <tr key={item.symbol}><td>{item.symbol}</td><td>{item.last_date ?? '—'}</td><td>{item.minute_through ?? '无分钟数据'}</td><td>{item.warnings?.join('；') || '请结合来源校准及逐日覆盖检查'}</td></tr>)}{report.failures?.map(item => <tr key={item.symbol}><td>{item.symbol}</td><td colSpan={3} className="loss">失败：{item.reason}</td></tr>)}</tbody></table></TableViewport>{!report.symbols && !report.failures && <pre className="json-preview">{JSON.stringify(report, null, 2)}</pre>}</Card></section></div>}
     <button className="text-link market-refresh" onClick={() => setRefreshToken(value => value + 1)}>刷新本地视图</button>
   </>

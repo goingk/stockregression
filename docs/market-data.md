@@ -251,6 +251,12 @@ uv run --frozen stockregression data aggregate --symbol 600000.SH --from 1day --
 
 查询缓存按文件版本、查询区间、字段和解析规则生成键。文件替换后旧缓存自然失效。默认预算为 256 MiB，由 `market_cache_mb` 控制。
 
+## 区间日均振幅
+
+行情页按日线计算指定标的的区间日均振幅，复用当前数据的复权规则。可用交易日的总振幅为 `(最高价-最低价)/前收盘价`，向上振幅为 `max(0, 最高价/前收盘价-1)`，向下振幅为 `max(0, 1-最低价/前收盘价)`。前收优先取当日有效 `preclose`，缺失时回退到上一有效日收盘价；停牌、无效 OHLC 和无基准价的日期不计入样本。均值与中位数使用同一组有效交易日。
+
+向上和向下振幅分别描述相对前收的上探与回撤，跳空可能使两者之和大于总振幅，不将三项强制做加法关系。默认按最近 60 个可用交易日统计，也支持显式起止日期；日期范围含首尾，实际样本、排除数量和复权锚点随结果一起返回。
+
 ## API
 
 | 接口 | 用途 |
@@ -263,6 +269,7 @@ uv run --frozen stockregression data aggregate --symbol 600000.SH --from 1day --
 | GET /api/v1/data/datasets | 按周期数据集列表 |
 | GET /api/v1/data/coverage/{symbol}?timeframe=1day | 覆盖、版本与质量 |
 | GET /api/v1/data/bars/{symbol}?frequency=1day | 数据包行情 |
+| GET /api/v1/market/amplitude/{symbol}?lookback=60&adjustment=qfq | 日线区间日均振幅、中位数与逐日样本 |
 | POST /api/v1/data/import-package/scan | 预览 ETF、股票或混合数据包 |
 | POST /api/v1/data/import-package | 从 schema 2 清单幂等重建行情索引 |
 | POST /api/v1/data/import-batch/scan | 预览普通文件夹 |

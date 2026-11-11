@@ -11,16 +11,16 @@
   },
   "backtest": {
     "grid": {
-      "link_spacing": true,
+      "link_spacing": false,
       "grid_mode": "geometric",
-      "buy_step": 0.047,
-      "sell_step": 0.047,
+      "buy_step": 0.05,
+      "sell_step": 0.1,
       "lower_price": null,
       "upper_price": null
     },
     "position": {
-      "link_shares": true,
-      "initial_shares": 20000,
+      "link_shares": false,
+      "initial_shares": 10000,
       "min_shares": 0,
       "max_shares": null,
       "buy_shares": 1000,
@@ -37,7 +37,7 @@
       "reference_version": null,
       "ma_window": 250,
       "change_window": 1,
-      "sensitivity": 10.0,
+      "sensitivity": 5.0,
       "min_multiplier": 0.1,
       "max_multiplier": 3.0
     },
@@ -142,7 +142,7 @@
   },
   "market_data": {
     "cache_mb": 256,
-    "recent_minute_source": "tdx",
+    "recent_minute_source": "sina",
     "etf_daily_source": "baostock",
     "etf_daily_fallback_enabled": true,
     "network_timeout_seconds": 15.0,
@@ -195,5 +195,5 @@
     "subprocess_timeout_seconds": 45,
     "lock_timeout_seconds": 30
   },
-  "config_revision": "816fcd0ba4a10bc818eae415b40ddbc41d09d22b30991e3d1f94a073fd2874e4"
+  "config_revision": "a9c106349862d3d5789c045ef6d6bbcac906cc6bb0fbffe0155b12b2291d40c9"
 }
